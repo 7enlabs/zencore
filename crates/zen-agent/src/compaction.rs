@@ -347,6 +347,35 @@ mod tests {
     }
 
     #[test]
+    fn file_ops_collect_only_reads_summaries_from_user_messages() {
+        // Pins `m.role == "user" && text.starts_with(SUMMARY_PREFIX)`:
+        // swapping `&&` for `||` would let a non-user message, or a
+        // user message that is not a summary, contribute file lists.
+        let summary = format!(
+            "{SUMMARY_PREFIX}\n\n<read-files>\nspy.rs\n</read-files>\n\n<modified-files>\nspy2.rs\n</modified-files>"
+        );
+        // An assistant message carrying summary text must not count.
+        let ops = FileOps::collect(&[ChatMessage::assistant(Some(summary.clone()), None)]);
+        assert!(ops.read.is_empty(), "read: {:?}", ops.read);
+        assert!(ops.modified.is_empty(), "modified: {:?}", ops.modified);
+        // A user message that is not a summary must not count either.
+        let not_summary = "hello\n\n<read-files>\nspy.rs\n</read-files>".to_string();
+        let ops = FileOps::collect(&[ChatMessage::user(not_summary)]);
+        assert!(ops.read.is_empty(), "read: {:?}", ops.read);
+        assert!(ops.modified.is_empty(), "modified: {:?}", ops.modified);
+        // The same text as a user summary does count.
+        let ops = FileOps::collect(&[ChatMessage::user(summary)]);
+        assert_eq!(
+            ops.read.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["spy.rs"]
+        );
+        assert_eq!(
+            ops.modified.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["spy2.rs"]
+        );
+    }
+
+    #[test]
     fn focus_text_is_included_only_when_present() {
         let plain = summarization_prompt(None);
         assert!(plain.contains("Summarize this coding session"));

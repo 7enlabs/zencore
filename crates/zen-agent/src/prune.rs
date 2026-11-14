@@ -461,6 +461,39 @@ mod tests {
     }
 
     #[test]
+    fn prune_messages_keeps_original_first_line() {
+        // Pins `let original = messages[i].text()`: replacing it with ""
+        // would leave the summary with no first line.
+        let (mut messages, turn_starts) = fixture_15_turns();
+        let current_turn = turn_starts.len() - 1;
+        let stats = prune_messages(&mut messages, &turn_starts, current_turn, &cfg(), "");
+        assert_eq!(stats.pruned, 10);
+        let content = messages[2].text();
+        assert!(
+            content.contains("Original first line: // file1 contents"),
+            "pruned summary: {content}"
+        );
+    }
+
+    #[test]
+    fn prune_messages_keeps_result_referenced_by_later_message() {
+        // Pins the later-text scan: if the later messages were ignored,
+        // the turn-1 result would be pruned even though it is referenced.
+        let (mut messages, turn_starts) = fixture_15_turns();
+        messages.push(ChatMessage::assistant(
+            Some("noted src/file1.rs for the follow-up".into()),
+            None,
+        ));
+        let current_turn = turn_starts.len() - 1;
+        let stats = prune_messages(&mut messages, &turn_starts, current_turn, &cfg(), "");
+        assert_eq!(stats.pruned, 9, "only the referenced turn is kept");
+        assert!(
+            !messages[2].text().starts_with(PRUNE_MARKER),
+            "turn 1 is referenced later, must not be pruned"
+        );
+    }
+
+    #[test]
     fn prune_messages_respects_protected_plan() {
         let (mut messages, turn_starts) = fixture_15_turns();
         let current_turn = turn_starts.len() - 1;

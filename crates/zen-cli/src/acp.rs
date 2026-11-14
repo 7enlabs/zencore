@@ -541,6 +541,98 @@ mod tests {
     }
 
     #[test]
+    fn emit_assistant_registers_tool_calls() {
+        let sink = AcpSink {
+            out: Arc::new(Mutex::new(std::io::stdout())),
+            session_id: "probe".into(),
+            tools: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let message = ChatMessage::assistant(
+            None,
+            Some(vec![zen_core::ToolCall {
+                id: "c1".into(),
+                call_type: "function".into(),
+                function: zen_core::FunctionCall {
+                    name: "Read".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+        );
+        emit_assistant(&sink, &message);
+        let tools = sink.tools.lock().unwrap();
+        assert_eq!(tools.get("c1").map(String::as_str), Some("Read"));
+    }
+
+    /// Probe entry point for the emit_assistant stdout tests below.
+    /// The parent test runs this test as a subprocess (current_exe with
+    /// this test name); it reads the message JSON from ACP_PROBE_MSG and
+    /// emits it through emit_assistant, so the parent can assert on the
+    /// JSON-RPC lines it writes to stdout. Without the env var it is a
+    /// no-op, so a plain `cargo test` run is unaffected.
+    #[test]
+    fn __acp_probe_emit_assistant() {
+        let Ok(json) = std::env::var("ACP_PROBE_MSG") else {
+            return;
+        };
+        let Ok(message) = serde_json::from_str::<ChatMessage>(&json) else {
+            return;
+        };
+        let sink = AcpSink {
+            out: Arc::new(Mutex::new(std::io::stdout())),
+            session_id: "probe".into(),
+            tools: Arc::new(Mutex::new(HashMap::new())),
+        };
+        emit_assistant(&sink, &message);
+    }
+
+    fn probe_emit_assistant(message_json: &str) -> Vec<serde_json::Value> {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .args([
+                "acp::tests::__acp_probe_emit_assistant",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("ACP_PROBE_MSG", message_json)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "probe run failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        stdout
+            .lines()
+            .filter(|l| l.starts_with("{\"jsonrpc\""))
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn emit_assistant_sends_nonempty_text_chunk() {
+        // Pins the `.filter(|t| !t.is_empty())`: negating the check
+        // would send no chunk for real text.
+        let lines = probe_emit_assistant(r#"{"role":"assistant","content":"hello"}"#);
+        assert_eq!(lines.len(), 1, "lines: {lines:?}");
+        assert_eq!(
+            lines[0]["params"]["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
+        assert_eq!(lines[0]["params"]["update"]["content"]["text"], "hello");
+    }
+
+    #[test]
+    fn emit_assistant_skips_empty_text() {
+        // Pins the filter the other way: dropping it would send an
+        // empty chunk for empty text.
+        let lines = probe_emit_assistant(r#"{"role":"assistant","content":""}"#);
+        assert!(lines.is_empty(), "lines: {lines:?}");
+        let lines = probe_emit_assistant(r#"{"role":"assistant"}"#);
+        assert!(lines.is_empty(), "lines: {lines:?}");
+    }
+
+    #[test]
     fn error_response_shape() {
         let resp = RpcResponse::err(json!(7), -32601, "method not found: foo");
         let v = serde_json::to_value(&resp).unwrap();

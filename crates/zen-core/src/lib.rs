@@ -1449,6 +1449,74 @@ mod tests {
         assert_eq!(ChatMessage::assistant(None, None).transcript_text(), "");
     }
     #[test]
+    fn system_message_carries_role_and_content() {
+        // Exact field values: replacing "system" with "" or the content
+        // with None must fail, as must emptying the text.
+        let msg = ChatMessage::system("hello");
+        assert_eq!(msg.role, "system");
+        assert_eq!(msg.content, Some(MessageContent::Text("hello".into())));
+        assert_eq!(msg.tool_calls, None);
+        assert_eq!(msg.tool_call_id, None);
+        assert_eq!(msg.name, None);
+        assert_eq!(msg.text_ref(), Some("hello"));
+        assert_eq!(msg.text(), "hello");
+        // Serialised shape pins role and content together.
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["role"], "system");
+        assert_eq!(v["content"], "hello");
+        assert!(v.get("tool_calls").is_none());
+        assert!(v.get("tool_call_id").is_none());
+        // Empty text is still content, not absent.
+        assert_eq!(ChatMessage::system("").text_ref(), Some(""));
+    }
+    #[test]
+    fn assistant_message_carries_role_content_and_calls() {
+        // Exact field values: replacing "assistant" with "", the content
+        // with None, or the tool calls with None must fail.
+        let msg = ChatMessage::assistant(
+            Some("hi".into()),
+            Some(vec![ToolCall {
+                id: "call_1".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "Read".into(),
+                    arguments: r#"{"path":"a.rs"}"#.into(),
+                },
+            }]),
+        );
+        assert_eq!(msg.role, "assistant");
+        assert_eq!(msg.content, Some(MessageContent::Text("hi".into())));
+        assert_eq!(msg.tool_calls.as_ref().unwrap().len(), 1);
+        assert_eq!(msg.tool_calls.as_ref().unwrap()[0].function.name, "Read");
+        assert_eq!(msg.tool_call_id, None);
+        assert_eq!(msg.name, None);
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["role"], "assistant");
+        assert_eq!(v["content"], "hi");
+        assert_eq!(v["tool_calls"][0]["id"], "call_1");
+        assert_eq!(v["tool_calls"][0]["function"]["name"], "Read");
+        // No content and no calls stay absent, not empty.
+        let bare = ChatMessage::assistant(None, None);
+        assert_eq!(bare.role, "assistant");
+        assert_eq!(bare.content, None);
+        assert_eq!(bare.tool_calls, None);
+        assert_eq!(bare.text_ref(), None);
+        // Calls without text keep the calls and no content.
+        let calls_only = ChatMessage::assistant(
+            None,
+            Some(vec![ToolCall {
+                id: "call_2".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "Bash".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+        );
+        assert_eq!(calls_only.content, None);
+        assert_eq!(calls_only.tool_calls.as_ref().unwrap().len(), 1);
+    }
+    #[test]
     fn settings_parse_camel_case_and_extra() {
         let s: Settings = serde_json::from_str(r#"{"model":"m","baseUrl":"u","permissions":{"allow":["Read"],"defaultMode":"plan"},"foo":1}"#).unwrap();
         assert_eq!(s.base_url.as_deref(), Some("u"));

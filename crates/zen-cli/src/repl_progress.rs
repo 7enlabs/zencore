@@ -412,6 +412,62 @@ mod tests {
     }
 
     #[test]
+    fn render_assistant_with_empty_tool_calls_is_empty() {
+        // Pins the `.filter(|c| !c.is_empty())`: dropping the filter
+        // would render the text line for a call-less message.
+        use zen_core::ChatMessage;
+        let r = render(&AgentEvent::Assistant {
+            message: ChatMessage::assistant(Some("hi".into()), Some(vec![])),
+            parent_tool_use_id: None,
+        });
+        assert!(r.is_empty(), "lines: {r:?}");
+        // No calls at all renders nothing either.
+        let r = render(&AgentEvent::Assistant {
+            message: ChatMessage::assistant(Some("hi".into()), None),
+            parent_tool_use_id: None,
+        });
+        assert!(r.is_empty(), "lines: {r:?}");
+    }
+
+    #[test]
+    fn render_assistant_lists_text_and_tool_call() {
+        // Pins the filter the other way: negating `!c.is_empty()` would
+        // drop the real call and render nothing.
+        use zen_core::{ChatMessage, FunctionCall, ToolCall};
+        let msg = ChatMessage::assistant(
+            Some("running".into()),
+            Some(vec![ToolCall {
+                id: "c1".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "Bash".into(),
+                    arguments: r#"{"command":"cargo test"}"#.into(),
+                },
+            }]),
+        );
+        let r = render(&AgentEvent::Assistant {
+            message: msg.clone(),
+            parent_tool_use_id: None,
+        });
+        assert_eq!(
+            r,
+            vec!["● running".to_string(), "● Bash(cargo test)".to_string()]
+        );
+        // A nested call is indented.
+        let r = render(&AgentEvent::Assistant {
+            message: msg,
+            parent_tool_use_id: Some("parent".into()),
+        });
+        assert_eq!(
+            r,
+            vec![
+                "  ● running".to_string(),
+                "  ● Bash(cargo test)".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn retry_and_compaction_render() {
         let r = render(&AgentEvent::ApiRetry {
             attempt: 2,

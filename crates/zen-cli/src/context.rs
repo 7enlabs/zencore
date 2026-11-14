@@ -859,4 +859,103 @@ mod tests {
         );
         assert_eq!(tool_call_label("read", "not json"), "read");
     }
+
+    fn analyzed(messages: Vec<ChatMessage>) -> ContextAnalysis {
+        let parsed = ParsedSession {
+            session_id: "s".to_string(),
+            requests: vec![LoggedRequest {
+                seq: 1,
+                timestamp: "2026-10-17T10:00:00Z".to_string(),
+                model: "test-model".to_string(),
+                tools_hash: None,
+                body_bytes: 0,
+                messages,
+            }],
+            usage_by_seq: HashMap::new(),
+            tools_by_hash: HashMap::new(),
+            summaries: vec![],
+        };
+        analyze(&parsed)
+    }
+
+    fn assistant_call(id: &str, name: &str, args: &str) -> ChatMessage {
+        ChatMessage::assistant(
+            None,
+            Some(vec![zen_core::ToolCall {
+                id: id.into(),
+                call_type: "function".into(),
+                function: zen_core::FunctionCall {
+                    name: name.into(),
+                    arguments: args.into(),
+                },
+            }]),
+        )
+    }
+
+    #[test]
+    fn message_tokens_counts_text_images_and_tool_calls_exactly() {
+        // Exact totals pin the `+` and `*` in message_tokens: swapping
+        // either operator changes the total (or underflows).
+        let msgs = vec![
+            ChatMessage::user_parts(vec![
+                zen_core::ContentPart::text("abcdefgh"),
+                zen_core::ContentPart::image_url("data:image/png;base64,AAAA"),
+                zen_core::ContentPart::image("image/png", "AAAA"),
+            ]),
+            assistant_call("c1", "Read", "{}"),
+            ChatMessage::tool("c1", "abcdefgh"),
+        ];
+        let a = analyzed(msgs);
+        assert_eq!(a.total_source, TotalSource::Estimated);
+        // Text 8 chars / 4 = 2, plus 2 images * 384 = 770.
+        assert_eq!(a.turns[0].tokens, 770);
+        // Tool call: name 4 / 4 = 1, args 2 / 4 = 0, plus 4 = 5.
+        assert_eq!(a.turns[1].tokens, 5);
+        // Tool result: text 8 / 4 = 2, plus 4 for the call id = 6.
+        assert_eq!(a.turns[2].tokens, 6);
+        assert_eq!(a.total_tokens, 781);
+    }
+
+    #[test]
+    fn analyze_flags_tool_result_at_exactly_the_prune_threshold() {
+        // Boundary of `tokens >= PRUNE_CANDIDATE_TOKENS`: exactly 2000
+        // tokens (1996 text + 4 call id) is prunable; `>` would miss it.
+        let content = "y".repeat(7984);
+        let msgs = vec![
+            assistant_call("c1", "read", r#"{"path": "src/main.rs"}"#),
+            ChatMessage::tool("c1", content),
+            ChatMessage::user("thanks"),
+            ChatMessage::assistant(Some("done".into()), None),
+        ];
+        let a = analyzed(msgs);
+        assert_eq!(a.turns[1].tokens, 2000);
+        assert!(a.turns[1].prunable, "turns: {:?}", a.turns);
+        assert!(
+            a.turns[1]
+                .prune_reason
+                .as_ref()
+                .unwrap()
+                .contains("2000 tokens")
+        );
+        assert!(
+            a.top_consumers
+                .iter()
+                .any(|c| c.label.contains("read src/main.rs"))
+        );
+    }
+
+    #[test]
+    fn analyze_does_not_flag_tool_result_just_below_the_threshold() {
+        // 1999 tokens (1995 text + 4 call id) stays under the threshold.
+        let content = "y".repeat(7980);
+        let msgs = vec![
+            assistant_call("c1", "read", r#"{"path": "src/main.rs"}"#),
+            ChatMessage::tool("c1", content),
+            ChatMessage::user("thanks"),
+            ChatMessage::assistant(Some("done".into()), None),
+        ];
+        let a = analyzed(msgs);
+        assert_eq!(a.turns[1].tokens, 1999);
+        assert!(!a.turns[1].prunable, "turns: {:?}", a.turns);
+    }
 }
