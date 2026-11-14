@@ -945,6 +945,35 @@ mod tests {
     }
 
     #[test]
+    fn analyze_flags_tool_result_whose_identifier_appears_only_in_itself() {
+        // Pins `.skip(i + 1)` in the mentioned-later scan: the identifier
+        // appears in the tool result itself, but in no later message, so
+        // the result is still flagged prunable. `skip(i)` or `skip(i - 1)`
+        // would scan the result itself, see the identifier and clear it.
+        // Exactly 2000 tokens (1996 text + 4 call id), like the threshold
+        // test above, so the flag depends only on the later-text scan.
+        let content = format!("src/only-here.rs\n{}", "y".repeat(7967));
+        let msgs = vec![
+            assistant_call("c1", "read", r#"{"path": "src/only-here.rs"}"#),
+            ChatMessage::tool("c1", content),
+            ChatMessage::user("thanks"),
+            ChatMessage::assistant(Some("done".into()), None),
+        ];
+        let a = analyzed(msgs);
+        assert_eq!(a.turns[1].tokens, 2000);
+        assert!(a.turns[1].prunable, "turns: {:?}", a.turns);
+        assert!(
+            a.turns[1]
+                .prune_reason
+                .as_ref()
+                .unwrap()
+                .contains("not referenced"),
+            "turns: {:?}",
+            a.turns
+        );
+    }
+
+    #[test]
     fn analyze_does_not_flag_tool_result_just_below_the_threshold() {
         // 1999 tokens (1995 text + 4 call id) stays under the threshold.
         let content = "y".repeat(7980);

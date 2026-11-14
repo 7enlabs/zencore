@@ -494,6 +494,33 @@ mod tests {
     }
 
     #[test]
+    fn prune_messages_prunes_result_whose_identifier_appears_only_in_itself() {
+        // Pins `.skip(i + 1)` in the later-text scan: the identifier
+        // appears in the tool result itself, but in no later message, so
+        // the result is still prunable. `skip(i)` or `skip(i - 1)` would
+        // scan the result itself, see the identifier and keep it.
+        let body = format!("src/only-here.rs\n{}", "x".repeat(20_000));
+        let messages = vec![
+            ChatMessage::user("do the thing"),
+            assistant_with_call("call-1", "read", r#"{"path": "src/only-here.rs"}"#),
+            tool_msg("call-1", &body),
+            ChatMessage::assistant(Some("done with step 1".into()), None),
+            ChatMessage::user("next step"),
+        ];
+        let mut messages = messages;
+        let turn_starts = vec![0usize, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        let current_turn = turn_starts.len() - 1;
+        let stats = prune_messages(&mut messages, &turn_starts, current_turn, &cfg(), "");
+        assert_eq!(stats.pruned, 1, "stats: {:?}", stats);
+        let content = messages[2].text();
+        assert!(content.starts_with(PRUNE_MARKER), "content: {content}");
+        assert!(
+            content.contains("src/only-here.rs"),
+            "identifier preserved: {content}"
+        );
+    }
+
+    #[test]
     fn prune_messages_respects_protected_plan() {
         let (mut messages, turn_starts) = fixture_15_turns();
         let current_turn = turn_starts.len() - 1;
