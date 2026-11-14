@@ -1025,7 +1025,12 @@ impl Agent {
         self.usage.input_tokens += resp.usage.prompt_tokens;
         self.usage.output_tokens += resp.usage.completion_tokens;
         self.usage.cache_read_input_tokens += resp.usage.cache_read_input_tokens;
-        let summary = resp.message.content.unwrap_or_default();
+        let summary = resp
+            .message
+            .content
+            .as_ref()
+            .map(|c| c.text())
+            .unwrap_or_default();
         let summary = summary.trim();
         if summary.is_empty() {
             return (stop_text.to_string(), api_ms);
