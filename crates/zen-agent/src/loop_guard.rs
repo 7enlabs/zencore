@@ -557,6 +557,25 @@ mod tests {
     }
 
     #[test]
+    fn fingerprint_keeps_first_line_when_not_exit_code_line() {
+        // A non-exit-code first line must be the fingerprint even when a
+        // second line exists: replacing is_exit_code_line with `true`
+        // would skip to the body instead.
+        let fp = LoopGuard::error_fingerprint("cannot open file\nsecond line here").unwrap();
+        assert_eq!(fp.1, "cannot open file");
+    }
+
+    #[test]
+    fn exit_code_line_with_trailing_junk_is_not_skipped() {
+        // "Exit code 1x" is not a bare generic prefix (the code is not
+        // all digits), so it must be the fingerprint, not the body.
+        // Replacing && with || in is_exit_code_line would treat it as
+        // a prefix and skip to the body.
+        let fp = LoopGuard::error_fingerprint("Exit code 1x\nls: cannot access '/nope'").unwrap();
+        assert_eq!(fp.1, "exit code #x");
+    }
+
+    #[test]
     fn k_zero_disables_both_triggers() {
         let mut g = LoopGuard::new(0);
         let args = json!({"command": "ls"});
