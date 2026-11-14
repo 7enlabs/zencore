@@ -1258,6 +1258,197 @@ mod tests {
         assert_eq!(estimate_tokens(&two_images), 2 * IMAGE_PART_TOKEN_ESTIMATE);
     }
     #[test]
+    fn tool_message_carries_role_content_and_call_id() {
+        // Exact field values: deleting the `role` or `content` field from
+        // the struct literal (filled in by `..Default::default()`) must fail.
+        let msg = ChatMessage::tool("call_123", "result text");
+        assert_eq!(msg.role, "tool");
+        assert_eq!(
+            msg.content,
+            Some(MessageContent::Text("result text".into()))
+        );
+        assert_eq!(msg.tool_call_id.as_deref(), Some("call_123"));
+        assert_eq!(msg.text_ref(), Some("result text"));
+        assert_eq!(msg.text(), "result text");
+        // Serialised shape pins role, content and call id together.
+        assert_eq!(
+            serde_json::to_string(&msg).unwrap(),
+            r#"{"role":"tool","content":"result text","tool_call_id":"call_123"}"#
+        );
+    }
+    #[test]
+    fn text_ref_is_some_only_for_plain_text_content() {
+        // Exact value: kills replacing the body with None, Some("") and
+        // Some("xyzzy"), and deleting the Some(MessageContent::Text(s)) arm.
+        assert_eq!(ChatMessage::user("hello").text_ref(), Some("hello"));
+        // Parts content is never plain text, even with text parts in it.
+        let parts = ChatMessage::user_parts(vec![
+            ContentPart::text("hello"),
+            ContentPart::image_url("data:image/png;base64,AAAA"),
+        ]);
+        assert_eq!(parts.text_ref(), None);
+        // Absent content is not plain text.
+        assert_eq!(ChatMessage::assistant(None, None).text_ref(), None);
+        // Empty text is still Some(""): empty is not absent.
+        assert_eq!(ChatMessage::user("").text_ref(), Some(""));
+    }
+    #[test]
+    fn image_part_count_counts_only_image_parts() {
+        // Zero kills the "replace with 1" mutant; two pins the count.
+        assert_eq!(ChatMessage::user("hi").image_part_count(), 0);
+        assert_eq!(ChatMessage::assistant(None, None).image_part_count(), 0);
+        let one = ChatMessage::user_parts(vec![
+            ContentPart::text("hi"),
+            ContentPart::image_url("data:image/png;base64,AAAA"),
+        ]);
+        assert_eq!(one.image_part_count(), 1);
+        let two = ChatMessage::user_parts(vec![
+            ContentPart::image_url("data:image/png;base64,AAAA"),
+            ContentPart::image("image/png", "AAAA"),
+        ]);
+        assert_eq!(two.image_part_count(), 2);
+        let text_only =
+            ChatMessage::user_parts(vec![ContentPart::text("a"), ContentPart::text("b")]);
+        assert_eq!(text_only.image_part_count(), 0);
+        // Same assertions on MessageContent directly.
+        assert_eq!(MessageContent::Text("hi".into()).image_part_count(), 0);
+        assert_eq!(
+            MessageContent::Parts(vec![
+                ContentPart::text("a"),
+                ContentPart::image_url("data:image/png;base64,AAAA"),
+                ContentPart::image("image/png", "AAAA"),
+            ])
+            .image_part_count(),
+            2
+        );
+    }
+    #[test]
+    fn estimate_tokens_accumulates_text_and_images_exactly() {
+        // Exact totals: every operator mutation changes the result.
+        assert_eq!(estimate_tokens(&[]), 0);
+        // Single text message: 8 chars / 4 = 2. Kills `chars +=` -> `*=`.
+        assert_eq!(estimate_tokens(&[ChatMessage::user("abcdefgh")]), 2);
+        // Two messages accumulate: (8 + 8) / 4 = 4.
+        assert_eq!(
+            estimate_tokens(&[ChatMessage::user("abcdefgh"), ChatMessage::user("ijklmnop"),]),
+            4
+        );
+        // Text + one image: 8 / 4 + 384 = 386.
+        assert_eq!(
+            estimate_tokens(&[ChatMessage::user_parts(vec![
+                ContentPart::text("abcdefgh"),
+                ContentPart::image_url("data:image/png;base64,AAAA"),
+            ])]),
+            2 + IMAGE_PART_TOKEN_ESTIMATE
+        );
+        // Text + two images: 8 / 4 + 2 * 384 = 770.
+        // Kills `*` -> `+` / `/` and `+` -> `-` in the final expression.
+        assert_eq!(
+            estimate_tokens(&[ChatMessage::user_parts(vec![
+                ContentPart::text("abcdefgh"),
+                ContentPart::image_url("data:image/png;base64,AAAA"),
+                ContentPart::image("image/png", "AAAA"),
+            ])]),
+            2 + 2 * IMAGE_PART_TOKEN_ESTIMATE
+        );
+        // Long text + one image: 2000 / 4 + 384 = 884. The `+` -> `-`
+        // mutant gives 500 - 384 = 116 here (no underflow), so the exact
+        // value is what kills it.
+        let long = "x".repeat(2000);
+        assert_eq!(
+            estimate_tokens(&[ChatMessage::user_parts(vec![
+                ContentPart::text(long),
+                ContentPart::image_url("data:image/png;base64,AAAA"),
+            ])]),
+            500 + IMAGE_PART_TOKEN_ESTIMATE
+        );
+    }
+    #[test]
+    fn estimate_tokens_counts_tool_call_name_and_arguments() {
+        // Tool call name "get_time" (8) + arguments (16) = 24 chars,
+        // 24 / 4 = 6. Kills `+=` -> `*=` / `-=` on the tool-call
+        // accumulation and `+` -> `-` inside the length sum.
+        let call = ChatMessage::assistant(
+            None,
+            Some(vec![ToolCall {
+                id: "call_1".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "get_time".into(),
+                    arguments: r#"{"city":"Hanoi"}"#.into(),
+                },
+            }]),
+        );
+        assert_eq!(estimate_tokens(&[call]), 6);
+        // Text + tool call accumulate: (8 + 24) / 4 = 8.
+        let with_text = ChatMessage::assistant(
+            Some("abcdefgh".into()),
+            Some(vec![ToolCall {
+                id: "call_1".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "get_time".into(),
+                    arguments: r#"{"city":"Hanoi"}"#.into(),
+                },
+            }]),
+        );
+        assert_eq!(estimate_tokens(&[with_text]), 8);
+    }
+    #[test]
+    fn user_parts_and_assistant_content_carry_role_and_content() {
+        let parts = ChatMessage::user_parts(vec![ContentPart::text("hi")]);
+        assert_eq!(parts.role, "user");
+        assert_eq!(parts.text(), "hi");
+        assert_eq!(parts.image_part_count(), 0);
+        let content = ChatMessage::assistant_content(
+            Some(MessageContent::Parts(vec![ContentPart::text("hi")])),
+            None,
+        );
+        assert_eq!(content.role, "assistant");
+        assert_eq!(content.text(), "hi");
+        // Parts content is not plain text.
+        assert_eq!(content.text_ref(), None);
+    }
+    #[test]
+    fn message_content_text_transcript_and_len_pin_multimodal_views() {
+        assert_eq!(MessageContent::Text("hi".into()).text(), "hi");
+        let parts = MessageContent::Parts(vec![
+            ContentPart::text("a"),
+            ContentPart::image_url("data:image/png;base64,AAAA"),
+            ContentPart::text("b"),
+        ]);
+        // Only text parts join; image parts contribute nothing.
+        assert_eq!(parts.text(), "ab");
+        assert_eq!(parts.transcript_text(), "a[image]b");
+        assert_eq!(parts.text_len(), 2);
+        assert_eq!(MessageContent::Text("hello".into()).text_len(), 5);
+        assert_eq!(MessageContent::Text("hi".into()).transcript_text(), "hi");
+        // Image-only parts have no text at all.
+        let images_only =
+            MessageContent::Parts(vec![ContentPart::image_url("data:image/png;base64,AAAA")]);
+        assert_eq!(images_only.text(), "");
+        assert_eq!(images_only.text_len(), 0);
+    }
+    #[test]
+    fn content_part_is_image_distinguishes_text_from_images() {
+        assert!(!ContentPart::text("hi").is_image());
+        assert!(ContentPart::image_url("data:image/png;base64,AAAA").is_image());
+        assert!(ContentPart::image("image/png", "AAAA").is_image());
+    }
+    #[test]
+    fn chat_message_text_and_transcript_views() {
+        assert_eq!(ChatMessage::user("hi").text(), "hi");
+        assert_eq!(ChatMessage::assistant(None, None).text(), "");
+        let parts = ChatMessage::user_parts(vec![
+            ContentPart::text("a"),
+            ContentPart::image_url("data:image/png;base64,AAAA"),
+        ]);
+        assert_eq!(parts.text(), "a");
+        assert_eq!(parts.transcript_text(), "a[image]");
+        assert_eq!(ChatMessage::user("hi").transcript_text(), "hi");
+        assert_eq!(ChatMessage::assistant(None, None).transcript_text(), "");
+    }
+    #[test]
     fn settings_parse_camel_case_and_extra() {
         let s: Settings = serde_json::from_str(r#"{"model":"m","baseUrl":"u","permissions":{"allow":["Read"],"defaultMode":"plan"},"foo":1}"#).unwrap();
         assert_eq!(s.base_url.as_deref(), Some("u"));
