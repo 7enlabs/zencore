@@ -289,9 +289,9 @@ for line in sys.stdin:
         if mode == "paged" and not msg.get("params", {}).get("cursor"):
             send({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"alpha","description":"first tool","inputSchema":{"type":"object","properties":{"x":{"type":"string"}}}}],"nextCursor":"page2"}})
         elif mode == "paged":
-            send({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"beta","description":"second tool"}]}})
+            send({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"beta","description":"second tool","inputSchema":{"type":"object"}}]}})
         else:
-            send({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"echo","description":"echoes input","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}},{"name":"boom","description":"fails"}]}})
+            send({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"echo","description":"echoes input","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}},{"name":"boom","description":"fails","inputSchema":{"type":"object"}}]}})
     elif method == "tools/call":
         name = msg.get("params", {}).get("name")
         args = msg.get("params", {}).get("arguments", {})
