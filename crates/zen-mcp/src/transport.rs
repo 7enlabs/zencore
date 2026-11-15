@@ -116,7 +116,7 @@ impl Session {
     }
 }
 
-fn content_block_to_value(block: &ContentBlock) -> Value {
+pub(crate) fn content_block_to_value(block: &ContentBlock) -> Value {
     match block {
         ContentBlock::Text(text) => json!({ "type": "text", "text": text.text }),
         ContentBlock::Image(image) => {
@@ -318,6 +318,16 @@ impl Transport {
                 session.call_tool(&name, args).await
             }
             other => Err(anyhow!("unsupported MCP method '{other}'")),
+        }
+    }
+
+    /// The timeout this transport resolved at construction (0 means the
+    /// documented 30 s default). Test-only: production code never reads it
+    /// back, it only passes the value to the session.
+    #[cfg(test)]
+    pub(crate) fn resolved_timeout_ms(&self) -> u64 {
+        match self {
+            Transport::Stdio { timeout_ms, .. } | Transport::Http { timeout_ms, .. } => *timeout_ms,
         }
     }
 
