@@ -2814,9 +2814,11 @@ mod model_picker_tests {
     static PICKER_STDIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     /// How long the key feeder waits for the picker to switch the
     /// slave to raw mode before writing the keys anyway.
+    #[cfg(unix)]
     const PICKER_RAW_MODE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
     /// How long pick_on_pty waits for the key feeder to finish
     /// before detaching it instead of joining it.
+    #[cfg(unix)]
     const FEEDER_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
     /// A pty whose slave replaces fd 0 (stdin) and fd 2 (stderr) for the
