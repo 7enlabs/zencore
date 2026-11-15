@@ -2812,6 +2812,14 @@ mod model_picker_tests {
     /// two such tests must never run at once.
     #[cfg(unix)]
     static PICKER_STDIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// How long the key feeder waits for the picker to switch the
+    /// slave to raw mode before writing the keys anyway.
+    #[cfg(unix)]
+    const PICKER_RAW_MODE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+    /// How long pick_on_pty waits for the key feeder to finish
+    /// before detaching it instead of joining it.
+    #[cfg(unix)]
+    const FEEDER_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
     /// A pty whose slave replaces fd 0 (stdin) and fd 2 (stderr) for the
     /// duration of a test. dialoguer renders to stderr and reads keys
@@ -2848,6 +2856,28 @@ mod model_picker_tests {
             assert_eq!(unsafe { libc::dup2(slave, 0) }, 0);
             assert_eq!(unsafe { libc::dup2(slave, 2) }, 2);
             unsafe { libc::close(slave) };
+            // Drain the master: dialoguer renders to the slave and
+            // nothing reads the master, so on macOS the pty output
+            // queue fills up and the picker's tcsetattr(TCSADRAIN)
+            // sleeps forever waiting for output to drain (XNU ttywait
+            // with t_timeout defaulting to 0 = no timeout; Linux
+            // returns at once). The drainer discards the output and
+            // exits on its own when the slave closes (read fails), so
+            // it is never joined.
+            let drain = unsafe { libc::dup(master) };
+            assert!(drain >= 0, "dup pty master for drainer failed");
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = unsafe {
+                        libc::read(drain, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                    };
+                    if n <= 0 {
+                        break;
+                    }
+                }
+                unsafe { libc::close(drain) };
+            });
             Self {
                 saved_stdin,
                 saved_stderr,
@@ -2857,14 +2887,41 @@ mod model_picker_tests {
 
         /// Feed key bytes to the picker from a thread: the writer waits
         /// until the picker has switched the slave to raw mode, so CR
-        /// stays CR and the escape sequence is parsed as one key. The
-        /// writer owns its own dup of the master, so the guard can be
-        /// dropped (restoring fd 0/2) before joining it.
-        fn feed_keys(&self, keys: &'static [u8]) -> std::thread::JoinHandle<()> {
+        /// stays CR and the escape sequence is parsed as one key. Raw
+        /// mode is polled via tcgetattr on the master, which shares
+        /// the pair's termios; if it never appears within the budget
+        /// (or tcgetattr fails on the master), the writer falls back
+        /// to writing after a short sleep, as before. The writer owns
+        /// its own dup of the master, so the guard can be dropped
+        /// (restoring fd 0/2) before the writer finishes, and it
+        /// signals completion on a channel so the test never joins it
+        /// unbounded: a write to a master whose slave has closed
+        /// sleeps forever on macOS (XNU ptcwrite waits for the slave
+        /// to open).
+        fn feed_keys(
+            &self,
+            keys: &'static [u8],
+        ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<()>) {
             let master = unsafe { libc::dup(self.master) };
             assert!(master >= 0, "dup pty master failed");
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(500));
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + PICKER_RAW_MODE_WAIT;
+                loop {
+                    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+                    let rc = unsafe { libc::tcgetattr(master, &mut termios) };
+                    if rc != 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        break;
+                    }
+                    if (termios.c_lflag & libc::ICANON) == 0 {
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
                 let mut sent = 0;
                 while sent < keys.len() {
                     let n = unsafe {
@@ -2878,7 +2935,9 @@ mod model_picker_tests {
                     sent += n as usize;
                 }
                 unsafe { libc::close(master) };
-            })
+                let _ = done_tx.send(());
+            });
+            (handle, done_rx)
         }
     }
 
@@ -2953,7 +3012,7 @@ mod model_picker_tests {
                 .collect();
             let owned_current = current.to_string();
             let guard = PtyStdin::open();
-            let feeder = guard.feed_keys(keys);
+            let (feeder, feeder_done) = guard.feed_keys(keys);
             let (tx, rx) = std::sync::mpsc::channel();
             let handle = std::thread::spawn(move || {
                 let old_mask = block_sigchld();
@@ -2965,7 +3024,24 @@ mod model_picker_tests {
                 Ok(picked) => {
                     let _ = handle.join();
                     drop(guard);
-                    feeder.join().expect("key feeder thread panicked");
+                    // Bounded wait for the feeder: on macOS a write
+                    // to a master whose slave has closed sleeps
+                    // forever (XNU ptcwrite waits for the slave to
+                    // open), so an unbounded join could hang the test
+                    // and, through PICKER_STDIN_LOCK, the whole suite.
+                    // A stuck feeder is detached; it owns only its own
+                    // dup of a dead pty.
+                    match feeder_done.recv_timeout(FEEDER_JOIN_TIMEOUT) {
+                        Ok(()) => {
+                            let _ = feeder.join();
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            eprintln!("picker test: key feeder stuck, detaching it");
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            feeder.join().expect("key feeder thread panicked");
+                        }
+                    }
                     match picked {
                         Ok(value) => return value,
                         Err(e) => last_err = Some(e),
@@ -2986,10 +3062,6 @@ mod model_picker_tests {
     }
 
     #[cfg(unix)]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "hangs on macOS aarch64 CI, job 132516251247: pick_on_pty never returns; stopgap until root fix"
-    )]
     #[test]
     fn picker_enter_selects_the_default_row() {
         // Enter with no movement picks the default row (the current
@@ -3000,10 +3072,6 @@ mod model_picker_tests {
     }
 
     #[cfg(unix)]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "hangs on macOS aarch64 CI, job 132516251247: pick_on_pty never returns; stopgap until root fix"
-    )]
     #[test]
     fn picker_arrow_down_then_enter_selects_the_next_row() {
         let picked = pick_on_pty("deepseek-v4.1-flash", &rows(), b"\x1b[B\r");
@@ -3011,10 +3079,6 @@ mod model_picker_tests {
     }
 
     #[cfg(unix)]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "hangs on macOS aarch64 CI, job 132516251247: pick_on_pty never returns; stopgap until root fix"
-    )]
     #[test]
     fn picker_escape_cancels_without_picking() {
         let picked = pick_on_pty("deepseek-v4.1-flash", &rows(), b"\x1b");
