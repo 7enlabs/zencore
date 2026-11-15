@@ -98,7 +98,8 @@ while True:
 /// Mock server that answers every didOpen/didChange with a
 /// `publishDiagnostics` batch derived from the file text: a line
 /// containing `ERROR_ONE` yields an Error diagnostic, `ERROR_TWO` a
-/// Warning. Text without markers yields an empty batch (which must
+/// Warning, `INFO_THREE` an Information and `HINT_FOUR` a Hint.
+/// Text without markers yields an empty batch (which must
 /// clear previously published diagnostics for the URI).
 const MOCK_SERVER_DIAG: &str = r##"#!/usr/bin/env python3
 import sys, json
@@ -142,6 +143,14 @@ def diagnostics_for(text, uri):
             diags.append({"range": {"start": {"line": i, "character": 0},
                                     "end": {"line": i, "character": 5}},
                           "severity": 2, "message": "mock warning two", "source": "mock"})
+        if "INFO_THREE" in line:
+            diags.append({"range": {"start": {"line": i, "character": 0},
+                                    "end": {"line": i, "character": 5}},
+                          "severity": 3, "message": "mock info three", "source": "mock"})
+        if "HINT_FOUR" in line:
+            diags.append({"range": {"start": {"line": i, "character": 0},
+                                    "end": {"line": i, "character": 5}},
+                          "severity": 4, "message": "mock hint four", "source": "mock"})
     return {"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
             "params": {"uri": uri, "diagnostics": diags}}
 
@@ -1021,6 +1030,27 @@ async fn diagnostics_diff_only_new() {
 }
 
 #[tokio::test]
+async fn diagnostics_after_edit_keeps_only_error_and_warning() {
+    let Some(setup) = mock_diag_setup() else {
+        eprintln!("SKIP: python3 not found");
+        return;
+    };
+    // Mixed severity: the mock publishes one diagnostic per severity.
+    // Q5: only Error and Warning reach the feedback loop; Information
+    // and Hint are filtered out at collection.
+    write_file(
+        &setup.main_rs,
+        "fn main() {\n    ERROR_ONE\n    ERROR_TWO\n    INFO_THREE\n    HINT_FOUR\n}\n",
+    );
+    let diags = setup.manager.diagnostics_after_edit(&setup.main_rs).await;
+    assert_eq!(diags.len(), 2, "got: {diags:?}");
+    assert_eq!(diags[0].message, "mock error one");
+    assert_eq!(diags[0].severity, 1);
+    assert_eq!(diags[1].message, "mock warning two");
+    assert_eq!(diags[1].severity, 2);
+}
+
+#[tokio::test]
 async fn diagnostics_after_edit_unsupported_extension_returns_empty_without_spawn() {
     let tmp = unique_tmpdir("diag-unsupported");
     let f = tmp.join("notes.txt");
@@ -1103,6 +1133,52 @@ async fn diagnostics_tool_reads_cached_diagnostics_without_waiting() {
     );
     assert!(out.content.contains("Error [2:5]"), "got: {}", out.content);
     assert!(out.content.contains("```json"), "got: {}", out.content);
+}
+
+#[tokio::test]
+async fn diagnostics_tool_keeps_only_error_and_warning() {
+    let Some(setup) = mock_diag_setup() else {
+        eprintln!("SKIP: python3 not found");
+        return;
+    };
+    write_file(
+        &setup.main_rs,
+        "fn main() {\n    ERROR_ONE\n    ERROR_TWO\n    INFO_THREE\n    HINT_FOUR\n}\n",
+    );
+    let diags = setup.manager.diagnostics_after_edit(&setup.main_rs).await;
+    assert_eq!(diags.len(), 2, "got: {diags:?}");
+
+    let mgr = std::sync::Arc::new(setup.manager);
+    let ctx = test_ctx(&setup._tmp);
+    let out = DiagnosticsTool::new(mgr)
+        .call(json!({"file": "main.rs"}), &ctx)
+        .await;
+    assert!(!out.is_error, "got error: {}", out.content);
+    assert!(
+        out.content.contains("mock error one"),
+        "got: {}",
+        out.content
+    );
+    assert!(
+        out.content.contains("mock warning two"),
+        "got: {}",
+        out.content
+    );
+    assert!(
+        !out.content.contains("mock info three"),
+        "Information must be filtered out: {}",
+        out.content
+    );
+    assert!(
+        !out.content.contains("mock hint four"),
+        "Hint must be filtered out: {}",
+        out.content
+    );
+    assert!(
+        out.content.contains("(2):"),
+        "count header must say 2: {}",
+        out.content
+    );
 }
 
 #[tokio::test]

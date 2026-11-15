@@ -1501,7 +1501,8 @@ impl Agent {
 
     /// Post-edit LSP diagnostics note (P0 #4): after a successful Edit,
     /// MultiEdit or Write, ask the diagnostics provider for NEW
-    /// diagnostics for the edited file and append them so the model can
+    /// diagnostics (Error and Warning only, Q5) for the edited file and
+    /// append them so the model can
     /// fix its own type errors. Returns None when the provider is off,
     /// the tool is not a file edit, the call failed, the file has no
     /// new diagnostics, or the per-file feedback cap for this run is

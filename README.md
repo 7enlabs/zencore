@@ -707,15 +707,17 @@ Tool reference:
 - `find_references(file, line, col, include_declaration=true)` - every use of the symbol.
 - `diagnostics(file)` - the server's latest diagnostics for a file, from the last
   `publishDiagnostics` batch. Never starts a server or waits: if no server is running
-  for the file it says so.
+  for the file it says so. Only Error and Warning severities are shown; Information
+  and Hint are filtered out.
 
 Each result prints human-readable `path:line:col` lines followed by a fenced `json` block, so
 both the model and scripts can consume it.
 
 Post-edit feedback loop (off by default): when `lsp.diagnosticsAfterEdit` is enabled in
 settings, a successful Edit/Write/MultiEdit waits for the language server's fresh
-diagnostics for the edited file and appends only the NEW ones (snapshot diff) to the tool
-result, so the model can fix its own type errors. The wait resolves 150ms after the
+diagnostics for the edited file and appends only the NEW ones (snapshot diff) at Error
+and Warning severity (Information and Hint are filtered out) to the tool result, so
+the model can fix its own type errors. The wait resolves 150ms after the
 server's last diagnostics batch (`lsp.diagnosticsDebounceMs`) and never waits more than
 3s (`lsp.diagnosticsTimeoutSecs`): 3s is a cap, not a fixed wait, and a slow first batch
 on a large project just yields an empty round - raise the cap if your server needs more.
