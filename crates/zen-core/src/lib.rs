@@ -612,6 +612,13 @@ pub trait Tool: Send + Sync {
             },
         }
     }
+
+    /// The sub-agent runner this tool spawns children through, if it is
+    /// a sub-agent tool (`Task`/`delegate`). `None` for every other tool.
+    /// Lets callers verify what spawned children inherit.
+    fn subagent_runner(&self) -> Option<&dyn SubAgentRunner> {
+        None
+    }
 }
 
 #[derive(Clone, Default)]
@@ -970,6 +977,12 @@ pub trait SubAgentRunner: Send + Sync {
         prompt: &str,
         parent_tool_use_id: &str,
     ) -> anyhow::Result<String>;
+
+    /// The post-edit LSP diagnostics provider spawned children inherit
+    /// (`None` when the parent session has the feedback loop off).
+    fn diagnostics_provider(&self) -> Option<Arc<dyn DiagnosticsProvider>> {
+        None
+    }
 }
 
 pub fn estimate_tokens(messages: &[ChatMessage]) -> u64 {

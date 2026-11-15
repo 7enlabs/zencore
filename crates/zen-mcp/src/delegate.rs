@@ -438,6 +438,10 @@ impl Tool for DelegateTool {
         "delegate"
     }
 
+    fn subagent_runner(&self) -> Option<&dyn SubAgentRunner> {
+        Some(&*self.runner)
+    }
+
     fn description(&self) -> &str {
         "Delegate work to sub-agents (Scout/Worker/Reviewer) in one session. \
          Three modes: single {agent, task}; parallel {tasks: [{agent, task}]} \
@@ -692,6 +696,13 @@ mod tests {
 
     fn ctx() -> ToolContext {
         ToolContext::new(std::env::temp_dir(), "test-session")
+    }
+
+    #[test]
+    fn delegate_tool_exposes_its_subagent_runner() {
+        // F1 seam: callers verify what children inherit through the runner.
+        let t = tool(Arc::new(FakeRunner::new(0)));
+        assert!(t.subagent_runner().is_some());
     }
 
     struct FakeRunner {

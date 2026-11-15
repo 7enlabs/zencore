@@ -487,6 +487,32 @@ fn edit_cfg(provider: Arc<FakeDiagnosticsProvider>) -> crate::AgentConfig {
     }
 }
 
+#[test]
+fn subagent_executor_exposes_inherited_diagnostics_provider() {
+    // F1: the executor surfaces the base config's provider so callers can
+    // verify children inherit it; None when the loop is off.
+    let with = crate::SubAgentExecutor::new(
+        MockLlm::new(vec![]),
+        ToolRegistry::new(),
+        FakePerms::new(PermissionDecision::Allow),
+        FakeHooks::new(),
+        Arc::new(CollectSink::default()),
+        temp_ctx(),
+        edit_cfg(FakeDiagnosticsProvider::new(vec![])),
+    );
+    assert!(with.diagnostics_provider().is_some());
+    let without = crate::SubAgentExecutor::new(
+        MockLlm::new(vec![]),
+        ToolRegistry::new(),
+        FakePerms::new(PermissionDecision::Allow),
+        FakeHooks::new(),
+        Arc::new(CollectSink::default()),
+        temp_ctx(),
+        base_cfg(),
+    );
+    assert!(without.diagnostics_provider().is_none());
+}
+
 async fn run_one_edit(
     cfg: crate::AgentConfig,
     tool: &'static str,
