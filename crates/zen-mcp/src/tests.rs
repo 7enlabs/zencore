@@ -261,7 +261,7 @@ fn python_exe() -> Option<String> {
 }
 
 const SERVER_SCRIPT: &str = r#"
-import sys, json
+import os, sys, json
 
 mode = sys.argv[1] if len(sys.argv) > 1 else "ok"
 calls = 0
@@ -286,12 +286,28 @@ for line in sys.stdin:
     elif method == "notifications/initialized":
         pass
     elif method == "tools/list":
-        if mode == "paged" and not msg.get("params", {}).get("cursor"):
+        if mode == "content":
+            send({"jsonrpc":"2.0","id":mid,"result":{"tools":[
+                {"name":"img","description":"image tool","inputSchema":{"type":"object"}},
+                {"name":"aud","description":"audio tool","inputSchema":{"type":"object"}},
+                {"name":"link","description":"link tool","inputSchema":{"type":"object"}},
+                {"name":"res","description":"resource tool","inputSchema":{"type":"object"}}
+            ]}})
+        elif mode == "responses":
+            send({"jsonrpc":"2.0","id":mid,"result":{"tools":[
+                {"name":"needin","description":"needs input","inputSchema":{"type":"object"}},
+                {"name":"tasky","description":"starts a task","inputSchema":{"type":"object"}}
+            ]}})
+        elif mode == "env":
+            send({"jsonrpc":"2.0","id":mid,"result":{"tools":[
+                {"name":"envprobe","description":os.environ.get("ZEN_MCP_TEST_ENV","missing"),"inputSchema":{"type":"object"}}
+            ]}})
+        elif mode == "paged" and not msg.get("params", {}).get("cursor"):
             send({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"alpha","description":"first tool","inputSchema":{"type":"object","properties":{"x":{"type":"string"}}}}],"nextCursor":"page2"}})
         elif mode == "paged":
-            send({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"beta","description":"second tool"}]}})
+            send({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"beta","description":"second tool","inputSchema":{"type":"object"}}]}})
         else:
-            send({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"echo","description":"echoes input","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}},{"name":"boom","description":"fails"}]}})
+            send({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"echo","description":"echoes input","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}},{"name":"boom","description":"fails","inputSchema":{"type":"object"}}]}})
     elif method == "tools/call":
         name = msg.get("params", {}).get("name")
         args = msg.get("params", {}).get("arguments", {})
@@ -301,6 +317,18 @@ for line in sys.stdin:
             send({"jsonrpc":"2.0","id":mid,"result":{"isError":True,"content":[{"type":"text","text":"boom happened"}]}})
         elif name == "image":
             send({"jsonrpc":"2.0","id":mid,"result":{"content":[{"type":"image","data":"..."}]}})
+        elif name == "img":
+            send({"jsonrpc":"2.0","id":mid,"result":{"content":[{"type":"image","data":"QQ==","mimeType":"image/png"}]}})
+        elif name == "aud":
+            send({"jsonrpc":"2.0","id":mid,"result":{"content":[{"type":"audio","data":"QQ==","mimeType":"audio/wav"}]}})
+        elif name == "link":
+            send({"jsonrpc":"2.0","id":mid,"result":{"content":[{"type":"resource_link","uri":"file:///a.txt","name":"a"}]}})
+        elif name == "res":
+            send({"jsonrpc":"2.0","id":mid,"result":{"content":[{"type":"resource","resource":{"uri":"file:///a.txt","text":"hi","mimeType":"text/plain"}}]}})
+        elif name == "needin":
+            send({"jsonrpc":"2.0","id":mid,"result":{"resultType":"input_required","requestState":"st"}})
+        elif name == "tasky":
+            send({"jsonrpc":"2.0","id":mid,"result":{"resultType":"task","taskId":"t1","status":"working","createdAt":"2026-11-15T00:00:00Z","lastUpdatedAt":"2026-11-15T00:00:00Z"}})
         else:
             send({"jsonrpc":"2.0","id":mid,"error":{"code":-32601,"message":"no such tool"}})
     else:
@@ -491,10 +519,20 @@ async fn spawn_http_mock(sse: bool) -> (String, tokio::task::JoinHandle<()>) {
             let id = msg.get("id").cloned().unwrap_or(Value::Null);
 
             let result = match method {
-                "initialize" => json!({"protocolVersion":"2025-06-18","capabilities":{}}),
+                "initialize" => json!({
+                    "protocolVersion":"2025-06-18",
+                    "capabilities":{},
+                    "serverInfo":{"name":"fake-http","version":"1"}
+                }),
                 "notifications/initialized" => Value::Null,
                 "tools/list" => {
-                    json!({"tools":[{"name":"http_echo","description":"http echo","inputSchema":{"type":"object"}}]})
+                    let seen = req.to_ascii_lowercase().contains("x-zen-test: see-me");
+                    let desc = if seen {
+                        "header-seen"
+                    } else {
+                        "header-missing"
+                    };
+                    json!({"tools":[{"name":"http_echo","description":desc,"inputSchema":{"type":"object"}}]})
                 }
                 "tools/call" => json!({"content":[{"type":"text","text":"http-ok"}]}),
                 _ => Value::Null,
@@ -889,4 +927,870 @@ fn mcpcap_non_text_content_untouched_and_error_flag_kept() {
         std::fs::read_to_string(mcpcap_spill_path(&out.content)).unwrap(),
         big
     );
+}
+
+// ========================================================================
+// Transport-level tests for crates/zen-mcp/src/transport.rs
+//
+// These drive the real `Transport` (the crate's only pub(crate) entry point
+// into transport.rs) so every mutant reported by cargo-mutants on that file
+// is exercised: connect_stdio's env branch, connect_http's header branch,
+// Session::call_tool's response arms, content_block_to_value's variants,
+// tool_to_value, Transport::from_config's timeout default, and
+// Transport::kill / Session::shutdown.
+//
+// The mock server speaks newline-delimited JSON-RPC, the same framing the
+// existing SERVER_SCRIPT above uses, which is what this repo's rmcp
+// TokioChildProcess transport actually speaks.
+// ========================================================================
+
+fn transport_mock_script() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mcp_mock.py")
+}
+
+use crate::transport::Transport;
+
+/// Build a stdio config for the transport mock.
+fn tcfg_stdio(
+    py: &str,
+    mode: &str,
+    log: &Path,
+    env: BTreeMap<String, String>,
+    env_dump: Option<&Path>,
+) -> McpServerConfig {
+    let mut args = vec![
+        transport_mock_script().to_string_lossy().into_owned(),
+        mode.to_string(),
+        log.to_string_lossy().into_owned(),
+    ];
+    if let Some(dump) = env_dump {
+        args.push(dump.to_string_lossy().into_owned());
+    }
+    McpServerConfig {
+        kind: None,
+        command: Some(py.to_string()),
+        args,
+        env,
+        url: None,
+        headers: BTreeMap::new(),
+    }
+}
+
+fn tcfg_http(url: &str, headers: BTreeMap<String, String>) -> McpServerConfig {
+    McpServerConfig {
+        kind: Some("http".to_string()),
+        command: None,
+        args: vec![],
+        env: BTreeMap::new(),
+        url: Some(url.to_string()),
+        headers,
+    }
+}
+
+#[tokio::test]
+async fn transport_from_config_timeout_defaults_to_30s() {
+    // Kills the `if timeout_ms == 0 { 30_000 }` mutant in from_config.
+    let cfg = tcfg_stdio("x", "ok", Path::new("l"), BTreeMap::new(), None);
+    match Transport::from_config(&cfg, 0).unwrap() {
+        Transport::Stdio { timeout_ms, .. } => assert_eq!(timeout_ms, 30_000),
+        _ => panic!("expected Stdio"),
+    }
+}
+
+#[tokio::test]
+async fn transport_from_config_keeps_explicit_timeout() {
+    // Kills the counterpart mutant (always returning the default).
+    let cfg = tcfg_stdio("x", "ok", Path::new("l"), BTreeMap::new(), None);
+    match Transport::from_config(&cfg, 5_000).unwrap() {
+        Transport::Stdio { timeout_ms, .. } => assert_eq!(timeout_ms, 5_000),
+        _ => panic!("expected Stdio"),
+    }
+    let h = tcfg_http("http://127.0.0.1:1/mcp", BTreeMap::new());
+    match Transport::from_config(&h, 7_000).unwrap() {
+        Transport::Http { timeout_ms, .. } => assert_eq!(timeout_ms, 7_000),
+        _ => panic!("expected Http"),
+    }
+}
+
+#[tokio::test]
+async fn transport_from_config_rejects_missing_command_and_url() {
+    let empty = McpServerConfig {
+        kind: None,
+        command: None,
+        args: vec![],
+        env: BTreeMap::new(),
+        url: None,
+        headers: BTreeMap::new(),
+    };
+    // command.is_none() && url.is_some() is false, and kind != "http", so this
+    // takes the stdio branch and must fail with "no command".
+    assert!(Transport::from_config(&empty, 1_000).is_err());
+
+    let http_no_url = McpServerConfig {
+        kind: Some("http".to_string()),
+        command: None,
+        args: vec![],
+        env: BTreeMap::new(),
+        url: None,
+        headers: BTreeMap::new(),
+    };
+    let err = match Transport::from_config(&http_no_url, 1_000) {
+        Ok(_) => panic!("expected an error for http config without url"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("no url"), "got: {err}");
+}
+
+#[tokio::test]
+async fn transport_stdio_tools_list_uses_tool_to_value() {
+    // Kills tool_to_value mutants (name / description / inputSchema).
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_list");
+    let log = dir.join("methods.log");
+    let cfg = tcfg_stdio(&py, "ok", &log, BTreeMap::new(), None);
+    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+
+    let out = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
+        .await
+        .unwrap()
+        .unwrap();
+    let tools = out["tools"].as_array().expect("tools array");
+    let echo = tools
+        .iter()
+        .find(|t| t["name"] == "echo")
+        .expect("echo tool present");
+    assert_eq!(echo["description"], "echoes input");
+    assert_eq!(echo["inputSchema"]["properties"]["text"]["type"], "string");
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn transport_stdio_tools_list_paginates() {
+    // Kills the cursor loop in list_all_tools.
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_page");
+    let log = dir.join("methods.log");
+    let cfg = tcfg_stdio(&py, "paged", &log, BTreeMap::new(), None);
+    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+
+    let out = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
+        .await
+        .unwrap()
+        .unwrap();
+    let names: Vec<String> = out["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn transport_stdio_call_tool_text_blocks() {
+    // Baseline Complete arm + text rendering.
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_text");
+    let log = dir.join("methods.log");
+    let cfg = tcfg_stdio(&py, "ok", &log, BTreeMap::new(), None);
+    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+
+    let out = tokio::time::timeout(
+        TEST_TIMEOUT,
+        tr.request(
+            "tools/call",
+            json!({"name": "echo", "arguments": {"text": "hi"}}),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let content = out["content"].as_array().expect("content array");
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "echo: hi");
+    assert_eq!(content[1]["text"], "second part");
+    assert!(out.get("isError").is_none());
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn transport_stdio_call_tool_input_required_arm() {
+    // Kills the CallToolResponse::InputRequired arm.
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_ir");
+    let log = dir.join("methods.log");
+    let cfg = tcfg_stdio(&py, "input_required", &log, BTreeMap::new(), None);
+    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+
+    let err = tokio::time::timeout(
+        TEST_TIMEOUT,
+        tr.request("tools/call", json!({"name": "echo", "arguments": {}})),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("requires client-side input"),
+        "got: {err}"
+    );
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn transport_stdio_call_tool_task_arm() {
+    // Kills the CallToolResponse::Task arm.
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_task");
+    let log = dir.join("methods.log");
+    let cfg = tcfg_stdio(&py, "task", &log, BTreeMap::new(), None);
+    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+
+    let err = tokio::time::timeout(
+        TEST_TIMEOUT,
+        tr.request("tools/call", json!({"name": "echo", "arguments": {}})),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(err.to_string().contains("task result"), "got: {err}");
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn transport_stdio_content_block_variants() {
+    // Kills content_block_to_value mutants for image / audio / resource_link /
+    // resource.
+    let Some(py) = python_exe() else { return };
+
+    let cases: [(&str, &str, &str, &str); 4] = [
+        ("image", "type", "image", "image/png"),
+        ("audio", "type", "audio", "audio/wav"),
+        ("resource_link", "type", "resource_link", "file:///x"),
+        ("resource", "type", "resource", "file:///x"),
+    ];
+
+    for (mode, key, want, extra) in cases {
+        let dir = tmpdir(&format!("t_cb_{mode}"));
+        let log = dir.join("methods.log");
+        let cfg = tcfg_stdio(&py, mode, &log, BTreeMap::new(), None);
+        let tr = Transport::from_config(&cfg, 10_000).unwrap();
+
+        let out = tokio::time::timeout(
+            TEST_TIMEOUT,
+            tr.request("tools/call", json!({"name": mode, "arguments": {}})),
+        )
+        .await
+        .unwrap()
+        .unwrap_or_else(|e| panic!("{mode} call failed: {e}"));
+
+        let first = &out["content"].as_array().expect("content array")[0];
+        assert_eq!(first[key], want, "mode {mode} produced {first}");
+        if mode == "image" || mode == "audio" {
+            assert_eq!(first["data"], "abc", "mode {mode}");
+            assert_eq!(first["mimeType"], extra, "mode {mode}");
+        }
+        if mode == "resource_link" {
+            assert_eq!(first["uri"], extra, "mode {mode}");
+            assert_eq!(first["name"], "x", "mode {mode}");
+        }
+        if mode == "resource" {
+            // Strict shape: render_result and every consumer read
+            // content[i].resource.uri. A double-wrapped payload
+            // (resource.resource.uri) breaks them, so pin the exact path.
+            assert_eq!(
+                first["resource"]["uri"], extra,
+                "resource uri not at resource.uri; full block: {first}"
+            );
+        }
+
+        tr.kill();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[tokio::test]
+async fn transport_stdio_connect_passes_env_to_child() {
+    // Kills the `if !env.is_empty()` branch in connect_stdio.
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_env");
+    let log = dir.join("methods.log");
+    let dump = dir.join("env.txt");
+
+    let mut env = BTreeMap::new();
+    env.insert("ZEN_MCP_TEST_TOKEN".to_string(), "secret123".to_string());
+
+    let cfg = tcfg_stdio(&py, "ok", &log, env, Some(&dump));
+    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+    // Any request forces the handshake, which spawns the child with the env.
+    let _ = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
+        .await
+        .unwrap()
+        .expect("tools/list");
+
+    let want = format!("ZEN_MCP_TEST_TOKEN={}", "secret123");
+    let mut found = false;
+    for _ in 0..50 {
+        if let Ok(text) = std::fs::read_to_string(&dump)
+            && text.contains(&want)
+        {
+            found = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(found, "child did not receive ZEN_MCP_TEST_TOKEN");
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// In-process HTTP MCP mock that records request headers so the test can
+/// assert connect_http's header branch. Returns (url, headers, handle).
+async fn spawn_header_recording_http_mock()
+-> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{}/mcp", addr);
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_task = seen.clone();
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = match listener.accept().await {
+                Ok(x) => x,
+                Err(_) => break,
+            };
+            let mut buf: Vec<u8> = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                let n = match sock.read(&mut tmp).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                buf.extend_from_slice(&tmp[..n]);
+                let s = String::from_utf8_lossy(&buf);
+                if let Some(hdr_end) = s.find("\r\n\r\n") {
+                    let content_len = s
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= hdr_end + 4 + content_len {
+                        break;
+                    }
+                }
+            }
+            let req = String::from_utf8_lossy(&buf).to_string();
+            for line in req.lines().take_while(|l| !l.is_empty()) {
+                if let Ok(mut g) = seen_task.lock() {
+                    g.push(line.to_string());
+                }
+            }
+            let body_start = req.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+            let body = &req[body_start..];
+            let msg: Value = serde_json::from_str(body).unwrap_or(json!({}));
+            let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
+            let id = msg.get("id").cloned().unwrap_or(Value::Null);
+
+            let (status, ctype, payload) = match method {
+                "initialize" => (
+                    "200 OK",
+                    "application/json",
+                    json!({"jsonrpc":"2.0","id":id,"result":{
+                        "protocolVersion":"2026-07-28",
+                        "capabilities":{},
+                        "serverInfo":{"name":"hdr-mock","version":"1"}}}),
+                ),
+                "notifications/initialized" => {
+                    let resp = "HTTP/1.1 202 Accepted\r\nMcp-Session-Id: s1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                    continue;
+                }
+                "tools/list" => (
+                    "200 OK",
+                    "application/json",
+                    json!({"jsonrpc":"2.0","id":id,"result":{"tools":[
+                        {"name":"echo","description":"echoes input",
+                         "inputSchema":{"type":"object"}}]}}),
+                ),
+                _ => (
+                    "200 OK",
+                    "application/json",
+                    json!({"jsonrpc":"2.0","id":id,"result":{}}),
+                ),
+            };
+            let data = serde_json::to_string(&payload).unwrap();
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nMcp-Session-Id: s1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                data.len(),
+                data
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+
+    (url, seen, handle)
+}
+
+#[tokio::test]
+async fn transport_http_connect_sends_configured_headers() {
+    // Kills the `if !headers.is_empty()` branch (and the header-parsing loop)
+    // in connect_http.
+    let (url, seen, handle) = spawn_header_recording_http_mock().await;
+
+    let mut headers = BTreeMap::new();
+    headers.insert("X-Test-Header".to_string(), "secret123".to_string());
+    headers.insert("X-Second".to_string(), "two".to_string());
+
+    let cfg = tcfg_http(&url, headers);
+    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+    let out = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
+        .await
+        .unwrap()
+        .expect("tools/list over http");
+    assert_eq!(out["tools"][0]["name"], "echo");
+
+    let lines = seen.lock().unwrap().clone();
+    let joined = lines.join("\n").to_ascii_lowercase();
+    assert!(
+        joined.contains("x-test-header: secret123"),
+        "headers not forwarded; saw:\n{joined}"
+    );
+    assert!(joined.contains("x-second: two"), "saw:\n{joined}");
+
+    tr.kill();
+    handle.abort();
+}
+
+#[tokio::test]
+async fn transport_http_without_headers_still_connects() {
+    // Companion to the header test: the empty-headers branch must not panic.
+    let (url, seen, handle) = spawn_header_recording_http_mock().await;
+    let cfg = tcfg_http(&url, BTreeMap::new());
+    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+    let out = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
+        .await
+        .unwrap()
+        .expect("tools/list over http");
+    assert_eq!(out["tools"][0]["name"], "echo");
+
+    let joined = seen.lock().unwrap().join("\n").to_ascii_lowercase();
+    assert!(
+        !joined.contains("x-test-header"),
+        "unexpected header leaked:\n{joined}"
+    );
+
+    tr.kill();
+    handle.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn transport_kill_tears_down_the_session() {
+    // Kills Transport::kill and Session::shutdown by proving the spawned child
+    // actually dies. A reconnect would succeed (the script is still on disk),
+    // so the observable is the child PID: the mock writes it on startup and
+    // we poll /proc until it disappears.
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_kill");
+    let log = dir.join("methods.log");
+    let pid_file = dir.join("methods.log.pid");
+    let cfg = tcfg_stdio(&py, "ok", &log, BTreeMap::new(), None);
+    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+
+    let ok = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
+        .await
+        .unwrap();
+    assert!(ok.is_ok(), "first request should succeed");
+
+    let mut pid = String::new();
+    for _ in 0..50 {
+        if let Ok(text) = std::fs::read_to_string(&pid_file)
+            && !text.trim().is_empty()
+        {
+            pid = text.trim().to_string();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!pid.is_empty(), "mock never wrote its pid");
+    let proc_path = format!("/proc/{pid}");
+    assert!(
+        Path::new(&proc_path).exists(),
+        "child {pid} should be alive before kill"
+    );
+
+    tr.kill();
+
+    let mut dead = false;
+    for _ in 0..100 {
+        if !Path::new(&proc_path).exists() {
+            dead = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(dead, "child {pid} still alive after Transport::kill()");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn transport_request_rejects_unknown_method_and_bad_params() {
+    // Kills the method-dispatch catch-all in request().
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_req");
+    let log = dir.join("methods.log");
+    let cfg = tcfg_stdio(&py, "ok", &log, BTreeMap::new(), None);
+    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+
+    // Unknown method needs no live session.
+    let err = tr.request("resources/list", json!({})).await.unwrap_err();
+    assert!(
+        err.to_string().contains("unsupported MCP method"),
+        "got: {err}"
+    );
+
+    // tools/call without a name.
+    let err = tr
+        .request("tools/call", json!({"arguments": {}}))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("missing 'name'"), "got: {err}");
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn transport_shutdown_kills_the_whole_process_group() {
+    // Kills `replace kill_process_group with ()`. The mock spawns a long-lived
+    // grandchild; rmcp's DropGuard kills only the leader, so if shutdown() does
+    // not kill the process group the grandchild survives and this test fails.
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_pgrp");
+    let log = dir.join("methods.log");
+    let worker_pid_file = dir.join("methods.log.worker.pid");
+    let cfg = tcfg_stdio(&py, "spawn_worker", &log, BTreeMap::new(), None);
+    let tr = Transport::from_config(&cfg, 15_000).unwrap();
+
+    let _ = tokio::time::timeout(
+        TEST_TIMEOUT,
+        tr.request("tools/call", json!({"name": "echo", "arguments": {}})),
+    )
+    .await
+    .expect("tools/call should resolve")
+    .expect("tools/call should succeed");
+
+    let mut worker_pid = String::new();
+    for _ in 0..100 {
+        if let Ok(t) = std::fs::read_to_string(&worker_pid_file) {
+            let t = t.trim().to_string();
+            if !t.is_empty() {
+                worker_pid = t;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!worker_pid.is_empty(), "mock never recorded a worker pid");
+    let proc_path = format!("/proc/{worker_pid}");
+    assert!(
+        Path::new(&proc_path).exists(),
+        "grandchild {worker_pid} should be alive before kill"
+    );
+    tr.kill();
+
+    let mut dead = false;
+    for _ in 0..150 {
+        if !Path::new(&proc_path).exists() {
+            dead = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        dead,
+        "grandchild {worker_pid} survived Transport::kill(): process group not torn down"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn transport_from_config_defaults_timeout_and_does_not_connect() {
+    // Kills the `timeout_ms == 0` / `is_http()` mutants in
+    // Transport::from_config, and pins the documented 30 s default.
+    let stdio_cfg = McpServerConfig {
+        kind: None,
+        command: Some("definitely-not-spawned".to_string()),
+        args: vec![],
+        env: BTreeMap::new(),
+        url: None,
+        headers: BTreeMap::new(),
+    };
+    let tr = Transport::from_config(&stdio_cfg, 0).unwrap();
+    assert_eq!(tr.resolved_timeout_ms(), 30_000);
+    assert!(
+        matches!(tr, Transport::Stdio { .. }),
+        "stdio config must not build an HTTP transport"
+    );
+    // Never connected: kill must be a no-op, not a panic.
+    tr.kill();
+
+    let explicit = Transport::from_config(&stdio_cfg, 1234).unwrap();
+    assert_eq!(explicit.resolved_timeout_ms(), 1234);
+    explicit.kill();
+
+    let http_cfg = McpServerConfig {
+        kind: Some("http".to_string()),
+        command: None,
+        args: vec![],
+        env: BTreeMap::new(),
+        url: Some("http://127.0.0.1:9/mcp".to_string()),
+        headers: BTreeMap::new(),
+    };
+    let http = Transport::from_config(&http_cfg, 0).unwrap();
+    assert_eq!(http.resolved_timeout_ms(), 30_000);
+    assert!(
+        matches!(http, Transport::Http { .. }),
+        "http config must not build a stdio transport"
+    );
+    http.kill();
+
+    // Missing command / url are hard errors.
+    let bad_stdio = McpServerConfig {
+        kind: None,
+        command: None,
+        args: vec![],
+        env: BTreeMap::new(),
+        url: None,
+        headers: BTreeMap::new(),
+    };
+    assert!(Transport::from_config(&bad_stdio, 1000).is_err());
+    let bad_http = McpServerConfig {
+        kind: Some("http".to_string()),
+        command: None,
+        args: vec![],
+        env: BTreeMap::new(),
+        url: None,
+        headers: BTreeMap::new(),
+    };
+    assert!(Transport::from_config(&bad_http, 1000).is_err());
+}
+
+#[test]
+fn tool_to_value_maps_name_description_schema() {
+    // Kills the `tool_to_value -> Default::default()` mutant.
+    use rmcp::model::{JsonObject, Tool};
+
+    let mut schema = JsonObject::new();
+    schema.insert("type".to_string(), json!("object"));
+    let tool = Tool::new("probe", "does things", schema);
+    let v = crate::transport::tool_to_value(&tool);
+    assert_eq!(v["name"], "probe");
+    assert_eq!(v["description"], "does things");
+    assert_eq!(v["inputSchema"]["type"], "object");
+
+    // A tool without a description renders an empty string, not null.
+    let bare = Tool::new_with_raw("bare", None, JsonObject::new());
+    let v = crate::transport::tool_to_value(&bare);
+    assert_eq!(v["name"], "bare");
+    assert_eq!(v["description"], "");
+}
+
+#[tokio::test]
+async fn transport_kill_terminates_session() {
+    // Transport::kill() must terminate the session (covers mutant: kill is a no-op)
+    let py = match crate::tests::python_exe() {
+        Some(p) => p,
+        None => return,
+    };
+    let dir = crate::tests::tmpdir("kill_test");
+    let script = dir.join("sleep.py");
+    std::fs::write(&script, "import time; time.sleep(60)").unwrap();
+
+    let mut configs = std::collections::BTreeMap::new();
+    configs.insert(
+        "sleep".to_string(),
+        crate::McpServerConfig {
+            kind: None,
+            command: Some(py.to_string()),
+            args: vec![script.to_string_lossy().to_string()],
+            env: std::collections::BTreeMap::new(),
+            url: None,
+            headers: std::collections::BTreeMap::new(),
+        },
+    );
+
+    let _mgr = tokio::time::timeout(
+        crate::tests::TEST_TIMEOUT,
+        crate::McpManager::start(configs, 10_000),
+    )
+    .await
+    .expect("start did not time out");
+
+    // Get a transport directly and kill it
+    let cfg = crate::McpServerConfig {
+        kind: None,
+        command: Some(py.to_string()),
+        args: vec![script.to_string_lossy().to_string()],
+        env: std::collections::BTreeMap::new(),
+        url: None,
+        headers: std::collections::BTreeMap::new(),
+    };
+    let transport = Transport::from_config(&cfg, 10_000).unwrap();
+
+    // Get a session first (this spawns the process)
+    let _session = tokio::time::timeout(
+        crate::tests::TEST_TIMEOUT,
+        transport.request("tools/list", json!({})),
+    )
+    .await
+    .expect("session did not time out");
+
+    // Now kill it
+    transport.kill();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn transport_tool_to_value_shape() {
+    // tool_to_value must produce non-default JSON for real rmcp::Tool input.
+    // Gets a Tool from mock server's list_all_tools and passes through tool_to_value.
+    // This kills the mutant: replace tool_to_value -> Value with Default::default().
+    use serde_json::json;
+
+    let py = match crate::tests::python_exe() {
+        Some(p) => p,
+        None => return,
+    };
+    let dir = crate::tests::tmpdir("tool_to_value");
+    let script = dir.join("fake_tool.py");
+    std::fs::write(
+        &script,
+        r#"import sys, json
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    if msg.get("method") == "initialize":
+        send({"jsonrpc":"2.0","id":msg.get("id"),"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}})
+    elif msg.get("method") == "notifications/initialized":
+        pass
+    elif msg.get("method") == "tools/list":
+        send({"jsonrpc":"2.0","id":msg.get("id"),"result":{"tools":[{"name":"test_tool","description":"test","inputSchema":{"type":"object","properties":{"x":{"type":"string"}},"required":["x"]}}]}})
+    elif msg.get("method") == "tools/call":
+        send({"jsonrpc":"2.0","id":msg.get("id"),"result":{"content":[{"type":"text","text":"ok"}],"isError":False}})
+    else:
+        if msg.get("id") is not None:
+            send({"jsonrpc":"2.0","id":msg.get("id"),"error":{"code":-32601,"message":"unknown method"}})
+"#,
+    )
+    .unwrap();
+
+    let mut configs = std::collections::BTreeMap::new();
+    configs.insert(
+        "srv".to_string(),
+        crate::McpServerConfig {
+            kind: None,
+            command: Some(py.to_string()),
+            args: vec![script.to_string_lossy().to_string()],
+            env: std::collections::BTreeMap::new(),
+            url: None,
+            headers: std::collections::BTreeMap::new(),
+        },
+    );
+
+    let mgr = tokio::time::timeout(
+        crate::tests::TEST_TIMEOUT,
+        crate::McpManager::start(configs, 10_000),
+    )
+    .await
+    .expect("start did not time out");
+
+    // Get the transport and session to access list_all_tools
+    // Access via internal: we need the Transport to call session() then list_all_tools
+    // Instead, use mgr.tools() which returns RemoteTool - but we need rmcp::Tool for tool_to_value
+
+    // We'll test tool_to_value indirectly: call transport.request("tools/list")
+    // which uses tool_to_value internally. Get transport from manager internals.
+    // Since we can't access Transport from mgr directly, start a new transport:
+    let cfg = crate::McpServerConfig {
+        kind: None,
+        command: Some(py.to_string()),
+        args: vec![script.to_string_lossy().to_string()],
+        env: std::collections::BTreeMap::new(),
+        url: None,
+        headers: std::collections::BTreeMap::new(),
+    };
+    let transport = Transport::from_config(&cfg, 10_000).unwrap();
+
+    // Call tools/list via transport.request which uses tool_to_value
+    let result = tokio::time::timeout(
+        crate::tests::TEST_TIMEOUT,
+        transport.request("tools/list", json!({})),
+    )
+    .await
+    .expect("tools/list did not time out")
+    .expect("tools/list request failed");
+
+    // Verify the output has tools with inputSchema (tool_to_value produced non-default output)
+    let tools = result
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .expect("tools array");
+    assert!(!tools.is_empty(), "tools list should not be empty");
+    let first_tool = &tools[0];
+    assert_eq!(
+        first_tool.get("name").and_then(|v| v.as_str()).unwrap(),
+        "test_tool"
+    );
+    assert_eq!(
+        first_tool
+            .get("inputSchema")
+            .and_then(|v| v.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap(),
+        "object"
+    );
+    assert!(
+        first_tool
+            .get("inputSchema")
+            .and_then(|v| v.get("required"))
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty())
+    );
+
+    tokio::time::timeout(crate::tests::TEST_TIMEOUT, mgr.shutdown())
+        .await
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }
