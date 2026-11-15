@@ -1403,6 +1403,7 @@ async fn transport_http_without_headers_still_connects() {
     handle.abort();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn transport_kill_tears_down_the_session() {
     // Kills Transport::kill and Session::shutdown by proving the spawned child
@@ -1479,6 +1480,7 @@ async fn transport_request_rejects_unknown_method_and_bad_params() {
     tr.kill();
     let _ = std::fs::remove_dir_all(&dir);
 }
+#[cfg(unix)]
 #[tokio::test]
 async fn transport_shutdown_kills_the_whole_process_group() {
     // Kills `replace kill_process_group with ()`. The mock spawns a long-lived
