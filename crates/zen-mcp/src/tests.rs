@@ -491,7 +491,11 @@ async fn spawn_http_mock(sse: bool) -> (String, tokio::task::JoinHandle<()>) {
             let id = msg.get("id").cloned().unwrap_or(Value::Null);
 
             let result = match method {
-                "initialize" => json!({"protocolVersion":"2025-06-18","capabilities":{}}),
+                "initialize" => json!({
+                    "protocolVersion":"2025-06-18",
+                    "capabilities":{},
+                    "serverInfo":{"name":"fake-http","version":"1"}
+                }),
                 "notifications/initialized" => Value::Null,
                 "tools/list" => {
                     json!({"tools":[{"name":"http_echo","description":"http echo","inputSchema":{"type":"object"}}]})
