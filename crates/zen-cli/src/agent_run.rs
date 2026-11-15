@@ -274,10 +274,26 @@ pub async fn assemble(
     let hooks = build_hooks(cli, cfg, session_id, transcript_path, cwd);
     let _ = &assembly_permissions;
 
+    // Build the LSP diagnostics provider BEFORE the subagent executor block:
+    // each executor snapshots its base config at construction, so a provider
+    // built afterwards would never reach subagents (F1). The manager is
+    // shared with the LSP tools registered below; `new` starts no servers.
+    let lsp_manager = Arc::new(zen_mcp::LspManager::new());
+    let diagnostics_provider: Option<Arc<dyn zen_core::DiagnosticsProvider>> =
+        if cli.tools.as_deref() != Some("") {
+            lsp_diagnostics_provider(cfg.lsp.as_ref(), &lsp_manager)
+        } else {
+            None
+        };
+
     let subagent_sink = Arc::new(ForwardSink::default());
     if !agents.is_empty() && cli.tools.as_deref() != Some("") && !tool_denied("Task") {
         let fwd: Arc<dyn EventSink> = subagent_sink.clone();
         let make_executor = |tools: ToolRegistry| {
+            let mut base = base_agent_config(cfg, cli, "");
+            // Subagents inherit the parent session's diagnostics provider
+            // (None when the feedback loop is off - the default).
+            base.diagnostics_provider = diagnostics_provider.clone();
             zen_agent::SubAgentExecutor::new(
                 crate::eventlog::wrap(cfg.gated_llm_client(fwd.clone(), home), recorder.as_ref()),
                 tools,
@@ -285,7 +301,7 @@ pub async fn assemble(
                 hooks.clone(),
                 fwd.clone(),
                 ToolContext::new(cwd.to_path_buf(), session_id.to_string()),
-                base_agent_config(cfg, cli, ""),
+                base,
             )
         };
         let executor = make_executor(registry.clone());
@@ -319,9 +335,7 @@ pub async fn assemble(
         assembly_permissions = Arc::new(skill_gate.shared(build_permissions(cwd, cfg, cli)));
     }
 
-    let mut diagnostics_provider: Option<Arc<dyn zen_core::DiagnosticsProvider>> = None;
     if cli.tools.as_deref() != Some("") {
-        let lsp_manager = Arc::new(zen_mcp::LspManager::new());
         let lsp_tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(zen_mcp::GotoDefinitionTool::new(lsp_manager.clone())),
             Arc::new(zen_mcp::HoverTool::new(lsp_manager.clone())),
@@ -336,7 +350,6 @@ pub async fn assemble(
                 registry.register(tool);
             }
         }
-        diagnostics_provider = lsp_diagnostics_provider(cfg.lsp.as_ref(), &lsp_manager);
     }
 
     let slash_commands: Vec<String> = commands::BUILTIN_COMMANDS
@@ -2252,5 +2265,73 @@ mod lsp_provider_tests {
                 std::time::Duration::from_millis(1)
             )
         );
+    }
+
+    /// F1: a delegate sub-agent inherits the parent session's diagnostics
+    /// provider when `lsp.diagnosticsAfterEdit` is on.
+    #[tokio::test]
+    async fn delegate_inherits_diagnostics_provider_when_enabled() {
+        let assembly = assemble_with_lsp(true).await;
+        let delegate = assembly
+            .registry
+            .get("delegate")
+            .expect("delegate tool is registered when agents exist");
+        let runner = delegate
+            .subagent_runner()
+            .expect("delegate exposes its sub-agent runner");
+        assert!(
+            runner.diagnostics_provider().is_some(),
+            "sub-agent executor must inherit the parent diagnostics provider"
+        );
+    }
+
+    /// F1: default-off is preserved - no provider reaches sub-agents when
+    /// the feedback loop is not enabled.
+    #[tokio::test]
+    async fn delegate_gets_no_provider_when_disabled() {
+        let assembly = assemble_with_lsp(false).await;
+        let delegate = assembly
+            .registry
+            .get("delegate")
+            .expect("delegate tool is registered when agents exist");
+        let runner = delegate
+            .subagent_runner()
+            .expect("delegate exposes its sub-agent runner");
+        assert!(
+            runner.diagnostics_provider().is_none(),
+            "sub-agent executor must not get a provider when the loop is off"
+        );
+    }
+
+    async fn assemble_with_lsp(enabled: bool) -> AgentAssembly {
+        use clap::Parser;
+        let tag = if enabled { "on" } else { "off" };
+        let base = std::env::temp_dir().join(format!(
+            "zen-f1-lsp-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the epoch")
+                .as_nanos()
+        ));
+        let cwd = base.join("cwd");
+        let home = base.join("home");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let agents_json =
+            r#"{"scout": {"description": "Scout", "prompt": "Scout.", "tools": ["Read"]}}"#;
+        let cli =
+            crate::cli::Cli::try_parse_from(["zen", "-p", "--bare", "--agents", agents_json, "hi"])
+                .unwrap();
+        let mut cfg = crate::settings::resolve_config_with_home(&cli, &cwd, Some(&home)).unwrap();
+        if enabled {
+            cfg.lsp = Some(json!({ "diagnosticsAfterEdit": true }));
+        }
+        let assembly = assemble(&cli, &cwd, Some(&home), &cfg, "f1-test", None)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+        assembly
     }
 }

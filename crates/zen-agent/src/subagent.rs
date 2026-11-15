@@ -92,6 +92,10 @@ fn strip_frontmatter(raw: &str) -> &str {
 
 #[async_trait]
 impl SubAgentRunner for SubAgentExecutor {
+    fn diagnostics_provider(&self) -> Option<Arc<dyn DiagnosticsProvider>> {
+        self.base_config.diagnostics_provider.clone()
+    }
+
     async fn run_subagent(
         &self,
         def: &AgentDefinition,

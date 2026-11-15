@@ -23,6 +23,10 @@ impl Tool for TaskTool {
     fn name(&self) -> &str {
         "Task"
     }
+
+    fn subagent_runner(&self) -> Option<&dyn SubAgentRunner> {
+        Some(&*self.runner)
+    }
     fn description(&self) -> &str {
         "Delegate a self-contained task to a sub-agent."
     }

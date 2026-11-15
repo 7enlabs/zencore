@@ -711,6 +711,14 @@ fn test_agents() -> Vec<AgentDefinition> {
     ]
 }
 
+#[test]
+fn task_tool_exposes_its_subagent_runner() {
+    // F1 seam: callers verify what children inherit through the runner.
+    let runner = Arc::new(RecordingRunner::default());
+    let tool = TaskTool::new(test_agents(), runner);
+    assert!(tool.subagent_runner().is_some());
+}
+
 #[tokio::test]
 async fn task_tool_default_type_and_parent_id() {
     let dir = tmpdir("task");
