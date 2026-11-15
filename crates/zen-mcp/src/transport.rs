@@ -21,6 +21,8 @@ pub(crate) struct Session {
     service: Mutex<Option<RunningService<RoleClient, ()>>>,
     peer: Peer<RoleClient>,
     timeout_ms: u64,
+    /// PID of the stdio child process (for process group kill on Unix)
+    child_pid: Mutex<Option<u32>>,
 }
 
 impl Session {
@@ -84,6 +86,30 @@ impl Session {
     }
 
     fn shutdown(&self) {
+        // Kill process tree first (Unix: process group, Windows: tree)
+        if let Ok(pid_guard) = self.child_pid.lock()
+            && let Some(pid) = *pid_guard
+        {
+            #[cfg(unix)]
+            {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", "--", &format!("-{}", pid)])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+            #[cfg(windows)]
+            {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/T", "/F", "/PID", &pid.to_string()])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
+        // Then drop the rmcp service (kills the direct child via DropGuard)
         if let Ok(mut guard) = self.service.lock() {
             guard.take();
         }
@@ -104,7 +130,7 @@ fn content_block_to_value(block: &ContentBlock) -> Value {
         }
         ContentBlock::Resource(resource) => json!({
             "type": "resource",
-            "resource": serde_json::to_value(resource).unwrap_or(Value::Null),
+            "resource": serde_json::to_value(&resource.resource).unwrap_or(Value::Null),
         }),
         // `ContentBlock` is #[non_exhaustive]: future variants render as a
         // placeholder so an rmcp upgrade cannot break the build silently.
@@ -134,11 +160,15 @@ async fn connect_stdio(
     #[cfg(unix)]
     cmd.process_group(0);
 
-    let transport =
-        TokioChildProcess::new(cmd).map_err(|e| anyhow!("failed to spawn '{command}': {e}"))?;
+    // Use rmcp's TokioChildProcess builder to capture PID
+    let transport = TokioChildProcess::builder(cmd)
+        .spawn()
+        .map_err(|e| anyhow!("failed to spawn '{command}': {e}"))?;
+    let child_pid = transport.0.id();
+
     let service = tokio::time::timeout(
         Duration::from_millis(timeout_ms.max(1)),
-        rmcp::serve_client((), transport),
+        rmcp::serve_client((), transport.0),
     )
     .await
     .map_err(|_| anyhow!("MCP stdio handshake timed out after {timeout_ms} ms"))?
@@ -148,6 +178,7 @@ async fn connect_stdio(
         service: Mutex::new(Some(service)),
         peer,
         timeout_ms,
+        child_pid: Mutex::new(child_pid),
     })
 }
 
@@ -183,6 +214,7 @@ async fn connect_http(
         service: Mutex::new(Some(service)),
         peer,
         timeout_ms,
+        child_pid: Mutex::new(None),
     })
 }
 
