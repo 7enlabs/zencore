@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use zen_agent::{Agent, AgentConfig, OpenAiClient};
+use zen_core::lock_recovery::lock_or_recover;
 use zen_core::{
     AgentEvent, ChatMessage, ChatRequest, ChatResponse, EventSink, FunctionCall, LlmBackend,
     NoHooks, PermissionChecker, PermissionDecision, PermissionMode, RunResult, ToolCall,
@@ -294,7 +295,7 @@ impl EventSink for MetricSink {
             AgentEvent::Assistant { message, .. } => {
                 self.requests.fetch_add(1, Ordering::Relaxed);
                 if let Some(calls) = message.tool_calls {
-                    let mut map = self.tool_names.lock().expect("eval tool_names lock poisoned: tool-name recording never panics while holding the lock");
+                    let mut map = lock_or_recover(&self.tool_names, "eval tool_names");
                     for tc in calls {
                         map.insert(tc.id, tc.function.name);
                     }
@@ -311,7 +312,7 @@ impl EventSink for MetricSink {
                 is_error: true,
                 ..
             } => {
-                let map = self.tool_names.lock().expect("eval tool_names lock poisoned: tool-name recording never panics while holding the lock");
+                let map = lock_or_recover(&self.tool_names, "eval tool_names");
                 if let Some(name) = map.get(&tool_use_id)
                     && EDIT_TOOLS.contains(&name.as_str())
                 {

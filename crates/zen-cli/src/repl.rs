@@ -2554,6 +2554,12 @@ fn persist(
     if let Err(e) = writer.persist_turn(before, agent.messages()) {
         eprintln!("warning: could not write transcript: {}", e);
     }
+    // A poisoned lock anywhere in the process marks the session
+    // degraded; flush the transcript explicitly so nothing written so
+    // far is left buffered when the user saves and restarts.
+    if zen_core::lock_recovery::is_degraded() {
+        writer.flush();
+    }
 }
 
 pub type ReplSink = Arc<dyn EventSink>;

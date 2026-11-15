@@ -403,6 +403,17 @@ impl TranscriptWriter {
         Ok(())
     }
 
+    /// Flush any buffered transcript bytes to disk. Records are
+    /// already flushed by `append_line`, so this is a no-op when
+    /// nothing is buffered; it exists so a degraded session can
+    /// flush explicitly instead of relying on that.
+    pub fn flush(&mut self) {
+        use std::io::Write;
+        if let Some(w) = self.file.as_mut() {
+            let _ = w.flush();
+        }
+    }
+
     fn write(&mut self, kind: &str, message: Option<Value>, summary: Option<Value>) -> Result<()> {
         let id = Uuid::new_v4().to_string();
         let rec = TranscriptRecord {

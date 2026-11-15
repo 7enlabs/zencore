@@ -5,6 +5,7 @@ use crate::settings::ResolvedConfig;
 use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
+use zen_core::lock_recovery::lock_or_recover;
 use zen_core::{
     AgentEvent, EventSink, HookRunner, NoHooks, PermissionChecker, PermissionDenial,
     PermissionMode, Prompter, RunResult, Tool, ToolContext, ToolRegistry,
@@ -39,13 +40,13 @@ pub struct ForwardSink {
 
 impl ForwardSink {
     pub fn set(&self, sink: Arc<dyn EventSink>) {
-        *self.target.lock().expect("event sink target lock poisoned: sink registration never panics while holding the lock") = Some(sink);
+        *lock_or_recover(&self.target, "event sink target") = Some(sink);
     }
 }
 
 impl EventSink for ForwardSink {
     fn emit(&self, ev: AgentEvent) {
-        let target = self.target.lock().expect("event sink target lock poisoned: sink registration never panics while holding the lock").clone();
+        let target = lock_or_recover(&self.target, "event sink target").clone();
         if let Some(t) = target {
             t.emit(ev);
         }
