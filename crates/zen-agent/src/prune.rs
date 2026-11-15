@@ -226,8 +226,8 @@ pub fn prune_messages(
         if m.role != "tool" {
             continue;
         }
-        let content = m.content.as_deref().unwrap_or("");
-        let tokens = est_tokens(content);
+        let content = m.text();
+        let tokens = est_tokens(&content);
         let age = current_turn.saturating_sub(turn_of(turn_starts, i));
         let (label, identifier) = match m.tool_call_id.as_deref().and_then(|id| args_by_id.get(id))
         {
@@ -241,7 +241,7 @@ pub fn prune_messages(
         let later_text: String = messages
             .iter()
             .skip(i + 1)
-            .filter_map(|m| m.content.as_deref())
+            .filter_map(|m| m.text_ref())
             .collect::<Vec<_>>()
             .join("\n");
         if should_prune(
@@ -254,13 +254,13 @@ pub fn prune_messages(
         )
         .is_some()
         {
-            let original = messages[i].content.clone().unwrap_or_default();
+            let original = messages[i].text();
             let summary = format!(
                 "{}\nOriginal first line: {}",
                 summarize_pruned(&label, identifier.as_deref(), tokens, age),
                 first_line(&original, 200)
             );
-            messages[i].content = Some(summary);
+            messages[i].content = Some(summary.into());
             stats.pruned += 1;
             stats.pruned_tokens += tokens;
         }
@@ -431,7 +431,7 @@ mod tests {
         let current_turn = turn_starts.len() - 1;
         let before: u64 = messages
             .iter()
-            .filter_map(|m| m.content.as_deref())
+            .filter_map(|m| m.text_ref())
             .map(est_tokens)
             .sum();
 
@@ -442,7 +442,7 @@ mod tests {
 
         let after: u64 = messages
             .iter()
-            .filter_map(|m| m.content.as_deref())
+            .filter_map(|m| m.text_ref())
             .map(est_tokens)
             .sum();
         assert!(
@@ -453,11 +453,71 @@ mod tests {
         );
 
         let pruned_msg = &messages[2];
-        let content = pruned_msg.content.as_deref().unwrap();
+        let content = pruned_msg.text();
         assert!(content.starts_with(PRUNE_MARKER), "marker present");
         assert!(content.contains("src/file1.rs"), "identifier preserved");
         assert_eq!(pruned_msg.role, "tool");
         assert_eq!(pruned_msg.tool_call_id.as_deref(), Some("call-1"));
+    }
+
+    #[test]
+    fn prune_messages_keeps_original_first_line() {
+        // Pins `let original = messages[i].text()`: replacing it with ""
+        // would leave the summary with no first line.
+        let (mut messages, turn_starts) = fixture_15_turns();
+        let current_turn = turn_starts.len() - 1;
+        let stats = prune_messages(&mut messages, &turn_starts, current_turn, &cfg(), "");
+        assert_eq!(stats.pruned, 10);
+        let content = messages[2].text();
+        assert!(
+            content.contains("Original first line: // file1 contents"),
+            "pruned summary: {content}"
+        );
+    }
+
+    #[test]
+    fn prune_messages_keeps_result_referenced_by_later_message() {
+        // Pins the later-text scan: if the later messages were ignored,
+        // the turn-1 result would be pruned even though it is referenced.
+        let (mut messages, turn_starts) = fixture_15_turns();
+        messages.push(ChatMessage::assistant(
+            Some("noted src/file1.rs for the follow-up".into()),
+            None,
+        ));
+        let current_turn = turn_starts.len() - 1;
+        let stats = prune_messages(&mut messages, &turn_starts, current_turn, &cfg(), "");
+        assert_eq!(stats.pruned, 9, "only the referenced turn is kept");
+        assert!(
+            !messages[2].text().starts_with(PRUNE_MARKER),
+            "turn 1 is referenced later, must not be pruned"
+        );
+    }
+
+    #[test]
+    fn prune_messages_prunes_result_whose_identifier_appears_only_in_itself() {
+        // Pins `.skip(i + 1)` in the later-text scan: the identifier
+        // appears in the tool result itself, but in no later message, so
+        // the result is still prunable. `skip(i)` or `skip(i - 1)` would
+        // scan the result itself, see the identifier and keep it.
+        let body = format!("src/only-here.rs\n{}", "x".repeat(20_000));
+        let messages = vec![
+            ChatMessage::user("do the thing"),
+            assistant_with_call("call-1", "read", r#"{"path": "src/only-here.rs"}"#),
+            tool_msg("call-1", &body),
+            ChatMessage::assistant(Some("done with step 1".into()), None),
+            ChatMessage::user("next step"),
+        ];
+        let mut messages = messages;
+        let turn_starts = vec![0usize, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        let current_turn = turn_starts.len() - 1;
+        let stats = prune_messages(&mut messages, &turn_starts, current_turn, &cfg(), "");
+        assert_eq!(stats.pruned, 1, "stats: {:?}", stats);
+        let content = messages[2].text();
+        assert!(content.starts_with(PRUNE_MARKER), "content: {content}");
+        assert!(
+            content.contains("src/only-here.rs"),
+            "identifier preserved: {content}"
+        );
     }
 
     #[test]
@@ -476,7 +536,7 @@ mod tests {
 
         let kept = &messages[7];
         assert!(
-            !kept.content.as_deref().unwrap().starts_with(PRUNE_MARKER),
+            !kept.text().starts_with(PRUNE_MARKER),
             "protected identifier must not be pruned"
         );
     }

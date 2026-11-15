@@ -96,10 +96,9 @@ impl zen_core::EventSink for TextSink {
                 self.buf.write_str(&text);
             }
             AgentEvent::Assistant { message, .. } => {
-                if let Some(content) = &message.content
-                    && !content.is_empty()
-                {
-                    self.buf.write_str(content);
+                let text = message.text();
+                if !text.is_empty() {
+                    self.buf.write_str(&text);
                 }
 
                 if self.is_repl
@@ -159,9 +158,7 @@ impl zen_core::EventSink for CapturingSink {
         match ev {
             AgentEvent::TextDelta { text } => self.buf.write_str(&text),
             AgentEvent::Assistant { message, .. } => {
-                if let Some(c) = &message.content {
-                    self.buf.write_str(c);
-                }
+                self.buf.write_str(&message.text());
             }
             AgentEvent::ToolResult { .. } => {}
             AgentEvent::PermissionDenied(_) => {}
@@ -812,6 +809,71 @@ mod tests {
             parent_tool_use_id: None,
         });
         assert_eq!(buf.text(), "hello");
+    }
+
+    #[test]
+    fn text_sink_writes_assistant_text() {
+        // Pins the Assistant arm: replacing message.text() with "" or
+        // dropping the write must change the buffer.
+        let buf = Arc::new(Buffered::new());
+        let sink = TextSink::new_headless(buf.clone());
+        sink.emit(AgentEvent::TextDelta {
+            text: "hello".into(),
+        });
+        sink.emit(AgentEvent::Assistant {
+            message: ChatMessage::assistant(Some(" world".into()), None),
+            parent_tool_use_id: None,
+        });
+        assert_eq!(buf.text(), "hello world");
+        // Empty assistant text writes nothing.
+        sink.emit(AgentEvent::Assistant {
+            message: ChatMessage::assistant(Some("".into()), None),
+            parent_tool_use_id: None,
+        });
+        assert_eq!(buf.text(), "hello world");
+    }
+
+    #[test]
+    fn text_sink_repl_lists_tool_calls() {
+        let buf = Arc::new(Buffered::new());
+        let sink = TextSink::new_repl(buf.clone());
+        sink.emit(AgentEvent::Assistant {
+            message: ChatMessage::assistant(
+                Some("reading".into()),
+                Some(vec![ToolCall {
+                    id: "call_1".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "Read".into(),
+                        arguments: r#"{"file_path":"a.rs"}"#.into(),
+                    },
+                }]),
+            ),
+            parent_tool_use_id: None,
+        });
+        assert_eq!(buf.text(), "reading● Read(...) {\"file_path\":\"a.rs\"}\n");
+    }
+
+    #[test]
+    fn capturing_sink_collects_deltas_and_assistant_text() {
+        // Pins both write sites: dropping either must change the buffer.
+        let sink = CapturingSink::new();
+        sink.emit(AgentEvent::TextDelta {
+            text: "hello".into(),
+        });
+        sink.emit(AgentEvent::Assistant {
+            message: ChatMessage::assistant(Some(" world".into()), None),
+            parent_tool_use_id: None,
+        });
+        // Tool results are deliberately not captured.
+        sink.emit(AgentEvent::ToolResult {
+            tool_use_id: "call_1".into(),
+            content: "ignored".into(),
+            is_error: false,
+            parent_tool_use_id: None,
+            parallel: false,
+        });
+        assert_eq!(sink.buf.text(), "hello world");
     }
 
     #[test]

@@ -205,7 +205,10 @@ pub fn init_prompt_with_imports(candidates: &[std::path::PathBuf]) -> String {
 /// Bytes one message adds to the estimate; the same terms as
 /// `zen_core::estimate_tokens`, so the groups below add up to its total.
 fn message_bytes(m: &zen_core::ChatMessage) -> usize {
-    m.content.as_deref().map(str::len).unwrap_or(0)
+    // Image parts cost the fixed estimate; expressed in bytes (4 bytes per
+    // token) so the groups below still add up to `estimate_tokens`.
+    m.text().len()
+        + m.image_part_count() * (zen_core::IMAGE_PART_TOKEN_ESTIMATE as usize * 4)
         + m.tool_calls
             .as_ref()
             .map(|calls| {
@@ -422,14 +425,12 @@ pub fn transcript_markdown(session_id: &str, messages: &[zen_core::ChatMessage])
     let mut out = format!("# zen session {}\n", session_id);
     for m in messages {
         match m.role.as_str() {
-            "user" => out.push_str(&format!(
-                "\n## User\n\n{}\n",
-                m.content.as_deref().unwrap_or("")
-            )),
+            "user" => out.push_str(&format!("\n## User\n\n{}\n", m.text())),
             "assistant" => {
                 out.push_str("\n## Assistant\n\n");
-                if let Some(c) = m.content.as_deref().filter(|c| !c.is_empty()) {
-                    out.push_str(c);
+                let text = m.text();
+                if !text.is_empty() {
+                    out.push_str(&text);
                     out.push('\n');
                 }
                 for call in m.tool_calls.iter().flatten() {
@@ -443,7 +444,7 @@ pub fn transcript_markdown(session_id: &str, messages: &[zen_core::ChatMessage])
                 out.push_str(&format!(
                     "\n**Tool result** ({}):\n\n```\n{}\n```\n",
                     m.tool_call_id.as_deref().unwrap_or("?"),
-                    m.content.as_deref().unwrap_or("")
+                    m.text()
                 ));
             }
             _ => {}
@@ -1081,6 +1082,61 @@ mod tests {
         assert!(
             report.contains("Last request (reported by the API): 500 prompt tokens (estimate is "),
             "{report}"
+        );
+    }
+
+    #[test]
+    fn context_breakdown_counts_images_and_tool_calls_exactly() {
+        // Exact groups pin message_bytes: swapping `+` for `-` or `*`
+        // for `+` in the image term changes the totals (or underflows).
+        let msgs = vec![
+            zen_core::ChatMessage::user_parts(vec![
+                zen_core::ContentPart::text("abcdefgh"),
+                zen_core::ContentPart::image_url("data:image/png;base64,AAAA"),
+                zen_core::ContentPart::image("image/png", "AAAA"),
+            ]),
+            zen_core::ChatMessage::assistant(
+                None,
+                Some(vec![zen_core::ToolCall {
+                    id: "c1".into(),
+                    call_type: "function".into(),
+                    function: zen_core::FunctionCall {
+                        name: "Read".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+            ),
+        ];
+        // System prompt "abcd" is 1 token; no memory, no tools.
+        let b = context_breakdown("abcd", "", &[], &msgs);
+        assert_eq!(b.instructions, 1);
+        assert_eq!(b.memory, 0);
+        assert_eq!(b.tools, 0);
+        // History bytes: (8 + 2 * 384 * 4) + (4 + 2) = 3086, / 4 = 771.
+        // Tool bytes: 4 + 2 = 6, / 4 = 1.
+        assert_eq!(b.history_tools, 1);
+        assert_eq!(b.history_conversation, 770);
+        assert_eq!(b.history(), 771);
+        assert_eq!(b.total(), 772);
+        // The groups add up to zen_core::estimate_tokens, as documented.
+        assert_eq!(b.history(), zen_core::estimate_tokens(&msgs));
+    }
+
+    #[test]
+    fn transcript_markdown_shows_unknown_tool_call_id() {
+        // Pins the `unwrap_or("?")`: replacing "?" with "" must fail.
+        let missing = zen_core::ChatMessage {
+            role: "tool".into(),
+            content: Some(zen_core::MessageContent::Text("result".into())),
+            ..Default::default()
+        };
+        let md = transcript_markdown("s1", &[missing]);
+        assert!(md.contains("**Tool result** (?):"), "transcript:\n{md}");
+        let known = zen_core::ChatMessage::tool("call_9", "result");
+        let md = transcript_markdown("s1", &[known]);
+        assert!(
+            md.contains("**Tool result** (call_9):"),
+            "transcript:\n{md}"
         );
     }
 

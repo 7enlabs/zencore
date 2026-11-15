@@ -479,21 +479,21 @@ impl Agent {
         let mut glue = false;
         for m in self.messages.iter().rev() {
             if m.role == "user" {
-                if m.content.as_deref() == Some(TRUNCATION_CONTINUE_NUDGE) {
+                if m.text_ref() == Some(TRUNCATION_CONTINUE_NUDGE) {
                     glue = true;
                     continue;
                 }
                 break;
             }
             if m.role == "assistant"
-                && let Some(c) = &m.content
+                && let Some(c) = m.text_ref()
             {
                 if glue && !parts.is_empty() {
                     if let Some(last) = parts.last_mut() {
                         last.insert_str(0, c);
                     }
                 } else if !c.trim().is_empty() {
-                    parts.push(c.clone());
+                    parts.push(c.to_string());
                 }
                 glue = false;
             }
@@ -690,7 +690,7 @@ impl Agent {
                     .as_ref()
                     .is_none_or(|c| c.is_empty())
             {
-                let text = resp.message.content.clone().unwrap_or_default();
+                let text = resp.message.text();
                 if !text.trim().is_empty() {
                     self.messages.push(resp.message.clone());
                     self.sink.emit(AgentEvent::Assistant {
@@ -719,7 +719,7 @@ impl Agent {
                 if calls.is_empty() || broken {
                     let mut msg = resp.message.clone();
                     msg.tool_calls = None;
-                    let text = msg.content.clone().unwrap_or_default();
+                    let text = msg.text();
 
                     if !text.is_empty() {
                         self.messages.push(msg.clone());
@@ -782,7 +782,7 @@ impl Agent {
                 .as_ref()
                 .is_none_or(|c| c.is_empty())
             {
-                let text = resp.message.content.clone().unwrap_or_default();
+                let text = resp.message.text();
                 if let Some((name, arguments)) =
                     repair::tool_call_in_text(&text, &self.tools.names())
                 {
@@ -805,7 +805,7 @@ impl Agent {
 
             let assistant = &resp.message;
             let tool_calls = assistant.tool_calls.clone().unwrap_or_default();
-            final_text = assistant.content.clone().unwrap_or_default();
+            final_text = assistant.text();
 
             if tool_calls.is_empty()
                 && final_text.trim().is_empty()
@@ -1025,7 +1025,12 @@ impl Agent {
         self.usage.input_tokens += resp.usage.prompt_tokens;
         self.usage.output_tokens += resp.usage.completion_tokens;
         self.usage.cache_read_input_tokens += resp.usage.cache_read_input_tokens;
-        let summary = resp.message.content.unwrap_or_default();
+        let summary = resp
+            .message
+            .content
+            .as_ref()
+            .map(|c| c.text())
+            .unwrap_or_default();
         let summary = summary.trim();
         if summary.is_empty() {
             return (stop_text.to_string(), api_ms);
@@ -1549,9 +1554,18 @@ impl Agent {
         if let Some(last) = self.messages.last_mut()
             && (last.role == "tool" || last.role == "user")
         {
-            let content = last.content.get_or_insert_with(String::new);
-            content.push_str("\n\n");
-            content.push_str(&note);
+            let content = last
+                .content
+                .get_or_insert_with(|| MessageContent::Text(String::new()));
+            match content {
+                MessageContent::Text(text) => {
+                    text.push_str("\n\n");
+                    text.push_str(&note);
+                }
+                MessageContent::Parts(parts) => {
+                    parts.push(ContentPart::text(format!("\n\n{note}")));
+                }
+            }
             self.model_calls_since_todo = 0;
         }
     }
@@ -1664,6 +1678,92 @@ pub(crate) fn combine_permission(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{FakePerms, MockLlm, base_cfg, build_agent, registry_with};
+
+    fn agent_with(messages: Vec<ChatMessage>) -> Agent {
+        let (mut agent, _sink, _hooks) = build_agent(
+            MockLlm::new(vec![]),
+            registry_with(vec![]),
+            FakePerms::new(PermissionDecision::Allow),
+            base_cfg(),
+        );
+        agent.set_messages(messages);
+        agent
+    }
+
+    #[test]
+    fn plan_text_keeps_chronological_order() {
+        // Pins parts.reverse() and the "\n\n" join: dropping the
+        // reverse (or the separator) changes the result.
+        let agent = agent_with(vec![
+            ChatMessage::user("do it"),
+            ChatMessage::assistant(Some("first".into()), None),
+            ChatMessage::assistant(Some("second".into()), None),
+        ]);
+        assert_eq!(agent.plan_text().as_deref(), Some("first\n\nsecond"));
+    }
+
+    #[test]
+    fn plan_text_glues_across_truncation_nudge() {
+        // The text after a truncation nudge continues the text before
+        // it, with no separator. Pins `glue && !parts.is_empty()`: if
+        // the `!` were dropped, the parts would stay separate.
+        let agent = agent_with(vec![
+            ChatMessage::user("do it"),
+            ChatMessage::assistant(Some("part one".into()), None),
+            ChatMessage::user(TRUNCATION_CONTINUE_NUDGE),
+            ChatMessage::assistant(Some("part two".into()), None),
+        ]);
+        assert_eq!(agent.plan_text().as_deref(), Some("part onepart two"));
+    }
+
+    #[test]
+    fn plan_text_glue_with_empty_parts_keeps_text() {
+        // Pins `glue && !parts.is_empty()` the other way: swapping
+        // `&&` for `||` (or dropping the `!`) would swallow the only
+        // part when glue is set but nothing was collected yet.
+        let agent = agent_with(vec![
+            ChatMessage::assistant(Some("only".into()), None),
+            ChatMessage::user(TRUNCATION_CONTINUE_NUDGE),
+        ]);
+        assert_eq!(agent.plan_text().as_deref(), Some("only"));
+    }
+
+    #[test]
+    fn plan_text_does_not_carry_glue_past_one_message() {
+        // After one assistant message the glue is spent: an earlier
+        // message starts a new part. Pins `glue = false`.
+        let agent = agent_with(vec![
+            ChatMessage::user("do it"),
+            ChatMessage::assistant(Some("a".into()), None),
+            ChatMessage::assistant(Some("b".into()), None),
+            ChatMessage::user(TRUNCATION_CONTINUE_NUDGE),
+        ]);
+        assert_eq!(agent.plan_text().as_deref(), Some("a\n\nb"));
+    }
+
+    #[test]
+    fn plan_text_skips_whitespace_only_assistant_text() {
+        // Pins `!c.trim().is_empty()`: negating it would keep the
+        // blank text and drop the real one.
+        let agent = agent_with(vec![
+            ChatMessage::user("do it"),
+            ChatMessage::assistant(Some("   ".into()), None),
+            ChatMessage::assistant(Some("real".into()), None),
+        ]);
+        assert_eq!(agent.plan_text().as_deref(), Some("real"));
+        let blank_only = agent_with(vec![
+            ChatMessage::user("do it"),
+            ChatMessage::assistant(Some("   ".into()), None),
+        ]);
+        assert_eq!(blank_only.plan_text(), None);
+    }
+
+    #[test]
+    fn plan_text_returns_none_without_assistant_text() {
+        let agent = agent_with(vec![ChatMessage::user("do it")]);
+        assert_eq!(agent.plan_text(), None);
+    }
 
     #[test]
     fn default_model_is_the_decided_free_gateway_id() {

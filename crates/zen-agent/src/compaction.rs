@@ -79,7 +79,7 @@ pub(crate) async fn compact_impl(
     )
     .await?;
 
-    let model_summary = resp.message.content.clone().unwrap_or_default();
+    let model_summary = resp.message.text();
     if model_summary.trim().is_empty() {
         anyhow::bail!("compaction produced an empty summary");
     }
@@ -139,7 +139,8 @@ fn truncate_chars(s: &str, max: usize) -> String {
 pub fn serialize_conversation(msgs: &[ChatMessage]) -> String {
     let mut out: Vec<String> = Vec::new();
     for m in msgs {
-        let text = m.content.as_deref().unwrap_or("").trim();
+        let text = m.transcript_text();
+        let text = text.trim();
         match m.role.as_str() {
             "user" if !text.is_empty() => out.push(format!("[User]: {text}")),
             "assistant" => {
@@ -176,10 +177,10 @@ impl FileOps {
     pub fn collect(msgs: &[ChatMessage]) -> Self {
         let mut ops = FileOps::default();
         for m in msgs {
-            let text = m.content.as_deref().unwrap_or("");
+            let text = m.transcript_text();
             if m.role == "user" && text.starts_with(SUMMARY_PREFIX) {
-                ops.read.extend(block_lines(text, "read-files"));
-                ops.modified.extend(block_lines(text, "modified-files"));
+                ops.read.extend(block_lines(&text, "read-files"));
+                ops.modified.extend(block_lines(&text, "modified-files"));
             }
             for c in m.tool_calls.iter().flatten() {
                 let Ok(args) = serde_json::from_str::<serde_json::Value>(&c.function.arguments)
@@ -278,6 +279,28 @@ mod tests {
     }
 
     #[test]
+    fn serialize_conversation_replaces_image_parts_with_placeholder() {
+        let payload = "A".repeat(10_000);
+        let msgs = vec![
+            ChatMessage::user_parts(vec![
+                ContentPart::text("what is wrong in this screenshot?"),
+                ContentPart::image_url(format!("data:image/png;base64,{payload}")),
+            ]),
+            ChatMessage::assistant(Some("the button is misaligned".into()), None),
+        ];
+        let t = serialize_conversation(&msgs);
+        assert!(
+            t.contains("[User]: what is wrong in this screenshot?[image]"),
+            "image part renders as a placeholder next to the text: {t}"
+        );
+        assert!(
+            !t.contains(&payload),
+            "base64 payload must never reach the compaction transcript"
+        );
+        assert!(t.contains("[Assistant]: the button is misaligned"));
+    }
+
+    #[test]
     fn truncation_is_char_safe() {
         let s = "é".repeat(5);
         assert_eq!(
@@ -321,6 +344,35 @@ mod tests {
             "\n\n<read-files>\na.rs\nold.rs\n</read-files>\n\n<modified-files>\nb.rs\nlib.rs\n</modified-files>"
         );
         assert_eq!(FileOps::default().render(), "");
+    }
+
+    #[test]
+    fn file_ops_collect_only_reads_summaries_from_user_messages() {
+        // Pins `m.role == "user" && text.starts_with(SUMMARY_PREFIX)`:
+        // swapping `&&` for `||` would let a non-user message, or a
+        // user message that is not a summary, contribute file lists.
+        let summary = format!(
+            "{SUMMARY_PREFIX}\n\n<read-files>\nspy.rs\n</read-files>\n\n<modified-files>\nspy2.rs\n</modified-files>"
+        );
+        // An assistant message carrying summary text must not count.
+        let ops = FileOps::collect(&[ChatMessage::assistant(Some(summary.clone()), None)]);
+        assert!(ops.read.is_empty(), "read: {:?}", ops.read);
+        assert!(ops.modified.is_empty(), "modified: {:?}", ops.modified);
+        // A user message that is not a summary must not count either.
+        let not_summary = "hello\n\n<read-files>\nspy.rs\n</read-files>".to_string();
+        let ops = FileOps::collect(&[ChatMessage::user(not_summary)]);
+        assert!(ops.read.is_empty(), "read: {:?}", ops.read);
+        assert!(ops.modified.is_empty(), "modified: {:?}", ops.modified);
+        // The same text as a user summary does count.
+        let ops = FileOps::collect(&[ChatMessage::user(summary)]);
+        assert_eq!(
+            ops.read.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["spy.rs"]
+        );
+        assert_eq!(
+            ops.modified.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["spy2.rs"]
+        );
     }
 
     #[test]
