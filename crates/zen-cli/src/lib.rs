@@ -15,6 +15,7 @@ pub mod eventlog;
 pub mod export;
 pub mod git;
 pub mod github;
+pub mod hook_watch;
 pub mod mentions;
 pub mod models;
 pub mod ollama;
@@ -264,6 +265,14 @@ pub async fn run_with_home(cli: Cli, cwd: &Path, home: Option<&Path>) -> Result<
 
     if let Some(sub) = cli.subcommand.clone() {
         return run_subcommand(&cli, cwd, home, &sub).await;
+    }
+
+    if cli.init_only {
+        return run_init_only(&cli, cwd, home).await;
+    }
+    if (cli.init || cli.maintenance) && !cli.print {
+        eprintln!("error: --init and --maintenance require -p (non-interactive mode)");
+        return Ok(exit_code::VALIDATION);
     }
 
     if cli.print {
@@ -760,6 +769,19 @@ fn untrusted_notice(skipped: &[String]) -> String {
     )
 }
 
+/// `--init-only`: run Setup hooks (trigger `"init"`), then SessionStart
+/// with the startup matcher, print any SessionStart feedback, and exit
+/// without starting a conversation.
+async fn run_init_only(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result<i32> {
+    let cfg = settings::resolve_config_with_home(cli, cwd, home)?;
+    let session_id = session::new_session_id();
+    let feedback = agent_run::run_init_only_hooks(cli, &cfg, &session_id, cwd).await;
+    if let Some(text) = feedback.filter(|s| !s.trim().is_empty()) {
+        println!("{text}");
+    }
+    Ok(0)
+}
+
 async fn run_headless(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result<i32> {
     use std::io::IsTerminal;
 
@@ -821,6 +843,31 @@ async fn run_headless(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result<i32>
     }
 
     let (session_id, transcript_path, history_from) = resolve_session(cli, cwd, home)?;
+
+    // `--init` / `--maintenance`: run Setup hooks before the headless
+    // run (the trigger is the matcher for the Setup hooks).
+    if cli.init {
+        agent_run::run_setup(
+            cli,
+            &cfg,
+            &session_id,
+            transcript_path.as_deref(),
+            cwd,
+            "init",
+        )
+        .await;
+    }
+    if cli.maintenance {
+        agent_run::run_setup(
+            cli,
+            &cfg,
+            &session_id,
+            transcript_path.as_deref(),
+            cwd,
+            "maintenance",
+        )
+        .await;
+    }
 
     if cli.plan {
         return agent_run::run_plan_flow(

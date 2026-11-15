@@ -2562,3 +2562,328 @@ async fn b61_transient_always_fail_calls_three_times() {
     assert!(out.is_error);
     assert_eq!(*counter.calls.lock().unwrap(), 3);
 }
+
+// --- Wave 1 #3: hook system, 33 events ---
+
+fn todo_args(items: &[(&str, &str)]) -> String {
+    let list: Vec<Value> = items
+        .iter()
+        .map(|(c, s)| json!({"content": c, "status": s}))
+        .collect();
+    serde_json::to_string(&json!({ "todos": list })).unwrap()
+}
+
+#[tokio::test]
+async fn wave1_permission_request_allow_skips_prompt() {
+    let llm = MockLlm::new(vec![resp_tool("Write", "{}", "w1"), resp("done")]);
+    let reg = registry_with(vec![fake("Write", false, "wrote")]);
+    let (mut agent, _s, hooks) = build_agent(
+        llm,
+        reg,
+        FakePerms::new(PermissionDecision::Ask),
+        base_cfg(),
+    );
+    hooks.push(
+        HookEvent::PermissionRequest,
+        HookOutcome {
+            permission_override: Some(PermissionDecision::Allow),
+            ..Default::default()
+        },
+    );
+    let r = agent.run_turn("go").await;
+    assert_eq!(r.result, "done");
+    assert!(r.permission_denials.is_empty());
+    let calls = hooks.calls.lock().unwrap();
+    assert!(
+        calls
+            .iter()
+            .any(|(ev, target, p)| *ev == HookEvent::PermissionRequest
+                && target == "Write"
+                && p["tool_name"] == "Write"),
+        "PermissionRequest should fire with the tool name: {:?}",
+        calls
+    );
+}
+
+#[tokio::test]
+async fn wave1_permission_request_block_denies_tool() {
+    let llm = MockLlm::new(vec![resp_tool("Write", "{}", "w1"), resp("done")]);
+    let reg = registry_with(vec![fake("Write", false, "wrote")]);
+    let (mut agent, _s, hooks) = build_agent(
+        llm,
+        reg,
+        FakePerms::new(PermissionDecision::Ask),
+        base_cfg(),
+    );
+    hooks.push(
+        HookEvent::PermissionRequest,
+        HookOutcome {
+            blocked: true,
+            feedback: Some("hook says no".into()),
+            ..Default::default()
+        },
+    );
+    let r = agent.run_turn("go").await;
+    assert_eq!(r.permission_denials.len(), 1);
+    let tool_msg = agent.messages().iter().find(|m| m.role == "tool").unwrap();
+    assert_eq!(tool_msg.text_ref(), Some("hook says no"));
+    let calls = hooks.calls.lock().unwrap();
+    assert!(
+        calls
+            .iter()
+            .any(|(ev, _, _)| *ev == HookEvent::PermissionRequest)
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|(ev, _, _)| *ev == HookEvent::PermissionDenied),
+        "a blocked request still records a denial: {:?}",
+        calls
+    );
+}
+
+#[tokio::test]
+async fn wave1_permission_denied_hook_runs_and_retry_note() {
+    let llm = MockLlm::new(vec![resp_tool("Write", r#"{"p":"a"}"#, "w1"), resp("ok")]);
+    let reg = registry_with(vec![fake("Write", false, "wrote")]);
+    let perms = FakePerms::new(PermissionDecision::Deny("rule says no".into()));
+    let (mut agent, _s, hooks) = build_agent(llm, reg, perms, base_cfg());
+    hooks.push(
+        HookEvent::PermissionDenied,
+        HookOutcome {
+            allow_retry: true,
+            ..Default::default()
+        },
+    );
+    let r = agent.run_turn("go").await;
+    assert_eq!(r.permission_denials.len(), 1);
+    let tool_msg = agent.messages().iter().find(|m| m.role == "tool").unwrap();
+    let text = tool_msg.text_ref().unwrap();
+    assert!(text.contains("rule says no"), "{text}");
+    assert!(text.contains("may retry"), "{text}");
+    let calls = hooks.calls.lock().unwrap();
+    let (_, _, payload) = calls
+        .iter()
+        .find(|(ev, _, _)| *ev == HookEvent::PermissionDenied)
+        .expect("PermissionDenied should fire");
+    assert_eq!(payload["tool_name"], "Write");
+    assert_eq!(payload["reason"], "rule says no");
+}
+
+#[tokio::test]
+async fn wave1_task_created_block_vetoes_todo_write() {
+    let llm = MockLlm::new(vec![
+        resp_tool("TodoWrite", &todo_args(&[("write tests", "pending")]), "t1"),
+        resp("done"),
+    ]);
+    let reg = registry_with(vec![fake("TodoWrite", true, "RAN")]);
+    let (mut agent, _s, hooks) = build_agent(llm, reg, allow(), base_cfg());
+    hooks.push(
+        HookEvent::TaskCreated,
+        HookOutcome {
+            blocked: true,
+            feedback: Some("tasks need a ticket".into()),
+            ..Default::default()
+        },
+    );
+    agent.run_turn("go").await;
+    let tool_msg = agent.messages().iter().find(|m| m.role == "tool").unwrap();
+    assert_eq!(tool_msg.text_ref(), Some("tasks need a ticket"));
+    assert!(
+        !agent
+            .messages()
+            .iter()
+            .any(|m| m.role == "tool" && m.text_ref() == Some("RAN")),
+        "a vetoed TodoWrite must not run"
+    );
+    let calls = hooks.calls.lock().unwrap();
+    let (_, _, payload) = calls
+        .iter()
+        .find(|(ev, _, _)| *ev == HookEvent::TaskCreated)
+        .expect("TaskCreated should fire");
+    assert_eq!(payload["task_subject"], "write tests");
+    assert_eq!(payload["task_id"], "todo-0");
+}
+
+#[tokio::test]
+async fn wave1_task_completed_fires_for_newly_completed_todo() {
+    let llm = MockLlm::new(vec![
+        resp_tool(
+            "TodoWrite",
+            &todo_args(&[("write tests", "completed")]),
+            "t1",
+        ),
+        resp("done"),
+    ]);
+    let reg = registry_with(vec![fake("TodoWrite", true, "RAN")]);
+    let (mut agent, _s, hooks) = build_agent(llm, reg, allow(), base_cfg());
+    agent.ctx.todos.lock().unwrap().push(TodoItem {
+        content: "write tests".into(),
+        status: "pending".into(),
+        active_form: None,
+    });
+    agent.run_turn("go").await;
+    let calls = hooks.calls.lock().unwrap();
+    let (_, _, payload) = calls
+        .iter()
+        .find(|(ev, _, _)| *ev == HookEvent::TaskCompleted)
+        .expect("TaskCompleted should fire");
+    assert_eq!(payload["task_subject"], "write tests");
+    assert!(
+        !calls.iter().any(|(ev, _, _)| *ev == HookEvent::TaskCreated),
+        "an existing item completing is not a creation: {:?}",
+        calls
+    );
+}
+
+#[tokio::test]
+async fn wave1_post_tool_batch_context_injected_before_next_call() {
+    let llm = MockLlm::new(vec![resp_tool("Echo", "{}", "e1"), resp("done")]);
+    let reg = registry_with(vec![fake("Echo", true, "echoed")]);
+    let (mut agent, _s, hooks) = build_agent(llm.clone(), reg, allow(), base_cfg());
+    hooks.push(
+        HookEvent::PostToolBatch,
+        HookOutcome {
+            feedback: Some("BATCH-NOTE: check the echo".into()),
+            ..Default::default()
+        },
+    );
+    let r = agent.run_turn("go").await;
+    assert_eq!(r.result, "done");
+    let calls = hooks.calls.lock().unwrap();
+    let (_, _, payload) = calls
+        .iter()
+        .find(|(ev, _, _)| *ev == HookEvent::PostToolBatch)
+        .expect("PostToolBatch should fire");
+    assert_eq!(payload["tool_calls"][0]["tool_name"], "Echo");
+    assert_eq!(payload["tool_calls"][0]["tool_response"], "echoed");
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .any(|m| m.role == "user" && m.text().contains("BATCH-NOTE")),
+        "batch context must reach the next model call"
+    );
+}
+
+#[tokio::test]
+async fn wave1_post_tool_batch_block_stops_run() {
+    let llm = MockLlm::new(vec![resp_tool("Echo", "{}", "e1"), resp("never seen")]);
+    let reg = registry_with(vec![fake("Echo", true, "echoed")]);
+    let (mut agent, _s, hooks) = build_agent(llm.clone(), reg, allow(), base_cfg());
+    hooks.push(
+        HookEvent::PostToolBatch,
+        HookOutcome {
+            blocked: true,
+            feedback: Some("batch rejected".into()),
+            ..Default::default()
+        },
+    );
+    let r = agent.run_turn("go").await;
+    assert_eq!(r.result, "batch rejected");
+    assert_eq!(llm.requests().len(), 1, "no model call after the block");
+}
+
+#[tokio::test]
+async fn wave1_message_display_replacement_changes_display_only() {
+    let llm = MockLlm::new(vec![resp("hello secret")]);
+    let (mut agent, sink, hooks) = build_agent(llm, ToolRegistry::new(), allow(), base_cfg());
+    hooks.push(
+        HookEvent::MessageDisplay,
+        HookOutcome {
+            display_replacement: Some("hello [redacted]".into()),
+            ..Default::default()
+        },
+    );
+    let r = agent.run_turn("go").await;
+    assert_eq!(r.result, "hello secret");
+    let events = sink.events.lock().unwrap();
+    let shown = events.iter().find_map(|e| match e {
+        AgentEvent::Assistant { message, .. } => Some(message.text()),
+        _ => None,
+    });
+    assert_eq!(shown.as_deref(), Some("hello [redacted]"));
+    let stored = agent
+        .messages()
+        .iter()
+        .find(|m| m.role == "assistant")
+        .unwrap();
+    assert_eq!(
+        stored.text(),
+        "hello secret",
+        "model context keeps the original"
+    );
+}
+
+#[tokio::test]
+async fn wave1_stop_failure_hook_runs_on_api_error() {
+    let llm = MockLlm::with_errors(vec![Err(anyhow::anyhow!(
+        "API Error: 429 rate limit reached"
+    ))]);
+    let (mut agent, _s, hooks) = build_agent(llm, ToolRegistry::new(), allow(), base_cfg());
+    let r = agent.run_turn("go").await;
+    assert!(r.is_error);
+    let calls = hooks.calls.lock().unwrap();
+    let (_, target, payload) = calls
+        .iter()
+        .find(|(ev, _, _)| *ev == HookEvent::StopFailure)
+        .expect("StopFailure should fire");
+    assert_eq!(target, "rate_limit");
+    assert_eq!(payload["error"], "rate_limit");
+    assert!(payload["error_details"].as_str().unwrap().contains("429"));
+}
+
+struct CdTool;
+#[async_trait::async_trait]
+impl Tool for CdTool {
+    fn name(&self) -> &str {
+        "Bash"
+    }
+    fn description(&self) -> &str {
+        "fake bash that cds"
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+    fn is_read_only(&self) -> bool {
+        false
+    }
+    async fn call(&self, _args: Value, ctx: &ToolContext) -> ToolOutput {
+        let sub = ctx.cwd().join("deeper");
+        std::fs::create_dir_all(&sub).unwrap();
+        *ctx.cwd.lock().unwrap() = sub;
+        ToolOutput::ok("moved")
+    }
+}
+
+#[tokio::test]
+async fn wave1_cwd_changed_fires_when_tool_moves_cwd() {
+    let llm = MockLlm::new(vec![
+        resp_tool("Bash", r#"{"command":"cd deeper"}"#, "b1"),
+        resp("done"),
+    ]);
+    let reg = registry_with(vec![Arc::new(CdTool)]);
+    let (mut agent, _s, hooks) = build_agent(llm, reg, allow(), base_cfg());
+    let before = agent.ctx.cwd();
+    hooks.push(
+        HookEvent::CwdChanged,
+        HookOutcome {
+            watch_paths: Some(vec!["/tmp/watch.env".to_string()]),
+            ..Default::default()
+        },
+    );
+    agent.run_turn("go").await;
+    let calls = hooks.calls.lock().unwrap();
+    let (_, _, payload) = calls
+        .iter()
+        .find(|(ev, _, _)| *ev == HookEvent::CwdChanged)
+        .expect("CwdChanged should fire");
+    assert_eq!(payload["old_cwd"], before.display().to_string());
+    assert!(payload["new_cwd"].as_str().unwrap().ends_with("deeper"));
+    assert_eq!(
+        agent.dynamic_watch_paths,
+        vec![std::path::PathBuf::from("/tmp/watch.env")]
+    );
+}

@@ -345,6 +345,12 @@ pub async fn run_repl(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result<()> 
 
     repl_session_start(&mut agent, &session_id, cwd, &cfg, "startup").await;
 
+    // `ConfigChange` / `FileChanged` hooks are driven by polling: the
+    // watchers snapshot mtimes at session start and report each change
+    // once per prompt iteration (see hook_watch.rs).
+    let mut config_watcher = crate::hook_watch::ConfigWatcher::new(cwd, home);
+    let mut file_watcher = crate::hook_watch::FileWatcher::new(cwd, &cfg.hooks);
+
     let mut interrupts = ReplInterrupts::install();
     let mut repl = ReplState {
         session_id: &mut session_id,
@@ -459,6 +465,11 @@ pub async fn run_repl(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result<()> 
         reader.set_prompt_style(repl.theme);
         reader.set_model_rows(&repl.model_rows);
 
+        // Poll the `ConfigChange` / `FileChanged` watchers before
+        // blocking on input, so changes made during the last turn
+        // surface before the next prompt.
+        poll_hook_watchers(&mut config_watcher, &mut file_watcher, &mut agent).await;
+
         let line = match reader.read(&prompt) {
             crate::repl_input::ReadOutcome::Line(l) => {
                 last_interrupt = None;
@@ -517,6 +528,58 @@ async fn repl_session_start(
             "[SessionStart hook context]\n{}",
             ctx
         )));
+    }
+}
+
+/// Poll the `ConfigChange` / `FileChanged` watchers once per prompt
+/// iteration and fire any hooks whose files changed.
+async fn poll_hook_watchers(
+    config_watcher: &mut crate::hook_watch::ConfigWatcher,
+    file_watcher: &mut crate::hook_watch::FileWatcher,
+    agent: &mut zen_agent::Agent,
+) {
+    use zen_core::HookEvent;
+    for (path, source) in config_watcher.poll() {
+        // A blocked change is not applied. ZenCode loads settings once
+        // at startup and never hot-reloads, so there is nothing to
+        // withhold; the event fires for audit/logging either way.
+        let _ = agent
+            .hooks
+            .run(
+                HookEvent::ConfigChange,
+                source,
+                serde_json::json!({
+                    "source": source,
+                    "file_path": path.display().to_string(),
+                }),
+            )
+            .await;
+    }
+    file_watcher.set_dynamic_paths(&agent.dynamic_watch_paths);
+    for (path, event) in file_watcher.poll() {
+        let target = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let out = agent
+            .hooks
+            .run(
+                HookEvent::FileChanged,
+                &target,
+                serde_json::json!({
+                    "file_path": path.display().to_string(),
+                    "event": event,
+                }),
+            )
+            .await;
+        if let Some(paths) = out.watch_paths {
+            agent.dynamic_watch_paths = paths.iter().map(std::path::PathBuf::from).collect();
+            file_watcher.set_dynamic_paths(&agent.dynamic_watch_paths);
+        }
+        if let Some(text) = out.system_message.filter(|s| !s.trim().is_empty()) {
+            eprintln!("[FileChanged] {text}");
+        }
     }
 }
 
@@ -1151,7 +1214,7 @@ fn run_model_picker(current: &str, rows: &[ModelRow]) -> Result<Option<String>, 
 }
 
 /// Switch to a model the picker returned, on the same path as /model <name>.
-fn apply_picked_model(
+async fn apply_picked_model(
     id: &str,
     cfg: &mut crate::settings::ResolvedConfig,
     agent: &mut zen_agent::Agent,
@@ -1159,20 +1222,105 @@ fn apply_picked_model(
     home: Option<&Path>,
     cwd: &Path,
 ) {
-    match apply_model_switch(
-        cfg,
-        agent,
-        repl.recorder.as_ref(),
-        home,
-        &repl.home_api_key,
-        id,
-    ) {
+    match switch_model_with_hooks(id, "picker", cfg, agent, repl, home).await {
         Ok(msg) => {
             // A pinned model turns auto off.
             repl.auto_model = false;
             report_model_switch(cwd, false, &cfg.model, &cfg.base_url, &msg);
         }
         Err(e) => eprintln!("{e}"),
+    }
+}
+
+/// Run `PreModelSwitch` hooks before a model switch and `PostModelSwitch`
+/// after it. A Pre hook may block the switch (exit 2 / decision block /
+/// `permissionDecision: "deny"`) or ask the user to confirm it; the Post
+/// hook's `additionalContext` is stashed for the next turn. Returns the
+/// switch message, or the reason the switch did not happen.
+#[allow(clippy::too_many_arguments)]
+async fn switch_model_with_hooks(
+    requested: &str,
+    source: &str,
+    cfg: &mut crate::settings::ResolvedConfig,
+    agent: &mut zen_agent::Agent,
+    repl: &mut ReplState<'_>,
+    home: Option<&Path>,
+) -> Result<String, String> {
+    use zen_core::HookEvent;
+    let from = agent.config.model.clone();
+    let context_tokens = zen_core::estimate_tokens(agent.messages());
+    let payload = serde_json::json!({
+        "from_model": from,
+        "to_model": requested,
+        "requested_model": requested,
+        "source": source,
+        "context_tokens": context_tokens,
+    });
+    let pre = agent
+        .hooks
+        .run(HookEvent::PreModelSwitch, requested, payload.clone())
+        .await;
+    if let Some(text) = &pre.system_message {
+        agent.sink.emit(zen_core::AgentEvent::SystemMessage {
+            event: "PreModelSwitch".into(),
+            text: text.clone(),
+        });
+    }
+    if pre.blocked {
+        return Err(pre
+            .feedback
+            .unwrap_or_else(|| format!("model switch to {requested} blocked by hook")));
+    }
+    match pre.permission_override {
+        Some(zen_core::PermissionDecision::Deny(reason)) => return Err(reason),
+        Some(zen_core::PermissionDecision::Ask)
+            if !prompt_yes_no(&format!("Switch model to {requested}?")) =>
+        {
+            return Err(format!("model switch to {requested} declined"));
+        }
+        _ => {}
+    }
+    let msg = apply_model_switch(
+        cfg,
+        agent,
+        repl.recorder.as_ref(),
+        home,
+        &repl.home_api_key,
+        requested,
+    )?;
+    let to = agent.config.model.clone();
+    fire_post_model_switch(agent, &from, &to, source).await;
+    Ok(msg)
+}
+
+/// Fire `PostModelSwitch` after the session model changed. The hook's
+/// `additionalContext` is stashed for the next turn; `systemMessage` is
+/// shown to the user. Used for user-requested switches and for automatic
+/// changes (source `"auto"`), which never run `PreModelSwitch`.
+async fn fire_post_model_switch(agent: &mut zen_agent::Agent, from: &str, to: &str, source: &str) {
+    use zen_core::HookEvent;
+    let post = agent
+        .hooks
+        .run(
+            HookEvent::PostModelSwitch,
+            to,
+            serde_json::json!({
+                "from_model": from,
+                "to_model": to,
+                "requested_model": null,
+                "source": source,
+                "context_tokens": zen_core::estimate_tokens(agent.messages()),
+            }),
+        )
+        .await;
+    if let Some(text) = &post.system_message {
+        agent.sink.emit(zen_core::AgentEvent::SystemMessage {
+            event: "PostModelSwitch".into(),
+            text: text.clone(),
+        });
+    }
+    if let Some(fb) = post.feedback.filter(|s| !s.trim().is_empty()) {
+        agent.pending_hook_context.push(fb);
     }
 }
 
@@ -1326,6 +1474,19 @@ fn apply_model_switch(
     ))
 }
 
+/// True when the merged hook config defines at least one entry for the
+/// event. The worktree handlers use this to decide between the hook path
+/// (a configured hook replaces the default git behavior) and the git
+/// default; running the hooks cannot tell the two apart because an
+/// empty config and `NoHooks` both return a default outcome.
+fn worktree_hooks_configured(cfg: &crate::settings::ResolvedConfig, event: &str) -> bool {
+    cfg.hooks
+        .get(event)
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false)
+}
+
 async fn handle_slash(
     line: &str,
     cli: &Cli,
@@ -1441,7 +1602,7 @@ async fn handle_slash(
                 ) {
                     match run_model_picker(&agent.config.model, &rows) {
                         Ok(Some(id)) => {
-                            apply_picked_model(&id, cfg, agent, repl, home, cwd);
+                            apply_picked_model(&id, cfg, agent, repl, home, cwd).await;
                         }
                         Ok(None) => {
                             println!("model unchanged (still {})", agent.config.model);
@@ -1468,14 +1629,8 @@ async fn handle_slash(
                 {
                     Some(entry) => {
                         let id = entry.id.to_string();
-                        match apply_model_switch(
-                            cfg,
-                            agent,
-                            repl.recorder.as_ref(),
-                            home,
-                            &repl.home_api_key,
-                            &id,
-                        ) {
+                        match switch_model_with_hooks(&id, "command", cfg, agent, repl, home).await
+                        {
                             Ok(msg) => {
                                 repl.auto_model = true;
                                 report_model_switch(
@@ -1496,14 +1651,8 @@ async fn handle_slash(
             } else {
                 match pick_model(&arg, &rows) {
                     Ok(id) => {
-                        match apply_model_switch(
-                            cfg,
-                            agent,
-                            repl.recorder.as_ref(),
-                            home,
-                            &repl.home_api_key,
-                            &id,
-                        ) {
+                        match switch_model_with_hooks(&id, "command", cfg, agent, repl, home).await
+                        {
                             Ok(msg) => {
                                 // A pinned model turns auto off.
                                 repl.auto_model = false;
@@ -1530,14 +1679,8 @@ async fn handle_slash(
                 match crate::models::provider_default_model(&arg) {
                     Some(entry) => {
                         let id = entry.id.to_string();
-                        match apply_model_switch(
-                            cfg,
-                            agent,
-                            repl.recorder.as_ref(),
-                            home,
-                            &repl.home_api_key,
-                            &id,
-                        ) {
+                        match switch_model_with_hooks(&id, "command", cfg, agent, repl, home).await
+                        {
                             Ok(msg) => {
                                 repl.auto_model = true;
                                 // The provider switch also moves the
@@ -1650,21 +1793,74 @@ async fn handle_slash(
                         cwd.file_name().and_then(|n| n.to_str()).unwrap_or("repo"),
                         name
                     ));
-                    match crate::git::remove_worktree(cwd, &wt_path) {
-                        Ok(()) => println!("removed worktree {}", wt_path.display()),
-                        Err(e) => eprintln!("failed: {}", e),
+                    if worktree_hooks_configured(cfg, "WorktreeRemove") {
+                        // A WorktreeRemove hook owns the cleanup: exit 0
+                        // counts as removed; a non-zero exit fails the
+                        // removal when the directory still exists.
+                        let removed = agent
+                            .hooks
+                            .run(
+                                zen_core::HookEvent::WorktreeRemove,
+                                "",
+                                serde_json::json!({
+                                    "worktree_path": wt_path.display().to_string(),
+                                }),
+                            )
+                            .await;
+                        if !removed.failed || !wt_path.exists() {
+                            println!("removed worktree {}", wt_path.display());
+                        } else {
+                            eprintln!("worktree removal failed, kept: {}", wt_path.display());
+                        }
+                    } else {
+                        match crate::git::remove_worktree(cwd, &wt_path) {
+                            Ok(()) => println!("removed worktree {}", wt_path.display()),
+                            Err(e) => eprintln!("failed: {}", e),
+                        }
                     }
                 }
                 [name] if crate::git::valid_worktree_name(name) && *name != "rm" => {
                     let repo = cwd.file_name().and_then(|n| n.to_str()).unwrap_or("repo");
                     let wt_path = cwd.join(format!("../{}-{}", repo, name));
-                    match crate::git::create_worktree(cwd, &wt_path, name) {
-                        Ok(p) => println!(
-                            "created worktree {} on branch {}\ncd to it and run zen there for an isolated session",
-                            p.display(),
-                            name
-                        ),
-                        Err(e) => eprintln!("failed: {}", e),
+                    if worktree_hooks_configured(cfg, "WorktreeCreate") {
+                        // A WorktreeCreate hook replaces the default git
+                        // behavior entirely: the hook creates the worktree
+                        // and returns its path; a failure means no
+                        // worktree is created.
+                        let created = agent
+                            .hooks
+                            .run(
+                                zen_core::HookEvent::WorktreeCreate,
+                                "",
+                                serde_json::json!({ "name": name }),
+                            )
+                            .await;
+                        match created.worktree_path {
+                            Some(p) if !created.blocked && !created.failed => {
+                                println!(
+                                    "created worktree {} on branch {}\ncd to it and run zen there for an isolated session",
+                                    p, name
+                                )
+                            }
+                            _ => {
+                                let reason = created
+                                    .feedback
+                                    .filter(|s| !s.trim().is_empty())
+                                    .unwrap_or_else(|| {
+                                        "WorktreeCreate hook did not return a path".into()
+                                    });
+                                eprintln!("failed: {reason}");
+                            }
+                        }
+                    } else {
+                        match crate::git::create_worktree(cwd, &wt_path, name) {
+                            Ok(p) => println!(
+                                "created worktree {} on branch {}\ncd to it and run zen there for an isolated session",
+                                p.display(),
+                                name
+                            ),
+                            Err(e) => eprintln!("failed: {}", e),
+                        }
                     }
                 }
                 _ => eprintln!(
@@ -1778,8 +1974,29 @@ async fn handle_slash(
                     Ok(dir) if dir.is_dir() => {
                         if !agent.ctx.extra_dirs.contains(&dir) {
                             agent.ctx.extra_dirs.push(dir.clone());
+                            println!("added working directory {}", dir.display());
+                            // `DirectoryAdded`: the add already completed;
+                            // the hook cannot block it. Its systemMessage
+                            // becomes context for the next turn.
+                            let added = agent
+                                .hooks
+                                .run(
+                                    zen_core::HookEvent::DirectoryAdded,
+                                    "slash_command",
+                                    serde_json::json!({
+                                        "directory": dir.display().to_string(),
+                                        "source": "slash_command",
+                                    }),
+                                )
+                                .await;
+                            if let Some(text) =
+                                added.system_message.filter(|s| !s.trim().is_empty())
+                            {
+                                agent.pending_hook_context.push(text);
+                            }
+                        } else {
+                            println!("added working directory {}", dir.display());
                         }
-                        println!("added working directory {}", dir.display());
                     }
                     _ => eprintln!("not a directory: {}", p.display()),
                 }
@@ -1950,11 +2167,42 @@ async fn handle_slash(
             }
         }
         "/review" | "/init" => {
+            // `UserPromptExpansion`: a typed slash command expands into a
+            // prompt before it reaches the model. A hook may block the
+            // expansion or inject context for it.
+            let command_name = cmd.trim_start_matches('/');
+            let expansion = agent
+                .hooks
+                .run(
+                    zen_core::HookEvent::UserPromptExpansion,
+                    command_name,
+                    serde_json::json!({
+                        "expansion_type": "slash_command",
+                        "command_name": command_name,
+                        "command_args": arg,
+                        "prompt": line,
+                    }),
+                )
+                .await;
+            if expansion.blocked {
+                eprintln!(
+                    "{}",
+                    expansion
+                        .feedback
+                        .unwrap_or_else(|| format!("/{command_name} blocked by hook"))
+                );
+                return Ok(LineAction::Continue);
+            }
             let prompt = if cmd == "/review" {
                 commands::review_prompt(&arg)
             } else {
                 init_prompt_with_import_offer(cwd)
             };
+            let mut prompt = prompt;
+            if let Some(extra) = expansion.feedback.filter(|s| !s.trim().is_empty()) {
+                prompt.push_str("\n\n");
+                prompt.push_str(&extra);
+            }
             let usage_before = agent.usage.clone();
             let result =
                 run_turn_interruptible(agent, &prompt, repl.interrupts.as_deref_mut()).await;
@@ -2308,14 +2556,9 @@ async fn handle_slash(
                         // A refused route (the provider key is unset)
                         // prints the reason and skips the turn instead
                         // of sending the id to the wrong gateway.
-                        if let Err(e) = apply_model_switch(
-                            cfg,
-                            agent,
-                            repl.recorder.as_ref(),
-                            home,
-                            &repl.home_api_key,
-                            m,
-                        ) {
+                        if let Err(e) =
+                            switch_model_with_hooks(m, "command", cfg, agent, repl, home).await
+                        {
                             eprintln!("{e}");
                             return Ok(LineAction::Continue);
                         }
@@ -2333,12 +2576,18 @@ async fn handle_slash(
                 let result =
                     run_turn_interruptible(agent, &expanded, repl.interrupts.as_deref_mut()).await;
                 record_turn_cost(home, repl.session_id.as_str(), cfg, agent, &usage_before);
+                let pinned = agent.config.model.clone();
                 cfg.base_url = saved_base_url;
                 cfg.api_key = saved_api_key;
                 cfg.model = saved_cfg_model;
                 agent.llm = saved_llm;
-                agent.config.model = saved_model;
+                agent.config.model = saved_model.clone();
                 agent.permissions = saved_perms;
+                // Restoring the startup route is an automatic model
+                // change: PostModelSwitch only, no Pre hook.
+                if pinned != saved_model {
+                    fire_post_model_switch(agent, &pinned, &saved_model, "auto").await;
+                }
                 print_turn(result);
             } else {
                 eprintln!("unknown command: {}", other);
@@ -2395,6 +2644,9 @@ fn save_local_settings(cwd: &Path, entries: &[(&str, &str)]) -> Result<std::path
     ));
     std::fs::write(&tmp, serde_json::to_string_pretty(&obj)? + "\n")?;
     std::fs::rename(&tmp, &path)?;
+    // The ConfigChange watcher must not fire for a save this session
+    // just made itself (see hook_watch.rs).
+    crate::hook_watch::note_self_write(&path);
     Ok(path)
 }
 /// Record a successful `/model` or `/provider` switch in
@@ -3174,14 +3426,20 @@ mod model_picker_tests {
             model_rows: Vec::new(),
         };
         assert_eq!(agent.config.model, "google/gemini-4-argon:free");
-        apply_picked_model(
-            "cohere/north-mini-code:free",
-            &mut cfg,
-            &mut agent,
-            &mut repl,
-            None,
-            &dir,
-        );
+        // The switch runs hooks, so it is async; drive it on a local
+        // runtime instead of holding the env lock across an await.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(apply_picked_model(
+                "cohere/north-mini-code:free",
+                &mut cfg,
+                &mut agent,
+                &mut repl,
+                None,
+                &dir,
+            ));
         assert_eq!(agent.config.model, "cohere/north-mini-code:free");
         assert_eq!(cfg.model, "cohere/north-mini-code:free");
         assert!(!repl.auto_model, "pinning a model must turn auto off");

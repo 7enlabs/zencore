@@ -725,6 +725,29 @@ pub enum HookEvent {
     PermissionRequest,
 
     PermissionDenied,
+
+    // Events added by the Wave 1 #3 hook system, mirroring the Claude
+    // Code hooks reference (33 events). See docs/hooks.md for the
+    // ZenCode trigger of each one.
+    Setup,
+    UserPromptExpansion,
+    MessageDisplay,
+    PostToolBatch,
+    TaskCreated,
+    TaskCompleted,
+    StopFailure,
+    TeammateIdle,
+    InstructionsLoaded,
+    ConfigChange,
+    CwdChanged,
+    DirectoryAdded,
+    FileChanged,
+    WorktreeCreate,
+    WorktreeRemove,
+    PreModelSwitch,
+    PostModelSwitch,
+    Elicitation,
+    ElicitationResult,
 }
 impl HookEvent {
     pub fn as_str(&self) -> &'static str {
@@ -743,7 +766,106 @@ impl HookEvent {
             Self::PostCompact => "PostCompact",
             Self::PermissionRequest => "PermissionRequest",
             Self::PermissionDenied => "PermissionDenied",
+            Self::Setup => "Setup",
+            Self::UserPromptExpansion => "UserPromptExpansion",
+            Self::MessageDisplay => "MessageDisplay",
+            Self::PostToolBatch => "PostToolBatch",
+            Self::TaskCreated => "TaskCreated",
+            Self::TaskCompleted => "TaskCompleted",
+            Self::StopFailure => "StopFailure",
+            Self::TeammateIdle => "TeammateIdle",
+            Self::InstructionsLoaded => "InstructionsLoaded",
+            Self::ConfigChange => "ConfigChange",
+            Self::CwdChanged => "CwdChanged",
+            Self::DirectoryAdded => "DirectoryAdded",
+            Self::FileChanged => "FileChanged",
+            Self::WorktreeCreate => "WorktreeCreate",
+            Self::WorktreeRemove => "WorktreeRemove",
+            Self::PreModelSwitch => "PreModelSwitch",
+            Self::PostModelSwitch => "PostModelSwitch",
+            Self::Elicitation => "Elicitation",
+            Self::ElicitationResult => "ElicitationResult",
         }
+    }
+
+    /// Parse an event name from settings/docs. Unknown names return `None`;
+    /// the settings loader keeps unknown hook keys inert rather than failing.
+    pub fn parse_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "PreToolUse" => Self::PreToolUse,
+            "PostToolUse" => Self::PostToolUse,
+            "UserPromptSubmit" => Self::UserPromptSubmit,
+            "Stop" => Self::Stop,
+            "SubagentStop" => Self::SubagentStop,
+            "SessionStart" => Self::SessionStart,
+            "SessionEnd" => Self::SessionEnd,
+            "PreCompact" => Self::PreCompact,
+            "Notification" => Self::Notification,
+            "PostToolUseFailure" => Self::PostToolUseFailure,
+            "SubagentStart" => Self::SubagentStart,
+            "PostCompact" => Self::PostCompact,
+            "PermissionRequest" => Self::PermissionRequest,
+            "PermissionDenied" => Self::PermissionDenied,
+            "Setup" => Self::Setup,
+            "UserPromptExpansion" => Self::UserPromptExpansion,
+            "MessageDisplay" => Self::MessageDisplay,
+            "PostToolBatch" => Self::PostToolBatch,
+            "TaskCreated" => Self::TaskCreated,
+            "TaskCompleted" => Self::TaskCompleted,
+            "StopFailure" => Self::StopFailure,
+            "TeammateIdle" => Self::TeammateIdle,
+            "InstructionsLoaded" => Self::InstructionsLoaded,
+            "ConfigChange" => Self::ConfigChange,
+            "CwdChanged" => Self::CwdChanged,
+            "DirectoryAdded" => Self::DirectoryAdded,
+            "FileChanged" => Self::FileChanged,
+            "WorktreeCreate" => Self::WorktreeCreate,
+            "WorktreeRemove" => Self::WorktreeRemove,
+            "PreModelSwitch" => Self::PreModelSwitch,
+            "PostModelSwitch" => Self::PostModelSwitch,
+            "Elicitation" => Self::Elicitation,
+            "ElicitationResult" => Self::ElicitationResult,
+            _ => return None,
+        })
+    }
+
+    /// All 33 hook events, in the order the reference lists them.
+    pub fn all() -> [Self; 33] {
+        [
+            Self::SessionStart,
+            Self::Setup,
+            Self::UserPromptSubmit,
+            Self::UserPromptExpansion,
+            Self::PreToolUse,
+            Self::PermissionRequest,
+            Self::PermissionDenied,
+            Self::PostToolUse,
+            Self::PostToolUseFailure,
+            Self::PostToolBatch,
+            Self::Notification,
+            Self::MessageDisplay,
+            Self::SubagentStart,
+            Self::SubagentStop,
+            Self::TaskCreated,
+            Self::TaskCompleted,
+            Self::Stop,
+            Self::StopFailure,
+            Self::TeammateIdle,
+            Self::InstructionsLoaded,
+            Self::ConfigChange,
+            Self::CwdChanged,
+            Self::DirectoryAdded,
+            Self::FileChanged,
+            Self::WorktreeCreate,
+            Self::WorktreeRemove,
+            Self::PreCompact,
+            Self::PostCompact,
+            Self::PreModelSwitch,
+            Self::PostModelSwitch,
+            Self::Elicitation,
+            Self::ElicitationResult,
+            Self::SessionEnd,
+        ]
     }
 }
 
@@ -764,6 +886,29 @@ pub struct HookOutcome {
     pub updated_output: Option<String>,
 
     pub system_message: Option<String>,
+
+    /// `PermissionDenied`: the hook said the model may retry the denied
+    /// call (`hookSpecificOutput.retry: true`).
+    pub allow_retry: bool,
+
+    /// `MessageDisplay`: replacement text for what is shown on screen.
+    /// The model context and transcript keep the original text.
+    pub display_replacement: Option<String>,
+
+    /// `WorktreeCreate`: absolute path of the worktree the hook created
+    /// (last non-empty stdout line, or `hookSpecificOutput.worktreePath`).
+    pub worktree_path: Option<String>,
+
+    /// `CwdChanged` / `FileChanged`: dynamic watch list
+    /// (`watchPaths` from the hook's JSON output). Replaces the current
+    /// dynamic list; static matcher paths are always watched.
+    pub watch_paths: Option<Vec<String>>,
+
+    /// True when any hook failed to run (spawn failure, timeout, or a
+    /// non-zero exit that is not a block). Non-blocking for most events;
+    /// `WorktreeRemove` / `WorktreeCreate` use it to decide whether the
+    /// worktree operation failed.
+    pub failed: bool,
 }
 
 #[async_trait]
@@ -1212,6 +1357,21 @@ pub fn resolve_shell(preferred: &str) -> ShellSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hook_events_all_33_roundtrip() {
+        let all = HookEvent::all();
+        assert_eq!(all.len(), 33);
+        for ev in all {
+            assert_eq!(
+                HookEvent::parse_name(ev.as_str()),
+                Some(ev),
+                "{}",
+                ev.as_str()
+            );
+        }
+        assert_eq!(HookEvent::parse_name("NoSuchEvent"), None);
+        assert_eq!(HookEvent::parse_name("pretooluse"), None);
+    }
     #[test]
     fn message_serializes_without_nulls() {
         let s = serde_json::to_string(&ChatMessage::user("hi")).unwrap();

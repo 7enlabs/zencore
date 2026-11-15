@@ -1491,6 +1491,39 @@ pub fn descendants_of(root: u32) -> Vec<u32> {
     out
 }
 
+/// `--init-only` flow: Setup hooks (trigger `"init"`), then SessionStart
+/// with the startup matcher. Returns the SessionStart feedback.
+pub(crate) async fn run_init_only_hooks(
+    cli: &Cli,
+    cfg: &ResolvedConfig,
+    session_id: &str,
+    cwd: &Path,
+) -> Option<String> {
+    run_setup(cli, cfg, session_id, None, cwd, "init").await;
+    let hooks = build_hooks(cli, cfg, session_id, None, cwd);
+    run_session_start(&hooks, session_id, cwd, cfg, "startup").await
+}
+
+/// Run the `Setup` hooks for one trigger (`"init"` or `"maintenance"`).
+/// Setup hooks cannot block the session; their output is discarded.
+pub(crate) async fn run_setup(
+    cli: &Cli,
+    cfg: &ResolvedConfig,
+    session_id: &str,
+    transcript_path: Option<&Path>,
+    cwd: &Path,
+    trigger: &str,
+) {
+    let hooks = build_hooks(cli, cfg, session_id, transcript_path, cwd);
+    let _ = hooks
+        .run(
+            zen_core::HookEvent::Setup,
+            trigger,
+            serde_json::json!({ "trigger": trigger }),
+        )
+        .await;
+}
+
 pub(crate) async fn run_session_start(
     hooks: &Arc<dyn HookRunner>,
     session_id: &str,
@@ -1506,11 +1539,48 @@ pub(crate) async fn run_session_start(
         "source": source,
     });
 
-    hooks
+    let feedback = hooks
         .run(HookEvent::SessionStart, source, payload)
         .await
         .feedback
-        .filter(|s| !s.trim().is_empty())
+        .filter(|s| !s.trim().is_empty());
+
+    // `InstructionsLoaded`: one event per memory file (ZEN.md / AGENTS.md
+    // / rules) loaded into context at session start. The matcher filters
+    // on the load reason (`session_start` here).
+    for (path, _) in zen_ext::memory_files(cwd, None) {
+        let _ = hooks
+            .run(
+                HookEvent::InstructionsLoaded,
+                "session_start",
+                serde_json::json!({
+                    "file_path": path.display().to_string(),
+                    "memory_type": memory_type_for(&path),
+                    "load_reason": "session_start",
+                }),
+            )
+            .await;
+    }
+
+    feedback
+}
+
+/// Scope of a memory file for `InstructionsLoaded`: the managed file is
+/// `Managed`, `ZEN.local.md` is `Local`, anything under `~/.zen` is
+/// `User`, the rest is `Project`.
+fn memory_type_for(path: &Path) -> &'static str {
+    if path == Path::new(zen_ext::MANAGED_MEMORY_PATH) {
+        return "Managed";
+    }
+    if path.file_name().and_then(|n| n.to_str()) == Some("ZEN.local.md") {
+        return "Local";
+    }
+    if let Some(home) = dirs::home_dir()
+        && path.starts_with(home.join(".zen"))
+    {
+        return "User";
+    }
+    "Project"
 }
 
 pub(crate) async fn run_session_end(
