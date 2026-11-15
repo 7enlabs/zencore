@@ -462,6 +462,14 @@ impl LspDiagnostic {
         }
     }
 
+    /// Whether this diagnostic reaches the feedback loop: only Error (1)
+    /// and Warning (2) do. Information (3), Hint (4) and unknown
+    /// severities are filtered out at collection (Q5), so the model is
+    /// only interrupted by diagnostics it can act on.
+    pub fn is_actionable(&self) -> bool {
+        matches!(self.severity, 1 | 2)
+    }
+
     /// OpenCode-style one-line render: `Error [line:col] message`.
     pub fn pretty(&self) -> String {
         format!(
@@ -515,7 +523,9 @@ pub fn render_diagnostics(diags: &[LspDiagnostic]) -> String {
 pub trait DiagnosticsProvider: Send + Sync {
     /// Wait for the language server's diagnostics for `path` after an
     /// edit, returning only diagnostics that are NEW compared to the
-    /// snapshot taken before the edit was sent. Best effort: any failure
+    /// snapshot taken before the edit was sent. Only Error and Warning
+    /// severities are returned; Information and Hint are filtered out
+    /// at collection (Q5). Best effort: any failure
     /// (no server, unsupported file type, timeout) yields an empty vec,
     /// never an error, so diagnostics can never fail a run.
     async fn diagnostics_after_edit(&self, path: &Path) -> Vec<LspDiagnostic>;
@@ -1807,6 +1817,16 @@ mod glob_tests {
         assert_eq!(sample_diag(3, "i").severity_label(), "Information");
         assert_eq!(sample_diag(4, "h").severity_label(), "Hint");
         assert_eq!(sample_diag(9, "?").severity_label(), "Diagnostic");
+    }
+
+    #[test]
+    fn lsp_diagnostic_is_actionable_only_error_and_warning() {
+        assert!(sample_diag(1, "e").is_actionable());
+        assert!(sample_diag(2, "w").is_actionable());
+        assert!(!sample_diag(3, "i").is_actionable());
+        assert!(!sample_diag(4, "h").is_actionable());
+        assert!(!sample_diag(0, "unknown").is_actionable());
+        assert!(!sample_diag(9, "unknown").is_actionable());
     }
 
     #[test]

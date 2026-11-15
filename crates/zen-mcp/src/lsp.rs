@@ -722,12 +722,15 @@ impl LspConnection {
     }
 }
 
-/// Diagnostics in `after` whose (range, message) was not in `before`.
+/// Diagnostics in `after` whose (range, message) was not in `before`,
+/// keeping only Error and Warning severities (Q5): Information and
+/// Hint are filtered out at collection so the feedback loop only sees
+/// diagnostics the model can act on.
 fn diff_diagnostics(before: &[LspDiagnostic], after: &[LspDiagnostic]) -> Vec<LspDiagnostic> {
     let old: std::collections::HashSet<_> = before.iter().map(LspDiagnostic::dedup_key).collect();
     after
         .iter()
-        .filter(|d| !old.contains(&d.dedup_key()))
+        .filter(|d| d.is_actionable() && !old.contains(&d.dedup_key()))
         .cloned()
         .collect()
 }
@@ -973,9 +976,11 @@ impl LspManager {
     }
 
     /// Diagnostics currently cached for `path`, without spawning a
-    /// server or waiting. Returns None when no language server is
-    /// running for the file's language/project (the `diagnostics` tool
-    /// reports that instead of starting a server for a read-only query).
+    /// server or waiting. Only Error and Warning severities are
+    /// returned; Information and Hint are filtered out (Q5). Returns
+    /// None when no language server is running for the file's
+    /// language/project (the `diagnostics` tool reports that instead
+    /// of starting a server for a read-only query).
     pub fn cached_diagnostics(&self, path: &Path) -> Option<Vec<LspDiagnostic>> {
         let lang = detect_language(path)?;
         let root = find_project_root(path, lang);
@@ -984,7 +989,13 @@ impl LspManager {
             root,
         };
         let conn = self.servers.lock().ok()?.get(&key).cloned()?;
-        Some(conn.cached_diagnostics(path))
+        let diags = conn.cached_diagnostics(path);
+        Some(
+            diags
+                .into_iter()
+                .filter(LspDiagnostic::is_actionable)
+                .collect(),
+        )
     }
 
     pub fn set_server_command(&self, lang: LspLanguage, command: String, args: Vec<String>) {
