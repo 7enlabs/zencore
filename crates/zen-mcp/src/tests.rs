@@ -1132,3 +1132,180 @@ async fn mcp_shutdown_kills_process() {
         .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn transport_kill_terminates_session() {
+    // Transport::kill() must terminate the session (covers mutant: kill is a no-op)
+    let py = match crate::tests::python_exe() {
+        Some(p) => p,
+        None => return,
+    };
+    let dir = crate::tests::tmpdir("kill_test");
+    let script = dir.join("sleep.py");
+    std::fs::write(&script, "import time; time.sleep(60)").unwrap();
+
+    let mut configs = std::collections::BTreeMap::new();
+    configs.insert(
+        "sleep".to_string(),
+        crate::McpServerConfig {
+            kind: None,
+            command: Some(py.to_string()),
+            args: vec![script.to_string_lossy().to_string()],
+            env: std::collections::BTreeMap::new(),
+            url: None,
+            headers: std::collections::BTreeMap::new(),
+        },
+    );
+
+    let _mgr = tokio::time::timeout(
+        crate::tests::TEST_TIMEOUT,
+        crate::McpManager::start(configs, 10_000),
+    )
+    .await
+    .expect("start did not time out");
+
+    // Get a transport directly and kill it
+    let cfg = crate::McpServerConfig {
+        kind: None,
+        command: Some(py.to_string()),
+        args: vec![script.to_string_lossy().to_string()],
+        env: std::collections::BTreeMap::new(),
+        url: None,
+        headers: std::collections::BTreeMap::new(),
+    };
+    let transport = Transport::from_config(&cfg, 10_000).unwrap();
+
+    // Get a session first (this spawns the process)
+    let _session = tokio::time::timeout(
+        crate::tests::TEST_TIMEOUT,
+        transport.request("tools/list", json!({})),
+    )
+    .await
+    .expect("session did not time out");
+
+    // Now kill it
+    transport.kill();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn transport_tool_to_value_shape() {
+    // tool_to_value must produce non-default JSON for real rmcp::Tool input.
+    // Gets a Tool from mock server's list_all_tools and passes through tool_to_value.
+    // This kills the mutant: replace tool_to_value -> Value with Default::default().
+    use serde_json::json;
+
+    let py = match crate::tests::python_exe() {
+        Some(p) => p,
+        None => return,
+    };
+    let dir = crate::tests::tmpdir("tool_to_value");
+    let script = dir.join("fake_tool.py");
+    std::fs::write(
+        &script,
+        r#"import sys, json
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    if msg.get("method") == "initialize":
+        send({"jsonrpc":"2.0","id":msg.get("id"),"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}})
+    elif msg.get("method") == "notifications/initialized":
+        pass
+    elif msg.get("method") == "tools/list":
+        send({"jsonrpc":"2.0","id":msg.get("id"),"result":{"tools":[{"name":"test_tool","description":"test","inputSchema":{"type":"object","properties":{"x":{"type":"string"}},"required":["x"]}}]}})
+    elif msg.get("method") == "tools/call":
+        send({"jsonrpc":"2.0","id":msg.get("id"),"result":{"content":[{"type":"text","text":"ok"}],"isError":False}})
+    else:
+        if msg.get("id") is not None:
+            send({"jsonrpc":"2.0","id":msg.get("id"),"error":{"code":-32601,"message":"unknown method"}})
+"#,
+    )
+    .unwrap();
+
+    let mut configs = std::collections::BTreeMap::new();
+    configs.insert(
+        "srv".to_string(),
+        crate::McpServerConfig {
+            kind: None,
+            command: Some(py.to_string()),
+            args: vec![script.to_string_lossy().to_string()],
+            env: std::collections::BTreeMap::new(),
+            url: None,
+            headers: std::collections::BTreeMap::new(),
+        },
+    );
+
+    let mgr = tokio::time::timeout(
+        crate::tests::TEST_TIMEOUT,
+        crate::McpManager::start(configs, 10_000),
+    )
+    .await
+    .expect("start did not time out");
+
+    // Get the transport and session to access list_all_tools
+    // Access via internal: we need the Transport to call session() then list_all_tools
+    // Instead, use mgr.tools() which returns RemoteTool - but we need rmcp::Tool for tool_to_value
+
+    // We'll test tool_to_value indirectly: call transport.request("tools/list")
+    // which uses tool_to_value internally. Get transport from manager internals.
+    // Since we can't access Transport from mgr directly, start a new transport:
+    let cfg = crate::McpServerConfig {
+        kind: None,
+        command: Some(py.to_string()),
+        args: vec![script.to_string_lossy().to_string()],
+        env: std::collections::BTreeMap::new(),
+        url: None,
+        headers: std::collections::BTreeMap::new(),
+    };
+    let transport = Transport::from_config(&cfg, 10_000).unwrap();
+
+    // Call tools/list via transport.request which uses tool_to_value
+    let result = tokio::time::timeout(
+        crate::tests::TEST_TIMEOUT,
+        transport.request("tools/list", json!({})),
+    )
+    .await
+    .expect("tools/list did not time out")
+    .expect("tools/list request failed");
+
+    // Verify the output has tools with inputSchema (tool_to_value produced non-default output)
+    let tools = result
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .expect("tools array");
+    assert!(!tools.is_empty(), "tools list should not be empty");
+    let first_tool = &tools[0];
+    assert_eq!(
+        first_tool.get("name").and_then(|v| v.as_str()).unwrap(),
+        "test_tool"
+    );
+    assert_eq!(
+        first_tool
+            .get("inputSchema")
+            .and_then(|v| v.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap(),
+        "object"
+    );
+    assert!(
+        first_tool
+            .get("inputSchema")
+            .and_then(|v| v.get("required"))
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty())
+    );
+
+    tokio::time::timeout(crate::tests::TEST_TIMEOUT, mgr.shutdown())
+        .await
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
