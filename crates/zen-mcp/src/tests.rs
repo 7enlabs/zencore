@@ -1095,15 +1095,6 @@ fn transport_timeout_zero_defaults_to_30s() {
     let _ = transport;
 }
 
-#[test]
-fn transport_tool_to_value_shape() {
-    // tool_to_value output is validated through RemoteTool.schema from list_tools.
-    // The mock server returns tools with inputSchema; verify the shape is preserved.
-    // Covered implicitly by mcp_content_block_variants which lists tools and checks
-    // that content_block_to_value produces correct output shapes.
-    assert!(true);
-}
-
 #[tokio::test]
 async fn mcp_shutdown_kills_process() {
     // Session::shutdown() kills the process group
