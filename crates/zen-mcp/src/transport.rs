@@ -92,12 +92,16 @@ impl Session {
         {
             #[cfg(unix)]
             {
-                let _ = std::process::Command::new("kill")
-                    .args(["-KILL", "--", &format!("-{}", pid)])
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
+                // Signal the process group directly instead of shelling out to
+                // `kill`: minimal images (rust:slim, distroless) ship no
+                // /bin/kill binary, so Command::new("kill") fails silently and
+                // the group survives. Prove it with
+                // transport_shutdown_kills_the_whole_process_group.
+                // SAFETY: kill(2) with a negative pid signals the group led by
+                // `pid`. Plain integers, no memory-safety preconditions.
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
             }
             #[cfg(windows)]
             {

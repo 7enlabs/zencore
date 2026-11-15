@@ -2601,6 +2601,7 @@ dependencies = [
  "dirs",
  "futures",
  "http",
+ "libc",
  "process-wrap",
  "regex",
  "reqwest 0.12.28",
