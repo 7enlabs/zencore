@@ -1403,7 +1403,10 @@ async fn transport_http_without_headers_still_connects() {
     handle.abort();
 }
 
-#[cfg(unix)]
+// Linux-only: the test polls /proc/<pid> to observe the child, and macOS
+// has no /proc, so the "alive before kill" check always fails there.
+// The kill itself (libc::kill) is Unix-wide and stays covered on Linux.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn transport_kill_tears_down_the_session() {
     // Kills Transport::kill and Session::shutdown by proving the spawned child
@@ -1480,7 +1483,9 @@ async fn transport_request_rejects_unknown_method_and_bad_params() {
     tr.kill();
     let _ = std::fs::remove_dir_all(&dir);
 }
-#[cfg(unix)]
+// Linux-only: same /proc polling as transport_kill_tears_down_the_session;
+// macOS has no /proc, so the "alive before kill" check cannot run there.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn transport_shutdown_kills_the_whole_process_group() {
     // Kills `replace kill_process_group with ()`. The mock spawns a long-lived
