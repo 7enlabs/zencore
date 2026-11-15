@@ -339,7 +339,7 @@ impl Transport {
     }
 }
 
-fn tool_to_value(tool: &Tool) -> Value {
+pub(crate) fn tool_to_value(tool: &Tool) -> Value {
     json!({
         "name": tool.name.as_ref(),
         "description": tool.description.as_deref().unwrap_or(""),
