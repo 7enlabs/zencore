@@ -145,8 +145,13 @@ impl Checkpoints {
     /// `next_id` from the turn directories on disk so a new turn
     /// never reuses an existing backup directory. Entry paths are not
     /// stored on disk, so a dropped turn cannot be rebuilt entry by
-    /// entry; dropping it is the safe degraded behavior (undo simply
-    /// has nothing to undo for it).
+    /// entry; dropping it is the safe degraded behavior. A turn is
+    /// the consistency unit: finished turns were flushed to disk,
+    /// the in-flight turn may be mid-update, so dropping it and
+    /// keeping finished turns is the last consistent snapshot by
+    /// design (Leader decision, msg 13600). History before the
+    /// recovery point may be inconsistent, so undo across that
+    /// boundary requires an explicit force.
     ///
     /// The drop runs only on the first recovery after the poison: a
     /// poisoned mutex stays poisoned, so every later lock also
