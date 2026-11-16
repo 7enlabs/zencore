@@ -2004,7 +2004,9 @@ pub(crate) fn combine_permission(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{FakePerms, MockLlm, base_cfg, build_agent, registry_with};
+    use crate::testutil::{
+        FakeHooks, FakePerms, MockLlm, base_cfg, build_agent, registry_with, resp,
+    };
 
     fn agent_with(messages: Vec<ChatMessage>) -> Agent {
         let (mut agent, _sink, _hooks) = build_agent(
@@ -2128,6 +2130,173 @@ mod tests {
                 *expected,
                 "classify_api_error({input:?})"
             );
+        }
+    }
+
+    fn agent_with_hooks() -> (Agent, Arc<FakeHooks>) {
+        let (agent, _sink, hooks) = build_agent(
+            MockLlm::new(vec![]),
+            registry_with(vec![]),
+            FakePerms::new(PermissionDecision::Allow),
+            base_cfg(),
+        );
+        (agent, hooks)
+    }
+
+    fn post_tool_batch_response(hooks: &FakeHooks) -> String {
+        let calls = hooks.calls.lock().unwrap();
+        let payload = calls
+            .iter()
+            .find(|(ev, _, _)| *ev == HookEvent::PostToolBatch)
+            .map(|(_, _, payload)| payload.clone())
+            .expect("PostToolBatch hook should run");
+        payload["tool_calls"][0]["tool_response"]
+            .as_str()
+            .expect("entry should carry a tool_response string")
+            .to_string()
+    }
+
+    fn tool_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "Read".into(),
+                arguments: "{}".into(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn post_tool_batch_matches_tool_response_by_call_id() {
+        // Pins the `&&` in run_post_tool_batch's `.find(|m| m.role ==
+        // "tool" && m.tool_call_id == Some(tc.id))`: each scenario
+        // satisfies exactly ONE conjunct in the wrong place, so
+        // swapping `&&` for `||` returns the wrong response text.
+        // (a) An earlier tool message with a different id: it
+        // satisfies the role conjunct only and must not match.
+        let (mut agent, hooks) = agent_with_hooks();
+        agent.set_messages(vec![
+            ChatMessage::tool("call-first", "WRONG-first-response"),
+            ChatMessage::tool("call-second", "RIGHT-second-response"),
+        ]);
+        let stop = agent
+            .run_post_tool_batch(&[tool_call("call-second")], 0)
+            .await;
+        assert_eq!(stop, None);
+        assert_eq!(post_tool_batch_response(&hooks), "RIGHT-second-response");
+
+        // (b) A non-tool message carrying the wanted id: it satisfies
+        // the id conjunct only and must not match.
+        let (mut agent, hooks) = agent_with_hooks();
+        agent.set_messages(vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: Some(MessageContent::Text("WRONG-assistant-text".into())),
+                tool_call_id: Some("call-second".into()),
+                ..Default::default()
+            },
+            ChatMessage::tool("call-second", "RIGHT-second-response"),
+        ]);
+        let stop = agent
+            .run_post_tool_batch(&[tool_call("call-second")], 0)
+            .await;
+        assert_eq!(stop, None);
+        assert_eq!(post_tool_batch_response(&hooks), "RIGHT-second-response");
+    }
+
+    #[tokio::test]
+    async fn check_task_hooks_fires_task_completed_only_on_transition_to_completed() {
+        // Pins the match guard `p.status != "completed" &&
+        // status == "completed"` in check_task_hooks: each row
+        // exercises exactly ONE side of the guard, so replacing the
+        // guard with `true` or `&&` with `||` fires TaskCompleted
+        // where the original fires nothing (and vice versa the
+        // positive rows prove the event fires at all).
+        let cases: &[(Option<&str>, &str, Option<HookEvent>)] = &[
+            // Already completed, still completed: no transition.
+            (Some("completed"), "completed", None),
+            // Not completed before, still not completed: no transition.
+            (Some("in_progress"), "pending", None),
+            // Not completed before, now completed: the transition.
+            (
+                Some("in_progress"),
+                "completed",
+                Some(HookEvent::TaskCompleted),
+            ),
+            // Brand-new item: creation, not completion.
+            (None, "pending", Some(HookEvent::TaskCreated)),
+        ];
+        for (prev_status, new_status, expected) in cases {
+            let (agent, hooks) = agent_with_hooks();
+            if let Some(prev) = prev_status {
+                agent.ctx.todos.lock().unwrap().push(TodoItem {
+                    content: "Write tests".into(),
+                    status: (*prev).into(),
+                    active_form: None,
+                });
+            }
+            let veto = agent
+                .check_task_hooks(
+                    &json!({ "todos": [{ "content": "Write tests", "status": new_status }] }),
+                )
+                .await;
+            assert_eq!(veto, None, "no hook blocks in case {cases:?}");
+            let fired: Vec<HookEvent> = hooks
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(ev, _, _)| *ev)
+                .collect();
+            match expected {
+                Some(event) => assert!(
+                    fired.contains(event),
+                    "expected {event:?} to fire for prev={prev_status:?} new={new_status}, got {fired:?}"
+                ),
+                None => assert!(
+                    !fired.contains(&HookEvent::TaskCompleted)
+                        && !fired.contains(&HookEvent::TaskCreated),
+                    "expected no task hook to fire for prev={prev_status:?} new={new_status}, got {fired:?}"
+                ),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_turn_appends_only_non_empty_pending_hook_context() {
+        // Pins the `!` in run_turn's `if !pending.trim().is_empty()`:
+        // a non-empty pending note must reach the user message, while
+        // a blank one must not. Dropping the `!` flips both, so each
+        // row on its own kills the mutant.
+        let cases: &[(&[&str], &str)] = &[
+            (&["hook context note"], "do the thing\n\nhook context note"),
+            (
+                &["first note", "second note"],
+                "do the thing\n\nfirst note\n\nsecond note",
+            ),
+            (&["   "], "do the thing"),
+            (&[""], "do the thing"),
+        ];
+        for (pending, expected) in cases {
+            let llm = MockLlm::new(vec![resp("done")]);
+            let (mut agent, _sink, _hooks) = build_agent(
+                llm.clone(),
+                registry_with(vec![]),
+                FakePerms::new(PermissionDecision::Allow),
+                base_cfg(),
+            );
+            agent.pending_hook_context = pending.iter().map(|s| (*s).to_string()).collect();
+            let result = agent.run_turn("do the thing").await;
+            assert_eq!(result.subtype, "success");
+            assert_eq!(agent.messages()[0].text(), *expected, "pending={pending:?}");
+            let requests = llm.requests();
+            let sent = requests[0]
+                .messages
+                .iter()
+                .find(|m| m.role == "user")
+                .expect("a user message should be sent to the model");
+            assert_eq!(sent.text(), *expected, "pending={pending:?}");
         }
     }
 

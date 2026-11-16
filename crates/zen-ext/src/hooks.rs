@@ -1734,4 +1734,120 @@ mod tests {
         // PreModelSwitch never accepts updatedInput.
         assert!(out.updated_input.is_none());
     }
+
+    fn json_obj(value: Value) -> serde_json::Map<String, Value> {
+        match value {
+            Value::Object(map) => map,
+            other => panic!("expected a JSON object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpret_json_stdout_message_display_only_on_message_display() {
+        // Pins the `==` at hooks.rs:670: every case carries a
+        // display-text key, so flipping `==` to `!=` either drops the
+        // replacement for MessageDisplay or adds one for every other
+        // event, and the test fails either way.
+        let cases: &[(HookEvent, Value, Option<&str>)] = &[
+            (
+                HookEvent::MessageDisplay,
+                json!({"displayText": "hello"}),
+                Some("hello"),
+            ),
+            (
+                HookEvent::MessageDisplay,
+                json!({"replacement": "second"}),
+                Some("second"),
+            ),
+            (
+                HookEvent::MessageDisplay,
+                json!({"displayReplacement": "third"}),
+                Some("third"),
+            ),
+            // First matching key wins.
+            (
+                HookEvent::MessageDisplay,
+                json!({"displayText": "first", "replacement": "second"}),
+                Some("first"),
+            ),
+            // The same payload on other events must NOT produce a
+            // replacement.
+            (HookEvent::PreToolUse, json!({"displayText": "hello"}), None),
+            (HookEvent::Stop, json!({"displayText": "hello"}), None),
+            (
+                HookEvent::SessionStart,
+                json!({"replacement": "hello"}),
+                None,
+            ),
+            (
+                HookEvent::UserPromptSubmit,
+                json!({"displayReplacement": "hello"}),
+                None,
+            ),
+        ];
+        for (event, obj, expected) in cases {
+            let out = interpret_json_stdout(&json_obj(obj.clone()), *event);
+            assert_eq!(
+                out.display_replacement.as_deref(),
+                *expected,
+                "event: {event:?}, obj: {obj}"
+            );
+        }
+    }
+
+    #[test]
+    fn interpret_json_stdout_permission_denied_retry_needs_both_operands() {
+        // Pins the `&&` at hooks.rs:726: each case satisfies exactly
+        // one operand of the `event == PermissionDenied &&
+        // retry == Some(true)` conjunction (or neither), so replacing
+        // `&&` with `||` sets allow_retry on a case where it must stay
+        // false. The both-true case pins the positive direction.
+        let cases: &[(HookEvent, Value, bool)] = &[
+            // Both operands true: retry allowed.
+            (
+                HookEvent::PermissionDenied,
+                json!({"hookSpecificOutput": {"retry": true}}),
+                true,
+            ),
+            // Event matches but retry is false: must NOT allow retry.
+            (
+                HookEvent::PermissionDenied,
+                json!({"hookSpecificOutput": {"retry": false}}),
+                false,
+            ),
+            // Event matches but retry is absent: must NOT allow retry.
+            (
+                HookEvent::PermissionDenied,
+                json!({"hookSpecificOutput": {}}),
+                false,
+            ),
+            // Event matches but retry is not a bool: must NOT allow retry.
+            (
+                HookEvent::PermissionDenied,
+                json!({"hookSpecificOutput": {"retry": "yes"}}),
+                false,
+            ),
+            // Retry is true but the event is not PermissionDenied.
+            (
+                HookEvent::PreToolUse,
+                json!({"hookSpecificOutput": {"retry": true}}),
+                false,
+            ),
+            (
+                HookEvent::Stop,
+                json!({"hookSpecificOutput": {"retry": true}}),
+                false,
+            ),
+            // Neither operand true.
+            (
+                HookEvent::PreToolUse,
+                json!({"hookSpecificOutput": {"retry": false}}),
+                false,
+            ),
+        ];
+        for (event, obj, expected) in cases {
+            let out = interpret_json_stdout(&json_obj(obj.clone()), *event);
+            assert_eq!(out.allow_retry, *expected, "event: {event:?}, obj: {obj}");
+        }
+    }
 }

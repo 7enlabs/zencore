@@ -230,4 +230,193 @@ mod tests {
         assert_eq!(w.static_paths.len(), 2, "empty and * add nothing");
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    fn hook_watch_tmp(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("zen_hook_watch_{tag}_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn config_watcher_poll_reports_change_with_source() {
+        // Kills the whole-body replacements of ConfigWatcher::poll
+        // (empty vec, dummy path with "" or "xyzzy" source) and the
+        // inverted self-write filter (a plain change must be reported).
+        // Each changed file must come back with its real path and its
+        // real configuration source, not a placeholder.
+        let cwd = hook_watch_tmp("cfg_src");
+        let home = hook_watch_tmp("cfg_home");
+        let project = cwd.join(".zen").join("settings.json");
+        let local = cwd.join(".zen").join("settings.local.json");
+        let user = home.join(".zen").join("settings.json");
+        for (path, contents) in [
+            (&project, "one"),
+            (&local, "local-one"),
+            (&user, "home-one"),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        let mut w = ConfigWatcher::new(&cwd, Some(&home));
+        assert!(w.poll().is_empty(), "snapshot is clean at start");
+
+        for path in [&project, &local, &user] {
+            std::fs::write(path, "two").unwrap();
+        }
+        let mut got = w.poll();
+        got.sort();
+        let mut want = vec![
+            (local.clone(), "local_settings"),
+            (project.clone(), "project_settings"),
+            (user.clone(), "user_settings"),
+        ];
+        want.sort();
+        assert_eq!(got, want);
+        assert!(w.poll().is_empty(), "each change is reported once");
+        std::fs::remove_dir_all(&cwd).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn config_watcher_poll_skips_self_written_change_once() {
+        // The CLI's own save must be skipped exactly once: the next
+        // poll after note_self_write reports nothing, the change after
+        // that is reported again. Kills the no-op note_self_write, the
+        // always-false / always-true take_self_written, and the
+        // inverted filter in ConfigWatcher::poll.
+        let cwd = hook_watch_tmp("cfg_self");
+        let home = hook_watch_tmp("cfg_self_home");
+        let path = cwd.join(".zen").join("settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "one").unwrap();
+        let mut w = ConfigWatcher::new(&cwd, Some(&home));
+        assert!(w.poll().is_empty(), "snapshot is clean at start");
+
+        note_self_write(&path);
+        std::fs::write(&path, "two").unwrap();
+        assert!(
+            w.poll().is_empty(),
+            "a self-written change must be skipped once"
+        );
+
+        std::fs::write(&path, "three").unwrap();
+        assert_eq!(
+            w.poll(),
+            vec![(path.clone(), "project_settings")],
+            "the next change after the skip must be reported"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn file_watcher_poll_reports_static_change() {
+        // Kills the whole-body replacements of FileWatcher::poll: the
+        // poll must return the real changed path with the real event,
+        // not an empty vec or a dummy path with "" / "xyzzy".
+        let dir = hook_watch_tmp("file_static");
+        let file = dir.join(".envrc");
+        std::fs::write(&file, "one").unwrap();
+        let hooks = serde_json::json!({
+            "FileChanged": [{ "matcher": ".envrc", "hooks": [] }]
+        });
+        let mut w = FileWatcher::new(&dir, &hooks);
+        assert!(w.poll().is_empty(), "snapshot is clean at start");
+
+        std::fs::write(&file, "two").unwrap();
+        assert_eq!(w.poll(), vec![(file.clone(), "change")]);
+        assert!(w.poll().is_empty(), "each change is reported once");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_watcher_dynamic_path_reports_change() {
+        // Kills the no-op set_dynamic_paths and the no-op
+        // MtimeWatcher::watch: adding a dynamic path must watch it,
+        // snapshotting its current mtime so the first poll is quiet
+        // and a later change is reported.
+        let dir = hook_watch_tmp("file_dyn");
+        let dynamic = dir.join("dynamic.txt");
+        std::fs::write(&dynamic, "one").unwrap();
+        let mut w = FileWatcher::new(&dir, &serde_json::json!({"FileChanged": []}));
+        w.set_dynamic_paths(std::slice::from_ref(&dynamic));
+        assert!(
+            w.poll().is_empty(),
+            "watching a path must snapshot it, not report it"
+        );
+
+        std::fs::write(&dynamic, "two").unwrap();
+        assert_eq!(w.poll(), vec![(dynamic.clone(), "change")]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_watcher_dynamic_path_removed_stops_reporting() {
+        // Kills the no-op MtimeWatcher::retain: dropping a dynamic
+        // path must stop reporting it, while a static path keeps
+        // reporting.
+        let dir = hook_watch_tmp("file_dyn_rm");
+        let dynamic = dir.join("dynamic.txt");
+        let static_file = dir.join("static.txt");
+        std::fs::write(&dynamic, "one").unwrap();
+        std::fs::write(&static_file, "one").unwrap();
+        let hooks = serde_json::json!({
+            "FileChanged": [{ "matcher": "static.txt", "hooks": [] }]
+        });
+        let mut w = FileWatcher::new(&dir, &hooks);
+        w.set_dynamic_paths(std::slice::from_ref(&dynamic));
+        assert!(w.poll().is_empty(), "snapshot is clean at start");
+
+        w.set_dynamic_paths(&[]);
+        std::fs::write(&dynamic, "two").unwrap();
+        assert!(
+            w.poll().is_empty(),
+            "a removed dynamic path must not be reported"
+        );
+
+        std::fs::write(&static_file, "two").unwrap();
+        assert_eq!(w.poll(), vec![(static_file.clone(), "change")]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mtime_watcher_watch_snapshots_current_mtime() {
+        // Kills the no-op MtimeWatcher::watch: a watched path must be
+        // snapshotted (quiet until it changes) and then reported.
+        let dir = hook_watch_tmp("mtime_watch");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "one").unwrap();
+        let mut w = MtimeWatcher::new(vec![]);
+        w.watch(file.clone());
+        assert!(w.poll().is_empty(), "watch must snapshot, not report");
+
+        std::fs::write(&file, "two").unwrap();
+        assert_eq!(w.poll(), vec![(file.clone(), "change")]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mtime_watcher_retain_drops_removed_paths() {
+        // Kills the no-op MtimeWatcher::retain: a dropped path must
+        // stop reporting while a kept path keeps reporting.
+        let dir = hook_watch_tmp("mtime_retain");
+        let kept = dir.join("kept.txt");
+        let dropped = dir.join("dropped.txt");
+        std::fs::write(&kept, "one").unwrap();
+        std::fs::write(&dropped, "one").unwrap();
+        let mut w = MtimeWatcher::new(vec![kept.clone(), dropped.clone()]);
+        let keep: HashSet<PathBuf> = [kept.clone()].into_iter().collect();
+        w.retain(&keep);
+
+        std::fs::write(&dropped, "two").unwrap();
+        assert!(
+            w.poll().is_empty(),
+            "a retained-out path must not be reported"
+        );
+
+        std::fs::write(&kept, "two").unwrap();
+        assert_eq!(w.poll(), vec![(kept.clone(), "change")]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

@@ -1308,6 +1308,137 @@ mod tests {
         assert_eq!(exit_code_for_error(&err), exit_code::VALIDATION);
     }
 
+    #[tokio::test]
+    async fn run_with_home_init_or_maintenance_require_print() {
+        // Pins the `(cli.init || cli.maintenance) && !cli.print` guard
+        // in run_with_home, one row per side of each operator:
+        // - `||` -> `&&` (#22) is caught by the init-only and
+        //   maintenance-only rows, which must still be validation.
+        // - deleting the `!` (#23) is caught by the same rows (the
+        //   mutant falls through instead of returning validation)
+        //   and by the init-with-print row (the mutant returns
+        //   validation instead of falling through to the headless run).
+        // A fall-through never reaches the agent here: with no API key
+        // for the default route the REPL / headless path fails fast
+        // with an auth error, so it must never return the validation
+        // code. The temp home/cwd keep the run hermetic, and the key
+        // env vars are cleared so a developer's shell cannot smuggle
+        // a key into the fall-through path.
+        unsafe {
+            std::env::remove_var("ZEN_API_KEY");
+            std::env::remove_var("ZEN_BASE_URL");
+        }
+        // (init, maintenance, print, expect_validation)
+        let cases = [
+            (true, false, false, true),
+            (false, true, false, true),
+            (true, true, false, true),
+            (true, false, true, false),
+            (false, false, false, false),
+        ];
+        for (init, maintenance, print, expect_validation) in cases {
+            let dir = std::env::temp_dir().join(format!("zen_lib_init_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut args: Vec<&str> = vec!["zen"];
+            if init {
+                args.push("--init");
+            }
+            if maintenance {
+                args.push("--maintenance");
+            }
+            if print {
+                args.push("-p");
+            }
+            let cli = Cli::parse_from(args);
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                run_with_home(cli, &dir, Some(&dir)),
+            )
+            .await
+            .expect("run_with_home must not hang");
+            if expect_validation {
+                assert_eq!(
+                    result.unwrap(),
+                    exit_code::VALIDATION,
+                    "init={init} maintenance={maintenance} print={print} must be validation"
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "init={init} maintenance={maintenance} print={print} must fall through \
+                     and fail fast without an API key, got {result:?}"
+                );
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn run_init_only_prints_nonempty_session_start_feedback() {
+        // Pins the `!s.trim().is_empty()` filter in run_init_only:
+        // deleting the `!` keeps only empty feedback, so a
+        // SessionStart hook that prints text would print nothing.
+        // The print is stdout-only, so this runs the real binary as a
+        // subprocess and reads its stdout. The binary must be built
+        // from the same source (plain `cargo test -p zen-cli`, not
+        // `--lib`, which does not build it).
+        let bin = option_env!("CARGO_BIN_EXE_zen")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| exe.parent().and_then(|p| p.parent()).map(|p| p.join("zen")))
+            })
+            .expect("could not locate the zen binary");
+        assert!(
+            bin.is_file(),
+            "zen binary not built at {}: run `cargo test -p zen-cli` (not --lib) first",
+            bin.display()
+        );
+        let marker = format!("INIT-FEEDBACK-{}", uuid::Uuid::new_v4());
+        let home =
+            std::env::temp_dir().join(format!("zen_lib_initonly_home_{}", uuid::Uuid::new_v4()));
+        let cwd =
+            std::env::temp_dir().join(format!("zen_lib_initonly_cwd_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(home.join(".zen")).unwrap();
+        let settings = cwd.join(".zen").join("settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings,
+            format!(
+                r#"{{"hooks": {{"SessionStart": [{{"matcher": "startup", "hooks": [{{"type": "command", "command": "echo {marker}", "timeout": 5}}]}}]}}}}"#
+            ),
+        )
+        .unwrap();
+        let output = tokio::time::timeout(
+            Duration::from_secs(60),
+            tokio::process::Command::new(&bin)
+                .arg("--init-only")
+                .arg("--setting-sources")
+                .arg("project")
+                .current_dir(&cwd)
+                .env("HOME", &home)
+                .env("ZEN_TRUST_FOLDER", "1")
+                .output(),
+        )
+        .await
+        .expect("zen --init-only must not hang")
+        .expect("spawn zen binary");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&marker),
+            "--init-only must print non-empty SessionStart feedback {marker}; stdout was {stdout:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
     #[test]
     fn resolve_session_generates_id_and_path() {
         let dir = std::env::temp_dir().join(format!("zen_lib_sess_{}", std::process::id()));

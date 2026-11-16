@@ -2421,3 +2421,52 @@ mod lsp_provider_tests {
         assembly
     }
 }
+
+#[cfg(test)]
+mod memory_type_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn memory_type_for_distinguishes_each_branch() {
+        // Pins both `==` in memory_type_for (agent_run.rs:1543, 1546)
+        // and the whole-function return: each case matches exactly one
+        // branch, so flipping either `==` to `!=` moves a case to a
+        // different branch, and replacing the body with "" or "xyzzy"
+        // fails every case. A case matching two branches at once would
+        // NOT kill the mutant, so each path below is crafted to hit a
+        // single branch: the managed path only, a ZEN.local.md file
+        // name that is NOT the managed path, a path under ~/.zen whose
+        // file name is NOT ZEN.local.md, and the rest.
+        let home = dirs::home_dir().expect("tests need a home directory");
+        let cases: Vec<(PathBuf, &str)> = vec![
+            // Managed: exactly the managed path.
+            (PathBuf::from(zen_ext::MANAGED_MEMORY_PATH), "Managed"),
+            // Local: file name ZEN.local.md in a project dir.
+            (PathBuf::from("/tmp/some-project/ZEN.local.md"), "Local"),
+            // Local wins over User: ZEN.local.md under ~/.zen.
+            (home.join(".zen").join("ZEN.local.md"), "Local"),
+            // User: under ~/.zen, file name is not ZEN.local.md.
+            (home.join(".zen").join("ZEN.md"), "User"),
+            (home.join(".zen").join("sub").join("ZEN.md"), "User"),
+            // Project: plain project file, neither managed nor local
+            // nor under ~/.zen.
+            (PathBuf::from("/tmp/some-project/ZEN.md"), "Project"),
+            (PathBuf::from("/tmp/some-project/notes.md"), "Project"),
+            // Project: under $HOME but outside ~/.zen.
+            (home.join("some-project").join("ZEN.md"), "Project"),
+            // Project: ~/.zen2 is a sibling of ~/.zen, not under it.
+            (home.join(".zen2").join("ZEN.md"), "Project"),
+            // Project: near-miss file name, not ZEN.local.md.
+            (
+                PathBuf::from("/tmp/some-project/ZEN.local.md.bak"),
+                "Project",
+            ),
+            // Project: near-miss managed path, different file name.
+            (PathBuf::from("/etc/zen/other.md"), "Project"),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(memory_type_for(&path), expected, "path: {}", path.display());
+        }
+    }
+}

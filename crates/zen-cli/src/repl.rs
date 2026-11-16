@@ -4581,3 +4581,1121 @@ mod welcome_box_tests {
         assert!(out.starts_with("~/a"));
     }
 }
+
+/// Tests pinning the PR #208 missed mutants in this file (head bc1410c).
+///
+/// Each test is written as a table where a single case separates the two
+/// sides of one boolean operator, following the
+/// `classify_api_error_matches_each_single_signal` pattern in
+/// `zen-agent`: any one-operator mutation must flip at least one case.
+///
+/// The print-only branches (`/worktree`, `poll_hook_watchers` system
+/// messages) cannot be observed in-process - the test harness captures
+/// `println!` - so they use the subprocess-probe pattern from
+/// `acp::tests`: a `__pr208_probe_*` test that does the work when its
+/// env var is set (a no-op otherwise) and a parent test that spawns the
+/// current test binary with `--exact --nocapture` and asserts on the
+/// child's stdout/stderr.
+#[cfg(test)]
+mod pr208_mutant_tests {
+    use super::*;
+    use crate::settings::ENV_LOCK;
+    use clap::Parser;
+
+    fn temp_dir(prefix: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("{prefix}_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn test_cfg() -> crate::settings::ResolvedConfig {
+        use clap::Parser;
+        let old_model = std::env::var("ZEN_MODEL").ok();
+        let old_base = std::env::var("ZEN_BASE_URL").ok();
+        let old_key = std::env::var("ZEN_API_KEY").ok();
+        let old_openai_key = std::env::var("OPENAI_API_KEY").ok();
+        unsafe { std::env::remove_var("ZEN_MODEL") };
+        unsafe { std::env::remove_var("ZEN_BASE_URL") };
+        unsafe { std::env::remove_var("ZEN_API_KEY") };
+        unsafe { std::env::remove_var("OPENAI_API_KEY") };
+        let cli = crate::cli::Cli::parse_from(["zen"]);
+        let dir = temp_dir("zen_pr208_cfg");
+        let home = temp_dir("zen_pr208_home");
+        let cfg = crate::settings::resolve_config_with_home(&cli, &dir, Some(&home)).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&home).ok();
+        match old_model {
+            Some(v) => unsafe { std::env::set_var("ZEN_MODEL", v) },
+            None => unsafe { std::env::remove_var("ZEN_MODEL") },
+        }
+        match old_base {
+            Some(v) => unsafe { std::env::set_var("ZEN_BASE_URL", v) },
+            None => unsafe { std::env::remove_var("ZEN_BASE_URL") },
+        }
+        match old_key {
+            Some(v) => unsafe { std::env::set_var("ZEN_API_KEY", v) },
+            None => unsafe { std::env::remove_var("ZEN_API_KEY") },
+        }
+        match old_openai_key {
+            Some(v) => unsafe { std::env::set_var("OPENAI_API_KEY", v) },
+            None => unsafe { std::env::remove_var("OPENAI_API_KEY") },
+        }
+        cfg
+    }
+
+    struct RecordingBackend {
+        models: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl zen_core::LlmBackend for RecordingBackend {
+        async fn chat(&self, req: zen_core::ChatRequest) -> anyhow::Result<zen_core::ChatResponse> {
+            self.models.lock().unwrap().push(req.model);
+            Ok(zen_core::ChatResponse {
+                message: zen_core::ChatMessage::assistant(Some("ok".into()), None),
+                usage: zen_core::Usage::default(),
+                finish_reason: None,
+            })
+        }
+    }
+
+    /// Backend that records the text of every message in every request,
+    /// so a test can see what prompt a turn actually sent.
+    struct PromptRecordingBackend {
+        prompts: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl zen_core::LlmBackend for PromptRecordingBackend {
+        async fn chat(&self, req: zen_core::ChatRequest) -> anyhow::Result<zen_core::ChatResponse> {
+            let mut texts = Vec::new();
+            for m in &req.messages {
+                texts.push(m.text_ref().unwrap_or("").to_string());
+            }
+            self.prompts.lock().unwrap().push(texts.join("\n"));
+            Ok(zen_core::ChatResponse {
+                message: zen_core::ChatMessage::assistant(Some("ok".into()), None),
+                usage: zen_core::Usage::default(),
+                finish_reason: None,
+            })
+        }
+    }
+
+    struct AllowAll;
+
+    impl zen_core::PermissionChecker for AllowAll {
+        fn check(
+            &self,
+            _name: &str,
+            _input: &serde_json::Value,
+            _read_only: bool,
+            _ctx: &zen_core::ToolContext,
+        ) -> zen_core::PermissionDecision {
+            zen_core::PermissionDecision::Allow
+        }
+    }
+
+    fn test_agent_with_hooks<L>(
+        llm: std::sync::Arc<L>,
+        hooks: std::sync::Arc<dyn zen_core::HookRunner>,
+    ) -> zen_agent::Agent
+    where
+        L: zen_core::LlmBackend + 'static,
+    {
+        let dir = temp_dir("zen_pr208_ctx");
+        let ctx = zen_core::ToolContext::new(dir, "test-session");
+        let config = zen_agent::AgentConfig {
+            model: "google/gemini-4-argon:free".to_string(),
+            ..Default::default()
+        };
+        zen_agent::Agent::new(
+            llm,
+            zen_core::ToolRegistry::new(),
+            std::sync::Arc::new(AllowAll),
+            None,
+            hooks,
+            std::sync::Arc::new(zen_core::NullSink),
+            ctx,
+            config,
+        )
+    }
+
+    fn make_repl<'a>(
+        session_id: &'a mut String,
+        writer: &'a mut crate::session::TranscriptWriter,
+        dir: &Path,
+    ) -> ReplState<'a> {
+        ReplState {
+            session_id,
+            writer,
+            mcp_status: vec![],
+            interrupts: None,
+            recorder: None,
+            home_api_key: None,
+            auto_model: false,
+            goal: None,
+            personality: repl_polish::Personality::default(),
+            theme: repl_polish::Theme::default(),
+            vim_mode: false,
+            base_system_prompt: String::new(),
+            pre_plan_mode: zen_core::PermissionMode::Default,
+            pending_plan: None,
+            scope: crate::doneguard::ScopeGuard::default(),
+            scope_seeded: false,
+            checkpoints: std::sync::Arc::new(zen_tools::checkpoint::Checkpoints::new(
+                dir.join("checkpoints"),
+            )),
+            progress: std::sync::Arc::new(crate::repl_progress::ReplProgressSink::new()),
+            model_rows: Vec::new(),
+        }
+    }
+
+    /// A hook runner driven by a closure, recording every call as
+    /// `(Debug(event), matcher_target)`.
+    type HookHandler = std::sync::Arc<
+        dyn Fn(zen_core::HookEvent, &str, &serde_json::Value) -> zen_core::HookOutcome
+            + Send
+            + Sync,
+    >;
+
+    struct ScriptedHooks {
+        handler: HookHandler,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    impl ScriptedHooks {
+        fn new(
+            handler: impl Fn(zen_core::HookEvent, &str, &serde_json::Value) -> zen_core::HookOutcome
+            + Send
+            + Sync
+            + 'static,
+        ) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                handler: std::sync::Arc::new(handler),
+                calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            })
+        }
+
+        fn called(&self, event: &str) -> bool {
+            self.calls.lock().unwrap().iter().any(|(e, _)| e == event)
+        }
+
+        fn calls(&self) -> Vec<(String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl zen_core::HookRunner for ScriptedHooks {
+        async fn run(
+            &self,
+            event: zen_core::HookEvent,
+            target: &str,
+            payload: serde_json::Value,
+        ) -> zen_core::HookOutcome {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((format!("{event:?}"), target.to_string()));
+            (self.handler)(event, target, &payload)
+        }
+    }
+
+    /// Run one `__pr208_probe_*` test as a subprocess and return its
+    /// combined stdout + stderr. The probe test name is the full libtest
+    /// path, e.g. `repl::pr208_mutant_tests::__pr208_probe_worktree`.
+    /// The child's stdin is null: probes must never block on it (the
+    /// in-process `Ask` test used to hang here reading a pipe).
+    fn run_probe(test_path: &str, env_key: &str, env_val: &str) -> String {
+        run_probe_with_stdin(test_path, env_key, env_val, None)
+    }
+
+    /// Like `run_probe`, but feeds `stdin_data` to the child's stdin
+    /// and then closes it, so the child reads the input followed by
+    /// EOF. Used by the `Ask` probe to answer the confirmation prompt.
+    fn run_probe_with_stdin(
+        test_path: &str,
+        env_key: &str,
+        env_val: &str,
+        stdin_data: Option<&[u8]>,
+    ) -> String {
+        use std::io::Write;
+        let exe = std::env::current_exe().unwrap();
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args([test_path, "--exact", "--nocapture"])
+            .env(env_key, env_val);
+        let out = match stdin_data {
+            Some(data) => {
+                cmd.stdin(std::process::Stdio::piped());
+                let mut child = cmd.spawn().unwrap();
+                child.stdin.take().unwrap().write_all(data).unwrap();
+                // Dropping the stdin handle closes the pipe, so the
+                // child sees EOF right after the input.
+                child.wait_with_output().unwrap()
+            }
+            None => {
+                cmd.stdin(std::process::Stdio::null());
+                cmd.output().unwrap()
+            }
+        };
+        assert!(
+            out.status.success(),
+            "probe {test_path} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+        combined.push_str(&String::from_utf8_lossy(&out.stderr));
+        combined
+    }
+
+    fn switch_setup(
+        hooks: std::sync::Arc<dyn zen_core::HookRunner>,
+    ) -> (
+        crate::settings::ResolvedConfig,
+        zen_agent::Agent,
+        String,
+        crate::session::TranscriptWriter,
+        std::path::PathBuf,
+    ) {
+        let backend = std::sync::Arc::new(RecordingBackend {
+            models: std::sync::Mutex::new(vec![]),
+        });
+        let agent = test_agent_with_hooks(backend, hooks);
+        let cfg = test_cfg();
+        let dir = temp_dir("zen_pr208_switch");
+        let session_id = crate::session::new_session_id();
+        let writer =
+            crate::session::TranscriptWriter::new(dir.join("session.jsonl"), &session_id, &dir);
+        // The writer stores its own copy of the session id; hand that
+        // back so the caller owns a `String` to lend to `make_repl`.
+        let session_id = writer.session_id.clone();
+        (cfg, agent, session_id, writer, dir)
+    }
+
+    // Mutant #25 (repl.rs:1281): deleting the `Deny` arm lets a denied
+    // switch proceed. The switch must fail with the hook's reason and
+    // the model must stay put; the Post hook must not run either.
+    #[tokio::test]
+    async fn pre_model_switch_deny_blocks_switch_and_keeps_model() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let hooks = ScriptedHooks::new(|event, _, _| match event {
+            zen_core::HookEvent::PreModelSwitch => zen_core::HookOutcome {
+                permission_override: Some(zen_core::PermissionDecision::Deny(
+                    "denied by policy".into(),
+                )),
+                ..Default::default()
+            },
+            _ => zen_core::HookOutcome::default(),
+        });
+        let (mut cfg, mut agent, mut session_id, mut writer, dir) = switch_setup(hooks.clone());
+        let mut repl = make_repl(&mut session_id, &mut writer, &dir);
+        drop(_env);
+        let result = switch_model_with_hooks(ModelSwitchRequest {
+            requested: "deepseek-v4.1-flash",
+            source: "test",
+            cfg: &mut cfg,
+            agent: &mut agent,
+            repl: &mut repl,
+            home: None,
+        })
+        .await;
+        assert_eq!(result, Err("denied by policy".to_string()));
+        assert_eq!(agent.config.model, "google/gemini-4-argon:free");
+        assert!(hooks.called("PreModelSwitch"));
+        assert!(!hooks.called("PostModelSwitch"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Probe for the `Ask` arm (mutants #26/#27/#28), run as a
+    /// subprocess because `prompt_yes_no` reads process stdin: the
+    /// parent controls stdin (null = EOF, `y\n` = yes). Without
+    /// `PR208_ASK_EXPECT` it is a no-op. The env value is `"decline"`
+    /// or `"proceed"`.
+    #[tokio::test]
+    async fn __pr208_probe_ask() {
+        let Ok(expect) = std::env::var("PR208_ASK_EXPECT") else {
+            return;
+        };
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let hooks = ScriptedHooks::new(|event, _, _| match event {
+            zen_core::HookEvent::PreModelSwitch => zen_core::HookOutcome {
+                permission_override: Some(zen_core::PermissionDecision::Ask),
+                ..Default::default()
+            },
+            _ => zen_core::HookOutcome::default(),
+        });
+        let (mut cfg, mut agent, mut session_id, mut writer, dir) = switch_setup(hooks.clone());
+        let mut repl = make_repl(&mut session_id, &mut writer, &dir);
+        drop(_env);
+        let result = switch_model_with_hooks(ModelSwitchRequest {
+            requested: "deepseek-v4.1-flash",
+            source: "test",
+            cfg: &mut cfg,
+            agent: &mut agent,
+            repl: &mut repl,
+            home: None,
+        })
+        .await;
+        match expect.as_str() {
+            "decline" => {
+                let err = result.expect_err("an unconfirmed Ask switch must be declined");
+                assert!(err.contains("declined"), "{err}");
+                assert_eq!(agent.config.model, "google/gemini-4-argon:free");
+                assert!(!hooks.called("PostModelSwitch"));
+            }
+            "proceed" => {
+                assert!(result.is_ok(), "{result:?}");
+                assert_eq!(agent.config.model, "deepseek-v4.1-flash");
+                assert!(hooks.called("PostModelSwitch"));
+            }
+            _ => panic!("unknown PR208_ASK_EXPECT value: {expect}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Mutants #26/#27 (repl.rs:1283): the `Ask` arm declines when the
+    // user does not confirm. The probe runs with stdin null, so
+    // `prompt_yes_no` reads EOF and returns false. Deleting the `!`
+    // (#26) or forcing the guard to false (#27) both let the switch
+    // proceed, so the probe's decline assertion fails under either.
+    #[test]
+    fn pre_model_switch_ask_without_confirmation_declines_switch() {
+        run_probe(
+            "repl::pr208_mutant_tests::__pr208_probe_ask",
+            "PR208_ASK_EXPECT",
+            "decline",
+        );
+    }
+
+    // Mutant #28 (repl.rs:1283): forcing the guard to true declines
+    // even when the user answers yes. The probe runs with `y` on
+    // stdin, so the switch must proceed under the original code.
+    #[test]
+    fn pre_model_switch_ask_with_confirmation_proceeds() {
+        run_probe_with_stdin(
+            "repl::pr208_mutant_tests::__pr208_probe_ask",
+            "PR208_ASK_EXPECT",
+            "proceed",
+            Some(b"y\n"),
+        );
+    }
+
+    // Mutants #29 (repl.rs:1298, call in `switch_model_with_hooks`)
+    // and #30 (repl.rs:1328, the feedback filter in
+    // `fire_post_model_switch`): a Post hook that returns feedback has
+    // it stashed for the next turn. Replacing the call with `()` (#29)
+    // or dropping the `!` in the filter (#30, which then keeps only
+    // empty feedback) both leave the stash empty.
+    #[tokio::test]
+    async fn post_model_switch_feedback_is_stashed_for_next_turn() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let hooks = ScriptedHooks::new(|event, _, _| match event {
+            zen_core::HookEvent::PostModelSwitch => zen_core::HookOutcome {
+                feedback: Some("post-switch context".into()),
+                ..Default::default()
+            },
+            _ => zen_core::HookOutcome::default(),
+        });
+        let (mut cfg, mut agent, mut session_id, mut writer, dir) = switch_setup(hooks.clone());
+        let mut repl = make_repl(&mut session_id, &mut writer, &dir);
+        drop(_env);
+        let result = switch_model_with_hooks(ModelSwitchRequest {
+            requested: "deepseek-v4.1-flash",
+            source: "test",
+            cfg: &mut cfg,
+            agent: &mut agent,
+            repl: &mut repl,
+            home: None,
+        })
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(agent.config.model, "deepseek-v4.1-flash");
+        assert!(hooks.called("PostModelSwitch"));
+        assert_eq!(agent.pending_hook_context, vec!["post-switch context"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Mutant #30, other direction: whitespace-only feedback is not
+    // context. Dropping the `!` keeps exactly the whitespace feedback
+    // and stashes it.
+    #[tokio::test]
+    async fn post_model_switch_whitespace_feedback_is_not_stashed() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let hooks = ScriptedHooks::new(|event, _, _| match event {
+            zen_core::HookEvent::PostModelSwitch => zen_core::HookOutcome {
+                feedback: Some("   ".into()),
+                ..Default::default()
+            },
+            _ => zen_core::HookOutcome::default(),
+        });
+        let (mut cfg, mut agent, mut session_id, mut writer, dir) = switch_setup(hooks.clone());
+        let mut repl = make_repl(&mut session_id, &mut writer, &dir);
+        drop(_env);
+        let result = switch_model_with_hooks(ModelSwitchRequest {
+            requested: "deepseek-v4.1-flash",
+            source: "test",
+            cfg: &mut cfg,
+            agent: &mut agent,
+            repl: &mut repl,
+            home: None,
+        })
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(agent.pending_hook_context.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Mutants #31/#32 (repl.rs:1488, whole function forced to false /
+    // true) and #33 (repl.rs:1492, deleting the `!` in
+    // `.map(|a| !a.is_empty())`): each case separates one side.
+    // `[]` and a missing entry are false, a non-empty array is true,
+    // and a non-array value is false.
+    #[test]
+    fn worktree_hooks_configured_matches_only_nonempty_hook_arrays() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cfg = test_cfg();
+        let cases: Vec<(serde_json::Value, &str, bool)> = vec![
+            (serde_json::json!({}), "WorktreeCreate", false),
+            (
+                serde_json::json!({"WorktreeCreate": []}),
+                "WorktreeCreate",
+                false,
+            ),
+            (
+                serde_json::json!({"WorktreeCreate": [{"command": "x"}]}),
+                "WorktreeCreate",
+                true,
+            ),
+            (
+                serde_json::json!({"WorktreeCreate": "not-an-array"}),
+                "WorktreeCreate",
+                false,
+            ),
+            (
+                serde_json::json!({"WorktreeCreate": null}),
+                "WorktreeCreate",
+                false,
+            ),
+            (
+                serde_json::json!({"WorktreeRemove": [{"command": "x"}]}),
+                "WorktreeCreate",
+                false,
+            ),
+            (
+                serde_json::json!({"WorktreeRemove": [{"command": "x"}]}),
+                "WorktreeRemove",
+                true,
+            ),
+            (
+                serde_json::json!({"WorktreeCreate": [{}, {}]}),
+                "WorktreeCreate",
+                true,
+            ),
+        ];
+        for (hooks, event, expected) in cases {
+            cfg.hooks = hooks;
+            assert_eq!(
+                worktree_hooks_configured(&cfg, event),
+                expected,
+                "hooks={} event={event}",
+                cfg.hooks
+            );
+        }
+    }
+
+    /// Probe for the `/worktree` hook branches (mutants #34-42), run as
+    /// a subprocess by the table tests below so they can assert on the
+    /// `println!` / `eprintln!` output. Without `PR208_WORKTREE_JSON`
+    /// it is a no-op. The JSON carries one scenario:
+    /// `{"op": "rm" | "create", "failed": bool, "blocked": bool,
+    /// "worktree_path": string | null, "feedback": string | null,
+    /// "exists": bool, "cwd": string, "name": string}`.
+    #[tokio::test]
+    async fn __pr208_probe_worktree() {
+        let Ok(json) = std::env::var("PR208_WORKTREE_JSON") else {
+            return;
+        };
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let op = v["op"].as_str().unwrap();
+        let failed = v["failed"].as_bool().unwrap();
+        let blocked = v["blocked"].as_bool().unwrap();
+        let worktree_path = v["worktree_path"].as_str().map(str::to_string);
+        let feedback = v["feedback"].as_str().map(str::to_string);
+        let exists = v["exists"].as_bool().unwrap();
+        let cwd = std::path::PathBuf::from(v["cwd"].as_str().unwrap());
+        let name = v["name"].as_str().unwrap().to_string();
+        let repo = cwd.file_name().and_then(|n| n.to_str()).unwrap_or("repo");
+        let wt_path = cwd.join(format!("../{repo}-{name}"));
+        if exists {
+            std::fs::create_dir_all(&wt_path).unwrap();
+        }
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let hooks = ScriptedHooks::new(move |event, _, _| match event {
+            zen_core::HookEvent::WorktreeRemove | zen_core::HookEvent::WorktreeCreate => {
+                zen_core::HookOutcome {
+                    blocked,
+                    failed,
+                    worktree_path: worktree_path.clone(),
+                    feedback: feedback.clone(),
+                    ..Default::default()
+                }
+            }
+            _ => zen_core::HookOutcome::default(),
+        });
+        let backend = std::sync::Arc::new(RecordingBackend {
+            models: std::sync::Mutex::new(vec![]),
+        });
+        let mut agent = test_agent_with_hooks(backend, hooks);
+        let mut cfg = test_cfg();
+        cfg.hooks = serde_json::json!({
+            "WorktreeRemove": [{"command": "hook"}],
+            "WorktreeCreate": [{"command": "hook"}],
+        });
+        let cli = crate::cli::Cli::parse_from(["zen"]);
+        let mut session_id = crate::session::new_session_id();
+        let mut writer =
+            crate::session::TranscriptWriter::new(cwd.join("session.jsonl"), &session_id, &cwd);
+        let mut repl = make_repl(&mut session_id, &mut writer, &cwd);
+        drop(_env);
+        let line = if op == "rm" {
+            format!("/worktree rm {name}")
+        } else {
+            format!("/worktree {name}")
+        };
+        let action = handle_slash(&line, &cli, &cwd, None, &mut cfg, &mut repl, &mut agent)
+            .await
+            .unwrap();
+        assert!(matches!(action, LineAction::Continue));
+    }
+
+    /// One `/worktree` probe scenario: the hook outcome the probe's
+    /// hooks return plus the filesystem state the probe sets up.
+    struct WorktreeScenario<'a> {
+        op: &'a str,
+        failed: bool,
+        blocked: bool,
+        worktree_path: Option<&'a str>,
+        feedback: Option<&'a str>,
+        exists: bool,
+        cwd: &'a Path,
+        name: &'a str,
+    }
+
+    fn worktree_probe_output(s: WorktreeScenario<'_>) -> String {
+        let json = serde_json::json!({
+            "op": s.op,
+            "failed": s.failed,
+            "blocked": s.blocked,
+            "worktree_path": s.worktree_path,
+            "feedback": s.feedback,
+            "exists": s.exists,
+            "cwd": s.cwd.display().to_string(),
+            "name": s.name,
+        });
+        run_probe(
+            "repl::pr208_mutant_tests::__pr208_probe_worktree",
+            "PR208_WORKTREE_JSON",
+            &json.to_string(),
+        )
+    }
+
+    fn worktree_probe_cleanup(dir: &Path, name: &str) {
+        let repo = dir.file_name().and_then(|n| n.to_str()).unwrap_or("repo");
+        std::fs::remove_dir_all(dir.join(format!("../{repo}-{name}"))).ok();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // Mutants #34/#35/#36 (repl.rs:1840):
+    // `if !removed.failed || !wt_path.exists()`. One case per row of
+    // the truth table; each mutant flips at least one row:
+    // #34 (drop the first `!`) flips (false,true) and (true,true);
+    // #35 (`||` -> `&&`) flips (true,false) and (false,true);
+    // #36 (drop the second `!`) flips (true,false) and (true,true).
+    #[test]
+    fn worktree_remove_hook_outcome_table() {
+        for (failed, exists, removed) in [
+            (false, false, true),
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            let dir = temp_dir("zen_pr208_wtrm");
+            let repo = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap()
+                .to_string();
+            let wt_path = dir.join(format!("../{repo}-feat1"));
+            let out = worktree_probe_output(WorktreeScenario {
+                op: "rm",
+                failed,
+                blocked: false,
+                worktree_path: None,
+                feedback: None,
+                exists,
+                cwd: &dir,
+                name: "feat1",
+            });
+            let removed_marker = format!("removed worktree {}", wt_path.display());
+            let kept_marker = format!("worktree removal failed, kept: {}", wt_path.display());
+            if removed {
+                assert!(
+                    out.contains(&removed_marker),
+                    "failed={failed} exists={exists}: expected removal, got:\n{out}"
+                );
+                assert!(
+                    !out.contains(&kept_marker),
+                    "failed={failed} exists={exists}: unexpected kept message:\n{out}"
+                );
+            } else {
+                assert!(
+                    out.contains(&kept_marker),
+                    "failed={failed} exists={exists}: expected kept, got:\n{out}"
+                );
+                assert!(
+                    !out.contains(&removed_marker),
+                    "failed={failed} exists={exists}: unexpected removal:\n{out}"
+                );
+            }
+            worktree_probe_cleanup(&dir, "feat1");
+        }
+    }
+
+    // Mutants #37-#41 (repl.rs:1869):
+    // `Some(p) if !created.blocked && !created.failed`. The guard must
+    // pass only when a path was returned and neither flag is set:
+    // #37 (drop the first `!`) flips (blocked=true, failed=false);
+    // #38 (guard -> false) flips the all-clear row;
+    // #39 (guard -> true) flips every blocked/failed row with a path;
+    // #40 (`&&` -> `||`) flips (true,false) and (false,true);
+    // #41 (drop the second `!`) flips (false,true).
+    #[test]
+    fn worktree_create_hook_guard_table() {
+        for (blocked, failed, with_path, created) in [
+            (false, false, true, true),
+            (true, false, true, false),
+            (false, true, true, false),
+            (true, true, true, false),
+            (false, false, false, false),
+        ] {
+            let dir = temp_dir("zen_pr208_wtcr");
+            let path = if with_path {
+                Some(format!("/tmp/zen_pr208_created_{}", uuid::Uuid::new_v4()))
+            } else {
+                None
+            };
+            let out = worktree_probe_output(WorktreeScenario {
+                op: "create",
+                failed,
+                blocked,
+                worktree_path: path.as_deref(),
+                feedback: None,
+                exists: false,
+                cwd: &dir,
+                name: "feat1",
+            });
+            if created {
+                let marker = format!(
+                    "created worktree {} on branch feat1",
+                    path.as_deref().unwrap()
+                );
+                assert!(
+                    out.contains(&marker),
+                    "blocked={blocked} failed={failed} path={path:?}: expected creation, got:\n{out}"
+                );
+            } else {
+                assert!(
+                    out.contains("failed:"),
+                    "blocked={blocked} failed={failed} path={path:?}: expected failure, got:\n{out}"
+                );
+                assert!(
+                    !out.contains("created worktree"),
+                    "blocked={blocked} failed={failed} path={path:?}: unexpected creation:\n{out}"
+                );
+            }
+            worktree_probe_cleanup(&dir, "feat1");
+        }
+    }
+
+    // Mutant #42 (repl.rs:1878): the failure reason is the hook's
+    // feedback when it is non-blank, else the default message. Dropping
+    // the `!` in the filter keeps only blank feedback, so real feedback
+    // is replaced by the default and blank feedback is echoed verbatim.
+    #[test]
+    fn worktree_create_hook_failure_reason_uses_nonempty_feedback() {
+        for (feedback, expected_reason) in [
+            (Some("hook blew up"), "failed: hook blew up"),
+            (
+                Some("   "),
+                "failed: WorktreeCreate hook did not return a path",
+            ),
+            (
+                Some(""),
+                "failed: WorktreeCreate hook did not return a path",
+            ),
+            (None, "failed: WorktreeCreate hook did not return a path"),
+        ] {
+            let dir = temp_dir("zen_pr208_wtfb");
+            let out = worktree_probe_output(WorktreeScenario {
+                op: "create",
+                failed: false,
+                blocked: true,
+                worktree_path: None,
+                feedback,
+                exists: false,
+                cwd: &dir,
+                name: "feat1",
+            });
+            assert!(
+                out.contains(expected_reason),
+                "feedback={feedback:?}: expected {expected_reason:?}, got:\n{out}"
+            );
+            worktree_probe_cleanup(&dir, "feat1");
+        }
+    }
+
+    // Mutant #43 (repl.rs:2023): `/add-dir` stashes the hook's
+    // `systemMessage` as context for the next turn when it is non-blank.
+    // Dropping the `!` stashes only blank messages and drops real ones.
+    #[tokio::test]
+    async fn add_dir_hook_system_message_table() {
+        for system_message in [Some("remember this dir"), Some("   "), None] {
+            let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let hooks = ScriptedHooks::new(move |event, _, _| match event {
+                zen_core::HookEvent::DirectoryAdded => zen_core::HookOutcome {
+                    system_message: system_message.map(str::to_string),
+                    ..Default::default()
+                },
+                _ => zen_core::HookOutcome::default(),
+            });
+            let backend = std::sync::Arc::new(RecordingBackend {
+                models: std::sync::Mutex::new(vec![]),
+            });
+            let mut agent = test_agent_with_hooks(backend, hooks);
+            let mut cfg = test_cfg();
+            let dir = temp_dir("zen_pr208_adddir");
+            let new_dir = dir.join("newdir");
+            std::fs::create_dir_all(&new_dir).unwrap();
+            let cli = crate::cli::Cli::parse_from(["zen"]);
+            let mut session_id = crate::session::new_session_id();
+            let mut writer =
+                crate::session::TranscriptWriter::new(dir.join("session.jsonl"), &session_id, &dir);
+            let mut repl = make_repl(&mut session_id, &mut writer, &dir);
+            drop(_env);
+            let action = handle_slash(
+                &format!("/add-dir {}", new_dir.display()),
+                &cli,
+                &dir,
+                None,
+                &mut cfg,
+                &mut repl,
+                &mut agent,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(action, LineAction::Continue));
+            assert!(agent.ctx.extra_dirs.contains(&new_dir));
+            match system_message {
+                Some(text) if !text.trim().is_empty() => {
+                    assert_eq!(agent.pending_hook_context, vec![text]);
+                }
+                _ => assert!(
+                    agent.pending_hook_context.is_empty(),
+                    "blank/absent systemMessage must not be stashed: {:?}",
+                    agent.pending_hook_context
+                ),
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    // Mutant #44 (repl.rs:2232): `/review` appends the expansion hook's
+    // feedback to the review prompt when it is non-blank. Dropping the
+    // `!` appends only blank feedback and drops real feedback.
+    #[tokio::test]
+    async fn review_hook_feedback_table() {
+        for feedback in [Some("extra review notes"), Some("   "), None] {
+            let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prompts = std::sync::Arc::new(PromptRecordingBackend {
+                prompts: std::sync::Mutex::new(vec![]),
+            });
+            let hooks = ScriptedHooks::new(move |event, _, _| match event {
+                zen_core::HookEvent::UserPromptExpansion => zen_core::HookOutcome {
+                    feedback: feedback.map(str::to_string),
+                    ..Default::default()
+                },
+                _ => zen_core::HookOutcome::default(),
+            });
+            let mut agent = test_agent_with_hooks(prompts.clone(), hooks);
+            let mut cfg = test_cfg();
+            let dir = temp_dir("zen_pr208_review");
+            let cli = crate::cli::Cli::parse_from(["zen"]);
+            let mut session_id = crate::session::new_session_id();
+            let mut writer =
+                crate::session::TranscriptWriter::new(dir.join("session.jsonl"), &session_id, &dir);
+            let mut repl = make_repl(&mut session_id, &mut writer, &dir);
+            drop(_env);
+            let action = handle_slash("/review", &cli, &dir, None, &mut cfg, &mut repl, &mut agent)
+                .await
+                .unwrap();
+            assert!(matches!(action, LineAction::Continue));
+            let recorded = prompts.prompts.lock().unwrap().clone();
+            let base = crate::commands::review_prompt("");
+            match feedback {
+                Some(text) if !text.trim().is_empty() => {
+                    assert!(
+                        recorded.iter().any(|p| p.contains(text)),
+                        "feedback {text:?} must reach the turn prompt, recorded: {recorded:?}"
+                    );
+                }
+                _ => {
+                    assert!(
+                        recorded.iter().any(|p| p == &base),
+                        "blank/absent feedback must leave the review prompt untouched, recorded: {recorded:?}"
+                    );
+                    assert!(
+                        !recorded.iter().any(|p| p.contains("\n\n   ")),
+                        "blank feedback must not be appended, recorded: {recorded:?}"
+                    );
+                }
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    fn write_probe_command(dir: &Path, model: &str) {
+        let cmd_dir = dir.join(".zen").join("commands");
+        std::fs::create_dir_all(&cmd_dir).unwrap();
+        std::fs::write(
+            cmd_dir.join("probe.md"),
+            format!("---\nmodel: {model}\n---\nSay hi.\n"),
+        )
+        .unwrap();
+    }
+
+    // Mutant #29 (repl.rs:2598, the restore call in `handle_slash`)
+    // and #45 (repl.rs:2597, `if pinned != saved_model`): after a
+    // slash command with a model pin runs its turn, the startup route
+    // is restored and only then is `PostModelSwitch` fired with source
+    // `"auto"`. The Post hook returns feedback for the `"auto"` call
+    // only, so the stash proves the restore call ran. With `!=`
+    // flipped to `==` the restore call is skipped exactly when the
+    // model changed, so the stash stays empty.
+    #[tokio::test]
+    async fn slash_command_model_pin_restores_route_and_fires_post_hook() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let hooks = ScriptedHooks::new(|event, _, payload| match event {
+            zen_core::HookEvent::PostModelSwitch
+                if payload.get("source").and_then(|s| s.as_str()) == Some("auto") =>
+            {
+                zen_core::HookOutcome {
+                    feedback: Some("auto-restore ctx".into()),
+                    ..Default::default()
+                }
+            }
+            _ => zen_core::HookOutcome::default(),
+        });
+        let backend = std::sync::Arc::new(RecordingBackend {
+            models: std::sync::Mutex::new(vec![]),
+        });
+        let mut agent = test_agent_with_hooks(backend.clone(), hooks);
+        let mut cfg = test_cfg();
+        let dir = temp_dir("zen_pr208_pin");
+        write_probe_command(&dir, "deepseek-v4.1-flash");
+        let cli = crate::cli::Cli::parse_from(["zen"]);
+        let mut session_id = crate::session::new_session_id();
+        let mut writer =
+            crate::session::TranscriptWriter::new(dir.join("session.jsonl"), &session_id, &dir);
+        let mut repl = make_repl(&mut session_id, &mut writer, &dir);
+        drop(_env);
+        let action = handle_slash(
+            "/probe hi",
+            &cli,
+            &dir,
+            None,
+            &mut cfg,
+            &mut repl,
+            &mut agent,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(action, LineAction::Continue));
+        // The turn ran against the recording backend, and the route
+        // came back to the startup model.
+        assert_eq!(backend.models.lock().unwrap().len(), 1);
+        assert_eq!(agent.config.model, "google/gemini-4-argon:free");
+        assert_eq!(agent.pending_hook_context, vec!["auto-restore ctx"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Mutant #45, other direction: pinning the model the session
+    // already runs on changes nothing, so the restore is not a model
+    // change and no `"auto"` Post hook fires. (`google/gemini-4-argon`
+    // is not a catalog entry, so the pin is a string-only switch with
+    // no provider routing and no network.) Flipping `!=` to `==`
+    // fires the Post hook exactly in this case.
+    #[tokio::test]
+    async fn slash_command_model_pin_to_current_model_fires_no_post_hook() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let hooks = ScriptedHooks::new(|event, _, payload| match event {
+            zen_core::HookEvent::PostModelSwitch
+                if payload.get("source").and_then(|s| s.as_str()) == Some("auto") =>
+            {
+                zen_core::HookOutcome {
+                    feedback: Some("auto-restore ctx".into()),
+                    ..Default::default()
+                }
+            }
+            _ => zen_core::HookOutcome::default(),
+        });
+        let backend = std::sync::Arc::new(RecordingBackend {
+            models: std::sync::Mutex::new(vec![]),
+        });
+        let mut agent = test_agent_with_hooks(backend.clone(), hooks);
+        let mut cfg = test_cfg();
+        let dir = temp_dir("zen_pr208_pin_same");
+        write_probe_command(&dir, "google/gemini-4-argon:free");
+        let cli = crate::cli::Cli::parse_from(["zen"]);
+        let mut session_id = crate::session::new_session_id();
+        let mut writer =
+            crate::session::TranscriptWriter::new(dir.join("session.jsonl"), &session_id, &dir);
+        let mut repl = make_repl(&mut session_id, &mut writer, &dir);
+        drop(_env);
+        let action = handle_slash(
+            "/probe hi",
+            &cli,
+            &dir,
+            None,
+            &mut cfg,
+            &mut repl,
+            &mut agent,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(action, LineAction::Continue));
+        assert_eq!(backend.models.lock().unwrap().len(), 1);
+        assert_eq!(agent.config.model, "google/gemini-4-argon:free");
+        assert!(agent.pending_hook_context.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Mutant #46 (repl.rs:520, `poll_hook_watchers` replaced with
+    // `()`): a changed settings file fires `ConfigChange` and a
+    // changed watched file fires `FileChanged`. Replacing the whole
+    // poll with `()` fires neither. (The call site in the REPL loop
+    // itself needs a live terminal session and is not reachable from a
+    // unit test; this pins the function the loop calls.)
+    #[tokio::test]
+    async fn poll_hook_watchers_fires_config_and_file_hooks() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let hooks = ScriptedHooks::new(|_, _, _| zen_core::HookOutcome::default());
+        let backend = std::sync::Arc::new(RecordingBackend {
+            models: std::sync::Mutex::new(vec![]),
+        });
+        let mut agent = test_agent_with_hooks(backend, hooks.clone());
+        let dir = temp_dir("zen_pr208_poll");
+        let home = temp_dir("zen_pr208_poll_home");
+        let watched = dir.join("watched.txt");
+        std::fs::write(&watched, "one").unwrap();
+        let mut config_watcher = crate::hook_watch::ConfigWatcher::new(&dir, Some(&home));
+        let mut file_watcher = crate::hook_watch::FileWatcher::new(
+            &dir,
+            &serde_json::json!({"FileChanged": [{"matcher": "watched.txt", "hooks": []}]}),
+        );
+        // Change both files after the watchers snapshotted them.
+        std::fs::create_dir_all(dir.join(".zen")).unwrap();
+        std::fs::write(dir.join(".zen").join("settings.json"), "{}").unwrap();
+        std::fs::write(&watched, "two").unwrap();
+        drop(_env);
+        poll_hook_watchers(&mut config_watcher, &mut file_watcher, &mut agent).await;
+        let calls = hooks.calls();
+        assert!(
+            calls.iter().any(|(e, _)| e == "ConfigChange"),
+            "ConfigChange must fire, calls: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(e, t)| e == "FileChanged" && t == "watched.txt"),
+            "FileChanged for watched.txt must fire, calls: {calls:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Probe for mutant #47 (repl.rs:564): `poll_hook_watchers` prints
+    /// a `FileChanged` hook's `systemMessage` to stderr when it is
+    /// non-blank. Without `PR208_POLL_JSON` it is a no-op; the JSON
+    /// carries `{"system_message": string | null, "cwd": string,
+    /// "home": string}`.
+    #[tokio::test]
+    async fn __pr208_probe_poll_watchers() {
+        let Ok(json) = std::env::var("PR208_POLL_JSON") else {
+            return;
+        };
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let system_message = v["system_message"].as_str().map(str::to_string);
+        let dir = std::path::PathBuf::from(v["cwd"].as_str().unwrap());
+        let home = std::path::PathBuf::from(v["home"].as_str().unwrap());
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let hooks = ScriptedHooks::new(move |event, _, _| match event {
+            zen_core::HookEvent::FileChanged => zen_core::HookOutcome {
+                system_message: system_message.clone(),
+                ..Default::default()
+            },
+            _ => zen_core::HookOutcome::default(),
+        });
+        let backend = std::sync::Arc::new(RecordingBackend {
+            models: std::sync::Mutex::new(vec![]),
+        });
+        let mut agent = test_agent_with_hooks(backend, hooks);
+        let watched = dir.join("watched.txt");
+        std::fs::write(&watched, "one").unwrap();
+        let mut config_watcher = crate::hook_watch::ConfigWatcher::new(&dir, Some(&home));
+        let mut file_watcher = crate::hook_watch::FileWatcher::new(
+            &dir,
+            &serde_json::json!({"FileChanged": [{"matcher": "watched.txt", "hooks": []}]}),
+        );
+        std::fs::write(&watched, "two").unwrap();
+        drop(_env);
+        poll_hook_watchers(&mut config_watcher, &mut file_watcher, &mut agent).await;
+    }
+
+    // Mutant #47 (repl.rs:564): only a non-blank `FileChanged`
+    // `systemMessage` is printed. Dropping the `!` prints only blank
+    // messages and swallows real ones.
+    #[test]
+    fn poll_hook_watchers_file_changed_system_message_table() {
+        for (system_message, expect_print) in [
+            (Some("file note"), true),
+            (Some("   "), false),
+            (None, false),
+        ] {
+            let dir = temp_dir("zen_pr208_poll47");
+            let home = temp_dir("zen_pr208_poll47_home");
+            let json = serde_json::json!({
+                "system_message": system_message,
+                "cwd": dir.display().to_string(),
+                "home": home.display().to_string(),
+            });
+            let out = run_probe(
+                "repl::pr208_mutant_tests::__pr208_probe_poll_watchers",
+                "PR208_POLL_JSON",
+                &json.to_string(),
+            );
+            if expect_print {
+                assert!(
+                    out.contains("[FileChanged] file note"),
+                    "system_message={system_message:?}: expected print, got:\n{out}"
+                );
+            } else {
+                assert!(
+                    !out.contains("[FileChanged]"),
+                    "system_message={system_message:?}: expected silence, got:\n{out}"
+                );
+            }
+            std::fs::remove_dir_all(&dir).ok();
+            std::fs::remove_dir_all(&home).ok();
+        }
+    }
+}
