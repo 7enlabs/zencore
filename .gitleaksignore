@@ -7,3 +7,7 @@
 7ed74b7465634777c164d72fc5dd8b2360965919:crates/zen-cli/src/export.rs:generic-api-key:951
 ae246041d3bc6291d6b3b3209b9227339569338f:crates/zen-cli/src/export.rs:generic-api-key:951
 ec0539130da4c569ba28f415e3b7b0fb3ca78504:crates/zen-cli/src/export.rs:generic-api-key:951
+# - recall.rs lines 499, 613 + cross_session_recall.rs line 243 (commit ac6b919): same fake token fixture as export.rs:884, in redact tests.
+ac6b919e35ec7c9c875d11c25370dd823b9a4560:crates/zen-cli/src/recall.rs:generic-api-key:499
+ac6b919e35ec7c9c875d11c25370dd823b9a4560:crates/zen-cli/src/recall.rs:generic-api-key:613
+ac6b919e35ec7c9c875d11c25370dd823b9a4560:crates/zen-cli/tests/cross_session_recall.rs:generic-api-key:243
