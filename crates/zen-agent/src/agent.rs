@@ -2092,6 +2092,46 @@ mod tests {
     }
 
     #[test]
+    fn classify_api_error_matches_each_single_signal() {
+        // Pins every `||` in classify_api_error (agent.rs:501-515):
+        // each case matches exactly ONE disjunct of its branch, so
+        // swapping any `||` for `&&` drops the branch and the test
+        // fails. A case matching two disjuncts at once would NOT kill
+        // the mutant, so keep each input to a single signal.
+        let cases: &[(&str, &str)] = &[
+            ("rate limit exceeded", "rate_limit"),
+            ("error 429", "rate_limit"),
+            ("too many requests", "rate_limit"),
+            ("RATE LIMIT", "rate_limit"),
+            ("model overloaded", "overloaded"),
+            ("error 529", "overloaded"),
+            ("error 503", "overloaded"),
+            ("auth error", "authentication_failed"),
+            ("error 401", "authentication_failed"),
+            ("error 403", "authentication_failed"),
+            ("billing issue", "billing_error"),
+            ("payment required", "billing_error"),
+            ("error 402", "billing_error"),
+            ("model not found", "model_not_found"),
+            ("error 404", "model_not_found"),
+            ("max_output_tokens reached", "max_output_tokens"),
+            ("max tokens exceeded", "max_output_tokens"),
+            ("invalid request", "invalid_request"),
+            ("error 400", "invalid_request"),
+            ("server error", "server_error"),
+            ("error 500", "server_error"),
+            ("something went wrong", "unknown"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                Agent::classify_api_error(input),
+                *expected,
+                "classify_api_error({input:?})"
+            );
+        }
+    }
+
+    #[test]
     fn default_model_is_the_decided_free_gateway_id() {
         // PR #71 review F8: the old default named a paid model in
         // its OpenRouter form; the decided default is the free
