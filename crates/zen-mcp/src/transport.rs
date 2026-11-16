@@ -21,6 +21,8 @@ pub(crate) struct Session {
     service: Mutex<Option<RunningService<RoleClient, ()>>>,
     peer: Peer<RoleClient>,
     timeout_ms: u64,
+    /// PID of the child process (for Unix process group kill)
+    child_pid: Mutex<Option<u32>>,
 }
 
 impl Session {
@@ -84,9 +86,36 @@ impl Session {
     }
 
     fn shutdown(&self) {
+        // Kill the Unix process group first to ensure all child processes are terminated
+        kill_process_group(self.child_pid.lock().ok().and_then(|mut g| g.take()));
+        
         if let Ok(mut guard) = self.service.lock() {
             guard.take();
         }
+    }
+}
+
+/// Kill the entire Unix process group to prevent orphan processes.
+/// On Windows, kills the single PID.
+fn kill_process_group(pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", pid)])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
 }
 
@@ -102,10 +131,15 @@ fn content_block_to_value(block: &ContentBlock) -> Value {
         ContentBlock::ResourceLink(link) => {
             json!({ "type": "resource_link", "uri": link.uri, "name": link.name })
         }
-        ContentBlock::Resource(resource) => json!({
-            "type": "resource",
-            "resource": serde_json::to_value(resource).unwrap_or(Value::Null),
-        }),
+        ContentBlock::Resource(resource) => {
+            // EmbeddedResource wraps ResourceContents in `resource` field.
+            // We must extract the inner ResourceContents to match the shape
+            // expected by render_result: { "type": "resource", "resource": { "uri": ..., ... } }
+            json!({
+                "type": "resource",
+                "resource": resource.resource,
+            })
+        }
         // `ContentBlock` is #[non_exhaustive]: future variants render as a
         // placeholder so an rmcp upgrade cannot break the build silently.
         _ => json!({ "type": "unknown" }),
@@ -134,8 +168,13 @@ async fn connect_stdio(
     #[cfg(unix)]
     cmd.process_group(0);
 
-    let transport =
-        TokioChildProcess::new(cmd).map_err(|e| anyhow!("failed to spawn '{command}': {e}"))?;
+    // TokioChildProcess::new() returns the transport, and .id() exposes the
+    // child PID. Capture the PID *before* the transport is moved into
+    // serve_client, otherwise the process group is unreachable and a killed
+    // session leaves the grandchildren running.
+    let transport = TokioChildProcess::new(cmd)
+        .map_err(|e| anyhow!("failed to spawn '{command}': {e}"))?;
+    let child_pid = transport.id();
     let service = tokio::time::timeout(
         Duration::from_millis(timeout_ms.max(1)),
         rmcp::serve_client((), transport),
@@ -148,6 +187,7 @@ async fn connect_stdio(
         service: Mutex::new(Some(service)),
         peer,
         timeout_ms,
+        child_pid: Mutex::new(child_pid),
     })
 }
 
@@ -183,6 +223,7 @@ async fn connect_http(
         service: Mutex::new(Some(service)),
         peer,
         timeout_ms,
+        child_pid: Mutex::new(None),
     })
 }
 
