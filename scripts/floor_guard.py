@@ -17,7 +17,7 @@ Reads CONSTRAINTS.md's rules as code. Three kinds of check:
 * Task guard (P0-3 section 4.3 layer 2, section 6 step 5): one task = one
   branch = one pull request.
   - T1  the branch name or the PR body must name a task code (B-N, STU-N,
-        APP-N, DV-N, DS-N, C-N, `Việc N`, `P0-N step M`). A step code
+        APP-N, DV-N, DS-N, C-N, `Việc N`, `P0-N step M`, `Phase N #M`). A step code
         (`P0-3 step 6`) supersedes the bare project code (`P0-3`) in the
         same text, so two steps of one project are not flagged as the same task.
   - T2  two open pull requests sharing a task code are flagged; the Leader
@@ -75,6 +75,7 @@ TASK_GENERIC = re.compile(r"\b(?:B|STU|APP|DV|DS|C)-\d+\b", re.IGNORECASE)
 TASK_VIEC = re.compile(r"\bviệc\s*(\d+)\b", re.IGNORECASE)
 TASK_STEP = re.compile(r"\bP0-(\d+)[-\s]*(?:step|bước)[-\s]*(\d+)\b", re.IGNORECASE)
 TASK_PSTEP = re.compile(r"\bp0(\d)[-\s]?s(?:tep)?[-\s]*(\d+)\b", re.IGNORECASE)
+TASK_PHASE = re.compile(r"\bphase\s*(\d+)\s*#\s*(\d+)\b", re.IGNORECASE)
 EXEMPT_BRANCH_PREFIXES = ("dependabot/",)
 
 
@@ -231,6 +232,8 @@ def extract_task_codes(text: str) -> set[str]:
         codes.add(f"P0-{m.group(1)}-STEP-{m.group(2)}")
     for m in TASK_PSTEP.finditer(text):
         codes.add(f"P0-{m.group(1)}-STEP-{m.group(2)}")
+    for m in TASK_PHASE.finditer(text):
+        codes.add(f"PHASE-{m.group(1)}-#{m.group(2)}")
     for m in TASK_GENERIC.finditer(text):
         codes.add(m.group(0).upper())
     for m in TASK_VIEC.finditer(text):
@@ -252,7 +255,7 @@ def check_task_code(branch: str, body: str) -> list[Finding]:
         return []
     return [Finding("T1", branch or "PR", 0,
                      "no task code in branch name or PR body: name the task "
-                     "(B-N, STU-N, APP-N, DV-N, DS-N, C-N, Việc N, P0-N step M) "
+                     "(B-N, STU-N, APP-N, DV-N, DS-N, C-N, Việc N, P0-N step M, Phase N #M) "
                      "in the branch or the PR body")]
 
 
