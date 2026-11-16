@@ -20,4 +20,16 @@ exclude_re = [
   # exclusion and kill it with a test where the current model equals
   # the gateway id but not the catalog id (or vice versa).
   "replace \\|\\| with && in is_current_model",
+  # PR #214, session.rs TranscriptWriter::flush: replace flush with ().
+  # EQUIVALENT (waived by ZC Leader, 2026-11-16; verified by independent
+  # review of PR #214): append_line writes every record with
+  # writeln!(w, ...) followed by w.flush(), so the buffer is always
+  # empty when flush() runs; flush() is a no-op and replacing it with
+  # () cannot change any observable behaviour, and no test can kill
+  # this mutant.
+  # EXPIRY: if append_line stops flushing after every record, this
+  # mutant stops being equivalent: remove this exclusion and kill it
+  # with a test that writes a record, calls flush, and checks the
+  # bytes reach disk.
+  "session\\.rs:411:9: replace TranscriptWriter::flush with \\(\\)",
 ]
