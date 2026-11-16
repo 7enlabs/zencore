@@ -169,6 +169,12 @@ pub struct Cli {
     #[arg(short = 'r', long = "resume", num_args = 0..=1, default_missing_value = "")]
     pub resume: Option<String>,
 
+    /// Recall the compacted summaries of the N most recent prior
+    /// sessions in this directory into the new session (summaries only,
+    /// capped at 50 KB, secrets redacted); without a count, recalls 3
+    #[arg(long = "recall", num_args = 0..=1, default_missing_value = "3")]
+    pub recall: Option<usize>,
+
     /// Auto-compact context: auto, off, or a token count
     #[arg(long = "autocompact", value_parser = parse_autocompact)]
     pub autocompact: Option<String>,
@@ -542,7 +548,7 @@ pub struct ImportArgs {
 
 #[derive(Args, Debug, Clone)]
 #[command(
-    after_help = "Examples:\n  zen sessions list              List sessions\n  zen sessions list --all        Include archived sessions\n  zen sessions archive abc123    Archive a session\n  zen sessions delete abc123 --yes  Delete without prompting\n  zen sessions restore abc123    Restore an archived session"
+    after_help = "Examples:\n  zen sessions list              List sessions\n  zen sessions list --all        Include archived sessions\n  zen sessions search keyword    Search this directory's sessions for a keyword\n  zen sessions archive abc123    Archive a session\n  zen sessions delete abc123 --yes  Delete without prompting\n  zen sessions restore abc123    Restore an archived session"
 )]
 pub struct SessionsArgs {
     #[command(subcommand)]
@@ -556,6 +562,12 @@ pub enum SessionSubcommand {
         /// Include archived sessions
         #[arg(long)]
         all: bool,
+    },
+
+    /// Search this directory's sessions for a keyword (case-insensitive)
+    Search {
+        /// Keyword to search for
+        keyword: String,
     },
 
     /// Archive a session
@@ -1413,6 +1425,14 @@ mod tests {
             cli.subcommand,
             Some(Commands::Sessions(s)) if matches!(s.command, SessionSubcommand::Restore { .. })
         ));
+        let cli = parse(&["sessions", "search", "quokka"]);
+        match cli.subcommand {
+            Some(Commands::Sessions(s)) => match s.command {
+                SessionSubcommand::Search { keyword } => assert_eq!(keyword, "quokka"),
+                other => panic!("expected Search, got {:?}", other),
+            },
+            _ => panic!("expected Sessions"),
+        }
     }
 
     #[test]
@@ -1845,6 +1865,16 @@ mod tests {
     fn parse_resume_no_value() {
         let cli = parse(&["--resume"]);
         assert_eq!(cli.resume.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn parse_recall_flag() {
+        let cli = parse(&["--recall"]);
+        assert_eq!(cli.recall, Some(3));
+        let cli = parse(&["--recall", "5"]);
+        assert_eq!(cli.recall, Some(5));
+        let cli = parse(&[]);
+        assert_eq!(cli.recall, None);
     }
 
     #[test]

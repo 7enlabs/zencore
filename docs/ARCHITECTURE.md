@@ -220,6 +220,9 @@ One line per message (plus summary records after compaction). `--continue` opens
 the current directory, `--resume <id|path>` searches all project directories, `--fork-session` copies
 history into a new id, and `--no-session-persistence` writes nothing. On load, only messages after the
 last summary are replayed, so a resumed session starts from the compacted state.
+`zen sessions search <keyword>` searches this directory's transcripts, and `--recall [n]` / `/recall [n]`
+loads the compacted summaries (only) of the N most recent prior sessions into a new session, capped at
+50 KiB with secrets redacted (see `docs/session-format.md`).
 
 ## 9. Output formats (`zen-cli::output`)
 

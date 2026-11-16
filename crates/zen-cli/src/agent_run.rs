@@ -890,6 +890,18 @@ pub(crate) async fn run_agent_with_result(
             crate::session::append_usage(p, session_id, &agent.usage)?;
         }
     }
+    // Cross-session recall (Phase 2 #13): --recall loads the compacted
+    // summaries of prior sessions in this directory ahead of the resumed
+    // history (if any). Summaries only, capped at 50 KB, redacted; the
+    // current session is excluded.
+    if let (Some(n), Some(h)) = (cli.recall, home) {
+        let summaries = crate::recall::recall_summaries(h, cwd, n, Some(session_id));
+        if let Some(block) = crate::recall::recall_block(&summaries) {
+            let mut msgs = vec![zen_core::ChatMessage::user(block)];
+            msgs.extend(agent.messages().iter().cloned());
+            agent.set_messages(msgs);
+        }
+    }
     let usage_before = agent.usage.clone();
 
     let mut local_failed = false;

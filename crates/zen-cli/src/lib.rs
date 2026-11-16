@@ -21,6 +21,7 @@ pub mod ollama;
 pub mod output;
 pub mod planmode;
 pub mod prompt_budget;
+pub mod recall;
 pub mod repl;
 pub mod repl_input;
 pub mod repl_polish;

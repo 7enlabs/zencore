@@ -396,6 +396,22 @@ pub async fn run_repl(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result<()> 
             Err(e) => return Err(e),
         }
     }
+    // Cross-session recall (Phase 2 #13): --recall loads the compacted
+    // summaries of prior sessions in this directory ahead of any resumed
+    // history. Summaries only, capped at 50 KB, redacted.
+    if let (Some(n), Some(h)) = (cli.recall, home) {
+        let current = repl.session_id.clone();
+        let summaries = crate::recall::recall_summaries(h, cwd, n, Some(current.as_str()));
+        if let Some(block) = crate::recall::recall_block(&summaries) {
+            let mut msgs = vec![zen_core::ChatMessage::user(block)];
+            msgs.extend(agent.messages().iter().cloned());
+            agent.set_messages(msgs);
+            println!(
+                "recalled summaries of {} previous session(s)",
+                summaries.len()
+            );
+        }
+    }
     let first_prompt = cli.prompt.join(" ").trim().to_string();
     if !first_prompt.is_empty() {
         match handle_line(
@@ -2235,6 +2251,34 @@ async fn handle_slash(
                     }
                     None => eprintln!("no session found: {}", arg),
                 }
+            }
+        }
+        "/recall" => {
+            if cli.ephemeral {
+                println!("cannot recall sessions in ephemeral mode (nothing is persisted)");
+                return Ok(LineAction::Continue);
+            }
+            let n = match crate::recall::parse_recall_count(&arg) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return Ok(LineAction::Continue);
+                }
+            };
+            let home_dir = home
+                .map(Path::to_path_buf)
+                .unwrap_or_else(std::env::temp_dir);
+            let summaries = crate::recall::recall_summaries(&home_dir, cwd, n, Some(session_id));
+            if let Some(block) = crate::recall::recall_block(&summaries) {
+                let mut msgs = vec![zen_core::ChatMessage::user(block)];
+                msgs.extend(agent.messages().iter().cloned());
+                agent.set_messages(msgs);
+                println!(
+                    "recalled summaries of {} previous session(s)",
+                    summaries.len()
+                );
+            } else {
+                println!("(no previous session summaries to recall)");
             }
         }
         other => {

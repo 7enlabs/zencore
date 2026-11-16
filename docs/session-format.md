@@ -100,3 +100,31 @@ before publishing an export that touched real credentials.
 
 The imported session is a faithful copy of the conversation; it is not
 linked to the original and resuming it does not affect the original.
+
+## Cross-session recall (Phase 2 #13)
+
+A new session can look back at earlier sessions in the same directory.
+Recall loads ONLY the compacted `summary` records, never the raw
+transcript:
+
+```bash
+zen sessions search <keyword>   # find prior sessions by keyword (case-insensitive)
+zen --recall                    # load summaries of the 3 most recent prior sessions
+zen --recall 5                  # load summaries of the 5 most recent prior sessions
+/recall                         # same, inside the REPL (optional count: /recall 5)
+```
+
+Rules:
+
+- Only the latest `summary` record of each session is loaded; sessions
+  without a summary are skipped. The current (or resumed) session is
+  never recalled into itself.
+- Recalled text is redacted like `export --redact`, and the total is
+  capped at 50 KiB (same cap as the delegate handoff envelope): a
+  summary that would overflow the cap is truncated, and nothing further
+  is added.
+- Search matches message and summary text only; JSON keys, ids and
+  timestamps are not searchable. Snippets are redacted the same way.
+  Archived sessions are not searched.
+- Retention is unchanged: transcripts are kept until the user archives
+  or deletes them. There is no 30-day rule.
