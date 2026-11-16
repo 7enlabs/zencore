@@ -205,9 +205,21 @@ jobs:
     # Surviving mutants fail the job. The job gets its own rust-cache
     # namespace: it rebuilds the workspace per mutant batch and cannot
     # share the one-shot cache of the other jobs.
+    # Sharded 12 ways (2026-11-16, PR #213): the single mutants job was
+    # cancelled 3 times at ~33-36 min by a runner shutdown signal
+    # (run 43869850997, attempts 1-3) with zero mutant results in the
+    # log, while the job timeout is 90 min and no new push or run
+    # triggered the workflow concurrency cancel. Each shard tests ~10
+    # of the 121 mutants (round-robin) and should finish in ~15 min,
+    # well under the ~33 min window where the single job kept dying; a
+    # stuck mutant now stalls only its own shard instead of the gate.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { fetch-depth: 0 }
@@ -218,11 +230,17 @@ jobs:
         with: { tool: cargo-mutants }
       - name: Diff against the PR base
         run: git diff ${{ github.event.pull_request.base.sha }}...HEAD > mutants.diff
-      - name: cargo mutants --in-diff
+      - name: cargo mutants --in-diff (shard ${{ matrix.shard }}/12)
         shell: bash
         run: |
           if [ ! -s mutants.diff ]; then
             echo "empty diff - no mutants to check"
             exit 0
           fi
-          cargo mutants --in-diff mutants.diff
+          cargo mutants --in-diff mutants.diff --shard ${{ matrix.shard }}/12 --sharding round-robin --jobs 2
+      - name: Upload shard mutants.out
+        if: ${{ always() && hashFiles('mutants.out/**') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: mutants.out

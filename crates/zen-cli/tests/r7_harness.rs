@@ -45,8 +45,25 @@ async fn r7_snapshot_in_system_prompt_and_stable_across_requests() {
         systems[0]
     );
     assert!(systems[0].contains("src/\n    lib.rs"), "{}", systems[0]);
+    // Viec 5: env-context deltas append a per-request payload after the
+    // stable prompt text, so stability is checked on the stable prefix
+    // only; the env tail is expected to change (full, then deltas).
     assert!(
-        systems.iter().all(|s| s == &systems[0]),
+        systems[0].contains("Env context (turn 0, full snapshot)"),
+        "{}",
+        systems[0]
+    );
+    assert!(
+        systems[1].contains("Env context (turn 1, delta since turn 0)"),
+        "{}",
+        systems[1]
+    );
+    let stable: Vec<&str> = systems
+        .iter()
+        .map(|s| s.split("Env context (turn ").next().unwrap_or(s))
+        .collect();
+    assert!(
+        stable.iter().all(|s| s == &stable[0]),
         "system prompt changed mid-session"
     );
 
