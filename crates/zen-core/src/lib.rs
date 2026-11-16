@@ -1896,4 +1896,10 @@ mod glob_tests {
         let out = format!("{provider:?}");
         assert!(out.contains("DiagnosticsProvider"), "{out}");
     }
+
+    #[test]
+    fn c3_tool_context_cwd_returns_constructed_cwd() {
+        let ctx = ToolContext::new(PathBuf::from("/work/dir"), "sess-1");
+        assert_eq!(ctx.cwd(), PathBuf::from("/work/dir"));
+    }
 }
