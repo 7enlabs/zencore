@@ -1452,12 +1452,30 @@ mod tests {
             "cargo build -p zen-cli --bin zen failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        let built_bin = pick_built_binary(&canonical_bin);
         assert!(
-            canonical_bin.is_file(),
+            built_bin.is_file(),
             "zen binary still not built at {} after `cargo build`",
-            canonical_bin.display()
+            built_bin.display()
         );
-        canonical_bin
+        built_bin
+    }
+
+    /// Pick the built binary path: on Windows cargo lays it out as
+    /// `zen.exe`, but the path resolved from the test fallback
+    /// carries no extension, so the plain path does not exist even
+    /// though the build succeeded. Prefer the path that exists,
+    /// trying the `.exe` spelling before giving up.
+    fn pick_built_binary(canonical_bin: &Path) -> PathBuf {
+        if canonical_bin.is_file() {
+            return canonical_bin.to_path_buf();
+        }
+        let exe_bin = canonical_bin.with_extension("exe");
+        if exe_bin.is_file() {
+            exe_bin
+        } else {
+            canonical_bin.to_path_buf()
+        }
     }
 
     #[test]
@@ -1513,6 +1531,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pick_built_binary_prefers_exe_variant() {
+        // Windows layout (CI run 43973996062): only `zen.exe`
+        // exists, the plain `zen` path does not — the old
+        // `canonical_bin.is_file()` assert panicked even though
+        // the build had succeeded.
+        let dir = std::env::temp_dir().join(format!("zen_lib_exe_pick_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("zen");
+        let exe = dir.join("zen.exe");
+        std::fs::write(&exe, b"fake").unwrap();
+        assert_eq!(pick_built_binary(&plain), exe);
+        // Plain binary wins when it exists (Linux/macOS layout).
+        std::fs::write(&plain, b"fake").unwrap();
+        assert_eq!(pick_built_binary(&plain), plain);
+        // Neither exists: return the canonical path so the caller's
+        // assert reports the path it looked for.
+        std::fs::remove_file(&plain).unwrap();
+        std::fs::remove_file(&exe).unwrap();
+        assert_eq!(pick_built_binary(&plain), plain);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn run_init_only_prints_nonempty_session_start_feedback() {
         // Pins the `!s.trim().is_empty()` filter in run_init_only:
@@ -1526,9 +1567,16 @@ mod tests {
         let bin = option_env!("CARGO_BIN_EXE_zen")
             .map(PathBuf::from)
             .or_else(|| {
-                std::env::current_exe()
-                    .ok()
-                    .and_then(|exe| exe.parent().and_then(|p| p.parent()).map(|p| p.join("zen")))
+                std::env::current_exe().ok().and_then(|exe| {
+                    exe.parent().and_then(|p| p.parent()).map(|p| {
+                        // Windows lays the binary out as
+                        // `zen.exe`; the fallback must carry the
+                        // extension or the resolved path does not
+                        // exist (EXE_EXTENSION is "" on Unix).
+                        p.join("zen")
+                            .with_extension(std::env::consts::EXE_EXTENSION)
+                    })
+                })
             })
             .expect("could not locate the zen binary");
         let bin = ensure_zen_binary_built(bin);
