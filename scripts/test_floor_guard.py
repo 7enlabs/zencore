@@ -133,6 +133,39 @@ class TaskGuard(unittest.TestCase):
         self.assertEqual(fg.extract_task_codes("p03-s6 revive"), {"P0-3-STEP-6"})
         self.assertEqual(fg.extract_task_codes("P0-3-STEP-6"), {"P0-3-STEP-6"})
 
+    def test_extract_phase_code(self):
+        self.assertEqual(fg.extract_task_codes("Phase 2 #13 - cross-session memory"),
+                         {"PHASE-2-#13"})
+        self.assertEqual(fg.extract_task_codes("phase 2 #13"), {"PHASE-2-#13"})
+        self.assertEqual(fg.extract_task_codes("feat: recall (Phase 2 #13) (#210)"),
+                         {"PHASE-2-#13"})
+        self.assertEqual(fg.extract_task_codes("Phase 2#13"), {"PHASE-2-#13"})
+        self.assertEqual(fg.extract_task_codes("Phase 10 #3"), {"PHASE-10-#3"})
+
+    def test_extract_phase_code_rejects_malformed(self):
+        # No #M, no N, non-numeric parts, or trailing junk: not a task code.
+        for text in ("Phase 2 rollout", "Phase 2 (public, v1.0.0)",
+                     "Phase #13", "Phase 2 #", "Phase two #13",
+                     "Phase 2.5 #13", "Phase 2 #13a"):
+            self.assertEqual(fg.extract_task_codes(text), set(), text)
+
+    def test_t1_pass_from_phase_code_body(self):
+        self.assertEqual(fg.check_task_code("feature/cross-session-memory",
+                                            "Cross-session memory (Phase 2 #13)"), [])
+
+    def test_t2_duplicate_found_for_phase_code(self):
+        prs = [{"number": 210, "headRefName": "feature/cross-session-memory",
+                "body": "Phase 2 #13"}]
+        found = fg.check_task_duplicates({"PHASE-2-#13"}, prs, 211)
+        self.assertEqual(len(found), 1)
+        self.assertIn("#210", found[0].msg)
+
+    def test_t2_other_phase_is_not_a_duplicate(self):
+        prs = [{"number": 210, "headRefName": "feature/cross-session-memory",
+                "body": "Phase 2 #13"}]
+        self.assertEqual(fg.check_task_duplicates({"PHASE-2-#14"}, prs, 211), [])
+        self.assertEqual(fg.check_task_duplicates({"PHASE-3-#13"}, prs, 211), [])
+
     def test_extract_no_false_positive_on_dep_name(self):
         self.assertEqual(fg.extract_task_codes("dev/dep-security-rustls-webpki-2"), set())
         self.assertEqual(fg.extract_task_codes("dev/secret-scan-ci"), set())
