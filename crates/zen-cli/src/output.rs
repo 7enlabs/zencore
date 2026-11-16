@@ -959,4 +959,28 @@ mod tests {
         assert_eq!(p["session_id"], "s");
         assert_eq!(p["v"], json!(STREAM_JSON_VERSION));
     }
+
+    #[test]
+    fn c3_set_prompt_input_stores_prompt() {
+        let buf = Arc::new(Buffered::new());
+        let sink = StreamJsonSink::new(
+            buf.clone(),
+            "s".into(),
+            "/w".into(),
+            "m".into(),
+            vec![],
+            vec![],
+            "default".into(),
+            vec![],
+        );
+        assert_eq!(
+            lock_or_recover(&sink.prompt_input, "prompt input").as_deref(),
+            None
+        );
+        sink.set_prompt_input("hello".into());
+        assert_eq!(
+            lock_or_recover(&sink.prompt_input, "prompt input").as_deref(),
+            Some("hello")
+        );
+    }
 }
