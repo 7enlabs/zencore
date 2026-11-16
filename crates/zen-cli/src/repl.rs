@@ -2598,6 +2598,12 @@ fn persist(
     if let Err(e) = writer.persist_turn(before, agent.messages()) {
         eprintln!("warning: could not write transcript: {}", e);
     }
+    // A poisoned lock anywhere in the process marks the session
+    // degraded; flush the transcript explicitly so nothing written so
+    // far is left buffered when the user saves and restarts.
+    if zen_core::lock_recovery::is_degraded() {
+        writer.flush();
+    }
 }
 
 pub type ReplSink = Arc<dyn EventSink>;
@@ -4126,6 +4132,31 @@ mod model_picker_tests {
         assert_eq!(cfg.model, "deepseek-v4.1-flash");
         assert_eq!(cfg.base_url, "https://openrouter.ai/api/v1");
         assert_eq!(cfg.api_key.as_deref(), Some("custom-key"));
+    }
+
+    /// C3: the `persist -> ()` mutant was missed: no test observed
+    /// a turn reaching the transcript file. Persisting must write
+    /// the fresh messages so the turn survives a restart.
+    #[test]
+    fn c3_persist_writes_turn_to_transcript() {
+        let dir = std::env::temp_dir().join(format!("zen_c3_persist_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let transcript = dir.join("sess.jsonl");
+        let backend = std::sync::Arc::new(RecordingBackend {
+            models: std::sync::Mutex::new(vec![]),
+        });
+        let mut agent = test_agent(backend);
+        agent.set_messages(vec![
+            zen_core::ChatMessage::user("hello"),
+            zen_core::ChatMessage::assistant(Some("hi".into()), None),
+        ]);
+        let mut writer = crate::session::TranscriptWriter::new(transcript.clone(), "sess", &dir);
+        super::persist(&mut writer, &[], &agent);
+        assert_eq!(
+            crate::session::load_history(&transcript).unwrap(),
+            agent.messages()
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

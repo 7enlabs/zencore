@@ -6,6 +6,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+use zen_core::lock_recovery::lock_or_recover;
 use zen_core::{Tool, ToolContext, ToolOutput};
 
 pub const JOB_OUTPUT_MAX_CHARS: usize = 30_000;
@@ -108,26 +109,19 @@ pub fn start_job(
                 JobStatus::Killed
             }
         };
-        *st.lock().expect(
-            "job status lock poisoned: holders only assign or clone a JobStatus and cannot panic",
-        ) = end;
+        *lock_or_recover(&st, "job status") = end;
     });
 
-    jobs()
-        .lock()
-        .expect(
-            "job registry lock poisoned: holders only do HashMap insert/get/keys and cannot panic",
-        )
-        .insert(
-            id.clone(),
-            Job {
-                command: command.to_string(),
-                log: log.clone(),
-                read_pos: 0,
-                status,
-                kill_tx: Some(kill_tx),
-            },
-        );
+    lock_or_recover(jobs(), "job registry").insert(
+        id.clone(),
+        Job {
+            command: command.to_string(),
+            log: log.clone(),
+            read_pos: 0,
+            status,
+            kill_tx: Some(kill_tx),
+        },
+    );
     Ok(Started { id, pid, log })
 }
 
@@ -152,11 +146,9 @@ fn kill_tree(pid: Option<u32>) {
 }
 
 fn status_of(id: &str) -> Option<JobStatus> {
-    jobs()
-        .lock()
-        .expect("job registry lock poisoned: holders only do HashMap insert/get/keys and cannot panic")
+    lock_or_recover(jobs(), "job registry")
         .get(id)
-        .map(|j| j.status.lock().expect("job status lock poisoned: holders only assign or clone a JobStatus and cannot panic").clone())
+        .map(|j| lock_or_recover(&j.status, "job status").clone())
 }
 
 pub async fn read_new(
@@ -172,14 +164,12 @@ pub async fn read_new(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let found = {
-        let map = jobs().lock().expect(
-            "job registry lock poisoned: holders only do HashMap insert/get/keys and cannot panic",
-        );
+        let map = lock_or_recover(jobs(), "job registry");
         map.get(id).map(|j| {
             (
                 j.log.clone(),
                 j.read_pos,
-                j.status.lock().expect("job status lock poisoned: holders only assign or clone a JobStatus and cannot panic").clone(),
+                lock_or_recover(&j.status, "job status").clone(),
                 j.command.clone(),
             )
         })
@@ -196,13 +186,7 @@ pub async fn read_new(
     };
     let text = String::from_utf8_lossy(&bytes[..take]).to_string();
     let to = from + take as u64;
-    if let Some(j) = jobs()
-        .lock()
-        .expect(
-            "job registry lock poisoned: holders only do HashMap insert/get/keys and cannot panic",
-        )
-        .get_mut(id)
-    {
+    if let Some(j) = lock_or_recover(jobs(), "job registry").get_mut(id) {
         j.read_pos = to;
     }
     Ok((text, from, to, status, command))
@@ -219,9 +203,7 @@ fn read_from(path: &Path, from: u64) -> std::io::Result<Vec<u8>> {
 
 pub async fn kill_job(id: &str) -> Result<JobStatus, String> {
     let tx = {
-        let mut map = jobs().lock().expect(
-            "job registry lock poisoned: holders only do HashMap insert/get/keys and cannot panic",
-        );
+        let mut map = lock_or_recover(jobs(), "job registry");
         map.get_mut(id).map(|j| j.kill_tx.take())
     };
     let tx = tx.ok_or_else(|| unknown(id))?;
@@ -239,11 +221,7 @@ pub async fn kill_job(id: &str) -> Result<JobStatus, String> {
 }
 
 fn unknown(id: &str) -> String {
-    let mut ids: Vec<String> = jobs()
-        .lock()
-        .expect(
-            "job registry lock poisoned: holders only do HashMap insert/get/keys and cannot panic",
-        )
+    let mut ids: Vec<String> = lock_or_recover(jobs(), "job registry")
         .keys()
         .cloned()
         .collect();

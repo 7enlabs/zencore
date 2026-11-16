@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use zen_core::lock_recovery::lock_or_recover;
 use zen_core::*;
 
 /// Retries of one model request: the first attempt plus this many
@@ -262,18 +263,18 @@ impl OpenAiClient {
     }
 
     pub fn recent_429_count(&self) -> usize {
-        let mut v = self.recent_429s.lock().expect("recent_429s lock must not be poisoned: holders only retain or push timestamps and never panic while holding it");
+        let mut v = lock_or_recover(&self.recent_429s, "recent_429s");
         let cutoff = Instant::now() - Duration::from_secs(5 * 60);
         v.retain(|t| *t >= cutoff);
         v.len()
     }
 
     fn note_429(&self) {
-        self.recent_429s.lock().expect("recent_429s lock must not be poisoned: holders only retain or push timestamps and never panic while holding it").push(Instant::now());
+        lock_or_recover(&self.recent_429s, "recent_429s").push(Instant::now());
     }
 
     fn update_pacer_from_headers(&self, headers: &reqwest::header::HeaderMap) {
-        let mut guard = self.pacer.lock().expect("pacer lock must not be poisoned: holders only read header values and update the rate-limit ceiling and never panic while holding it");
+        let mut guard = lock_or_recover(&self.pacer, "pacer");
         let Some(pacer) = guard.as_mut() else { return };
         for name in [
             "x-ratelimit-limit-requests",
@@ -1854,6 +1855,45 @@ mod tests {
             "the 10 s hint must be slept, elapsed: {elapsed:?}"
         );
         assert!(elapsed.as_millis() < 15_000, "elapsed: {elapsed:?}");
+    }
+
+    /// C3: the 429 counter only changed its lock call, but the
+    /// function-return mutants in `recent_429_count` and `note_429`
+    /// were missed: no test observed the count moving. Noting a 429
+    /// must raise the count, and the count starts at zero.
+    #[test]
+    fn c3_recent_429_count_tracks_noted_429s() {
+        let client = OpenAiClient::new(
+            "https://api.openai.com/v1",
+            Some("test-key".into()),
+            Arc::new(NullSink),
+        );
+        assert_eq!(client.recent_429_count(), 0);
+        client.note_429();
+        assert_eq!(client.recent_429_count(), 1);
+        client.note_429();
+        assert_eq!(client.recent_429_count(), 2);
+    }
+
+    /// C3: the pacer-header update only changed its lock call, but
+    /// the `update_pacer_from_headers -> ()` mutant was missed. A
+    /// `x-ratelimit-limit-requests: 1` header must drop the ceiling
+    /// to 1 rpm, so the second acquire waits out the token refill
+    /// instead of returning at once.
+    #[test]
+    fn c3_pacer_header_update_lowers_ceiling() {
+        let client = OpenAiClient::new(
+            "https://api.openai.com/v1",
+            Some("test-key".into()),
+            Arc::new(NullSink),
+        );
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ratelimit-limit-requests", "1".parse().unwrap());
+        client.update_pacer_from_headers(&headers);
+        let mut pacer = lock_or_recover(&client.pacer, "pacer");
+        let pacer = pacer.as_mut().expect("openai url has a pacer");
+        assert!(pacer.acquire() < Duration::from_secs(1));
+        assert!(pacer.acquire() >= Duration::from_secs(30));
     }
 }
 

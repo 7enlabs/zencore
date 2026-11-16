@@ -1,3 +1,4 @@
+pub mod lock_recovery;
 pub mod secret;
 
 use async_trait::async_trait;
@@ -559,10 +560,7 @@ impl ToolContext {
         }
     }
     pub fn cwd(&self) -> PathBuf {
-        self.cwd
-            .lock()
-            .expect("cwd lock poisoned: cwd is set from plain assignment only")
-            .clone()
+        lock_recovery::lock_or_recover(&self.cwd, "cwd").clone()
     }
 
     pub fn scratch_dir(&self) -> PathBuf {
@@ -1186,11 +1184,7 @@ pub fn resolve_shell(preferred: &str) -> ShellSpec {
     use std::sync::{Mutex, OnceLock};
     static CACHE: OnceLock<Mutex<HashMap<String, ShellSpec>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(s) = cache
-        .lock()
-        .expect("shell cache lock poisoned: cache inserts never panic while holding the lock")
-        .get(preferred)
-    {
+    if let Some(s) = lock_recovery::lock_or_recover(cache, "shell cache").get(preferred) {
         return s.clone();
     }
     let zen_shell = std::env::var("ZEN_SHELL").ok();
@@ -1210,9 +1204,7 @@ pub fn resolve_shell(preferred: &str) -> ShellSpec {
     {
         spec.program = p.to_string_lossy().into_owned();
     }
-    cache
-        .lock()
-        .expect("shell cache lock poisoned: cache inserts never panic while holding the lock")
+    lock_recovery::lock_or_recover(cache, "shell cache")
         .insert(preferred.to_string(), spec.clone());
     spec
 }
@@ -1903,5 +1895,11 @@ mod glob_tests {
         let provider: &dyn DiagnosticsProvider = &DummyProvider;
         let out = format!("{provider:?}");
         assert!(out.contains("DiagnosticsProvider"), "{out}");
+    }
+
+    #[test]
+    fn c3_tool_context_cwd_returns_constructed_cwd() {
+        let ctx = ToolContext::new(PathBuf::from("/work/dir"), "sess-1");
+        assert_eq!(ctx.cwd(), PathBuf::from("/work/dir"));
     }
 }

@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use zen_core::lock_recovery::lock_or_recover;
 use zen_core::{
     PermissionChecker, PermissionDecision, PermissionMode, PermissionSettings, ToolContext,
 };
@@ -578,7 +579,11 @@ impl RulePermissions {
 
     pub fn effective_allow(&self) -> Vec<String> {
         let mut v = self.allow.clone();
-        v.extend(self.dynamic_allow.lock().expect("dynamic_allow lock poisoned: holders only clone or push rule strings and cannot panic").iter().cloned());
+        v.extend(
+            lock_or_recover(&self.dynamic_allow, "dynamic_allow")
+                .iter()
+                .cloned(),
+        );
         v
     }
 
@@ -713,7 +718,7 @@ impl PermissionChecker for RulePermissions {
             return;
         }
         {
-            let mut dyn_rules = self.dynamic_allow.lock().expect("dynamic_allow lock poisoned: holders only clone or push rule strings and cannot panic");
+            let mut dyn_rules = lock_or_recover(&self.dynamic_allow, "dynamic_allow");
             if !dyn_rules.iter().any(|r| r == rule) {
                 dyn_rules.push(rule.to_string());
             }

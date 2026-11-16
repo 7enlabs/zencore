@@ -6,6 +6,7 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use zen_core::lock_recovery::lock_or_recover;
 use zen_core::{AgentEvent, ChatMessage, EventSink, LlmBackend};
 
 use crate::agent_run;
@@ -135,9 +136,7 @@ impl AcpSink {
             params: serde_json::to_value(params).unwrap_or(Value::Null),
         };
         if let Ok(line) = serde_json::to_string(&notif) {
-            let mut out = self.out.lock().expect(
-                "acp stdout lock poisoned: stdout writes never panic while holding the lock",
-            );
+            let mut out = lock_or_recover(&self.out, "acp stdout");
             let _ = writeln!(out, "{line}");
             let _ = out.flush();
         }
@@ -191,9 +190,7 @@ fn emit_assistant(sink: &AcpSink, message: &ChatMessage) {
         });
     }
     if let Some(calls) = message.tool_calls.as_deref() {
-        let mut tools = sink.tools.lock().expect(
-            "acp tools lock poisoned: tool registration never panics while holding the lock",
-        );
+        let mut tools = lock_or_recover(&sink.tools, "acp tools");
         for call in calls {
             tools.insert(call.id.clone(), call.function.name.clone());
             sink.notify(SessionUpdate::ToolCall(ToolCallUpdate {

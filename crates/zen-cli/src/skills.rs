@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use zen_core::lock_recovery::lock_or_recover;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1632,9 +1633,7 @@ impl SkillPermissionGate {
     }
 
     pub fn load_skill(&self, skill: LoadedSkill) {
-        let mut active = self.active.lock().expect(
-            "skill registry lock poisoned: skill loading never panics while holding the lock",
-        );
+        let mut active = lock_or_recover(&self.active, "skill registry");
         if let Some(pos) = active.iter().position(|s| s.name == skill.name) {
             active[pos] = skill;
         } else {
@@ -1643,12 +1642,7 @@ impl SkillPermissionGate {
     }
 
     pub fn active_skills(&self) -> Vec<LoadedSkill> {
-        self.active
-            .lock()
-            .expect(
-                "skill registry lock poisoned: skill loading never panics while holding the lock",
-            )
-            .clone()
+        lock_or_recover(&self.active, "skill registry").clone()
     }
 }
 
@@ -1660,13 +1654,7 @@ impl zen_core::PermissionChecker for SkillPermissionGate {
         read_only: bool,
         ctx: &zen_core::ToolContext,
     ) -> zen_core::PermissionDecision {
-        let active = self
-            .active
-            .lock()
-            .expect(
-                "skill registry lock poisoned: skill loading never panics while holding the lock",
-            )
-            .clone();
+        let active = lock_or_recover(&self.active, "skill registry").clone();
         if active.is_empty() {
             return self.inner.check(tool_name, input, read_only, ctx);
         }

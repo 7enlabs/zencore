@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use zen_core::lock_recovery::lock_or_recover;
 use zen_core::{ChatMessage, ChatRequest, ChatResponse, LlmBackend, ToolDefinition, ToolJournal};
 
 pub const EVENT_LOG_VERSION: u64 = 1;
@@ -43,9 +44,7 @@ impl Recorder {
     }
 
     pub fn set_path(&self, path: PathBuf) {
-        *self.state.lock().expect(
-            "eventlog state lock poisoned: state updates never panic while holding the lock",
-        ) = State {
+        *lock_or_recover(&self.state, "eventlog state") = State {
             path,
             ..Default::default()
         };
@@ -53,10 +52,9 @@ impl Recorder {
 
     fn record_request(&self, req: &ChatRequest) -> Result<u64> {
         let body = serde_json::to_string(req)?;
-        let mut st = self
-            .state
-            .lock()
-            .map_err(|e| anyhow::anyhow!("eventlog state lock poisoned: {e}"))?;
+        // C3: trust the old data on a poisoned lock (Leader decision:
+        // rebuilding from disk would lose unflushed transcript).
+        let mut st = lock_or_recover(&self.state, "eventlog state");
         if !st.scanned {
             let (next, hashes) = scan(&st.path);
             st.next_seq = next;
@@ -120,14 +118,7 @@ impl Recorder {
     }
 
     fn record_response(&self, seq: u64, res: &Result<ChatResponse>) {
-        let path = self
-            .state
-            .lock()
-            .expect(
-                "eventlog state lock poisoned: state updates never panic while holding the lock",
-            )
-            .path
-            .clone();
+        let path = lock_or_recover(&self.state, "eventlog state").path.clone();
         let rec = match res {
             Ok(r) => json!({
                 "type": "response",
@@ -164,9 +155,7 @@ impl Recorder {
 
 impl Recorder {
     fn journal(&self, rec: Value) {
-        let st = self.state.lock().expect(
-            "eventlog state lock poisoned: state updates never panic while holding the lock",
-        );
+        let st = lock_or_recover(&self.state, "eventlog state");
         let res = (|| -> Result<()> {
             use std::io::Write;
             if let Some(parent) = st.path.parent() {
@@ -1025,5 +1014,66 @@ mod tests {
     #[tokio::test]
     async fn dtr_killed_mid_parallel_batch_resume_keeps_the_finished_result() {
         killed_after_one_of_two_tools(Hang("Glob", true)).await;
+    }
+
+    /// C3: a poisoned recorder lock trusts the old data and keeps
+    /// recording instead of crashing the session.
+    #[test]
+    fn c3_poisoned_recorder_state_still_records() {
+        let dir = tmp("c3rec");
+        let path = dir.join("sess.jsonl");
+        let r = Recorder::new(path.clone());
+        // Poison the state lock from another thread.
+        let r2 = r.clone();
+        let handle = std::thread::spawn(move || {
+            let _guard = r2.state.lock().unwrap();
+            panic!("deliberate poison for the C3 test");
+        });
+        let _ = handle.join();
+        assert!(r.state.is_poisoned());
+        let req = ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage::user("hi")],
+            tools: vec![],
+            max_tokens: None,
+        };
+        let seq = r.record_request(&req).unwrap();
+        assert_eq!(seq, 0);
+        r.record_response(seq, &Ok(reply(Some("hello"), None)));
+        assert!(zen_core::lock_recovery::is_degraded());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"type\":\"request\""));
+        assert!(text.contains("\"type\":\"response\""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C3: `set_path` only changed its lock call, but the
+    /// `set_path -> ()` mutant was missed: no test observed the
+    /// recorder moving to a new file. After `set_path`, records must
+    /// land in the new file with the sequence restarted.
+    #[test]
+    fn c3_set_path_moves_recorder_to_new_file() {
+        let dir = tmp("c3path");
+        let first = dir.join("first.jsonl");
+        let second = dir.join("second.jsonl");
+        let r = Recorder::new(first.clone());
+        let req = ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage::user("hi")],
+            tools: vec![],
+            max_tokens: None,
+        };
+        assert_eq!(r.record_request(&req).unwrap(), 0);
+        assert!(first.exists());
+        assert!(!second.exists());
+        r.set_path(second.clone());
+        assert_eq!(r.record_request(&req).unwrap(), 0);
+        assert!(second.exists());
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap().lines().count(),
+            1,
+            "no second record may land in the old file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

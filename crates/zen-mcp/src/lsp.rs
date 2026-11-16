@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use zen_core::LspDiagnostic;
+use zen_core::lock_recovery::lock_or_recover;
 
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -340,7 +341,7 @@ impl LspClient {
             let mut reader = BufReader::new(stdout);
             while let Ok(val) = read_frame(&mut reader).await {
                 if let Some(id) = val.get("id").and_then(id_to_u64) {
-                    let tx = reader_pending.lock().expect("reader_pending lock must not be poisoned: holders only remove or drain pending response senders and never panic while holding it").remove(&id);
+                    let tx = lock_or_recover(&reader_pending, "reader_pending").remove(&id);
                     if let Some(tx) = tx {
                         let _ = tx.send(val);
                     }
@@ -348,25 +349,18 @@ impl LspClient {
                     == Some("textDocument/publishDiagnostics")
                     && let Some((uri, diags)) = parse_publish_diagnostics(&val)
                 {
-                    reader_diagnostics
-                        .lock()
-                        .expect("diagnostics lock must not be poisoned: holders only insert or drain the diagnostics map and never panic while holding it")
-                        .insert(uri, diags);
+                    lock_or_recover(&reader_diagnostics, "diagnostics").insert(uri, diags);
                     reader_notify.notify_waiters();
                 }
             }
-
             // The server closed stdout: drop its diagnostics so a later
             // read never reports errors from a dead server, and wake any
             // waiter so a diagnostics wait ends promptly instead of
             // running to its cap.
-            reader_diagnostics
-                .lock()
-                .expect("diagnostics lock must not be poisoned: holders only insert or drain the diagnostics map and never panic while holding it")
-                .clear();
+            lock_or_recover(&reader_diagnostics, "diagnostics").clear();
             reader_notify.notify_waiters();
 
-            let mut map = reader_pending.lock().expect("reader_pending lock must not be poisoned: holders only remove or drain pending response senders and never panic while holding it");
+            let mut map = lock_or_recover(&reader_pending, "reader_pending");
             for (_, tx) in map.drain() {
                 let _ = tx.send(
                     json!({"jsonrpc":"2.0","error":{"code":-32000,"message":"LSP server closed"}}),
@@ -931,14 +925,14 @@ impl LspManager {
     /// tests use short values). Values are clamped to at least 1ms so
     /// a zero config can never spin the wait loop.
     pub fn set_diagnostics_timing(&self, timeout: Duration, debounce: Duration) {
-        let mut timing = self.timing.lock().expect("diagnostics timing lock must not be poisoned: holders only read or replace two Durations and never panic while holding it");
+        let mut timing = lock_or_recover(&self.timing, "diagnostics timing");
         timing.timeout = timeout.max(Duration::from_millis(1));
         timing.debounce = debounce.max(Duration::from_millis(1));
     }
 
     /// Effective diagnostics wait timing (timeout cap, debounce).
     pub fn diagnostics_timing(&self) -> (Duration, Duration) {
-        let timing = self.timing.lock().expect("diagnostics timing lock must not be poisoned: holders only read or replace two Durations and never panic while holding it");
+        let timing = lock_or_recover(&self.timing, "diagnostics timing");
         (timing.timeout, timing.debounce)
     }
 
@@ -999,7 +993,7 @@ impl LspManager {
     }
 
     pub fn set_server_command(&self, lang: LspLanguage, command: String, args: Vec<String>) {
-        self.overrides.lock().expect("overrides lock must not be poisoned: holders only insert or read server command overrides and never panic while holding it").insert(lang, (command, args));
+        lock_or_recover(&self.overrides, "overrides").insert(lang, (command, args));
     }
 
     pub(crate) async fn connection_for(&self, path: &Path) -> anyhow::Result<Arc<LspConnection>> {

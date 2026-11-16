@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Mutex;
+use zen_core::lock_recovery::lock_or_recover;
 use zen_core::{AgentEvent, EventSink};
 
 const ARG_MAX: usize = 80;
@@ -42,9 +43,7 @@ impl ReplProgressSink {
     }
 
     fn register_card(&self, id: &str, name: &str, arg: String) -> usize {
-        let mut cards = self.cards.lock().expect(
-            "repl progress cards lock poisoned: card updates never panic while holding the lock",
-        );
+        let mut cards = lock_or_recover(&self.cards, "repl progress cards");
         let n = cards.len() + 1;
         cards.push(ToolCard {
             n,
@@ -54,26 +53,13 @@ impl ReplProgressSink {
             is_error: false,
             expanded: false,
         });
-        self.by_id
-            .lock()
-            .expect(
-                "repl progress by-id lock poisoned: card registration never panics while holding the lock",
-            )
-            .insert(id.to_string(), cards.len() - 1);
+        lock_or_recover(&self.by_id, "repl progress by-id").insert(id.to_string(), cards.len() - 1);
         n
     }
 
     fn attach_result(&self, id: &str, content: &str, is_error: bool) -> Option<usize> {
-        let idx = *self
-            .by_id
-            .lock()
-            .expect(
-                "repl progress by-id lock poisoned: card registration never panics while holding the lock",
-            )
-            .get(id)?;
-        let mut cards = self.cards.lock().expect(
-            "repl progress cards lock poisoned: card updates never panic while holding the lock",
-        );
+        let idx = *lock_or_recover(&self.by_id, "repl progress by-id").get(id)?;
+        let mut cards = lock_or_recover(&self.cards, "repl progress cards");
         let card = cards.get_mut(idx)?;
         card.result = Some(store_result(content));
         card.is_error = is_error;
@@ -84,9 +70,7 @@ impl ReplProgressSink {
     /// driven by the /expand REPL command. With no number, the most recent
     /// finished card is toggled. Returns the text the REPL prints.
     pub fn toggle_expand(&self, n: Option<usize>) -> String {
-        let mut cards = self.cards.lock().expect(
-            "repl progress cards lock poisoned: card updates never panic while holding the lock",
-        );
+        let mut cards = lock_or_recover(&self.cards, "repl progress cards");
         let idx = match n {
             Some(n) => cards.iter().position(|c| c.n == n),
             None => cards.iter().rposition(|c| c.result.is_some()),

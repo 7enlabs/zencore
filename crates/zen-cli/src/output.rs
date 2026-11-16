@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use zen_core::lock_recovery::lock_or_recover;
 use zen_core::{AgentEvent, RunResult};
 
 pub struct Buffered {
@@ -22,10 +23,7 @@ impl Buffered {
         }
     }
     pub fn text(&self) -> String {
-        String::from_utf8_lossy(&self.out.lock().expect(
-            "buffered output lock poisoned: buffer writes never panic while holding the lock",
-        ))
-        .to_string()
+        String::from_utf8_lossy(&lock_or_recover(&self.out, "buffered output")).to_string()
     }
     pub fn write_str(&self, s: &str) {
         self.write_bytes(s.as_bytes());
@@ -37,9 +35,7 @@ impl Buffered {
         self.write_bytes(&line);
     }
     fn write_bytes(&self, bytes: &[u8]) {
-        let mut g = self.out.lock().expect(
-            "buffered output lock poisoned: buffer writes never panic while holding the lock",
-        );
+        let mut g = lock_or_recover(&self.out, "buffered output");
         if self.passthrough {
             let mut so = std::io::stdout().lock();
 
@@ -246,27 +242,15 @@ impl StreamJsonSink {
     }
 
     pub fn set_prompt_input(&self, prompt: String) {
-        *self
-            .prompt_input
-            .lock()
-            .expect("prompt input lock poisoned: prompt input is set from plain assignment only") =
-            Some(prompt);
+        *lock_or_recover(&self.prompt_input, "prompt input") = Some(prompt);
     }
 
     pub fn set_mcp_errors(&self, errors: Vec<(String, String)>) {
-        *self
-            .mcp_errors
-            .lock()
-            .expect("mcp errors lock poisoned: error list is set from plain assignment only") =
-            errors;
+        *lock_or_recover(&self.mcp_errors, "mcp errors") = errors;
     }
 
     pub fn set_folder_trusted(&self, trusted: bool) {
-        *self
-            .folder_trusted
-            .lock()
-            .expect("folder trusted lock poisoned: trust flag is set from plain assignment only") =
-            Some(trusted);
+        *lock_or_recover(&self.folder_trusted, "folder trusted") = Some(trusted);
     }
 
     pub fn init_now(&self) {
@@ -287,17 +271,10 @@ impl StreamJsonSink {
             "permissionMode": self.permission_mode,
             "slash_commands": self.slash_commands,
         });
-        if let Some(t) = *self
-            .folder_trusted
-            .lock()
-            .expect("folder trusted lock poisoned: trust flag is set from plain assignment only")
-        {
+        if let Some(t) = *lock_or_recover(&self.folder_trusted, "folder trusted") {
             line["folder_trusted"] = t.into();
         }
-        let errors = self
-            .mcp_errors
-            .lock()
-            .expect("mcp errors lock poisoned: error list is set from plain assignment only");
+        let errors = lock_or_recover(&self.mcp_errors, "mcp errors");
         if !errors.is_empty() {
             line["mcp_server_errors"] = errors
                 .iter()
@@ -981,5 +958,29 @@ mod tests {
         assert_eq!(p["elapsed_ms"], 12_345);
         assert_eq!(p["session_id"], "s");
         assert_eq!(p["v"], json!(STREAM_JSON_VERSION));
+    }
+
+    #[test]
+    fn c3_set_prompt_input_stores_prompt() {
+        let buf = Arc::new(Buffered::new());
+        let sink = StreamJsonSink::new(
+            buf.clone(),
+            "s".into(),
+            "/w".into(),
+            "m".into(),
+            vec![],
+            vec![],
+            "default".into(),
+            vec![],
+        );
+        assert_eq!(
+            lock_or_recover(&sink.prompt_input, "prompt input").as_deref(),
+            None
+        );
+        sink.set_prompt_input("hello".into());
+        assert_eq!(
+            lock_or_recover(&sink.prompt_input, "prompt input").as_deref(),
+            Some("hello")
+        );
     }
 }

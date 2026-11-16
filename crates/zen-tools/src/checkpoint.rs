@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use zen_core::FileCheckpoints;
+use zen_core::lock_recovery::lock_or_recover_status;
 
 pub const DEFAULT_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
@@ -89,6 +90,11 @@ pub struct Checkpoints {
     dir: PathBuf,
     max_bytes: u64,
     state: Mutex<State>,
+    /// Set once the state has been rebuilt after a poison. A poisoned
+    /// mutex stays poisoned, so every later lock also reports a
+    /// recovery; without this flag the in-flight turn would be dropped
+    /// on every call instead of only once.
+    rebuilt: std::sync::atomic::AtomicBool,
 }
 
 fn stamp(bytes: &[u8]) -> u64 {
@@ -96,6 +102,23 @@ fn stamp(bytes: &[u8]) -> u64 {
     bytes.len().hash(&mut h);
     bytes.hash(&mut h);
     h.finish()
+}
+
+/// Highest turn id with a backup directory on disk, if any. Turn
+/// directories are named by turn id (`<dir>/<turn_id>/<n>.bak`).
+fn max_turn_dir(dir: &Path) -> Option<u64> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut max: Option<u64> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(id) = name.to_str().and_then(|s| s.parse::<u64>().ok()) else {
+            continue;
+        };
+        if entry.path().is_dir() {
+            max = Some(max.map_or(id, |m| m.max(id)));
+        }
+    }
+    max
 }
 
 fn label_of(prompt: &str) -> String {
@@ -108,6 +131,46 @@ fn label_of(prompt: &str) -> String {
 }
 
 impl Checkpoints {
+    /// Lock the checkpoint state, rebuilding it from the on-disk
+    /// backups when the mutex is poisoned.
+    ///
+    /// The in-memory state is only a turn index; the backups
+    /// themselves (`<turn>/<n>.bak`) are the consistent snapshot on
+    /// disk. A poisoned lock means a holder panicked mid-update, so
+    /// the in-flight `current` turn may be half-written: an entry may
+    /// have been recorded without its `after` stamp, or a turn may
+    /// have been closed without being pushed to `done`. Rebuild drops
+    /// the in-flight turn and keeps the completed `done` turns (whole
+    /// turns only, closed before the poison), then re-derives
+    /// `next_id` from the turn directories on disk so a new turn
+    /// never reuses an existing backup directory. Entry paths are not
+    /// stored on disk, so a dropped turn cannot be rebuilt entry by
+    /// entry; dropping it is the safe degraded behavior. A turn is
+    /// the consistency unit: finished turns were flushed to disk,
+    /// the in-flight turn may be mid-update, so dropping it and
+    /// keeping finished turns is the last consistent snapshot by
+    /// design (Leader decision, msg 13600). History before the
+    /// recovery point may be inconsistent, so undo across that
+    /// boundary requires an explicit force.
+    ///
+    /// The drop runs only on the first recovery after the poison: a
+    /// poisoned mutex stays poisoned, so every later lock also
+    /// reports a recovery, and dropping `current` there would discard
+    /// every turn started after the first recovery. Re-deriving
+    /// `next_id` is idempotent, so it runs on every recovery.
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, State> {
+        let (mut guard, recovered) = lock_or_recover_status(&self.state, "checkpoint state");
+        if recovered {
+            if !self.rebuilt.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                guard.current = None;
+            }
+            if let Some(max) = max_turn_dir(&self.dir) {
+                guard.next_id = guard.next_id.max(max + 1);
+            }
+        }
+        guard
+    }
+
     pub fn new(dir: PathBuf) -> Self {
         Self::with_max_bytes(dir, DEFAULT_MAX_FILE_BYTES)
     }
@@ -121,6 +184,7 @@ impl Checkpoints {
                 current: None,
                 done: Vec::new(),
             }),
+            rebuilt: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -129,7 +193,7 @@ impl Checkpoints {
     }
 
     pub fn start_turn(&self, prompt: &str) {
-        let mut st = self.state.lock().expect("checkpoint state lock poisoned: critical sections only touch in-memory turn bookkeeping and invariant-checked Options");
+        let mut st = self.lock_state();
         Self::close_current(&mut st);
         let id = st.next_id;
         st.next_id += 1;
@@ -149,7 +213,7 @@ impl Checkpoints {
     }
 
     pub fn last_turn(&self) -> Option<Turn> {
-        let mut st = self.state.lock().expect("checkpoint state lock poisoned: critical sections only touch in-memory turn bookkeeping and invariant-checked Options");
+        let mut st = self.lock_state();
         Self::close_current(&mut st);
         st.done.last().cloned()
     }
@@ -159,7 +223,7 @@ impl Checkpoints {
     /// `after` is none - are skipped), so the preview the user
     /// confirms is the undo that actually runs.
     pub fn preview_last_turn(&self) -> Option<UndoReport> {
-        let mut st = self.state.lock().expect("checkpoint state lock poisoned: critical sections only touch in-memory turn bookkeeping and invariant-checked Options");
+        let mut st = self.lock_state();
         Self::close_current(&mut st);
         let turn = st.done.last()?;
         let mut report = UndoReport {
@@ -184,7 +248,7 @@ impl Checkpoints {
     }
 
     pub fn depth(&self) -> usize {
-        let mut st = self.state.lock().expect("checkpoint state lock poisoned: critical sections only touch in-memory turn bookkeeping and invariant-checked Options");
+        let mut st = self.lock_state();
         Self::close_current(&mut st);
         st.done.len()
     }
@@ -211,7 +275,7 @@ impl Checkpoints {
     }
 
     pub fn undo(&self, force: bool) -> Result<UndoReport, UndoError> {
-        let mut st = self.state.lock().expect("checkpoint state lock poisoned: critical sections only touch in-memory turn bookkeeping and invariant-checked Options");
+        let mut st = self.lock_state();
         Self::close_current(&mut st);
         let Some(turn) = st.done.last() else {
             return Err(UndoError::Nothing);
@@ -302,7 +366,7 @@ impl FileCheckpoints for Checkpoints {
     }
 
     fn before_write(&self, path: &Path) -> Option<String> {
-        let mut st = self.state.lock().expect("checkpoint state lock poisoned: critical sections only touch in-memory turn bookkeeping and invariant-checked Options");
+        let mut st = self.lock_state();
         if st.current.is_none() {
             let id = st.next_id;
             st.next_id += 1;
@@ -334,7 +398,7 @@ impl FileCheckpoints for Checkpoints {
     }
 
     fn after_write(&self, path: &Path, content: &[u8]) {
-        let mut st = self.state.lock().expect("checkpoint state lock poisoned: critical sections only touch in-memory turn bookkeeping and invariant-checked Options");
+        let mut st = self.lock_state();
         if let Some(e) = st
             .current
             .as_mut()
@@ -674,5 +738,58 @@ mod tests {
         assert_eq!(r.restored, preview.restored);
         assert_eq!(r.removed, preview.removed);
         assert_eq!(c.preview_last_turn(), None);
+    }
+
+    /// C3: a poisoned checkpoint lock rebuilds from disk instead of
+    /// crashing. The in-flight turn is dropped, completed turns stay
+    /// undoable, and the next turn id comes from the backup
+    /// directories on disk rather than the stale in-memory counter.
+    #[test]
+    fn c3_poisoned_state_rebuilds_from_disk() {
+        let d = tmp("c3ckpt");
+        let a = d.join("a.txt");
+        std::fs::write(&a, "old\n").unwrap();
+        let c = std::sync::Arc::new(Checkpoints::new(d.join(".ck")));
+        c.start_turn("t1");
+        write(&c, &a, "new\n");
+        c.start_turn("t2");
+        write(&c, &a, "newer\n");
+        // A backup directory with a higher id than the in-memory
+        // counter: after recovery the next turn must not reuse it.
+        std::fs::create_dir_all(d.join(".ck/9")).unwrap();
+        // Poison the state lock from another thread.
+        let c2 = c.clone();
+        let handle = std::thread::spawn(move || {
+            let _guard = c2.state.lock().unwrap();
+            panic!("deliberate poison for the C3 test");
+        });
+        let _ = handle.join();
+        assert!(c.state.is_poisoned());
+        // The first lock after the poison rebuilds: the in-flight
+        // turn (t2) is dropped, completed t1 stays. The degraded flag
+        // is set by the first recovery, not by the poison itself.
+        assert_eq!(c.depth(), 1);
+        assert!(zen_core::lock_recovery::is_degraded());
+        // The new turn takes its id from disk (9 + 1), so its backup
+        // lands in .ck/10, not in the stale counter's .ck/3.
+        c.start_turn("t3");
+        write(&c, &a, "after recovery\n");
+        assert!(
+            d.join(".ck/10").exists(),
+            "new turn must not reuse a backup dir"
+        );
+        // Undo walks back through the recovered turn (id 10, taken
+        // from disk), then t1. The second undo needs force: the
+        // dropped t2 wrote "newer" after t1, so the file no longer
+        // matches t1's after-stamp; that is the expected cost of
+        // dropping the in-flight turn.
+        let r = c.undo(false).unwrap();
+        assert_eq!(r.turn_id, 10);
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "newer\n");
+        assert_eq!(c.depth(), 1);
+        let r = c.undo(true).unwrap();
+        assert_eq!(r.turn_id, 1);
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "old\n");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
