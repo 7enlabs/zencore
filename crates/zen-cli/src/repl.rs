@@ -5394,7 +5394,11 @@ mod pr208_mutant_tests {
             .await
             .unwrap();
             assert!(matches!(action, LineAction::Continue));
-            assert!(agent.ctx.extra_dirs.contains(&new_dir));
+            // `/add-dir` stores the canonicalized path, which on
+            // Windows carries the `\\?\` verbatim prefix, so compare
+            // against the canonicalized dir, not the raw temp path.
+            let canonical = new_dir.canonicalize().unwrap();
+            assert!(agent.ctx.extra_dirs.contains(&canonical));
             match system_message {
                 Some(text) if !text.trim().is_empty() => {
                     assert_eq!(agent.pending_hook_context, vec![text]);

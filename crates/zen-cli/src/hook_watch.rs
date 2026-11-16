@@ -238,6 +238,28 @@ mod tests {
         dir
     }
 
+    /// Rewrite `path` with `contents`, ensuring the new mtime is
+    /// strictly later than the mtime the watcher snapshotted: NTFS
+    /// (Windows) only ticks the file clock about every 15 ms, so two
+    /// writes inside one tick leave the mtime unchanged and the
+    /// watcher legitimately sees no change. Rewrite (sleeping briefly
+    /// between attempts) until the mtime actually advances, instead
+    /// of assuming the clock has ticked.
+    fn rewrite_with_newer_mtime(path: &Path, contents: &str) {
+        let before = mtime(path);
+        for _ in 0..100 {
+            std::fs::write(path, contents).unwrap();
+            if mtime(path).is_some_and(|t| Some(t) > before) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!(
+            "file mtime did not advance after rewrite: {}",
+            path.display()
+        );
+    }
+
     #[test]
     fn config_watcher_poll_reports_change_with_source() {
         // Kills the whole-body replacements of ConfigWatcher::poll
@@ -314,7 +336,10 @@ mod tests {
     fn file_watcher_poll_reports_static_change() {
         // Kills the whole-body replacements of FileWatcher::poll: the
         // poll must return the real changed path with the real event,
-        // not an empty vec or a dummy path with "" / "xyzzy".
+        // not an empty vec or a dummy path with "" / "xyzzy". The
+        // rewrite must advance the mtime (see
+        // rewrite_with_newer_mtime): on Windows two writes inside one
+        // file-clock tick leave the mtime unchanged.
         let dir = hook_watch_tmp("file_static");
         let file = dir.join(".envrc");
         std::fs::write(&file, "one").unwrap();
@@ -324,7 +349,7 @@ mod tests {
         let mut w = FileWatcher::new(&dir, &hooks);
         assert!(w.poll().is_empty(), "snapshot is clean at start");
 
-        std::fs::write(&file, "two").unwrap();
+        rewrite_with_newer_mtime(&file, "two");
         assert_eq!(w.poll(), vec![(file.clone(), "change")]);
         assert!(w.poll().is_empty(), "each change is reported once");
         std::fs::remove_dir_all(&dir).ok();
@@ -346,7 +371,10 @@ mod tests {
             "watching a path must snapshot it, not report it"
         );
 
-        std::fs::write(&dynamic, "two").unwrap();
+        // The rewrite must advance the mtime (see
+        // rewrite_with_newer_mtime): on Windows two writes inside one
+        // file-clock tick leave the mtime unchanged.
+        rewrite_with_newer_mtime(&dynamic, "two");
         assert_eq!(w.poll(), vec![(dynamic.clone(), "change")]);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -391,7 +419,10 @@ mod tests {
         w.watch(file.clone());
         assert!(w.poll().is_empty(), "watch must snapshot, not report");
 
-        std::fs::write(&file, "two").unwrap();
+        // The rewrite must advance the mtime (see
+        // rewrite_with_newer_mtime): on Windows two writes inside one
+        // file-clock tick leave the mtime unchanged.
+        rewrite_with_newer_mtime(&file, "two");
         assert_eq!(w.poll(), vec![(file.clone(), "change")]);
         std::fs::remove_dir_all(&dir).ok();
     }

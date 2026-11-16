@@ -1373,15 +1373,66 @@ mod tests {
         }
     }
 
+    /// Build the `zen` binary when the test runner did not build it:
+    /// plain `cargo test -p zen-cli --lib` compiles only the lib test
+    /// binary, so `target/debug/zen` does not exist yet, and CI runs
+    /// `cargo test --workspace` on a fresh machine with no prebuilt
+    /// binary either. Building here (same target dir and profile as
+    /// the test binary, deps already fresh) keeps the test
+    /// self-contained instead of depending on how cargo was invoked.
+    fn ensure_zen_binary_built(bin: PathBuf) -> PathBuf {
+        if bin.is_file() {
+            return bin;
+        }
+        // The binary lives in <target>/<profile>/zen; build it into
+        // that same directory.
+        let profile_dir = bin.parent().expect("zen binary path has a parent dir");
+        let target_dir = profile_dir
+            .parent()
+            .expect("zen profile dir has a parent dir");
+        let profile = profile_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("debug");
+        let mut cmd = std::process::Command::new(env!("CARGO"));
+        cmd.arg("build")
+            .arg("-p")
+            .arg("zen-cli")
+            .arg("--bin")
+            .arg("zen")
+            .arg("--target-dir")
+            .arg(target_dir);
+        if profile == "release" {
+            cmd.arg("--release");
+        } else if profile != "debug" {
+            cmd.arg("--profile").arg(profile);
+        }
+        let output = cmd
+            .output()
+            .expect("spawn `cargo build -p zen-cli --bin zen`");
+        assert!(
+            output.status.success(),
+            "cargo build -p zen-cli --bin zen failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            bin.is_file(),
+            "zen binary still not built at {} after `cargo build`",
+            bin.display()
+        );
+        bin
+    }
+
     #[tokio::test]
     async fn run_init_only_prints_nonempty_session_start_feedback() {
         // Pins the `!s.trim().is_empty()` filter in run_init_only:
         // deleting the `!` keeps only empty feedback, so a
         // SessionStart hook that prints text would print nothing.
         // The print is stdout-only, so this runs the real binary as a
-        // subprocess and reads its stdout. The binary must be built
-        // from the same source (plain `cargo test -p zen-cli`, not
-        // `--lib`, which does not build it).
+        // subprocess and reads its stdout. The binary is built here
+        // when the test runner did not build it (plain
+        // `cargo test -p zen-cli --lib` compiles only the lib test
+        // binary, and CI has no prebuilt binary).
         let bin = option_env!("CARGO_BIN_EXE_zen")
             .map(PathBuf::from)
             .or_else(|| {
@@ -1390,11 +1441,7 @@ mod tests {
                     .and_then(|exe| exe.parent().and_then(|p| p.parent()).map(|p| p.join("zen")))
             })
             .expect("could not locate the zen binary");
-        assert!(
-            bin.is_file(),
-            "zen binary not built at {}: run `cargo test -p zen-cli` (not --lib) first",
-            bin.display()
-        );
+        let bin = ensure_zen_binary_built(bin);
         let marker = format!("INIT-FEEDBACK-{}", uuid::Uuid::new_v4());
         let home =
             std::env::temp_dir().join(format!("zen_lib_initonly_home_{}", uuid::Uuid::new_v4()));
