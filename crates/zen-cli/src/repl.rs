@@ -1222,7 +1222,16 @@ async fn apply_picked_model(
     home: Option<&Path>,
     cwd: &Path,
 ) {
-    match switch_model_with_hooks(id, "picker", cfg, agent, repl, home).await {
+    match switch_model_with_hooks(ModelSwitchRequest {
+        requested: id,
+        source: "picker",
+        cfg,
+        agent,
+        repl,
+        home,
+    })
+    .await
+    {
         Ok(msg) => {
             // A pinned model turns auto off.
             repl.auto_model = false;
@@ -1232,20 +1241,33 @@ async fn apply_picked_model(
     }
 }
 
+/// Everything a model switch with hooks needs: what was requested and
+/// where the switch came from, plus the mutable session state the switch
+/// touches. One argument so the hook runner needs no
+/// `#[allow(clippy::too_many_arguments)]`.
+struct ModelSwitchRequest<'a, 'b> {
+    requested: &'a str,
+    source: &'a str,
+    cfg: &'a mut crate::settings::ResolvedConfig,
+    agent: &'a mut zen_agent::Agent,
+    repl: &'a mut ReplState<'b>,
+    home: Option<&'a Path>,
+}
+
 /// Run `PreModelSwitch` hooks before a model switch and `PostModelSwitch`
 /// after it. A Pre hook may block the switch (exit 2 / decision block /
 /// `permissionDecision: "deny"`) or ask the user to confirm it; the Post
 /// hook's `additionalContext` is stashed for the next turn. Returns the
 /// switch message, or the reason the switch did not happen.
-#[allow(clippy::too_many_arguments)]
-async fn switch_model_with_hooks(
-    requested: &str,
-    source: &str,
-    cfg: &mut crate::settings::ResolvedConfig,
-    agent: &mut zen_agent::Agent,
-    repl: &mut ReplState<'_>,
-    home: Option<&Path>,
-) -> Result<String, String> {
+async fn switch_model_with_hooks(req: ModelSwitchRequest<'_, '_>) -> Result<String, String> {
+    let ModelSwitchRequest {
+        requested,
+        source,
+        cfg,
+        agent,
+        repl,
+        home,
+    } = req;
     use zen_core::HookEvent;
     let from = agent.config.model.clone();
     let context_tokens = zen_core::estimate_tokens(agent.messages());
@@ -1629,7 +1651,15 @@ async fn handle_slash(
                 {
                     Some(entry) => {
                         let id = entry.id.to_string();
-                        match switch_model_with_hooks(&id, "command", cfg, agent, repl, home).await
+                        match switch_model_with_hooks(ModelSwitchRequest {
+                            requested: &id,
+                            source: "command",
+                            cfg,
+                            agent,
+                            repl,
+                            home,
+                        })
+                        .await
                         {
                             Ok(msg) => {
                                 repl.auto_model = true;
@@ -1651,7 +1681,15 @@ async fn handle_slash(
             } else {
                 match pick_model(&arg, &rows) {
                     Ok(id) => {
-                        match switch_model_with_hooks(&id, "command", cfg, agent, repl, home).await
+                        match switch_model_with_hooks(ModelSwitchRequest {
+                            requested: &id,
+                            source: "command",
+                            cfg,
+                            agent,
+                            repl,
+                            home,
+                        })
+                        .await
                         {
                             Ok(msg) => {
                                 // A pinned model turns auto off.
@@ -1679,7 +1717,15 @@ async fn handle_slash(
                 match crate::models::provider_default_model(&arg) {
                     Some(entry) => {
                         let id = entry.id.to_string();
-                        match switch_model_with_hooks(&id, "command", cfg, agent, repl, home).await
+                        match switch_model_with_hooks(ModelSwitchRequest {
+                            requested: &id,
+                            source: "command",
+                            cfg,
+                            agent,
+                            repl,
+                            home,
+                        })
+                        .await
                         {
                             Ok(msg) => {
                                 repl.auto_model = true;
@@ -2556,8 +2602,15 @@ async fn handle_slash(
                         // A refused route (the provider key is unset)
                         // prints the reason and skips the turn instead
                         // of sending the id to the wrong gateway.
-                        if let Err(e) =
-                            switch_model_with_hooks(m, "command", cfg, agent, repl, home).await
+                        if let Err(e) = switch_model_with_hooks(ModelSwitchRequest {
+                            requested: m,
+                            source: "command",
+                            cfg,
+                            agent,
+                            repl,
+                            home,
+                        })
+                        .await
                         {
                             eprintln!("{e}");
                             return Ok(LineAction::Continue);
