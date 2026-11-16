@@ -1373,6 +1373,46 @@ mod tests {
         }
     }
 
+    /// Split a `zen` binary path into the cargo target dir, the
+    /// profile, and the canonical `<target>/<profile>/zen` path.
+    ///
+    /// Cargo normally lays the binary out as
+    /// `<target>/<profile>/zen`, but on CI `CARGO_BIN_EXE_zen` can
+    /// resolve to the build-script output dir
+    /// `<target>/<profile>/build/zen-cli/<hash>/zen`, where the
+    /// parent dir name is a hash, not a profile — passing that hash
+    /// to `cargo build --profile` fails with `<hash> is not defined`.
+    /// Walk up to the `target` dir instead and take the profile as
+    /// the component right after it, so both layouts resolve to the
+    /// same canonical binary. Paths with no `target` component fall
+    /// back to the old layout (parent dir = profile, grandparent =
+    /// target dir, binary path unchanged).
+    fn resolve_zen_build_dirs(bin: &Path) -> (PathBuf, String, PathBuf) {
+        let file_name = bin
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_else(|| std::ffi::OsString::from("zen"));
+        for ancestor in bin.ancestors() {
+            if ancestor.file_name().is_some_and(|n| n == "target")
+                && let Ok(rel) = bin.strip_prefix(ancestor)
+                && rel.components().count() >= 2
+                && let Some(profile) = rel.components().next().and_then(|c| c.as_os_str().to_str())
+            {
+                let canonical = ancestor.join(profile).join(&file_name);
+                return (ancestor.to_path_buf(), profile.to_string(), canonical);
+            }
+        }
+        // Fallback: no `target` component (e.g. a relocated binary).
+        let profile_dir = bin.parent().unwrap_or_else(|| Path::new(""));
+        let target_dir = profile_dir.parent().unwrap_or_else(|| Path::new(""));
+        let profile = profile_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("debug")
+            .to_string();
+        (target_dir.to_path_buf(), profile, bin.to_path_buf())
+    }
+
     /// Build the `zen` binary when the test runner did not build it:
     /// plain `cargo test -p zen-cli --lib` compiles only the lib test
     /// binary, so `target/debug/zen` does not exist yet, and CI runs
@@ -1385,15 +1425,12 @@ mod tests {
             return bin;
         }
         // The binary lives in <target>/<profile>/zen; build it into
-        // that same directory.
-        let profile_dir = bin.parent().expect("zen binary path has a parent dir");
-        let target_dir = profile_dir
-            .parent()
-            .expect("zen profile dir has a parent dir");
-        let profile = profile_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("debug");
+        // that same directory. Resolve the layout via
+        // resolve_zen_build_dirs: on CI CARGO_BIN_EXE_zen can point at
+        // the build-script dir
+        // <target>/<profile>/build/zen-cli/<hash>/zen, whose parent
+        // dir name is a hash, not a profile.
+        let (target_dir, profile, canonical_bin) = resolve_zen_build_dirs(&bin);
         let mut cmd = std::process::Command::new(env!("CARGO"));
         cmd.arg("build")
             .arg("-p")
@@ -1401,11 +1438,11 @@ mod tests {
             .arg("--bin")
             .arg("zen")
             .arg("--target-dir")
-            .arg(target_dir);
+            .arg(&target_dir);
         if profile == "release" {
             cmd.arg("--release");
         } else if profile != "debug" {
-            cmd.arg("--profile").arg(profile);
+            cmd.arg("--profile").arg(&profile);
         }
         let output = cmd
             .output()
@@ -1416,11 +1453,64 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            bin.is_file(),
+            canonical_bin.is_file(),
             "zen binary still not built at {} after `cargo build`",
-            bin.display()
+            canonical_bin.display()
         );
-        bin
+        canonical_bin
+    }
+
+    #[test]
+    fn resolve_zen_build_dirs_handles_build_script_hash_dir() {
+        // Normal layout: profile is the dir after `target`.
+        assert_eq!(
+            resolve_zen_build_dirs(Path::new("/x/target/debug/zen")),
+            (
+                PathBuf::from("/x/target"),
+                "debug".to_string(),
+                PathBuf::from("/x/target/debug/zen"),
+            )
+        );
+        // CI layout (lib.rs:1413 failure): CARGO_BIN_EXE_zen resolves
+        // to the build-script dir; the hash must NOT become the
+        // profile, and the canonical binary is target/debug/zen.
+        assert_eq!(
+            resolve_zen_build_dirs(Path::new(
+                "/x/target/debug/build/zen-cli/9f3a1b2c4d5e6f7a/zen"
+            )),
+            (
+                PathBuf::from("/x/target"),
+                "debug".to_string(),
+                PathBuf::from("/x/target/debug/zen"),
+            )
+        );
+        // Release and custom profiles keep working.
+        assert_eq!(
+            resolve_zen_build_dirs(Path::new("/x/target/release/zen")),
+            (
+                PathBuf::from("/x/target"),
+                "release".to_string(),
+                PathBuf::from("/x/target/release/zen"),
+            )
+        );
+        assert_eq!(
+            resolve_zen_build_dirs(Path::new("/x/target/profiling/zen")),
+            (
+                PathBuf::from("/x/target"),
+                "profiling".to_string(),
+                PathBuf::from("/x/target/profiling/zen"),
+            )
+        );
+        // No `target` component: fall back to parent = profile,
+        // grandparent = target dir, binary path unchanged.
+        assert_eq!(
+            resolve_zen_build_dirs(Path::new("/tmp/zenbin/zen")),
+            (
+                PathBuf::from("/tmp"),
+                "zenbin".to_string(),
+                PathBuf::from("/tmp/zenbin/zen"),
+            )
+        );
     }
 
     #[tokio::test]

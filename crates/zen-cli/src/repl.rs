@@ -5607,9 +5607,16 @@ mod pr208_mutant_tests {
             &serde_json::json!({"FileChanged": [{"matcher": "watched.txt", "hooks": []}]}),
         );
         // Change both files after the watchers snapshotted them.
+        // settings.json is new (the .zen dir did not exist at
+        // snapshot), so any write reads as "add" whatever the
+        // file-clock tick does; the watched file must be rewritten
+        // with a strictly newer mtime (see
+        // hook_watch::rewrite_with_newer_mtime), or on Windows two
+        // writes inside one file-clock tick leave the mtime unchanged
+        // and FileChanged never fires.
         std::fs::create_dir_all(dir.join(".zen")).unwrap();
         std::fs::write(dir.join(".zen").join("settings.json"), "{}").unwrap();
-        std::fs::write(&watched, "two").unwrap();
+        crate::hook_watch::rewrite_with_newer_mtime(&watched, "two");
         drop(_env);
         poll_hook_watchers(&mut config_watcher, &mut file_watcher, &mut agent).await;
         let calls = hooks.calls();
@@ -5660,7 +5667,12 @@ mod pr208_mutant_tests {
             &dir,
             &serde_json::json!({"FileChanged": [{"matcher": "watched.txt", "hooks": []}]}),
         );
-        std::fs::write(&watched, "two").unwrap();
+        // The rewrite must advance the mtime (see
+        // hook_watch::rewrite_with_newer_mtime): on Windows two writes
+        // inside one file-clock tick leave the mtime unchanged and the
+        // watcher would report nothing, so the "file note" case would
+        // fail and the blank cases would pass vacuously.
+        crate::hook_watch::rewrite_with_newer_mtime(&watched, "two");
         drop(_env);
         poll_hook_watchers(&mut config_watcher, &mut file_watcher, &mut agent).await;
     }
