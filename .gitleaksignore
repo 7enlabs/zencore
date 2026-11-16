@@ -11,3 +11,7 @@ ec0539130da4c569ba28f415e3b7b0fb3ca78504:crates/zen-cli/src/export.rs:generic-ap
 ac6b919e35ec7c9c875d11c25370dd823b9a4560:crates/zen-cli/src/recall.rs:generic-api-key:499
 ac6b919e35ec7c9c875d11c25370dd823b9a4560:crates/zen-cli/src/recall.rs:generic-api-key:613
 ac6b919e35ec7c9c875d11c25370dd823b9a4560:crates/zen-cli/tests/cross_session_recall.rs:generic-api-key:243
+# - recall.rs lines 503, 617 + cross_session_recall.rs line 243 (commit 65b9485, squash merge of PR #210): same fake ghp_ fixture as ac6b919, new commit + line numbers after the squash. The commit-keyed format breaks on every squash merge; a path+regex allowlist in .gitleaks.toml is the durable fix (TODO: add it once the exact fixture value is confirmed).
+65b948553989f08a51ca9882c011603566a3bd9c:crates/zen-cli/src/recall.rs:generic-api-key:503
+65b948553989f08a51ca9882c011603566a3bd9c:crates/zen-cli/src/recall.rs:generic-api-key:617
+65b948553989f08a51ca9882c011603566a3bd9c:crates/zen-cli/tests/cross_session_recall.rs:generic-api-key:243
