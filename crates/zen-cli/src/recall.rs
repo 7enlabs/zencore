@@ -52,10 +52,14 @@ fn truncate_to_bytes(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
-    let mut end = max_bytes;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
+    // Bounded walk down to the nearest char boundary: no arithmetic loop,
+    // so no mutant can turn this into an unbounded loop. (The old
+    // `while end -= 1` let the `-=` -> `/=` mutant hang forever and fail
+    // CI's mutants job on timeout, PR #210 run 43808976403.)
+    let end = (0..=max_bytes)
+        .rev()
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(0);
     s[..end].to_string()
 }
 
