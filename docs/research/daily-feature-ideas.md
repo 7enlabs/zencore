@@ -1,6 +1,6 @@
-# ZenCode - daily feature ideas
+# Zen - daily feature ideas
 
-Appended by the daily research task. Ideas already on the roadmap (`ZenCode-notion/02-roadmap.md`, `top-coding-agents-2026.md` #1–#17, r8 Code Mode / background subagents) are not repeated here.
+Appended by the daily research task. Ideas already on the roadmap (`Zen-notion/02-roadmap.md`, `top-coding-agents-2026.md` #1–#17, r8 Code Mode / background subagents) are not repeated here.
 
 ## 2026-10-15
 

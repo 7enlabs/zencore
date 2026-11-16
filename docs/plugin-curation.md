@@ -1,6 +1,6 @@
 # Plugin Curation
 
-ZenCode's skill registry has two tiers. This document describes how the
+Zen's skill registry has two tiers. This document describes how the
 **curated** tier works: how to submit, how reviews are done, and when entries
 are removed.
 
@@ -101,12 +101,12 @@ date. `zen skill search` never shows delisted entries.
       "name": "tdd",
       "description": "...",
       "version": "1.0.0",
-      "author": "ZenCode",
+      "author": "Zen",
       "trust_tier": "curated",
       "permissions": ["read", "write", "edit", "bash"],
       "source": "builtin:tdd",
       "curation": {
-        "reviewer": "ZC Leader (ZenCode maintainer)",
+        "reviewer": "ZC Leader (Zen maintainer)",
         "review_date": "2026-10-17",
         "review_notes": "Security: PASS. ... Quality: PASS. ... Documentation: PASS. ... Maintenance: PASS. ...",
         "reviewed_version": "1.0.0"

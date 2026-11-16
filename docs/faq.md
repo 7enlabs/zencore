@@ -1,8 +1,8 @@
-# ZenCode FAQ
+# Zen FAQ
 
 **Last updated:** 2026-10-17
 **Scope:** The questions every developer asks before trusting a "free" AI coding agent.
-For how we talk about ZenCode, see `docs/messaging.md`. For the full argument,
+For how we talk about Zen, see `docs/messaging.md`. For the full argument,
 see `docs/positioning.md`.
 
 ---
@@ -16,9 +16,9 @@ you'll convert to paid. When the math stops working, the tier gets narrowed
 (Gemini CLI, June 2026), locked to the vendor's app (OpenCode, September 2026), or
 killed outright (Qwen Code's 2,000 req/day tier, April 2026).
 
-ZenCode has no central API and no token subsidy. "Free" means:
+Zen has no central API and no token subsidy. "Free" means:
 
-- **Free cloud models** - ZenCode routes to providers with genuine free tiers
+- **Free cloud models** - Zen routes to providers with genuine free tiers
   (Google AI Studio, Groq, OpenRouter `:free`, Mistral, NVIDIA NIM, Cerebras).
   You use *their* free tier with *your* key, through an open protocol.
 - **Local models** - Ollama on your own machine. $0 marginal cost, no rate limits,
@@ -31,12 +31,12 @@ ZenCode has no central API and no token subsidy. "Free" means:
 Nobody pays for your tokens because nobody *needs* to - the tokens were already
 free at the source.
 
-## What if ZenCode shuts down?
+## What if Zen shuts down?
 
 **Nothing breaks.** This is the question the whole project is designed around
 (see "The Four Questions" in `docs/positioning.md`).
 
-- There is no ZenCode backend to turn off. The binary talks to *your* configured
+- There is no Zen backend to turn off. The binary talks to *your* configured
   endpoint - a cloud provider, your company's gateway, or `localhost:11434`.
 - The code is open source. Your config, sessions, skills, and memory (`ZEN.md`)
   live in open formats on your disk.
@@ -45,12 +45,12 @@ free at the source.
 
 Compare: when Gemini CLI's backend died on June 18, 2026, CI pipelines and cron
 jobs calling `gemini` broke overnight - the open-source repo survived, but *"a repo
-without a backend willing to serve it is source code, not a tool."* ZenCode never
+without a backend willing to serve it is source code, not a tool."* Zen never
 has a backend, so there is nothing to die.
 
 ## How do you make money?
 
-Honestly: **right now, we don't.** ZenCode is an open-source project, not a
+Honestly: **right now, we don't.** Zen is an open-source project, not a
 funnel. There is no paid tier to upsell you to, no "Pro" plan behind the free
 one, no investor demanding conversion metrics.
 
@@ -64,9 +64,9 @@ If monetization ever comes, the commitment is: it will be for something *additiv
 architecture makes that promise enforceable: we couldn't take away your local
 models if we wanted to.
 
-## How is ZenCode different from OpenCode / Pi / Claude Code?
+## How is Zen different from OpenCode / Pi / Claude Code?
 
-| | Claude Code | OpenCode | Pi | **ZenCode** |
+| | Claude Code | OpenCode | Pi | **Zen** |
 |---|---|---|---|---|
 | Cost | $20–200/mo, no free tier | Free agent; models BYOK or vendor PAYG | Free, BYOK | **$0 structural** (free models + local) |
 | Free tier rug-pull risk | n/a (paid) | **Real** - Zen free tier locked to app Sep 2026 | Low (no central free tier to pull) | **None** - no central free tier exists |
@@ -75,7 +75,7 @@ models if we wanted to.
 | Harness for weak models | No (frontier-first) | Manual tuning | Minimal by design | **Verify loop + eval + compaction** |
 | Auditability | Closed source | Partial | Partial | **Stream-json, eval, audit, export** |
 
-The short version: Claude Code is the best harness money can buy; **ZenCode is the
+The short version: Claude Code is the best harness money can buy; **Zen is the
 best harness $0 can buy** - engineered specifically to make free and weak models
 succeed, with the receipts to prove it.
 
@@ -90,14 +90,14 @@ API - 11+ providers configured out of the box, plus any custom endpoint:
 - **Local:** Ollama - Qwen3-Coder, Kimi K2, GLM-5.2, Devstral, gpt-oss. Fully
   offline, fully private.
 - **Paid (your choice):** OpenAI, Anthropic, Google, DeepSeek, Z.ai, Moonshot -
-  set the key in an environment variable (`ZEN_API_KEY`, `OPENAI_API_KEY`, or the variable named by `apiKeyEnv` in settings). ZenCode does not store keys itself. Paid is supported, never required.
+  set the key in an environment variable (`ZEN_API_KEY`, `OPENAI_API_KEY`, or the variable named by `apiKeyEnv` in settings). Zen does not store keys itself. Paid is supported, never required.
 
 `zen models` shows what's available; fallback chains fail over automatically when
 a free quota is exhausted.
 
 ## Do my prompts train someone else's models?
 
-**Only if you point ZenCode at a provider whose terms say so** - and we'll tell
+**Only if you point Zen at a provider whose terms say so** - and we'll tell
 you which ones do.
 
 - **Local models (Ollama):** your prompts never leave your machine. Nobody trains
@@ -107,10 +107,10 @@ you which ones do.
   unless the provider says otherwise.
 - **Paid APIs:** generally zero-retention by contract.
 
-ZenCode itself never sees your prompts - there is no telemetry phone-home. What
+Zen itself never sees your prompts - there is no telemetry phone-home. What
 leaves your machine goes exactly one place: the endpoint *you* configured.
 
-## Can I use ZenCode offline?
+## Can I use Zen offline?
 
 Yes - with a local model via Ollama. `zen --model ollama/qwen3-coder:30b` works
 with the network cable unplugged: no auth, no quota, no telemetry, no kill
@@ -119,7 +119,7 @@ deliberately.
 
 ## Is this a Claude Code clone?
 
-**No - and we never market it as one.** ZenCode is a clean-room implementation:
+**No - and we never market it as one.** Zen is a clean-room implementation:
 it mirrors *observable behavior* (REPL, agent loop, tools, hooks, skills) without
 using anyone's code, prompts, or tool descriptions. But "clone" is the wrong frame
 entirely: the product is *the free-first agent*, not *the free Claude Code*.
@@ -129,7 +129,7 @@ concedes that the original defines the category. It doesn't; the category is
 
 ## What does a run actually cost?
 
-Whatever your model costs - and ZenCode shows you, per session:
+Whatever your model costs - and Zen shows you, per session:
 
 - Free model: **$0.00** (ledger-verified).
 - Paid model: exact input/output token counts × the provider's price, plus cache
@@ -141,7 +141,7 @@ The #1 complaint about coding agents in 2026 is unpredictable per-run cost. Our
 answer is radical transparency: every token attributed, every cent (or lack of
 cent) on the record.
 
-## Who is ZenCode for?
+## Who is Zen for?
 
 - Developers who want a capable coding agent at **$0/month** - students, hobbyists,
   anyone between jobs, anyone in a region where $20/mo is real money.
@@ -152,12 +152,12 @@ cent) on the record.
 - Tinkerers who want an **observable** harness: stream-json contracts, eval
   harness, cost ledger - the agent as infrastructure you can inspect.
 
-## Who is ZenCode NOT for?
+## Who is Zen NOT for?
 
 Honesty matters more than conversion:
 
 - If you need the absolute frontier model on every task and never think about
-  cost, Claude Code with Max is a fine product. ZenCode supports paid models
+  cost, Claude Code with Max is a fine product. Zen supports paid models
   too, but our harness is *optimized* for making weaker models succeed.
 - If you need an IDE-native experience today, our VS Code extension is on the
   roadmap - the CLI is the product right now.

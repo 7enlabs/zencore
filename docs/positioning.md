@@ -1,13 +1,13 @@
-# ZenCode Positioning: Free Is Structural, Not Promotional
+# Zen Positioning: Free Is Structural, Not Promotional
 
 **Status:** Draft messaging foundation (2026-10-17) - pending review
-**Audience:** Everyone who writes about ZenCode - README, docs, launch posts, issue replies.
+**Audience:** Everyone who writes about Zen - README, docs, launch posts, issue replies.
 
 ---
 
 ## The one sentence
 
-> **ZenCode is the AI coding agent that costs $0 - by design, not by promotion.**
+> **Zen is the AI coding agent that costs $0 - by design, not by promotion.**
 
 ---
 
@@ -28,30 +28,30 @@ The pattern: **every "free" tier in this market is a marketing funnel, and funne
 Developers learned this lesson twice in four months. They are now - rationally - distrustful
 of any free tier that depends on a vendor's continued generosity.
 
-ZenCode's answer is not "our free tier is better." It is: **there is no tier to pull.**
+Zen's answer is not "our free tier is better." It is: **there is no tier to pull.**
 
 ---
 
-## 2. Why ZenCode's free is structural
+## 2. Why Zen's free is structural
 
 "Structural" means the $0 does not depend on anyone's business decision. Four properties
 make it so:
 
 ### 2.1 No central API exists to shut off
 
-ZenCode talks to **any OpenAI-compatible `/chat/completions` endpoint**. There is no
-ZenCode cloud, no ZenCode gateway, no ZenCode API key. When a provider changes its
-terms, you point ZenCode at a different endpoint - and when providers *in general*
+Zen talks to **any OpenAI-compatible `/chat/completions` endpoint**. There is no
+Zen cloud, no Zen gateway, no Zen API key. When a provider changes its
+terms, you point Zen at a different endpoint - and when providers *in general*
 can't be trusted, you point it at your own machine (see 2.3), whose terms nobody
 can change. *A repo without a backend willing to serve it is source code, not a
-tool* - so ZenCode was designed to never have a backend in the first place.
+tool* - so Zen was designed to never have a backend in the first place.
 
 ### 2.2 Bring your own model - including free ones
 
-ZenCode routes to 11+ providers out of the box: free cloud tiers (Google AI Studio,
+Zen routes to 11+ providers out of the box: free cloud tiers (Google AI Studio,
 Groq, OpenRouter `:free`, Mistral, NVIDIA NIM, Cerebras), paid APIs when you choose
 them, and local models. Fallback chains mean one provider's quota wall is a speed bump,
-not a wall: OpenRouter `:free` hits its limit → ZenCode fails over to Groq → Mistral →
+not a wall: OpenRouter `:free` hits its limit → Zen fails over to Groq → Mistral →
 local. `zen models` probes and picks the best free model *today*, because free catalogs
 rotate and static guides go stale on publish day.
 
@@ -86,24 +86,24 @@ adopting:
    *Inventory the blast radius before adopting.*
 4. **What's my exit cost, in hours?**
 
-ZenCode's answers: **yes / customer / nothing / near-zero** - because with local models
+Zen's answers: **yes / customer / nothing / near-zero** - because with local models
 there is no backend at all, and with cloud models the backend is yours, not ours.
 
-| Question | ZenCode | Typical vendor-hosted agent |
+| Question | Zen | Typical vendor-hosted agent |
 |---|---|---|
 | Is the backend as open as the code? | **Yes.** No backend; any endpoint or local model. | No - the API is the product. |
 | Am I the customer or the churn? | **Customer.** Your keys, your models, your machine. | Churn - free tiers are acquisition funnels. |
 | What breaks the day it dies? | **Nothing.** The repo + your models keep working. | Everything - CI, cron, scripts, muscle memory. |
 | Exit cost? | **Near zero.** Open formats, portable sessions (`zen export`). | Hours to weeks of migration. |
 
-This is ZenCode's single strongest positioning vehicle: it is *structural*, not a
+This is Zen's single strongest positioning vehicle: it is *structural*, not a
 feature, and it cannot be copied without rebuilding the competitor's business model.
 
 ---
 
 ## 4. "What happens if the company dies?" - the comparison
 
-| | Claude Code | OpenCode | Qwen Code | **ZenCode** |
+| | Claude Code | OpenCode | Qwen Code | **Zen** |
 |---|---|---|---|---|
 | If the vendor dies | **Tool dies.** Proprietary, API-only. | **Free tier dies.** Still needs vendor APIs. | **Free tier already died** (Apr 2026). BYOK survives. | **Nothing breaks.** No vendor backend exists. |
 | Who pays for "free"? | Nobody - no free tier. | The vendor (funnel). | The vendor (funnel, then cut). | **Nobody needs to.** Your keys, your models, or your hardware. |
@@ -120,7 +120,7 @@ The structural-$0 story opens the door; these are why developers stay:
   harness, prompt budget, compaction, repo-map budget - each exists because free models
   need them. An October 2026 experiment: a free local model matched paid models 15/15
   on coding tasks *with* test-and-retry feedback vs 4/15 without. The harness is the
-  product; competitors optimize harnesses for frontier models, ZenCode optimizes for
+  product; competitors optimize harnesses for frontier models, Zen optimizes for
   weak ones. Different objective function, different product.
 - **D3 - Auditability as a feature.** Stream-json contracts, prompt-budget regression
   tests, eval harness, cost ledger, `zen audit`, `zen export`. Nobody else treats the
@@ -134,7 +134,7 @@ Use these verbatim where they fit; do not invent new ones without review
 (see `docs/messaging.md`).
 
 1. *"The AI coding agent that costs $0 - by design, not by promotion."*
-2. *"When your Claude Code quota runs out at 2 PM, ZenCode keeps going."*
+2. *"When your Claude Code quota runs out at 2 PM, Zen keeps going."*
 3. *"Open source where it matters: no backend to shut off. Ask anyone who used Gemini CLI."*
 4. *"The harness that makes free models actually work."*
 5. *"Four questions. One answer: yes."*
@@ -143,13 +143,13 @@ Use these verbatim where they fit; do not invent new ones without review
 
 ## 7. What this positioning is NOT
 
-- **Not "a free Claude Code."** Never market ZenCode as a clone of anything
+- **Not "a free Claude Code."** Never market Zen as a clone of anything
   (see `docs/messaging.md` - legal risk and weak positioning). The product is
   *the free-first agent*, not *the free Claude Code*.
 - **Not "free models are as good as paid."** Free-model quality variance is real.
   We publish honest benchmarks with methodology and let the numbers speak.
   The community fact-checks within hours - never oversell.
-- **Not anti-paid.** ZenCode fully supports paid models and paid API keys
+- **Not anti-paid.** Zen fully supports paid models and paid API keys
   (`zen auth`). "Free-first" means free works great, not that paid is unwelcome.
   Many users will mix: free for exploration, paid for the hard parts.
 

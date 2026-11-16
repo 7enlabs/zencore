@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install ZenCode CLI from source on Linux and macOS.
+# Install Zen CLI from source on Linux and macOS.
 #
 # One command (inspect the script first if you want to):
 #   curl -fsSL https://raw.githubusercontent.com/7enlabs/zencore/main/install.sh | sh
@@ -13,16 +13,16 @@
 # and tells you how to install Rust.
 #
 # Environment overrides, all optional:
-#   ZENCODE_REPO        Git URL to clone (default: the 7enlabs repo below).
-#   ZENCODE_BRANCH      Branch to build (default: main).
-#   ZENCODE_SRC_DIR     Where the repo is cloned (default: ~/.local/share/zencode).
-#   ZENCODE_INSTALL_DIR Where the `zen` binary is copied (default: ~/.local/bin).
+#   ZENCORE_REPO        Git URL to clone (default: the 7enlabs repo below).
+#   ZENCORE_BRANCH      Branch to build (default: main).
+#   ZENCORE_SRC_DIR     Where the repo is cloned (default: ~/.local/share/zencore).
+#   ZENCORE_INSTALL_DIR Where the `zen` binary is copied (default: ~/.local/bin).
 set -eu
 
-REPO="${ZENCODE_REPO:-https://github.com/7enlabs/zencore.git}"
-BRANCH="${ZENCODE_BRANCH:-main}"
-SRC_DIR="${ZENCODE_SRC_DIR:-$HOME/.local/share/zencode}"
-INSTALL_DIR="${ZENCODE_INSTALL_DIR:-$HOME/.local/bin}"
+REPO="${ZENCORE_REPO:-https://github.com/7enlabs/zencore.git}"
+BRANCH="${ZENCORE_BRANCH:-main}"
+SRC_DIR="${ZENCORE_SRC_DIR:-$HOME/.local/share/zencore}"
+INSTALL_DIR="${ZENCORE_INSTALL_DIR:-$HOME/.local/bin}"
 
 need() {
     if ! command -v "$1" >/dev/null 2>&1; then

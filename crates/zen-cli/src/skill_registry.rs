@@ -200,7 +200,7 @@ pub fn format_skill_info(s: &RegistrySkill) -> String {
     out.push_str(&format!("  source: {}\n", s.source.describe()));
     out.push_str(
         "\n  NOTE: install re-verifies trust from the fetched manifest;\n\
-         \x20 a registry \"verified\" claim without a valid ZenCode signature\n\
+         \x20 a registry \"verified\" claim without a valid Zen signature\n\
          \x20 installs as community/unverified instead.\n",
     );
     out.push_str(&format!(

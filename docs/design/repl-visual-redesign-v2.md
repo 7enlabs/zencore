@@ -1,4 +1,4 @@
-# ZenCode CLI visual redesign v2 (REPL)
+# Zen CLI visual redesign v2 (REPL)
 
 Status: design only — no code changed in this document's pass.
 Date: 2026-11-06. Requested by Zen after seeing the v1 screenshot
@@ -47,11 +47,11 @@ descriptions, the status line following live model switches) stays.
   status bar shows active model + mode + connection state; the model
   picker shows model name, provider, token count, context limit, cost
   estimate and latency; dialogs are centred modal overlays.
-- Aider (line-based REPL, the closest structural cousin to ZenCode):
+- Aider (line-based REPL, the closest structural cousin to Zen):
   startup prints version, model and git status as plain lines; model
   switching is CLI-only (`--model`, `--list-models`) — no visual
   picker, which is exactly the gap Zen hit. Lesson: a REPL *can* ship
-  a picker (ZenCode v1 does); Aider shows what happens without one.
+  a picker (Zen v1 does); Aider shows what happens without one.
 - Gemini CLI (Ink TUI): `? for shortcuts` hint above the input;
   window-title status icons (Ready `◇`, Working `✦`, Action `✋`);
   `/model set <name>` with an optional `--persist` flag — the
@@ -109,7 +109,7 @@ Fix: cap the width and shorten the cwd (see §5.1).
 
 ### 2.3 No visual hierarchy inside the box [HIGH]
 
-Every line is the same colour and weight: `ZenCode CLI 0.1.0` (the
+Every line is the same colour and weight: `Zen CLI 0.1.0` (the
 product name — the most important line) looks identical to `model …`
 and `cwd …` (metadata). `welcome_box` does not even take a `Theme` —
 it is plain text. Claude Code uses bold/colour for the version line
@@ -121,7 +121,7 @@ labels dim, values plain (see §5.1, §6).
 
 v1 prints it unconditionally. Claude Code shows the full dashboard
 only when there is something to show and falls back to a condensed
-logo otherwise. ZenCode has the data to do the same:
+logo otherwise. Zen has the data to do the same:
 `list_sessions_for_cwd(home, cwd)` (`session.rs:451`) already exists.
 Fix: greet "Welcome back!" only when a previous session exists for
 this cwd; otherwise print a neutral line (or nothing — the brand line
@@ -154,7 +154,7 @@ number, where the eye never lands. No provider column (the id embeds
 it, but the eye must parse the prefix), no context window, no
 latency, no free badge. OpenCode's picker shows name + provider +
 context + cost + latency for a reason: those are the four facts a
-person uses to choose. ZenCode already *has* three of them:
+person uses to choose. Zen already *has* three of them:
 `ModelProbe` (`models.rs:103`) carries `context_window` and
 `latency_ms`, and `CatalogModel` (`models.rs:9`) carries
 `context_window` — but `available_model_ids` (`repl.rs:740`)
@@ -183,7 +183,7 @@ Fix: §5.5.
 `render()` (`repl_progress.rs:313`): `Still working - {tool} has
 been running for {N}s...`. It is long, it restates the tool name
 (already shown in the card), it has no spinner character, and it
-never tells the user how to stop the turn (ZenCode's interrupt is
+never tells the user how to stop the turn (Zen's interrupt is
 Ctrl-C; a first-time user does not know that). Claude Code's form is
 one verb + `…` + elapsed, accent-coloured, with `(esc to interrupt)`.
 Fix: §5.6 — including a small *original* Zen verb list (clean-room:
@@ -214,7 +214,7 @@ more deliberate. One-character change per corner. Fix with §5.1.
 
 ## 3. What the research says, distilled
 
-| Source | Lesson for ZenCode (line-based REPL) |
+| Source | Lesson for Zen (line-based REPL) |
 | --- | --- |
 | Claude Code LogoV2 | Full dashboard only when there is content; condensed logo otherwise. Two-column fill, never a wide box with one narrow column. Feeds (Recent / What's New) are *data*, not decoration — they exist because the data is cheap to read. |
 | Claude Code spinner verbs | One verb + `…` + elapsed. The verb is personality, not information — keep the list short, original, and deterministic per turn (no random flicker). |
@@ -466,7 +466,7 @@ Rules:
   `Zening`. Pick deterministically per turn (e.g. hash of the tool
   name or the turn index mod list length) so the word does not flicker
   randomly between heartbeats; one verb per turn.
-- **Interrupt hint**: `Ctrl-C to stop` is the point — ZenCode's
+- **Interrupt hint**: `Ctrl-C to stop` is the point — Zen's
   interrupt key was never shown anywhere. Keep it short; it is the
   equivalent of Claude Code's `(esc to interrupt)`.
 - **Elapsed**: keep the real elapsed seconds from the heartbeat
@@ -604,7 +604,7 @@ nearest; do not use it.)
   wording, its 185-verb spinner list, or any of its code/prompts/tool
   descriptions. The Zen verb list in §5.6 is written from scratch.
 - Do not copy OpenCode's/Gemini CLI's fullscreen TUI, sidebar, or
-  modal overlays. ZenCode stays a line-based REPL; the status line
+  modal overlays. Zen stays a line-based REPL; the status line
   *is* the status bar.
 - Do not add a TUI framework (ratatui, Bubble Tea, Ink, OpenTUI) or
   any new crate for this.
@@ -638,7 +638,7 @@ nearest; do not use it.)
   TTY checks) and the snappy TUI modernisation plan.
 - xterm-256 colour cube (Wikipedia / xterm.codes): nearest to
   `#2563EB` computed by script, not guessed — codes 26/27 tie.
-- ZenCode repo itself: `repl.rs` (`status_line`, `ZEN_MARK`,
+- Zen repo itself: `repl.rs` (`status_line`, `ZEN_MARK`,
   `welcome_box`, `format_model_list`, `pick_model`, `print_turn`,
   `/todos` arm), `repl_polish.rs` (`Theme::paint`, `ColorRole`),
   `repl_progress.rs` (`card_lines`, `render` ToolProgress arm),

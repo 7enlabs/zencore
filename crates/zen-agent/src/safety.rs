@@ -5,14 +5,11 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub fn user_agent() -> String {
-    format!(
-        "ZenCode/{} (+https://zencodego.com)",
-        env!("CARGO_PKG_VERSION")
-    )
+    format!("Zen/{} (+https://runzen.dev)", env!("CARGO_PKG_VERSION"))
 }
 
 pub const SAFETY_DISCLAIMER: &str = "No tool can guarantee your account won't be flagged - \
-    providers use automated systems with false positives. ZenCode minimizes the risk factors \
+    providers use automated systems with false positives. Zen minimizes the risk factors \
     within its control and warns you about the rest.";
 
 pub const MAX_RETRY_ATTEMPTS: u32 = 5;
@@ -298,9 +295,9 @@ pub fn auth_login_warning(provider: &str) -> String {
     format!(
         "API key saved for {provider}.\n\
         \n\
-        Account safety: ZenCode paces requests and backs off automatically, but your account is your responsibility. To stay safe:\n\
+        Account safety: Zen paces requests and backs off automatically, but your account is your responsibility. To stay safe:\n\
         - Use one key per machine - don't share keys across computers or people.\n\
-        - Avoid running many parallel ZenCode sessions on the same key.\n\
+        - Avoid running many parallel Zen sessions on the same key.\n\
         - If you see repeated rate-limit warnings, slow down rather than pushing through.\n\
         \n\
         Providers may suspend accounts for payment disputes, shared keys, or bot-like traffic patterns. Run `zen doctor` for a safety checklist."
@@ -309,7 +306,7 @@ pub fn auth_login_warning(provider: &str) -> String {
 
 pub fn parallel_sessions_warning(count: usize, provider: &str) -> String {
     format!(
-        "Warning: {count} concurrent ZenCode sessions are using the same {provider} API key.\n\
+        "Warning: {count} concurrent Zen sessions are using the same {provider} API key.\n\
         Agentic loops fire many requests per minute. Multiple sessions on one key can hit rate limits fast and may look like automated abuse to the provider.\n\
         Consider: separate API keys per session, or run fewer sessions. (Silence with --i-understand-the-risks.)"
     )
@@ -326,14 +323,14 @@ pub fn concurrency_cap_warning(requested: usize, cap: usize, provider: &str) -> 
 pub fn repeated_429_warning(hits: u32, provider: &str) -> String {
     format!(
         "Warning: rate limits hit {hits} times in the last 5 minutes ({provider}).\n\
-        ZenCode is backing off automatically. If this persists: reduce parallel sessions, switch to a higher tier, or use a different provider to spread load. Pushing through rate limits is the fastest way to get flagged."
+        Zen is backing off automatically. If this persists: reduce parallel sessions, switch to a higher tier, or use a different provider to spread load. Pushing through rate limits is the fastest way to get flagged."
     )
 }
 
 pub fn quota_exhausted_error(provider: &str, detail: &str) -> String {
     format!(
         "Out of quota / billing issue ({provider}: {detail}).\n\
-        ZenCode will NOT retry - retrying a billing error only creates failed-request noise on your account.\n\
+        Zen will NOT retry - retrying a billing error only creates failed-request noise on your account.\n\
         Check your billing dashboard, then re-run. Your work is saved; nothing was lost."
     )
 }
@@ -351,8 +348,8 @@ mod tests {
     #[test]
     fn user_agent_has_version_and_domain() {
         let ua = user_agent();
-        assert!(ua.starts_with("ZenCode/"), "ua: {ua}");
-        assert!(ua.contains("zencodego.com"), "ua: {ua}");
+        assert!(ua.starts_with("Zen/"), "ua: {ua}");
+        assert!(ua.contains("runzen.dev"), "ua: {ua}");
     }
 
     #[test]

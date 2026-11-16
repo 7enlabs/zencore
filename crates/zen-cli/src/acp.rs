@@ -342,8 +342,8 @@ fn handle_initialize(id: Value, params: &Value) -> RpcResponse {
                 "promptCapabilities": { "image": false, "audio": false },
             },
             "agentInfo": {
-                "name": "zencode",
-                "title": "ZenCode",
+                "name": "zencore",
+                "title": "Zen",
                 "version": env!("CARGO_PKG_VERSION"),
             },
         }),
@@ -485,7 +485,7 @@ mod tests {
         let resp = handle_initialize(req.id.unwrap(), &req.params);
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["result"]["protocolVersion"], 1);
-        assert_eq!(v["result"]["agentInfo"]["name"], "zencode");
+        assert_eq!(v["result"]["agentInfo"]["name"], "zencore");
     }
 
     #[test]

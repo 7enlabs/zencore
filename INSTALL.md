@@ -1,4 +1,4 @@
-# Install ZenCode CLI
+# Install Zen CLI
 
 ## Windows: prebuilt binary (recommended)
 
@@ -23,7 +23,7 @@ What the script does, and nothing else:
 2. Verifies the SHA-256 of the `zen.exe` inside it against the
    published hash `eb27ec87c348587423c172710c4b11c86efa18a4454ff8a48fb3cd7128699239`.
    If the hash does not match, the script stops and installs nothing.
-3. Copies `zen.exe` to `%LOCALAPPDATA%\Programs\ZenCode` and adds
+3. Copies `zen.exe` to `%LOCALAPPDATA%\Programs\Zen` and adds
    that directory to the user PATH if it is not there yet.
 4. Re-hashes the installed copy as a final check instead of running
    it, so the install still succeeds on machines that block a freshly
@@ -53,7 +53,7 @@ curl -fsSL https://raw.githubusercontent.com/7enlabs/zencore/main/install.sh | s
 
 ## Where the binary goes
 
-- Windows: `%LOCALAPPDATA%\Programs\ZenCode\zen.exe`. The script
+- Windows: `%LOCALAPPDATA%\Programs\Zen\zen.exe`. The script
   adds that directory to the user PATH if it is not there yet.
 - Linux and macOS: `~/.local/bin/zen`. If that directory is not on
   your PATH, the script prints the export line to add.
@@ -103,11 +103,11 @@ Remove the binary and the checkout:
 
 ```sh
 rm ~/.local/bin/zen
-rm -rf ~/.local/share/zencode
+rm -rf ~/.local/share/zencore
 ```
 
-On Windows, remove `%LOCALAPPDATA%\Programs\ZenCode\zen.exe` and
-`%USERPROFILE%\.local\share\zencode`, and remove the install
+On Windows, remove `%LOCALAPPDATA%\Programs\Zen\zen.exe` and
+`%USERPROFILE%\.local\share\zencore`, and remove the install
 directory from the user PATH if you no longer want it there.
 
 ## Troubleshooting

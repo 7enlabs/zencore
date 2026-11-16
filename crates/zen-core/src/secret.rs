@@ -60,7 +60,7 @@
 //!     URL-encoded forms of a value, longest value first, in one
 //!     pass, with short values (under 8 characters) replaced only
 //!     where they stand alone. The redactor here follows that shape
-//!     (written from scratch for ZenCode); the encoded/split/reversed
+//!     (written from scratch for Zen); the encoded/split/reversed
 //!     leak the dossier names is still not covered, and the tests
 //!     say so.
 //!   - Secrets live in `secrets.json` (mode 600) with the value in

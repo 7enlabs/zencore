@@ -1,7 +1,7 @@
-# ZenCode Skills
+# Zen Skills
 
 Skills are reusable bundles of instructions (methodology, checklists, habits)
-that the agent loads on demand. ZenCode adopts the **open SKILL.md standard**
+that the agent loads on demand. Zen adopts the **open SKILL.md standard**
 (Anthropic, Oct 2025 - same format as Claude Code / Codex / Cursor, so the
 existing skill corpus works here) and adds three things nobody else ships
 together: **declared permissions**, **trust tiers with signatures**, and
@@ -44,7 +44,7 @@ loads on demand via the Skill tool.
   "name": "tdd",
   "version": "1.0.0",
   "description": "Test-driven development workflow",
-  "author": "ZenCode",
+  "author": "Zen",
   "permissions": {
     "allowed_tools": ["read", "write", "edit", "bash"],
     "network": false,
@@ -92,14 +92,14 @@ Grammar: `CHECK <target> <op> <value>` where op is `==`, `!=`, `contains`,
 
 | Tier | Badge | Meaning | Updates |
 |---|---|---|---|
-| `verified` | `[✓ verified]` | ed25519-signed by ZenCode (or ships with the release) | Allowed, diff shown first |
+| `verified` | `[✓ verified]` | ed25519-signed by Zen (or ships with the release) | Allowed, diff shown first |
 | `community` | `[community]` | Installed from git/local with your explicit `--yes` | Never automatic |
 | `unverified` | `[⚠ unverified]` | No manifest | Never; sandboxed |
 
 **Sandbox for unverified:** read-only tools (`read`, `glob`, `grep`), no
 network, project scope - regardless of what the skill claims.
 
-**The Plugin4Shell lesson:** there are no silent auto-updates in ZenCode.
+**The Plugin4Shell lesson:** there are no silent auto-updates in Zen.
 `zen skill update` (planned) will show a diff before applying anything.
 SHA-pinning alone was bypassed in Sept 2026; signatures + human-reviewed
 diffs are the control that matters.
@@ -109,7 +109,7 @@ diffs are the control that matters.
 The signature covers the **canonical manifest**: JSON with sorted keys,
 sorted/deduped tool lists, compact separators, UTF-8 - the `signature` field
 itself excluded. Verification uses the ed25519 public key baked into the
-binary (`ZENCODE_SIGNING_PUBKEY_HEX` in `crates/zen-cli/src/skills.rs`).
+binary (`ZENCORE_SIGNING_PUBKEY_HEX` in `crates/zen-cli/src/skills.rs`).
 
 Key management: the private half must live in offline/CI signing
 infrastructure. Rotation = publish a new baked-in key + re-sign all verified

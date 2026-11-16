@@ -1,6 +1,6 @@
-# ZenCode privacy
+# Zen privacy
 
-This page describes the one piece of data ZenCode collects: the
+This page describes the one piece of data Zen collects: the
 anonymous usage counter (Viec 7). It is part of the product contract -
 the design lives in `docs/design/user-counter.md` and the backend is
 open source in `workers/user-counter/`.
@@ -43,7 +43,7 @@ the CLI checks them before every ping:
 
 - `zen telemetry off` (writes `"telemetry": "off"` to `~/.zen/settings.json`)
 - `DO_NOT_TRACK=1`
-- `ZENCODE_TELEMETRY=0`
+- `ZENCORE_TELEMETRY=0`
 - `"telemetry": "off"` in `~/.zen/settings.json`
 
 The first run prints a one-line notice naming these opt-out paths.

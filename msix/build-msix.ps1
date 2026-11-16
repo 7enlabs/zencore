@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Pack ZenCode as an MSIX from a built zen.exe (manual MSIX flow,
+  Pack Zen as an MSIX from a built zen.exe (manual MSIX flow,
   Microsoft Learn "Generating MSIX package components").
 
 .DESCRIPTION
@@ -21,8 +21,8 @@
   .\build-msix.ps1 -ExePath C:\builds\zen.exe
 
 .EXAMPLE
-  .\build-msix.ps1 -ExePath .\zen.exe -NameOverride Contoso.ZenCodeTest `
-    -PublisherOverride "CN=ZenCodeTest" -PfxPath .\test-cert.pfx `
+  .\build-msix.ps1 -ExePath .\zen.exe -NameOverride Contoso.ZenTest `
+    -PublisherOverride "CN=ZenTest" -PfxPath .\test-cert.pfx `
     -PfxPassword secret
 #>
 [CmdletBinding()]
@@ -103,7 +103,7 @@ $makeappx = Find-SdkTool 'makeappx.exe'
 $signtool = $null
 if ($PfxPath) { $signtool = Find-SdkTool 'signtool.exe' }
 
-$staging = Join-Path ([System.IO.Path]::GetTempPath()) "zencode-msix-$pkgVersion"
+$staging = Join-Path ([System.IO.Path]::GetTempPath()) "zencore-msix-$pkgVersion"
 if (Test-Path $staging) { Remove-Item $staging -Recurse -Force }
 New-Item -ItemType Directory -Path $staging | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $staging 'Assets') | Out-Null
@@ -132,7 +132,7 @@ try {
   }
 
   if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir | Out-Null }
-  $msixPath = Join-Path $OutputDir "ZenCode_${pkgVersion}_x64.msix"
+  $msixPath = Join-Path $OutputDir "Zen_${pkgVersion}_x64.msix"
 
   & $makeappx pack /d $staging /p $msixPath /o
   if ($LASTEXITCODE -ne 0) { throw "makeappx pack failed with exit code $LASTEXITCODE" }

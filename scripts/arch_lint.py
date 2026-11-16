@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Architectural lint for the ZenCode CLI workspace (D2 of the harness 7-point package).
+"""Architectural lint for the Zen CLI workspace (D2 of the harness 7-point package).
 
 Runs outside clippy: it checks the crate layering from docs/ARCHITECTURE.md
 and the ban on inline lint silencing in runtime Rust code. Stdlib only

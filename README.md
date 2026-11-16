@@ -1,4 +1,4 @@
-# ZenCode
+# Zen
 
 > **Status:** Private until v1.0.0.
 
@@ -12,17 +12,17 @@ using any of their code, prompts or tool descriptions. It talks to any OpenAI-co
 * How it works: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 * Desktop integration: [`docs/stream-json-v1.md`](docs/stream-json-v1.md) (stream-json contract)
 
-## Why ZenCode
+## Why Zen
 
 **Free is structural, not promotional.** In 2026, every major "free" AI coding tier got
 narrowed or killed: Gemini CLI shut down overnight (June 18), OpenCode locked free models
-to its app (September), Qwen Code ended its 2,000 req/day free tier (April 15). ZenCode
+to its app (September), Qwen Code ended its 2,000 req/day free tier (April 15). Zen
 can't rug-pull you - there is no central API to shut off. You bring your own endpoint:
 free cloud models, your paid keys, or Ollama running fully offline on your machine.
 
 **The Four Questions** (after the [Gemini CLI postmortem](https://www.jenariusganlary.com/blog/gemini-cli-shut-down-choosing-ai-coding-tools)):
 
-| Question | ZenCode's answer |
+| Question | Zen's answer |
 |---|---|
 | Is the backend as open as the code? | Yes - no backend. Any OpenAI-compatible endpoint, or local models. |
 | Am I the customer, or am I the churn? | The customer: your keys, your models, your machine. |
@@ -36,7 +36,7 @@ More: [`docs/positioning.md`](docs/positioning.md) · [`docs/faq.md`](docs/faq.m
 
 Windows: the one-command install downloads the prebuilt v0.1.0
 binary, verifies its SHA-256, and copies it to
-`%LOCALAPPDATA%\Programs\ZenCode`. No toolchain, no compile step:
+`%LOCALAPPDATA%\Programs\Zen`. No toolchain, no compile step:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/7enlabs/zencore/main/install.ps1 | iex"
@@ -177,7 +177,7 @@ DEEPSEEK_API_KEY=<key> zen -p "hi" --model deepseek/deepseek-v4-flash
 
 All three Chinese providers document Anthropic-compatible endpoints
 (`https://api.z.ai/api/anthropic`, `https://api.moonshot.ai/anthropic`,
-`https://api.deepseek.com/anthropic`); ZenCode uses their OpenAI-compatible
+`https://api.deepseek.com/anthropic`); Zen uses their OpenAI-compatible
 endpoints today and switches to the Anthropic endpoint automatically once an
 Anthropic client is available. Pricing feeds the `zen cost` ledger; see
 `crates/zen-agent/src/providers.rs` for the registry, featured models for
@@ -271,7 +271,7 @@ project commands/skills. Everything from `~/.zen/` always loads; project deny ru
 
 ### Anonymous usage counter
 
-ZenCode counts how many installs are active, so the team can see whether anyone uses it.
+Zen counts how many installs are active, so the team can see whether anyone uses it.
 Once per 24 hours at startup the CLI sends one anonymous ping with exactly four fields:
 a random install id (generated on first run, stored in `~/.zen/user-counter.json`), the CLI
 version, the OS, and the CPU architecture. The server stores only a SHA-256 hash of the
@@ -282,7 +282,7 @@ Opt out at any time, through any of:
 
 - `zen telemetry off` (writes `"telemetry": "off"` to `~/.zen/settings.json`)
 - `DO_NOT_TRACK=1`
-- `ZENCODE_TELEMETRY=0`
+- `ZENCORE_TELEMETRY=0`
 - `"telemetry": "off"` in `~/.zen/settings.json`
 
 Full details: `docs/privacy.md`. Backend source: `workers/user-counter/`.
@@ -514,7 +514,7 @@ justification.
 ## Session export / import
 
 No major coding agent ships session portability - transcripts are locked into
-one tool's format. ZenCode exports any session to a documented, versioned
+one tool's format. Zen exports any session to a documented, versioned
 format (`format_version`) that other tools can read, and imports it back:
 
 ```bash
@@ -612,9 +612,9 @@ zen skill search tdd --curated    # curated (maintainer-reviewed) only
 
 ## Account Safety
 
-ZenCode is designed to be a good API citizen so your accounts stay in good standing.
+Zen is designed to be a good API citizen so your accounts stay in good standing.
 
-**What ZenCode does automatically:**
+**What Zen does automatically:**
 - Exponential backoff with jitter on rate limits (never hammers through 429s)
 - Never retries billing/quota errors
 - Identifies itself with a versioned User-Agent on every request
@@ -630,7 +630,7 @@ ZenCode is designed to be a good API citizen so your accounts stay in good stand
 **What gets accounts banned (so you can avoid it):**
 Providers suspend accounts for payment disputes, shared/resold keys, bot-like traffic, and ToS violations (e.g., model distillation, subscription-token relay) - not for normal coding-agent usage within rate limits. [Full details →](docs/account-safety.md)
 
-> No tool can guarantee your account won't be flagged - providers use automated systems with false positives. ZenCode minimizes the risk factors within its control and warns you about the rest.
+> No tool can guarantee your account won't be flagged - providers use automated systems with false positives. Zen minimizes the risk factors within its control and warns you about the rest.
 ## REPL polish commands
 
 Small quality-of-life slash commands for the interactive REPL:
@@ -741,7 +741,7 @@ The tools honor `--tools` (allowlist and `+`/`-` delta forms) and `--disallowedT
 like built-in tools, and they are skipped by `--tools ""`.
 ## Skills
 
-ZenCode skills are installable, permission-declared, trust-tiered bundles of
+Zen skills are installable, permission-declared, trust-tiered bundles of
 instructions (methodology, checklists, habits). Format spec: [`docs/skills.md`](docs/skills.md).
 
 ```bash
@@ -760,7 +760,7 @@ ships curated with the binary (`zen skill search` works offline). The registry
 is advisory - install re-verifies trust from the skill's own signature, so a
 registry can never upgrade a skill's tier.
 
-Trust tiers: `[✓ verified]` (ed25519-signed by ZenCode - nobody else in the
+Trust tiers: `[✓ verified]` (ed25519-signed by Zen - nobody else in the
 industry ships a real verified tier), `[community]` (you approved the install,
 hash-pinned, never auto-updates), `[⚠ unverified]` (sandboxed: read-only, no
 network). Install always shows the permission diff first and requires `--yes`;

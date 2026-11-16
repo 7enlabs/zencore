@@ -1,4 +1,4 @@
-"""Terminal-Bench runner for ZenCode.
+"""Terminal-Bench runner for Zen.
 
 Runs a subset of Terminal-Bench 2.0 tasks against the `zen` CLI binary
 using a free model, collects pass/fail, and writes a report.
@@ -200,10 +200,10 @@ def write_report(
     errored = sum(1 for r in results if r.passed is None)
     score = f"{passed}/{len(results)}"
     lines = [
-        "# Terminal-Bench subset - ZenCode results",
+        "# Terminal-Bench subset - Zen results",
         "",
         f"- Model: `{model}` (free, $0) via `{base_url}`",
-        f"- ZenCode: `{zen_version}`",
+        f"- Zen: `{zen_version}`",
         f"- Date: {datetime.date.today().isoformat()}",
         f"- Score: **{score}** ({passed} passed, {failed} failed, {errored} infra errors)",
         "",
@@ -229,7 +229,7 @@ def write_report(
         "## Limitations",
         "",
         "- Small local model (4B params, CPU inference); this validates the",
-        "  benchmark pipeline, not ZenCode's ceiling with frontier models.",
+        "  benchmark pipeline, not Zen's ceiling with frontier models.",
         "- Subset only; not comparable to full 89-task leaderboard scores.",
         "- Single run per task; no retries.",
     ]

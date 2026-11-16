@@ -2,7 +2,7 @@
   "format_version": 1,
   "skills": [
     {
-      "author": "ZenCode",
+      "author": "Zen",
       "description": "Test-driven development workflow - write the failing test first",
       "name": "tdd",
       "permissions": {
@@ -29,7 +29,7 @@
       "version": "1.0.0"
     },
     {
-      "author": "ZenCode",
+      "author": "Zen",
       "description": "Token-efficiency habits for lean model calls",
       "name": "token-diet",
       "permissions": {
@@ -53,7 +53,7 @@
       "version": "1.0.0"
     },
     {
-      "author": "ZenCode",
+      "author": "Zen",
       "description": "Pre-commit security checklist",
       "name": "security-review",
       "permissions": {

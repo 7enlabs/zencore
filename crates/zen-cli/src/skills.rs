@@ -227,7 +227,7 @@ pub fn load_manifest(dir: &Path) -> Result<PluginManifest> {
     Ok(manifest)
 }
 
-pub const ZENCODE_SIGNING_PUBKEY_HEX: &str =
+pub const ZENCORE_SIGNING_PUBKEY_HEX: &str =
     "622c8cfc675dc43143a47fe69d6046e0411ba659aa647a9bfe1bea905db41bd5";
 
 fn hex_decode(s: &str) -> Result<Vec<u8>> {
@@ -250,7 +250,7 @@ fn hex_decode(s: &str) -> Result<Vec<u8>> {
 pub fn verify_signature(message: &[u8], signature_hex: &str) -> bool {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     let (Ok(pubkey_bytes), Ok(sig_bytes)) = (
-        hex_decode(ZENCODE_SIGNING_PUBKEY_HEX),
+        hex_decode(ZENCORE_SIGNING_PUBKEY_HEX),
         hex_decode(signature_hex),
     ) else {
         return false;
@@ -271,7 +271,7 @@ pub fn verify_signature(message: &[u8], signature_hex: &str) -> bool {
 }
 
 /// Trust ladder: builtins are verified by construction; a fetched skill is
-/// verified only with a valid ZenCode signature over its canonical manifest
+/// verified only with a valid Zen signature over its canonical manifest
 /// bytes. An unsigned manifest is community, and no manifest at all is
 /// unverified - a missing signature is never treated as verified.
 pub fn assign_tier(source: &InstallSource, manifest: Option<&PluginManifest>) -> TrustTier {
@@ -589,7 +589,7 @@ pub fn install_builtin(home: &Path, name: &str) -> Result<RegistryEntry> {
         Some(sig) if verify_signature(&manifest.canonical_bytes(), sig) => {}
         _ => {
             return Err(anyhow!(
-                "embedded manifest for {:?} has no valid ZenCode signature",
+                "embedded manifest for {:?} has no valid Zen signature",
                 name
             ));
         }
@@ -1450,7 +1450,7 @@ fn cmd_install(
                 tier.as_str()
             );
             if tier == TrustTier::Verified {
-                println!("signature: valid (signed by ZenCode)");
+                println!("signature: valid (signed by Zen)");
             }
         }
         None => {
@@ -1530,7 +1530,7 @@ pub fn skills_prompt_with_tiers(home: Option<&Path>, skills: &[zen_core::SkillIn
     // them adds no permission filtering (see docs/skills.md). Only
     // registry-installed unverified skills are sandboxed. Text only;
     // enforcement is unchanged.
-    out.push_str("Trust: [✓ verified] = audited + signed by ZenCode; [community] = user-approved; [⚠ unverified] = advisory for plain skill directories (no permission filtering); installed unverified skills are sandboxed.");
+    out.push_str("Trust: [✓ verified] = audited + signed by Zen; [community] = user-approved; [⚠ unverified] = advisory for plain skill directories (no permission filtering); installed unverified skills are sandboxed.");
     out
 }
 

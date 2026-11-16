@@ -1,11 +1,11 @@
-# ZenCode Session Export Format
+# Zen Session Export Format
 
 **Version:** 1 (`format_version: 1`)
 **Status:** stable - v1 is frozen; breaking changes get a new version number.
 
 No major coding agent ships session portability: transcripts are locked into
-one tool's internal format. ZenCode's export format is documented and versioned
-so that any tool - another agent, a script, or a future ZenCode web UI - can
+one tool's internal format. Zen's export format is documented and versioned
+so that any tool - another agent, a script, or a future Zen web UI - can
 read a session without knowing zen's internals.
 
 ## Producing / consuming

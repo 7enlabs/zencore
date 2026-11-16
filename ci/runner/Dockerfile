@@ -1,4 +1,4 @@
-# Ephemeral GitHub Actions runner image for ZenCode self-hosted CI.
+# Ephemeral GitHub Actions runner image for Zen self-hosted CI.
 # One container = one registration = one job. See README.md.
 # Base image pinned by digest (ubuntu:24.04 index digest, checked 2026-11-02).
 # Bump the digest on purpose; `docker pull ubuntu:24.04` then read RepoDigests.
@@ -17,7 +17,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# Base tools the runner and typical ZenCode jobs need. Rust toolchains are
+# Base tools the runner and typical Zen jobs need. Rust toolchains are
 # installed by the workflow (rustup / dtolnay/rust-toolchain), not baked in.
 # Ubuntu archive versions rotate, so packages track the 24.04 pocket.
 # hadolint ignore=DL3008

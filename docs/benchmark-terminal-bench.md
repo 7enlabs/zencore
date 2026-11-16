@@ -1,14 +1,14 @@
-# Terminal-Bench - ZenCode Benchmark
+# Terminal-Bench - Zen Benchmark
 
 **Status:** Infrastructure complete and pipeline-validated; live model runs
 blocked by worker resource constraints (see §Results).
 
 ## Why this benchmark
 
-ZenCode's core differentiator (D2) is a **harness engineered to make weak
+Zen's core differentiator (D2) is a **harness engineered to make weak
 models succeed** - verify loop, prompt budget, RateGate, repair of malformed
 tool calls, and (in progress) advisor pattern, result pruning, and eco mode.
-The claim "free models can do real work with ZenCode" needs public,
+The claim "free models can do real work with Zen" needs public,
 reproducible evidence. Terminal-Bench 2.0 is the standard benchmark for
 terminal agents (89 tasks, Docker-isolated, outcome-verified), used by
 virtually all frontier labs.

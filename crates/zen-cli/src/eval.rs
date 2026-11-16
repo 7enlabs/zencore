@@ -368,7 +368,7 @@ impl EvalReport {
         // results tabulated below, which are its evidence. The table
         // itself is deterministic output and stays unlabeled.
         out.push_str(&format!(
-            "# zencode eval - {}\n\n[CONFIRMED] {}/{} tasks passed\n\n",
+            "# zencore eval - {}\n\n[CONFIRMED] {}/{} tasks passed\n\n",
             self.model, self.passed_count, self.task_count
         ));
         out.push_str(
@@ -501,7 +501,7 @@ async fn run_one_task(
     let started = Instant::now();
 
     let workdir: PathBuf =
-        std::env::temp_dir().join(format!("zencode-eval-{}-{}", task.id, uuid::Uuid::new_v4()));
+        std::env::temp_dir().join(format!("zencore-eval-{}-{}", task.id, uuid::Uuid::new_v4()));
     let setup_result: Result<()> = (|| {
         std::fs::create_dir_all(&workdir)?;
         for (rel, content) in task.setup {
@@ -797,7 +797,7 @@ mod tests {
 
     #[test]
     fn check_file_operators() {
-        let dir = std::env::temp_dir().join(format!("zencode-eval-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("zencore-eval-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), "hello world").unwrap();
 

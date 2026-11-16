@@ -10,7 +10,7 @@ that one gap is recorded as deferred in section 7 instead of invented.
 
 ## 1. Purpose
 
-ZenCode work is verified by independent review: a task is DONE only with a
+Zen work is verified by independent review: a task is DONE only with a
 named verifier, a verification command, and a receipt - never by the author
 checking their own work. Today that review is one reviewer at a time. This
 design adds a multi-model review pass: several free models review the same

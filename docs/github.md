@@ -1,6 +1,6 @@
 # GitHub integration
 
-ZenCode talks to GitHub through the [`gh` CLI](https://cli.github.com) - auth
+Zen talks to GitHub through the [`gh` CLI](https://cli.github.com) - auth
 belongs to `gh` (`gh auth login`), zen never sees tokens. Everything zen fetches
 is read-only; applying fixes happens through normal agent turns, gated by the
 permission mode.

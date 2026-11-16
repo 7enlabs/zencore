@@ -376,14 +376,14 @@ mod tests {
                 name: name.to_string(),
                 description: format!("{} does things", name),
                 version: "1.2.0".to_string(),
-                author: "ZenCode".to_string(),
+                author: "Zen".to_string(),
                 trust_tier: "curated".to_string(),
                 permissions: vec!["read".to_string()],
                 tags: vec![],
                 source: Some(format!("builtin:{}", name)),
             },
             curation: CurationMeta {
-                reviewer: "ZC Leader (ZenCode maintainer)".to_string(),
+                reviewer: "ZC Leader (Zen maintainer)".to_string(),
                 review_date: "2026-10-17".to_string(),
                 review_notes: "Security: PASS. No network. Quality: PASS. Deterministic. Documentation: PASS. Complete. Maintenance: PASS. In-repo.".to_string(),
                 reviewed_version: "1.2.0".to_string(),
@@ -514,7 +514,7 @@ mod tests {
         let reg = sample_registry();
         assert_eq!(search_entries("tdd", false, &reg, &[]).len(), 1);
         assert_eq!(search_entries("does things", false, &reg, &[]).len(), 2);
-        assert_eq!(search_entries("zencode", false, &reg, &[]).len(), 2);
+        assert_eq!(search_entries("zen", false, &reg, &[]).len(), 2);
         assert_eq!(search_entries("TDD", false, &reg, &[]).len(), 1);
         assert!(search_entries("zzz-no-match", false, &reg, &[]).is_empty());
     }
@@ -544,7 +544,7 @@ mod tests {
         let desc = search_entries("does things", false, &reg, &[]);
         assert_eq!(desc.len(), 2);
         assert!(desc.iter().all(|h| h.score == 20));
-        let author = search_entries("zencode", false, &reg, &[]);
+        let author = search_entries("zen", false, &reg, &[]);
         assert_eq!(author.len(), 2);
         assert!(author.iter().all(|h| h.score == 10));
     }

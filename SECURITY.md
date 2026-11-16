@@ -32,8 +32,8 @@ Please include:
 
 ## Scope Notes
 
-ZenCode executes code and accesses API keys by design. The threat model
-assumes the operator trusts the machine ZenCode runs on. Out of scope:
+Zen executes code and accesses API keys by design. The threat model
+assumes the operator trusts the machine Zen runs on. Out of scope:
 
 - Social-engineering or phishing against operators
 - Vulnerabilities in third-party model providers (report to them directly)

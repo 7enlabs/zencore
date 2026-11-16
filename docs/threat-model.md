@@ -1,10 +1,10 @@
-# Threat Model - ZenCode CLI
+# Threat Model - Zen CLI
 
 This document tells security scanners (human or automated) what to test, which
 inputs are adversarial, what is out of scope, and how to classify severity.
 It follows the threat-model pattern used by Anthropic's OSS Scanner program.
 
-## What ZenCode is
+## What Zen is
 
 A local AI coding CLI. It runs with the user's own privileges on their machine,
 talks to model providers over the network (OpenAI-compatible and Anthropic
@@ -42,7 +42,7 @@ shell commands proposed by a language model.
 
 - Permission/approval gating for shell execution and file writes.
 - Credential handling: API keys are read from environment variables only (no OS
-  keyring, no `zen auth` command, no key file written by ZenCode). In scope:
+  keyring, no `zen auth` command, no key file written by Zen). In scope:
   keys leaking into logs, error messages or session files, and the best-effort
   pattern redaction used by `zen export --redact`.
 - Path handling: traversal outside the working directory, symlink following,

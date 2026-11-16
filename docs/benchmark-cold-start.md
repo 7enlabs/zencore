@@ -74,7 +74,7 @@ script methodology before citing side-by-side):
 
 | Tool | Runtime | Reported cold start |
 |---|---|---|
-| ZenCode `zen` | Native Rust binary | see table above |
+| Zen `zen` | Native Rust binary | see table above |
 | Codex CLI | Native Rust binary | not measured here yet |
 | Claude Code | Node.js | not measured here yet |
 | Gemini CLI | Node.js | not measured here yet |
