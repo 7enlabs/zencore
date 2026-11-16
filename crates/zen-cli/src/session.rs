@@ -335,7 +335,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<Value>> {
     Ok(out)
 }
 
-fn summary_text(rec: &Value) -> Option<String> {
+pub(crate) fn summary_text(rec: &Value) -> Option<String> {
     let s = rec.get("summary")?;
     match s {
         Value::String(t) => Some(t.clone()),

@@ -10,6 +10,7 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "/model",
     "/provider",
     "/resume",
+    "/recall",
     "/cost",
     "/status",
     "/permissions",
@@ -65,6 +66,10 @@ pub const COMMAND_DESCRIPTIONS: &[(&str, &str)] = &[
         "Switch provider; model resets to that provider's best free model",
     ),
     ("/resume", "Resume a saved session"),
+    (
+        "/recall",
+        "Load summaries of previous sessions in this directory",
+    ),
     (
         "/continue",
         "Resume the most recent session (alias of /resume)",
@@ -123,7 +128,7 @@ pub fn help_group(name: &str) -> &'static str {
         | "/exit" | "/quit" | "/theme" | "/personality" | "/vim" | "/terse" | "/quota"
         | "/config" | "/permissions" => "Session & model",
         "/clear" | "/compact" | "/context" | "/memory" | "/memories" | "/init" | "/add-dir"
-        | "/scope" => "Context",
+        | "/scope" | "/recall" => "Context",
         "/diff" | "/review" | "/commit" | "/undo" | "/plan" | "/ci-fix" | "/pr_comments"
         | "/worktree" | "/done" | "/goal" | "/loop" | "/export" | "/rename" | "/map"
         | "/map-refresh" | "/deep-research" => "Code & review",
@@ -928,6 +933,50 @@ pub async fn sessions_command(
             }
             Ok(())
         }
+        SessionSubcommand::Search { keyword } => {
+            let hits = crate::recall::search_sessions(home, cwd, keyword);
+            if cli.json_output || cli.raw {
+                if !cli.quiet {
+                    let v = serde_json::json!(
+                        hits.iter()
+                            .map(|h| {
+                                serde_json::json!({
+                                    "id": h.id,
+                                    "modified": sm::fmt_mtime(h.modified),
+                                    "title": h.title,
+                                    "snippet": h.snippet,
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    );
+                    if cli.raw {
+                        println!("{}", serde_json::to_string(&v)?);
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(&v)?);
+                    }
+                }
+                return Ok(());
+            }
+            if hits.is_empty() {
+                if !cli.quiet {
+                    println!("no sessions match {:?}", keyword);
+                }
+                return Ok(());
+            }
+            if cli.quiet {
+                return Ok(());
+            }
+            for h in &hits {
+                println!(
+                    "{}  {}  {}",
+                    sm::short_id(&h.id),
+                    sm::fmt_mtime(h.modified),
+                    h.title.as_deref().unwrap_or("")
+                );
+                println!("    {}", h.snippet);
+            }
+            Ok(())
+        }
         SessionSubcommand::Archive { id } => {
             let dest = sm::archive_session(home, id)?;
             if !cli.quiet {
@@ -1172,6 +1221,13 @@ mod tests {
     }
 
     #[test]
+    fn builtin_commands_list_includes_recall() {
+        assert!(BUILTIN_COMMANDS.contains(&"/recall"));
+
+        assert!(!HEADLESS_BUILTINS.contains(&"recall"));
+    }
+
+    #[test]
     fn init_prompt_with_imports_lists_files() {
         let cands = vec![
             std::path::PathBuf::from("/proj/CLAUDE.md"),
@@ -1308,5 +1364,14 @@ mod tests {
         };
         let r = cost_report(&u, "mock-model", "http://127.0.0.1:1");
         assert!(!r.contains("Prompt cache"), "{}", r);
+    }
+
+    #[test]
+    fn help_group_puts_recall_in_context() {
+        assert_eq!(help_group("/recall"), "Context");
+        assert_eq!(help_group("/clear"), "Context");
+        assert_eq!(help_group("/help"), "Session & model");
+        assert_eq!(help_group("/commit"), "Code & review");
+        assert_eq!(help_group("/not-a-command"), "Tools");
     }
 }
