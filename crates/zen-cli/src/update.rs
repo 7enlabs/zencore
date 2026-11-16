@@ -353,6 +353,20 @@ mod tests {
     }
 
     #[test]
+    fn repo_url_defaults_and_env_override() {
+        let _env = crate::settings::env_lock();
+        let old = std::env::var("ZENCORE_REPO").ok();
+        unsafe { std::env::remove_var("ZENCORE_REPO") };
+        assert_eq!(repo_url(), DEFAULT_REPO);
+        unsafe { std::env::set_var("ZENCORE_REPO", "https://example.com/custom.git") };
+        assert_eq!(repo_url(), "https://example.com/custom.git");
+        match old {
+            Some(v) => unsafe { std::env::set_var("ZENCORE_REPO", v) },
+            None => unsafe { std::env::remove_var("ZENCORE_REPO") },
+        }
+    }
+
+    #[test]
     fn parse_ls_remote_head_reads_first_field() {
         assert_eq!(
             parse_ls_remote_head("0123456789abcdef0123456789abcdef01234567\tHEAD\n"),

@@ -1392,6 +1392,17 @@ fn format_skill_list(registry: &Registry, discovered: &[zen_core::SkillInfo]) ->
     out
 }
 
+/// Note printed after the permission preview when the skill to install
+/// carries a valid ed25519 signature. A pure function so the
+/// Verified-only branch stays unit-testable.
+fn verified_signature_note(tier: &TrustTier) -> Option<&'static str> {
+    if *tier == TrustTier::Verified {
+        Some("signature: valid (signed by Zen)")
+    } else {
+        None
+    }
+}
+
 fn cmd_install(
     home: &Path,
     source: &str,
@@ -1449,8 +1460,8 @@ fn cmd_install(
                 tier.badge(),
                 tier.as_str()
             );
-            if tier == TrustTier::Verified {
-                println!("signature: valid (signed by Zen)");
+            if let Some(note) = verified_signature_note(&tier) {
+                println!("{note}");
             }
         }
         None => {
@@ -2441,6 +2452,30 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cmd_install_builtin_installs_skill() {
+        let home = tmp_home("cmd-install-builtin");
+        cmd_install(&home, "builtin:tdd", true, None).unwrap();
+        assert!(skills_root(&home).join("tdd").join("SKILL.md").exists());
+        assert!(
+            skills_root(&home)
+                .join("tdd")
+                .join("zen-plugin.json")
+                .exists()
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn verified_signature_note_only_for_verified() {
+        assert_eq!(
+            verified_signature_note(&TrustTier::Verified),
+            Some("signature: valid (signed by Zen)")
+        );
+        assert_eq!(verified_signature_note(&TrustTier::Community), None);
+        assert_eq!(verified_signature_note(&TrustTier::Unverified), None);
     }
 
     fn test_skill_info(name: &str, description: &str) -> zen_core::SkillInfo {
