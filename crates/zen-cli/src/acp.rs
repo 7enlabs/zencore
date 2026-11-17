@@ -1,10 +1,16 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
+use std::time::Duration;
+
+use tokio::sync::{mpsc, oneshot};
 
 use zen_core::lock_recovery::lock_or_recover;
 use zen_core::{AgentEvent, ChatMessage, EventSink, LlmBackend};
@@ -124,9 +130,15 @@ struct ToolCallResult {
     content: Option<Vec<ContentBlock>>,
 }
 
+/// Shared stdout writer for JSON-RPC lines. The dispatcher, prompt tasks
+/// and the AcpSink all write through this one lock, so lines never
+/// interleave. Boxed so tests can capture output with a Vec-backed writer
+/// instead of the real stdout.
+type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+
 #[derive(Clone)]
 struct AcpSink {
-    out: Arc<Mutex<std::io::Stdout>>,
+    out: SharedWriter,
     session_id: String,
 
     tools: Arc<Mutex<HashMap<String, String>>>,
@@ -211,119 +223,468 @@ fn emit_assistant(sink: &AcpSink, message: &ChatMessage) {
 }
 
 struct AcpSession {
-    agent: zen_agent::Agent,
+    /// Guarded by a tokio Mutex: a prompt turn holds it for the whole
+    /// turn, and the dispatcher never blocks on it (a second prompt for
+    /// the same session is rejected via `prompt_running` first).
+    agent: tokio::sync::Mutex<zen_agent::Agent>,
     sink: Arc<AcpSink>,
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+    /// True while a prompt turn is running for this session (M2). The
+    /// dispatcher sets it before spawning the turn and the turn clears it
+    /// when done, so a second prompt for a busy session is rejected
+    /// instead of racing the first turn for the agent.
+    prompt_running: AtomicBool,
 }
 
 pub async fn run_acp_server(cli: &Cli) -> Result<i32> {
     let home = dirs::home_dir();
     let default_cwd = std::env::current_dir()?;
-    let out = Arc::new(Mutex::new(std::io::stdout()));
-    let mut sessions: HashMap<String, AcpSession> = HashMap::new();
-    let mut initialized = false;
+    let state = Arc::new(AcpServerState::new(Arc::new(Mutex::new(
+        Box::new(std::io::stdout()) as Box<dyn Write + Send>,
+    ))));
 
-    let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
-        let line = line.context("failed to read stdin")?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let req: RpcRequest = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(e) => {
-                write_response(
-                    &out,
-                    &RpcResponse::err(Value::Null, ERR_PARSE, format!("parse error: {e}")),
-                )?;
-                continue;
-            }
-        };
-        if req.jsonrpc != "2.0" {
-            if let Some(id) = req.id.clone() {
-                write_response(
-                    &out,
-                    &RpcResponse::err(id, ERR_INVALID_REQUEST, "invalid JSON-RPC version"),
-                )?;
-            }
-            continue;
-        }
-        let is_notification = req.id.is_none();
-        let id = req.id.clone().unwrap_or(Value::Null);
+    // Stdin is read on a dedicated thread (M2): the reader only forwards
+    // lines into a channel, so the dispatcher keeps receiving client
+    // messages (session/cancel, responses to agent requests) while a
+    // prompt turn runs on a spawned task. A blocking read inside the async
+    // dispatcher would stall everything for the whole turn.
+    let (tx, rx) = mpsc::unbounded_channel::<String>();
+    let _reader = std::thread::Builder::new()
+        .name("acp-stdin-reader".into())
+        .spawn(move || read_stdin_lines(tx));
 
-        // Requests other than initialize (and the local shutdown/exit
-        // lifecycle) before a successful initialize are rejected with
-        // -32600; pre-init notifications get no response at all.
-        match pre_init_decision(initialized, &req.method, is_notification, &id) {
-            PreInit::Dispatch => {}
-            PreInit::Reject(resp) => {
-                write_response(&out, &resp)?;
-                continue;
-            }
-            PreInit::Ignore => continue,
-        }
+    run_dispatcher(cli.clone(), default_cwd, home, state, rx).await
+}
 
-        let response = match req.method.as_str() {
-            "initialize" => Some(apply_initialize(&mut initialized, id, &req.params)),
-            "authenticate" => Some(RpcResponse::ok(id, json!({}))),
-            "session/new" => {
-                match handle_session_new(cli, &default_cwd, home.as_deref(), &req.params, &out)
-                    .await
-                {
-                    Ok((session_id, session)) => {
-                        sessions.insert(session_id.clone(), session);
-                        Some(RpcResponse::ok(id, json!({ "sessionId": session_id })))
-                    }
-                    Err(e) => Some(RpcResponse::err(
-                        id,
-                        ERR_INTERNAL,
-                        format!("session/new failed: {e:#}"),
-                    )),
+/// Shared mutable state of the ACP server, owned by the dispatcher and
+/// borrowed by prompt tasks (M2). Everything in here is Sync, so a prompt
+/// can run on a spawned task while the dispatcher keeps reading stdin.
+struct AcpServerState {
+    /// Shared stdout writer (one JSON-RPC line per write, locked).
+    out: SharedWriter,
+    /// Sessions by id. A session stays in the map for the whole turn so
+    /// `session/cancel` can find it while its prompt runs.
+    sessions: Mutex<HashMap<String, Arc<AcpSession>>>,
+    /// Requests the agent sent to the client and is still waiting on,
+    /// keyed by the request id we generated.
+    pending: Mutex<HashMap<String, oneshot::Sender<ClientResponse>>>,
+    #[allow(dead_code)] // M2: kept intentionally; first production caller is M4 (session/request_permission).
+    /// Counter for agent-initiated request ids ("zen-1", "zen-2", ...).
+    next_request_id: AtomicU64,
+    /// Set once `initialize` succeeds (M1).
+    initialized: AtomicBool,
+}
+
+impl AcpServerState {
+    fn new(out: SharedWriter) -> Self {
+        Self {
+            out,
+            sessions: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            next_request_id: AtomicU64::new(1),
+            initialized: AtomicBool::new(false),
+        }
+    }
+
+    /// Send a request to the client and wait for its response (M2). The
+    /// request id is generated ("zen-1", ...) so it never collides with
+    /// client-chosen ids. Returns the result value, or an error when the
+    /// client answers with an error, the wait times out, or the client
+    /// disconnects while waiting. Callers without a custom timeout pass
+    /// 30 seconds; M4's `session/request_permission` uses that default
+    /// and treats a timeout as a refusal (fail closed, Leader Q4).
+    #[allow(dead_code)] // M2: kept intentionally; first production caller is M4 (session/request_permission).
+    async fn send_client_request(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, SendRequestError> {
+        let n = self.next_request_id.fetch_add(1, Ordering::SeqCst);
+        // Keep the id as a Value: the pending table is keyed by
+        // id_key(&id), the same function the response router uses, so a
+        // generated id can never miss its waiter over a key encoding.
+        let id = Value::String(format!("zen-{n}"));
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = lock_or_recover(&self.pending, "acp pending");
+            pending.insert(id_key(&id), tx);
+        }
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        if let Err(e) = write_json_line(&self.out, &request) {
+            // The client is gone: drop the waiter so nobody waits forever.
+            let mut pending = lock_or_recover(&self.pending, "acp pending");
+            pending.remove(&id_key(&id));
+            return Err(SendRequestError::WriteFailed(e.to_string()));
+        }
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(ClientResponse::Result(result))) => Ok(result),
+            Ok(Ok(ClientResponse::Error { code, message })) => {
+                Err(SendRequestError::ClientError { code, message })
+            }
+            Ok(Err(_)) => Err(SendRequestError::Disconnected),
+            Err(_) => {
+                let mut pending = lock_or_recover(&self.pending, "acp pending");
+                pending.remove(&id_key(&id));
+                Err(SendRequestError::Timeout)
+            }
+        }
+    }
+}
+
+#[allow(dead_code)] // M2: kept intentionally; first production caller is M4 (session/request_permission).
+/// What the client answered to an agent-initiated request.
+enum ClientResponse {
+    Result(Value),
+    Error { code: i64, message: String },
+}
+
+#[allow(dead_code)] // M2: kept intentionally; first production caller is M4 (session/request_permission).
+/// Why `send_client_request` did not return a result.
+#[derive(Debug, PartialEq)]
+enum SendRequestError {
+    /// The client answered with a JSON-RPC error.
+    ClientError { code: i64, message: String },
+    /// No answer within the timeout.
+    Timeout,
+    /// The server is shutting down (the waiter was dropped).
+    Disconnected,
+    /// The request line could not be written (client gone).
+    WriteFailed(String),
+}
+
+impl std::fmt::Display for SendRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ClientError { code, message } => {
+                write!(f, "client request failed: {code} {message}")
+            }
+            Self::Timeout => write!(f, "client request timed out"),
+            Self::Disconnected => write!(f, "client disconnected while waiting"),
+            Self::WriteFailed(e) => write!(f, "failed to write client request: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SendRequestError {}
+
+/// Route a client response (a message with `id` and `result`/`error` but
+/// no `method`) to the waiter of the agent-initiated request with that
+/// id. Returns true when a waiter was found. Unknown or late ids are
+/// ignored: the waiter already timed out, and a late answer is not an
+/// error.
+fn route_client_response(state: &AcpServerState, msg: &Value) -> bool {
+    let Some(id) = msg.get("id") else {
+        return false;
+    };
+    let key = id_key(id);
+    let response = if let Some(result) = msg.get("result") {
+        ClientResponse::Result(result.clone())
+    } else if let Some(error) = msg.get("error") {
+        ClientResponse::Error {
+            code: error
+                .get("code")
+                .and_then(Value::as_i64)
+                .unwrap_or(ERR_INTERNAL),
+            message: error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("client error")
+                .to_string(),
+        }
+    } else {
+        return false;
+    };
+    let sender = {
+        let mut pending = lock_or_recover(&state.pending, "acp pending");
+        pending.remove(&key)
+    };
+    match sender {
+        Some(tx) => {
+            let _ = tx.send(response);
+            true
+        }
+        None => {
+            eprintln!("acp: response for unknown request id {key}, ignoring");
+            false
+        }
+    }
+}
+
+/// Canonical map key for a JSON-RPC id (string or number). Generation and
+/// lookup must use the same function, so `"zen-1"` and `1` never collide
+/// with each other by accident.
+fn id_key(id: &Value) -> String {
+    serde_json::to_string(id).unwrap_or_default()
+}
+
+/// Stdin reader for the dispatcher (M2). Runs on its own thread and
+/// forwards every line to the dispatcher; dropping the sender when stdin
+/// closes tells the dispatcher to exit.
+fn read_stdin_lines(tx: mpsc::UnboundedSender<String>) {
+    read_lines(std::io::stdin().lock(), tx);
+}
+
+fn read_lines<R: BufRead>(reader: R, tx: mpsc::UnboundedSender<String>) {
+    for line in reader.lines() {
+        match line {
+            Ok(line) => {
+                if tx.send(line).is_err() {
+                    break; // Dispatcher is gone; nothing left to read for.
                 }
             }
-            "session/prompt" => match handle_prompt(&mut sessions, &req.params).await {
-                Ok(stop_reason) => Some(RpcResponse::ok(id, json!({ "stopReason": stop_reason }))),
-                Err(e) => Some(RpcResponse::err(
-                    id,
-                    ERR_INTERNAL,
-                    format!("session/prompt failed: {e:#}"),
-                )),
-            },
-            "session/cancel" => {
-                handle_cancel(&sessions, &req.params);
-                if is_notification {
-                    None
-                } else {
-                    Some(RpcResponse::ok(id, json!({})))
-                }
-            }
-            "shutdown" | "exit" => {
-                if !is_notification {
-                    write_response(&out, &RpcResponse::ok(id, json!({})))?;
-                }
-                break;
-            }
-            _ => {
-                if is_notification {
-                    None
-                } else {
-                    Some(RpcResponse::err(
-                        id,
-                        ERR_METHOD_NOT_FOUND,
-                        format!("method not found: {}", req.method),
-                    ))
-                }
-            }
-        };
-        if let Some(resp) = response {
-            write_response(&out, &resp)?;
+            Err(_) => break, // Read error: treat as EOF for the dispatcher.
+        }
+    }
+}
+
+/// What `dispatch_line` tells the dispatcher loop to do next.
+#[derive(Debug, PartialEq)]
+enum Dispatch {
+    /// Keep reading the next line.
+    Continue,
+    /// The client asked to shut down; stop the loop.
+    Stop,
+}
+
+/// The dispatcher loop (M2): reads lines from the channel fed by the
+/// stdin reader thread and dispatches them one by one. It never blocks
+/// on a prompt: `session/prompt` spawns a task and the loop moves on, so
+/// `session/cancel` and responses to agent requests are processed while
+/// a turn runs.
+async fn run_dispatcher(
+    cli: Cli,
+    default_cwd: PathBuf,
+    home: Option<PathBuf>,
+    state: Arc<AcpServerState>,
+    mut rx: mpsc::UnboundedReceiver<String>,
+) -> Result<i32> {
+    while let Some(line) = rx.recv().await {
+        if dispatch_line(&cli, &default_cwd, home.as_deref(), &state, &line).await?
+            == Dispatch::Stop
+        {
+            break;
         }
     }
     Ok(0)
 }
 
-fn write_response(out: &Arc<Mutex<std::io::Stdout>>, resp: &RpcResponse) -> Result<()> {
-    let line = serde_json::to_string(resp)?;
+/// Dispatch one incoming line. Returns `Dispatch::Stop` when the client
+/// asked to shut down.
+async fn dispatch_line(
+    cli: &Cli,
+    default_cwd: &Path,
+    home: Option<&Path>,
+    state: &Arc<AcpServerState>,
+    line: &str,
+) -> Result<Dispatch> {
+    if line.trim().is_empty() {
+        return Ok(Dispatch::Continue);
+    }
+    // Parse as a generic value first: a client response to an
+    // agent-initiated request has no `method`, so it does not parse as an
+    // RpcRequest at all. (Before M2, such a response came back as a -32700
+    // parse error, which made any agent-to-client request unusable.)
+    let msg: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(e) => {
+            write_response(
+                &state.out,
+                &RpcResponse::err(Value::Null, ERR_PARSE, format!("parse error: {e}")),
+            )?;
+            return Ok(Dispatch::Continue);
+        }
+    };
+    if msg.get("method").is_none() {
+        if msg.get("id").is_some() && (msg.get("result").is_some() || msg.get("error").is_some()) {
+            route_client_response(state, &msg);
+            return Ok(Dispatch::Continue);
+        }
+        // A message with neither method nor result/error is invalid.
+        if let Some(id) = msg.get("id").cloned() {
+            write_response(
+                &state.out,
+                &RpcResponse::err(
+                    id,
+                    ERR_INVALID_REQUEST,
+                    "invalid request: expected method or result/error",
+                ),
+            )?;
+        }
+        return Ok(Dispatch::Continue);
+    }
+    let req: RpcRequest = match serde_json::from_value(msg) {
+        Ok(r) => r,
+        Err(e) => {
+            write_response(
+                &state.out,
+                &RpcResponse::err(Value::Null, ERR_PARSE, format!("parse error: {e}")),
+            )?;
+            return Ok(Dispatch::Continue);
+        }
+    };
+    if req.jsonrpc != "2.0" {
+        if let Some(id) = req.id.clone() {
+            write_response(
+                &state.out,
+                &RpcResponse::err(id, ERR_INVALID_REQUEST, "invalid JSON-RPC version"),
+            )?;
+        }
+        return Ok(Dispatch::Continue);
+    }
+    let is_notification = req.id.is_none();
+    let id = req.id.clone().unwrap_or(Value::Null);
+
+    // Requests other than initialize (and the local shutdown/exit
+    // lifecycle) before a successful initialize are rejected with
+    // -32600; pre-init notifications get no response at all.
+    match pre_init_decision(
+        state.initialized.load(Ordering::SeqCst),
+        &req.method,
+        is_notification,
+        &id,
+    ) {
+        PreInit::Dispatch => {}
+        PreInit::Reject(resp) => {
+            write_response(&state.out, &resp)?;
+            return Ok(Dispatch::Continue);
+        }
+        PreInit::Ignore => return Ok(Dispatch::Continue),
+    }
+
+    let response = match req.method.as_str() {
+        "initialize" => Some(apply_initialize(&state.initialized, id, &req.params)),
+        "authenticate" => Some(RpcResponse::ok(id, json!({}))),
+        "session/new" => {
+            match handle_session_new(cli, default_cwd, home, &req.params, &state.out).await {
+                Ok((session_id, session)) => {
+                    let mut sessions = lock_or_recover(&state.sessions, "acp sessions");
+                    sessions.insert(session_id.clone(), Arc::new(session));
+                    Some(RpcResponse::ok(id, json!({ "sessionId": session_id })))
+                }
+                Err(e) => Some(RpcResponse::err(
+                    id,
+                    ERR_INTERNAL,
+                    format!("session/new failed: {e:#}"),
+                )),
+            }
+        }
+        "session/prompt" => {
+            // A prompt runs on a spawned task (M2): the dispatcher
+            // keeps reading stdin while the turn runs, so session/cancel
+            // and responses to agent requests are processed mid-turn.
+            // The session stays in the map for the whole turn, so a
+            // cancel sent mid-turn can find it.
+            match req.params.get("sessionId").and_then(Value::as_str) {
+                None => Some(RpcResponse::err(
+                    id,
+                    ERR_INTERNAL,
+                    "session/prompt failed: missing sessionId",
+                )),
+                Some(session_id) => {
+                    let session = {
+                        let sessions = lock_or_recover(&state.sessions, "acp sessions");
+                        sessions.get(session_id).cloned()
+                    };
+                    match session {
+                        None => Some(RpcResponse::err(
+                            id,
+                            ERR_INTERNAL,
+                            "session/prompt failed: unknown sessionId",
+                        )),
+                        Some(session) => {
+                            if session.prompt_running.swap(true, Ordering::SeqCst) {
+                                Some(RpcResponse::err(
+                                    id,
+                                    ERR_INVALID_REQUEST,
+                                    "session already has a prompt running",
+                                ))
+                            } else {
+                                // Reset here, at dispatch time: the
+                                // turn may not start polling until
+                                // later, and a cancel sent in between
+                                // must not be clobbered by the reset.
+                                session.cancelled.store(false, Ordering::SeqCst);
+                                let state2 = Arc::clone(state);
+                                let params = req.params.clone();
+                                tokio::spawn(async move {
+                                    let _guard = PromptRunningGuard { session: &session };
+                                    let resp = match run_prompt_turn(&session, &params).await {
+                                        Ok(stop_reason) => RpcResponse::ok(
+                                            id,
+                                            json!({ "stopReason": stop_reason }),
+                                        ),
+                                        Err(e) => RpcResponse::err(
+                                            id,
+                                            ERR_INTERNAL,
+                                            format!("session/prompt failed: {e:#}"),
+                                        ),
+                                    };
+                                    let _ = write_response(&state2.out, &resp);
+                                });
+                                None
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        "session/cancel" => {
+            {
+                let sessions = lock_or_recover(&state.sessions, "acp sessions");
+                handle_cancel(&sessions, &req.params);
+            }
+            if is_notification {
+                None
+            } else {
+                Some(RpcResponse::ok(id, json!({})))
+            }
+        }
+        "shutdown" | "exit" => {
+            if !is_notification {
+                write_response(&state.out, &RpcResponse::ok(id, json!({})))?;
+            }
+            return Ok(Dispatch::Stop);
+        }
+        _ => {
+            if is_notification {
+                None
+            } else {
+                Some(RpcResponse::err(
+                    id,
+                    ERR_METHOD_NOT_FOUND,
+                    format!("method not found: {}", req.method),
+                ))
+            }
+        }
+    };
+    if let Some(resp) = response {
+        write_response(&state.out, &resp)?;
+    }
+    Ok(Dispatch::Continue)
+}
+
+fn write_response(out: &SharedWriter, resp: &RpcResponse) -> Result<()> {
+    // Serialize the struct directly: round-tripping through Value would
+    // sort the keys alphabetically and move `jsonrpc` after `id`.
+    write_line(out, &serde_json::to_string(resp)?)
+}
+
+/// Write one JSON value as a single line on the shared writer (M2).
+/// Every JSON-RPC line the server sends goes through here (responses,
+/// notifications and agent-initiated requests), so a line is never split
+/// by a concurrent writer.
+#[allow(dead_code)] // M2: kept intentionally; first production caller is M4 (session/request_permission).
+fn write_json_line(out: &SharedWriter, value: &Value) -> Result<()> {
+    write_line(out, &serde_json::to_string(value)?)
+}
+
+fn write_line(out: &SharedWriter, line: &str) -> Result<()> {
     let mut out = lock_or_recover(out, "acp stdout");
     writeln!(out, "{line}")?;
     out.flush()?;
@@ -366,13 +727,13 @@ fn pre_init_decision(
 /// `initialize` after a successful one is rejected with -32600 (exactly
 /// one initialize per connection); `initialized` is set only when
 /// negotiation succeeds, so a failed attempt can be retried.
-fn apply_initialize(initialized: &mut bool, id: Value, params: &Value) -> RpcResponse {
-    if *initialized {
+fn apply_initialize(initialized: &AtomicBool, id: Value, params: &Value) -> RpcResponse {
+    if initialized.load(Ordering::SeqCst) {
         return RpcResponse::err(id, ERR_INVALID_REQUEST, "already initialized");
     }
     let resp = handle_initialize(id, params);
     if resp.error.is_none() {
-        *initialized = true;
+        initialized.store(true, Ordering::SeqCst);
     }
     resp
 }
@@ -435,7 +796,7 @@ async fn handle_session_new(
     default_cwd: &Path,
     home: Option<&Path>,
     params: &Value,
-    out: &Arc<Mutex<std::io::Stdout>>,
+    out: &SharedWriter,
 ) -> Result<(String, AcpSession)> {
     let cwd = params
         .get("cwd")
@@ -479,9 +840,10 @@ async fn handle_session_new(
     Ok((
         session_id,
         AcpSession {
-            agent,
+            agent: tokio::sync::Mutex::new(agent),
             sink: sink.clone(),
-            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            prompt_running: AtomicBool::new(false),
         },
     ))
 }
@@ -510,28 +872,27 @@ fn prompt_text(params: &Value) -> String {
         .unwrap_or_default()
 }
 
-async fn handle_prompt(
-    sessions: &mut HashMap<String, AcpSession>,
-    params: &Value,
-) -> Result<&'static str> {
-    let session_id = params
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .context("missing sessionId")?;
-    let session = sessions.get_mut(session_id).context("unknown sessionId")?;
-    session
-        .cancelled
-        .store(false, std::sync::atomic::Ordering::SeqCst);
-
+/// Run one prompt turn for a session (M2). Called on a spawned task by
+/// the dispatcher, so the turn runs while the dispatcher keeps reading
+/// stdin. The caller guarantees the session exists and no other turn is
+/// running for it (see `prompt_running`), and resets `cancelled` at
+/// dispatch time.
+async fn run_prompt_turn(session: &Arc<AcpSession>, params: &Value) -> Result<&'static str> {
+    // The dispatcher resets `cancelled` at dispatch time (before the
+    // spawn), not here: a cancel sent between the spawn and the first
+    // poll of this task must survive.
     let text = prompt_text(params);
-    let result = session.agent.run_turn(&text).await;
+    let mut agent = session.agent.lock().await;
+    let result = agent.run_turn(&text).await;
+    let size = agent.config.context_window;
+    drop(agent);
 
     session.sink.notify(SessionUpdate::UsageUpdate {
         used: result.usage.input_tokens + result.usage.output_tokens,
-        size: session.agent.config.context_window,
+        size,
     });
 
-    let stop_reason = if session.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+    let stop_reason = if session.cancelled.load(Ordering::SeqCst) {
         "cancelled"
     } else {
         match result.subtype.as_str() {
@@ -543,7 +904,19 @@ async fn handle_prompt(
     Ok(stop_reason)
 }
 
-fn handle_cancel(sessions: &HashMap<String, AcpSession>, params: &Value) {
+/// Clears a session's `prompt_running` flag when the prompt task ends,
+/// including on panic, so a failed turn does not wedge the session.
+struct PromptRunningGuard<'a> {
+    session: &'a AcpSession,
+}
+
+impl Drop for PromptRunningGuard<'_> {
+    fn drop(&mut self) {
+        self.session.prompt_running.store(false, Ordering::SeqCst);
+    }
+}
+
+fn handle_cancel(sessions: &HashMap<String, Arc<AcpSession>>, params: &Value) {
     if let Some(sid) = params.get("sessionId").and_then(Value::as_str)
         && let Some(s) = sessions.get(sid)
     {
@@ -554,6 +927,7 @@ fn handle_cancel(sessions: &HashMap<String, AcpSession>, params: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn rpc_initialize_roundtrip() {
@@ -625,30 +999,30 @@ mod tests {
 
     #[test]
     fn apply_initialize_sets_flag_only_on_success() {
-        let mut initialized = false;
-        let resp = apply_initialize(&mut initialized, json!(5), &json!({"protocolVersion": 1}));
+        let initialized = AtomicBool::new(false);
+        let resp = apply_initialize(&initialized, json!(5), &json!({"protocolVersion": 1}));
         assert!(serde_json::to_value(&resp).unwrap().get("error").is_none());
-        assert!(initialized);
+        assert!(initialized.load(Ordering::SeqCst));
 
         // A repeat initialize is rejected and leaves the flag set.
-        let resp = apply_initialize(&mut initialized, json!(6), &json!({"protocolVersion": 1}));
+        let resp = apply_initialize(&initialized, json!(6), &json!({"protocolVersion": 1}));
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["error"]["code"], -32600);
-        assert!(initialized);
+        assert!(initialized.load(Ordering::SeqCst));
     }
 
     #[test]
     fn apply_initialize_failed_attempt_leaves_flag_clear() {
-        let mut initialized = false;
-        let resp = apply_initialize(&mut initialized, json!(7), &json!({}));
+        let initialized = AtomicBool::new(false);
+        let resp = apply_initialize(&initialized, json!(7), &json!({}));
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["error"]["code"], -32602);
-        assert!(!initialized);
+        assert!(!initialized.load(Ordering::SeqCst));
 
         // Retrying with a good request then succeeds.
-        let resp = apply_initialize(&mut initialized, json!(8), &json!({"protocolVersion": 1}));
+        let resp = apply_initialize(&initialized, json!(8), &json!({"protocolVersion": 1}));
         assert!(serde_json::to_value(&resp).unwrap().get("error").is_none());
-        assert!(initialized);
+        assert!(initialized.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -745,7 +1119,9 @@ mod tests {
     #[test]
     fn emit_assistant_registers_tool_calls() {
         let sink = AcpSink {
-            out: Arc::new(Mutex::new(std::io::stdout())),
+            out: Arc::new(Mutex::new(
+                Box::new(std::io::stdout()) as Box<dyn Write + Send>
+            )),
             session_id: "probe".into(),
             tools: Arc::new(Mutex::new(HashMap::new())),
         };
@@ -780,7 +1156,9 @@ mod tests {
             return;
         };
         let sink = AcpSink {
-            out: Arc::new(Mutex::new(std::io::stdout())),
+            out: Arc::new(Mutex::new(
+                Box::new(std::io::stdout()) as Box<dyn Write + Send>
+            )),
             session_id: "probe".into(),
             tools: Arc::new(Mutex::new(HashMap::new())),
         };
@@ -830,7 +1208,13 @@ mod tests {
             v.get("id").cloned().unwrap_or(Value::Null),
             v.get("result").cloned().unwrap_or(Value::Null),
         );
-        write_response(&Arc::new(Mutex::new(std::io::stdout())), &resp).unwrap();
+        write_response(
+            &Arc::new(Mutex::new(
+                Box::new(std::io::stdout()) as Box<dyn Write + Send>
+            )),
+            &resp,
+        )
+        .unwrap();
     }
 
     fn probe_write_response(response_json: &str) -> Vec<serde_json::Value> {
@@ -900,6 +1284,371 @@ mod tests {
         assert_eq!(v["error"]["code"], -32601);
         assert!(v.get("result").is_none());
     }
+
+    // ---- M2 helpers and tests ----
+
+    /// A Vec-backed writer for capturing dispatcher output in tests.
+    struct VecWriter {
+        buf: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for VecWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.buf.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Test server state with a Vec writer; returns the state and the
+    /// captured-output buffer.
+    fn test_state() -> (Arc<AcpServerState>, Arc<Mutex<Vec<u8>>>) {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let out: SharedWriter = Arc::new(Mutex::new(
+            Box::new(VecWriter { buf: buf.clone() }) as Box<dyn Write + Send>
+        ));
+        (Arc::new(AcpServerState::new(out)), buf)
+    }
+
+    /// Parse the captured output buffer into one JSON value per complete
+    /// line. A line that does not parse yet (a write in flight) is
+    /// skipped; the next poll sees it whole.
+    fn read_output_lines(buf: &Arc<Mutex<Vec<u8>>>) -> Vec<Value> {
+        let bytes = buf.lock().unwrap().clone();
+        let text = String::from_utf8_lossy(&bytes);
+        text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    /// Wait until the captured output satisfies `pred`, or panic with
+    /// what was captured so far.
+    async fn wait_for_output(
+        buf: &Arc<Mutex<Vec<u8>>>,
+        timeout: Duration,
+        pred: impl Fn(&[Value]) -> bool,
+    ) -> Vec<Value> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let lines = read_output_lines(buf);
+            if pred(&lines) {
+                return lines;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("timed out waiting for dispatcher output; got: {lines:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The response with the given numeric id, if one was written.
+    fn find_response(lines: &[Value], id: u64) -> Option<&Value> {
+        lines
+            .iter()
+            .find(|l| l.get("id").and_then(Value::as_u64) == Some(id))
+    }
+
+    fn init_line(id: u64) -> String {
+        json!({"jsonrpc": "2.0", "id": id, "method": "initialize", "params": {"protocolVersion": 1}})
+            .to_string()
+    }
+
+    /// Run the dispatcher over `lines` (sent back-to-back, then the
+    /// channel is closed) and return a handle to await for its exit.
+    /// Prompt tasks outlive the loop; use `wait_for_output` afterwards
+    /// for their responses.
+    fn drive_dispatcher(
+        state: Arc<AcpServerState>,
+        lines: Vec<String>,
+    ) -> tokio::task::JoinHandle<Result<i32>> {
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        let cli = Cli::try_parse_from(["zen"]).unwrap();
+        let cwd = std::env::temp_dir();
+        let run = tokio::spawn(run_dispatcher(cli, cwd, None, state, rx));
+        for line in lines {
+            tx.send(line).unwrap();
+        }
+        drop(tx);
+        run
+    }
+
+    /// A fake LLM backend that sleeps `delay_ms` before every reply (M2):
+    /// the delay is what lets a test send a cancel mid-turn and prove the
+    /// dispatcher processes it while the turn runs.
+    struct DelayedLlm {
+        delay_ms: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmBackend for DelayedLlm {
+        async fn chat(
+            &self,
+            _req: zen_core::ChatRequest,
+        ) -> anyhow::Result<zen_core::ChatResponse> {
+            if self.delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+            }
+            Ok(zen_core::ChatResponse {
+                message: ChatMessage::assistant(Some("done".into()), None),
+                usage: zen_core::Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    total_tokens: 15,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                },
+                finish_reason: Some("stop".into()),
+            })
+        }
+    }
+
+    /// A permission checker that allows everything (test double).
+    struct AllowAll;
+
+    impl zen_core::PermissionChecker for AllowAll {
+        fn check(
+            &self,
+            _tool_name: &str,
+            _input: &Value,
+            _read_only: bool,
+            _ctx: &zen_core::ToolContext,
+        ) -> zen_core::PermissionDecision {
+            zen_core::PermissionDecision::Allow
+        }
+    }
+
+    /// Build a session backed by the delayed fake LLM and insert it into
+    /// the test state, so dispatcher tests can run a real turn without a
+    /// live LLM.
+    fn fake_session(state: &Arc<AcpServerState>, session_id: &str, delay_ms: u64) {
+        let sink = Arc::new(AcpSink {
+            out: state.out.clone(),
+            session_id: session_id.into(),
+            tools: Arc::new(Mutex::new(HashMap::new())),
+        });
+        let agent = zen_agent::Agent::new(
+            Arc::new(DelayedLlm { delay_ms }),
+            zen_core::ToolRegistry::new(),
+            Arc::new(AllowAll),
+            None,
+            Arc::new(zen_core::NoHooks),
+            sink.clone(),
+            zen_core::ToolContext::new(std::env::temp_dir(), session_id),
+            zen_agent::AgentConfig::default(),
+        );
+        let session = Arc::new(AcpSession {
+            agent: tokio::sync::Mutex::new(agent),
+            sink,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            prompt_running: AtomicBool::new(false),
+        });
+        let mut sessions = lock_or_recover(&state.sessions, "acp sessions");
+        sessions.insert(session_id.to_string(), session);
+    }
+
+    /// M2 core property: while a prompt turn runs, the dispatcher keeps
+    /// processing stdin. The turn uses a delayed fake LLM (800 ms); a
+    /// cancel and an unknown-method request sent right after the prompt
+    /// are answered before the prompt finishes, and the turn ends
+    /// cancelled.
+    #[tokio::test]
+    async fn dispatcher_processes_messages_during_prompt() {
+        let (state, buf) = test_state();
+        fake_session(&state, "s1", 800);
+        let run = drive_dispatcher(
+            Arc::clone(&state),
+            vec![
+                init_line(1),
+                json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": "s1", "content": [{"type": "text", "text": "hi"}]}})
+                    .to_string(),
+                json!({"jsonrpc": "2.0", "id": 3, "method": "bogus/method", "params": {}})
+                    .to_string(),
+                json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": "s1"}})
+                    .to_string(),
+            ],
+        );
+        run.await.unwrap().unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some()
+        })
+        .await;
+        assert_eq!(lines[0]["result"]["protocolVersion"], 1, "{lines:?}");
+        // The -32601 for the unknown method arrives before the prompt
+        // response: the dispatcher did not block on the turn.
+        let pos = |id: u64| {
+            lines
+                .iter()
+                .position(|l| l.get("id").and_then(Value::as_u64) == Some(id))
+                .unwrap()
+        };
+        assert!(pos(3) < pos(2), "{lines:?}");
+        let unknown = find_response(&lines, 3).expect("bogus method must be answered");
+        assert_eq!(unknown["error"]["code"], -32601, "{lines:?}");
+        let prompt = find_response(&lines, 2).expect("prompt must be answered");
+        assert_eq!(prompt["result"]["stopReason"], "cancelled", "{lines:?}");
+    }
+
+    /// A second prompt for a session with a turn running is rejected
+    /// with -32600 instead of racing the first turn for the agent.
+    #[tokio::test]
+    async fn second_prompt_for_busy_session_is_rejected() {
+        let (state, buf) = test_state();
+        fake_session(&state, "s1", 800);
+        let run = drive_dispatcher(
+            Arc::clone(&state),
+            vec![
+                init_line(1),
+                json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": "s1", "content": [{"type": "text", "text": "one"}]}})
+                    .to_string(),
+                json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {"sessionId": "s1", "content": [{"type": "text", "text": "two"}]}})
+                    .to_string(),
+            ],
+        );
+        run.await.unwrap().unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some() && find_response(ls, 3).is_some()
+        })
+        .await;
+        let busy = find_response(&lines, 3).unwrap();
+        assert_eq!(busy["error"]["code"], -32600, "{lines:?}");
+        let first = find_response(&lines, 2).unwrap();
+        assert_eq!(first["result"]["stopReason"], "end_turn", "{lines:?}");
+    }
+
+    /// The agent can send a request to the client and get its response
+    /// back through the pending table (M2 infrastructure for M4).
+    #[tokio::test]
+    async fn pending_request_routes_response() {
+        let (state, buf) = test_state();
+        let asked = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                state
+                    .send_client_request(
+                        "session/request_permission",
+                        json!({}),
+                        Duration::from_secs(5),
+                    )
+                    .await
+            }
+        });
+        // The fake client: read the request the server wrote, answer it.
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            ls.iter().any(|l| l.get("method").is_some())
+        })
+        .await;
+        let request = lines
+            .iter()
+            .find(|l| l.get("method").is_some())
+            .expect("request must be written");
+        assert_eq!(request["method"], "session/request_permission");
+        let id = request["id"].clone();
+        assert!(route_client_response(
+            &state,
+            &json!({"jsonrpc": "2.0", "id": id, "result": {"outcome": "ok"}}),
+        ));
+        assert_eq!(asked.await.unwrap().unwrap(), json!({"outcome": "ok"}));
+    }
+
+    #[tokio::test]
+    async fn pending_request_reports_client_error() {
+        let (state, buf) = test_state();
+        let asked = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                state
+                    .send_client_request(
+                        "session/request_permission",
+                        json!({}),
+                        Duration::from_secs(5),
+                    )
+                    .await
+            }
+        });
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            ls.iter().any(|l| l.get("method").is_some())
+        })
+        .await;
+        let id = lines.iter().find(|l| l.get("method").is_some()).unwrap()["id"].clone();
+        assert!(route_client_response(
+            &state,
+            &json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "no such method"}}),
+        ));
+        assert_eq!(
+            asked.await.unwrap().unwrap_err(),
+            SendRequestError::ClientError {
+                code: -32601,
+                message: "no such method".into(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_request_times_out_and_late_answer_is_ignored() {
+        let (state, _buf) = test_state();
+        let err = state
+            .send_client_request(
+                "session/request_permission",
+                json!({}),
+                Duration::from_millis(10),
+            )
+            .await
+            .expect_err("no client answer must time out");
+        assert_eq!(err, SendRequestError::Timeout);
+        // The stale waiter is gone: a late answer is ignored, not routed.
+        assert!(!route_client_response(
+            &state,
+            &json!({"jsonrpc": "2.0", "id": "zen-1", "result": {}}),
+        ));
+    }
+
+    #[test]
+    fn stdin_reader_forwards_lines() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let data = b"one\ntwo\n\nthree\n";
+        read_lines(std::io::Cursor::new(&data[..]), tx);
+        assert_eq!(rx.try_recv().unwrap(), "one");
+        assert_eq!(rx.try_recv().unwrap(), "two");
+        assert_eq!(rx.try_recv().unwrap(), "");
+        assert_eq!(rx.try_recv().unwrap(), "three");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatcher_rejects_prompt_for_missing_or_unknown_session() {
+        let (state, buf) = test_state();
+        let run = drive_dispatcher(
+            Arc::clone(&state),
+            vec![
+                init_line(1),
+                json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {}})
+                    .to_string(),
+                json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {"sessionId": "nope"}})
+                    .to_string(),
+            ],
+        );
+        run.await.unwrap().unwrap();
+        let lines = read_output_lines(&buf);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines[1]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("missing sessionId"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[2]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown sessionId"),
+            "{lines:?}"
+        );
+    }
 }
 
 // Tests added for Việc A (floor coverage 88%): the AcpSink::emit arms
@@ -907,7 +1656,9 @@ mod tests {
 // write_response, the prompt_text resource arm, and the cheap error paths
 // of handle_prompt / handle_cancel / handle_session_new. The stdio loop
 // in run_acp_server is not drivable in-process; it is covered end to end
-// by crates/zen-cli/tests/acp_server.rs instead.
+// by crates/zen-cli/tests/acp_server.rs instead. The dispatcher (M2) is
+// drivable in-process through run_dispatcher with a channel; see the M2
+// tests at the end of mod tests.
 #[cfg(test)]
 mod viec_a_tests {
     use super::*;
@@ -921,7 +1672,9 @@ mod viec_a_tests {
     #[test]
     fn __acp_probe_emit() {
         let sink = AcpSink {
-            out: Arc::new(Mutex::new(std::io::stdout())),
+            out: Arc::new(Mutex::new(
+                Box::new(std::io::stdout()) as Box<dyn Write + Send>
+            )),
             session_id: "probe".into(),
             tools: Arc::new(Mutex::new(HashMap::new())),
         };
@@ -1013,7 +1766,9 @@ mod viec_a_tests {
 
     #[test]
     fn write_response_writes_json_line() {
-        let out = Arc::new(Mutex::new(std::io::stdout()));
+        let out = Arc::new(Mutex::new(
+            Box::new(std::io::stdout()) as Box<dyn Write + Send>
+        ));
         write_response(&out, &RpcResponse::ok(json!(1), json!({"a": 1}))).unwrap();
         write_response(
             &out,
@@ -1043,22 +1798,9 @@ mod viec_a_tests {
         );
     }
 
-    #[tokio::test]
-    async fn handle_prompt_missing_and_unknown_session() {
-        let mut sessions: HashMap<String, AcpSession> = HashMap::new();
-        let err = handle_prompt(&mut sessions, &json!({}))
-            .await
-            .expect_err("missing sessionId must error");
-        assert!(err.to_string().contains("missing sessionId"), "{err}");
-        let err = handle_prompt(&mut sessions, &json!({"sessionId": "nope"}))
-            .await
-            .expect_err("unknown sessionId must error");
-        assert!(err.to_string().contains("unknown sessionId"), "{err}");
-    }
-
     #[test]
     fn handle_cancel_unknown_session_is_noop() {
-        let sessions: HashMap<String, AcpSession> = HashMap::new();
+        let sessions: HashMap<String, Arc<AcpSession>> = HashMap::new();
         handle_cancel(&sessions, &json!({"sessionId": "nope"}));
         handle_cancel(&sessions, &json!({}));
     }
@@ -1066,7 +1808,9 @@ mod viec_a_tests {
     #[tokio::test]
     async fn handle_session_new_rejects_relative_cwd() {
         let cli = Cli::try_parse_from(["zen"]).unwrap();
-        let out = Arc::new(Mutex::new(std::io::stdout()));
+        let out = Arc::new(Mutex::new(
+            Box::new(std::io::stdout()) as Box<dyn Write + Send>
+        ));
         let cwd = std::env::temp_dir();
         let err = match handle_session_new(&cli, &cwd, None, &json!({"cwd": "relative/path"}), &out)
             .await
