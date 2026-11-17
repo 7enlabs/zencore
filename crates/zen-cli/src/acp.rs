@@ -319,9 +319,7 @@ pub async fn run_acp_server(cli: &Cli) -> Result<i32> {
 
 fn write_response(out: &Arc<Mutex<std::io::Stdout>>, resp: &RpcResponse) -> Result<()> {
     let line = serde_json::to_string(resp)?;
-    let mut out = out
-        .lock()
-        .map_err(|e| anyhow::anyhow!("acp stdout lock poisoned: {e}"))?;
+    let mut out = lock_or_recover(out, "acp stdout");
     writeln!(out, "{line}")?;
     out.flush()?;
     Ok(())
