@@ -137,6 +137,9 @@ impl CommandHooks {
         obj.insert("session_id".into(), json!(self.session_id));
         obj.insert("transcript_path".into(), json!(self.transcript_path));
         obj.insert("cwd".into(), json!(self.cwd.display().to_string()));
+        // The task spec names this field `event`; the runner has always
+        // sent `hook_event_name` too, and both carry the same value.
+        obj.insert("event".into(), json!(event.as_str()));
         obj.insert("hook_event_name".into(), json!(event.as_str()));
         obj.insert(
             "permission_mode".into(),
@@ -189,6 +192,16 @@ fn exit2_blocks(event: HookEvent) -> bool {
             | HookEvent::SubagentStop
             | HookEvent::PreCompact
             | HookEvent::PermissionRequest
+            | HookEvent::UserPromptExpansion
+            | HookEvent::TaskCreated
+            | HookEvent::TaskCompleted
+            | HookEvent::ConfigChange
+            | HookEvent::PreModelSwitch
+            | HookEvent::WorktreeCreate
+            // PostToolBatch: exit 2 (or decision block) stops the loop
+            // before the next model call; the agent maps `blocked` to a
+            // run stop for this event, it never blocks a tool.
+            | HookEvent::PostToolBatch
     )
 }
 
@@ -210,6 +223,13 @@ struct SingleOutcome {
     updated_input: Option<Value>,
     updated_output: Option<String>,
     system_message: Option<String>,
+
+    allow_retry: bool,
+    display_replacement: Option<String>,
+    worktree_path: Option<String>,
+    watch_paths: Option<Vec<String>>,
+
+    failed: bool,
 
     logged_error: Option<String>,
 }
@@ -268,6 +288,21 @@ impl HookRunner for CommandHooks {
             }
             if outcome.updated_output.is_none() {
                 outcome.updated_output = r.updated_output;
+            }
+            if r.allow_retry {
+                outcome.allow_retry = true;
+            }
+            if r.failed {
+                outcome.failed = true;
+            }
+            if outcome.display_replacement.is_none() {
+                outcome.display_replacement = r.display_replacement;
+            }
+            if outcome.worktree_path.is_none() {
+                outcome.worktree_path = r.worktree_path;
+            }
+            if r.watch_paths.is_some() {
+                outcome.watch_paths = r.watch_paths;
             }
             if let Some(sm) = r.system_message {
                 system_parts.push(sm);
@@ -340,6 +375,7 @@ async fn run_one(
             }
         } else {
             SingleOutcome {
+                failed: true,
                 logged_error: Some(msg),
                 ..Default::default()
             }
@@ -561,6 +597,7 @@ fn interpret_output(output: &std::process::Output, event: HookEvent) -> SingleOu
                 msg.push_str(detail.trim());
             }
             SingleOutcome {
+                failed: true,
                 logged_error: Some(msg),
                 ..Default::default()
             }
@@ -580,6 +617,18 @@ fn interpret_success(stdout: &str, event: HookEvent) -> SingleOutcome {
     if matches!(event, HookEvent::UserPromptSubmit | HookEvent::SessionStart) {
         SingleOutcome {
             feedback: Some(stdout.to_string()),
+            ..Default::default()
+        }
+    } else if event == HookEvent::MessageDisplay {
+        // Plain stdout is the replacement text for what is shown.
+        SingleOutcome {
+            display_replacement: Some(stdout.trim_end_matches(['\r', '\n']).to_string()),
+            ..Default::default()
+        }
+    } else if event == HookEvent::WorktreeCreate {
+        // The last non-empty stdout line is the created worktree path.
+        SingleOutcome {
+            worktree_path: trimmed.lines().last().map(str::to_string),
             ..Default::default()
         }
     } else {
@@ -605,6 +654,28 @@ fn interpret_json_stdout(obj: &serde_json::Map<String, Value>, event: HookEvent)
         out.system_message = Some(sm.to_string());
     }
 
+    // `watchPaths` (CwdChanged / FileChanged): replace the dynamic watch list.
+    if matches!(event, HookEvent::CwdChanged | HookEvent::FileChanged)
+        && let Some(paths) = obj.get("watchPaths").and_then(|v| v.as_array())
+    {
+        out.watch_paths = Some(
+            paths
+                .iter()
+                .filter_map(|p| p.as_str().map(str::to_string))
+                .collect(),
+        );
+    }
+
+    // `MessageDisplay`: a JSON object may carry the replacement text.
+    if event == HookEvent::MessageDisplay {
+        for key in ["displayText", "replacement", "displayReplacement"] {
+            if let Some(t) = obj.get(key).and_then(|v| v.as_str()) {
+                out.display_replacement = Some(t.to_string());
+                break;
+            }
+        }
+    }
+
     if let Some(decision) = obj.get("decision").and_then(|v| v.as_str()) {
         let reason = obj.get("reason").and_then(|v| v.as_str()).unwrap_or("");
         if decision.eq_ignore_ascii_case("block") {
@@ -616,7 +687,10 @@ fn interpret_json_stdout(obj: &serde_json::Map<String, Value>, event: HookEvent)
     }
 
     if let Some(hso) = obj.get("hookSpecificOutput").and_then(|v| v.as_object()) {
-        if event == HookEvent::PreToolUse {
+        // `permissionDecision` is honored on PreToolUse and on
+        // PreModelSwitch (allow/deny/ask a model switch). On other events
+        // it is ignored, matching the reference.
+        if event == HookEvent::PreToolUse || event == HookEvent::PreModelSwitch {
             if let Some(pd) = hso.get("permissionDecision").and_then(|v| v.as_str()) {
                 let reason = hso
                     .get("permissionDecisionReason")
@@ -640,9 +714,26 @@ fn interpret_json_stdout(obj: &serde_json::Map<String, Value>, event: HookEvent)
                     push_feedback(&mut out, reason);
                 }
             }
-            if let Some(ui) = hso.get("updatedInput").filter(|v| v.is_object()) {
+            if event == HookEvent::PreToolUse
+                && let Some(ui) = hso.get("updatedInput").filter(|v| v.is_object())
+            {
                 out.updated_input = Some(ui.clone());
             }
+        }
+
+        // `PermissionDenied`: `retry: true` tells the model it may retry.
+        if event == HookEvent::PermissionDenied
+            && hso.get("retry").and_then(|v| v.as_bool()) == Some(true)
+        {
+            out.allow_retry = true;
+        }
+
+        // `WorktreeCreate`: `hookSpecificOutput.worktreePath`.
+        if event == HookEvent::WorktreeCreate
+            && let Some(p) = hso.get("worktreePath").and_then(|v| v.as_str())
+            && !p.trim().is_empty()
+        {
+            out.worktree_path = Some(p.to_string());
         }
 
         if event == HookEvent::PostToolUse
@@ -1105,7 +1196,12 @@ mod tests {
             json!({}),
         )
         .await;
-        assert_eq!(out, HookOutcome::default());
+        // A plain error: nothing is blocked and no feedback reaches the
+        // model, but the outcome records the failure (used by
+        // WorktreeRemove to decide whether the removal failed).
+        assert!(!out.blocked);
+        assert!(out.feedback.is_none());
+        assert!(out.failed);
     }
 
     #[tokio::test]
@@ -1286,7 +1382,11 @@ mod tests {
             json!({}),
         )
         .await;
-        assert_eq!(out, HookOutcome::default());
+        // A timeout discards the output and never blocks, but the
+        // failure is recorded on the outcome.
+        assert!(!out.blocked);
+        assert!(out.feedback.is_none());
+        assert!(out.failed);
 
         let hooks = json!({"PreToolUse": [{"hooks": [
             {"type": "command", "command": "sleep 5", "timeout": 1, "onFailure": "block"}
@@ -1474,6 +1574,280 @@ mod tests {
             for field in specific {
                 assert!(v.get(field).is_some(), "{event:?} missing field {field}");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn wave1_event_field_present_in_stdin() {
+        let tmp = TempDir::new();
+        let outfile = tmp.path().join("ev.json");
+        let hooks = hooks_with("Stop", None, &format!("cat > {}", shell_path(&outfile)), 10);
+        run_ev(&runner(hooks, tmp.path()), HookEvent::Stop, "", json!({})).await;
+        let v: Value = serde_json::from_str(&fs::read_to_string(&outfile).unwrap()).unwrap();
+        assert_eq!(v["event"], "Stop");
+        assert_eq!(v["hook_event_name"], "Stop");
+    }
+
+    #[tokio::test]
+    async fn wave1_exit2_blocks_new_blocking_events() {
+        let tmp = TempDir::new();
+        for ev in [
+            HookEvent::UserPromptExpansion,
+            HookEvent::TaskCreated,
+            HookEvent::TaskCompleted,
+            HookEvent::ConfigChange,
+            HookEvent::PreModelSwitch,
+            HookEvent::PermissionRequest,
+            HookEvent::WorktreeCreate,
+        ] {
+            let hooks = hooks_with(ev.as_str(), None, "echo 'no' >&2; exit 2", 10);
+            let out = run_ev(&runner(hooks, tmp.path()), ev, "", json!({})).await;
+            assert!(out.blocked, "{ev:?} exit 2 should block");
+            assert_eq!(out.feedback.as_deref(), Some("no"));
+        }
+    }
+
+    #[tokio::test]
+    async fn wave1_exit2_does_not_block_observational_events() {
+        let tmp = TempDir::new();
+        for ev in [
+            HookEvent::SessionStart,
+            HookEvent::SessionEnd,
+            HookEvent::StopFailure,
+            HookEvent::MessageDisplay,
+            HookEvent::Notification,
+            HookEvent::CwdChanged,
+            HookEvent::DirectoryAdded,
+            HookEvent::FileChanged,
+            HookEvent::InstructionsLoaded,
+            HookEvent::PostCompact,
+            HookEvent::PostModelSwitch,
+            HookEvent::SubagentStart,
+            HookEvent::WorktreeRemove,
+            HookEvent::TeammateIdle,
+            HookEvent::Elicitation,
+            HookEvent::ElicitationResult,
+        ] {
+            let hooks = hooks_with(ev.as_str(), None, "echo 'meh' >&2; exit 2", 10);
+            let out = run_ev(&runner(hooks, tmp.path()), ev, "", json!({})).await;
+            // Not a block and no feedback, but the failure is recorded.
+            assert!(!out.blocked, "{ev:?} exit 2 must not block");
+            assert!(out.feedback.is_none(), "{ev:?}");
+            assert!(out.failed, "{ev:?} exit 2 is a hook failure");
+        }
+    }
+
+    #[tokio::test]
+    async fn wave1_message_display_plain_stdout_is_replacement() {
+        let tmp = TempDir::new();
+        let hooks = hooks_with("MessageDisplay", None, "printf 'REDACTED\\n'", 10);
+        let out = run_ev(
+            &runner(hooks, tmp.path()),
+            HookEvent::MessageDisplay,
+            "",
+            json!({"delta": "secret"}),
+        )
+        .await;
+        assert_eq!(out.display_replacement.as_deref(), Some("REDACTED"));
+        assert!(!out.blocked);
+    }
+
+    #[tokio::test]
+    async fn wave1_worktree_create_last_stdout_line_is_path() {
+        let tmp = TempDir::new();
+        let hooks = hooks_with(
+            "WorktreeCreate",
+            None,
+            "echo setting up; echo /tmp/wt-x",
+            10,
+        );
+        let out = run_ev(
+            &runner(hooks, tmp.path()),
+            HookEvent::WorktreeCreate,
+            "",
+            json!({"name": "wt-x"}),
+        )
+        .await;
+        assert_eq!(out.worktree_path.as_deref(), Some("/tmp/wt-x"));
+
+        let cmd = r#"printf '{"hookSpecificOutput":{"worktreePath":"/tmp/wt-json"}}'"#;
+        let hooks = hooks_with("WorktreeCreate", None, cmd, 10);
+        let out = run_ev(
+            &runner(hooks, tmp.path()),
+            HookEvent::WorktreeCreate,
+            "",
+            json!({"name": "wt-x"}),
+        )
+        .await;
+        assert_eq!(out.worktree_path.as_deref(), Some("/tmp/wt-json"));
+    }
+
+    #[tokio::test]
+    async fn wave1_watch_paths_from_cwd_changed() {
+        let tmp = TempDir::new();
+        let cmd = r#"printf '{"watchPaths":["/tmp/a.env","/tmp/b.env"]}'"#;
+        let hooks = hooks_with("CwdChanged", None, cmd, 10);
+        let out = run_ev(
+            &runner(hooks, tmp.path()),
+            HookEvent::CwdChanged,
+            "",
+            json!({"old_cwd": "/a", "new_cwd": "/b"}),
+        )
+        .await;
+        assert_eq!(
+            out.watch_paths,
+            Some(vec!["/tmp/a.env".to_string(), "/tmp/b.env".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn wave1_permission_denied_retry_flag() {
+        let tmp = TempDir::new();
+        let cmd = r#"printf '{"hookSpecificOutput":{"retry":true}}'"#;
+        let hooks = hooks_with("PermissionDenied", None, cmd, 10);
+        let out = run_ev(
+            &runner(hooks, tmp.path()),
+            HookEvent::PermissionDenied,
+            "Bash",
+            json!({}),
+        )
+        .await;
+        assert!(out.allow_retry);
+    }
+
+    #[tokio::test]
+    async fn wave1_pre_model_switch_permission_decision() {
+        let tmp = TempDir::new();
+        let cmd = r#"printf '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"too pricey"}}'"#;
+        let hooks = hooks_with("PreModelSwitch", None, cmd, 10);
+        let out = run_ev(
+            &runner(hooks, tmp.path()),
+            HookEvent::PreModelSwitch,
+            "opus",
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            out.permission_override,
+            Some(PermissionDecision::Deny("too pricey".into()))
+        );
+        // PreModelSwitch never accepts updatedInput.
+        assert!(out.updated_input.is_none());
+    }
+
+    fn json_obj(value: Value) -> serde_json::Map<String, Value> {
+        match value {
+            Value::Object(map) => map,
+            other => panic!("expected a JSON object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpret_json_stdout_message_display_only_on_message_display() {
+        // Pins the `==` at hooks.rs:670: every case carries a
+        // display-text key, so flipping `==` to `!=` either drops the
+        // replacement for MessageDisplay or adds one for every other
+        // event, and the test fails either way.
+        let cases: &[(HookEvent, Value, Option<&str>)] = &[
+            (
+                HookEvent::MessageDisplay,
+                json!({"displayText": "hello"}),
+                Some("hello"),
+            ),
+            (
+                HookEvent::MessageDisplay,
+                json!({"replacement": "second"}),
+                Some("second"),
+            ),
+            (
+                HookEvent::MessageDisplay,
+                json!({"displayReplacement": "third"}),
+                Some("third"),
+            ),
+            // First matching key wins.
+            (
+                HookEvent::MessageDisplay,
+                json!({"displayText": "first", "replacement": "second"}),
+                Some("first"),
+            ),
+            // The same payload on other events must NOT produce a
+            // replacement.
+            (HookEvent::PreToolUse, json!({"displayText": "hello"}), None),
+            (HookEvent::Stop, json!({"displayText": "hello"}), None),
+            (
+                HookEvent::SessionStart,
+                json!({"replacement": "hello"}),
+                None,
+            ),
+            (
+                HookEvent::UserPromptSubmit,
+                json!({"displayReplacement": "hello"}),
+                None,
+            ),
+        ];
+        for (event, obj, expected) in cases {
+            let out = interpret_json_stdout(&json_obj(obj.clone()), *event);
+            assert_eq!(
+                out.display_replacement.as_deref(),
+                *expected,
+                "event: {event:?}, obj: {obj}"
+            );
+        }
+    }
+
+    #[test]
+    fn interpret_json_stdout_permission_denied_retry_needs_both_operands() {
+        // Pins the `&&` at hooks.rs:726: each case satisfies exactly
+        // one operand of the `event == PermissionDenied &&
+        // retry == Some(true)` conjunction (or neither), so replacing
+        // `&&` with `||` sets allow_retry on a case where it must stay
+        // false. The both-true case pins the positive direction.
+        let cases: &[(HookEvent, Value, bool)] = &[
+            // Both operands true: retry allowed.
+            (
+                HookEvent::PermissionDenied,
+                json!({"hookSpecificOutput": {"retry": true}}),
+                true,
+            ),
+            // Event matches but retry is false: must NOT allow retry.
+            (
+                HookEvent::PermissionDenied,
+                json!({"hookSpecificOutput": {"retry": false}}),
+                false,
+            ),
+            // Event matches but retry is absent: must NOT allow retry.
+            (
+                HookEvent::PermissionDenied,
+                json!({"hookSpecificOutput": {}}),
+                false,
+            ),
+            // Event matches but retry is not a bool: must NOT allow retry.
+            (
+                HookEvent::PermissionDenied,
+                json!({"hookSpecificOutput": {"retry": "yes"}}),
+                false,
+            ),
+            // Retry is true but the event is not PermissionDenied.
+            (
+                HookEvent::PreToolUse,
+                json!({"hookSpecificOutput": {"retry": true}}),
+                false,
+            ),
+            (
+                HookEvent::Stop,
+                json!({"hookSpecificOutput": {"retry": true}}),
+                false,
+            ),
+            // Neither operand true.
+            (
+                HookEvent::PreToolUse,
+                json!({"hookSpecificOutput": {"retry": false}}),
+                false,
+            ),
+        ];
+        for (event, obj, expected) in cases {
+            let out = interpret_json_stdout(&json_obj(obj.clone()), *event);
+            assert_eq!(out.allow_retry, *expected, "event: {event:?}, obj: {obj}");
         }
     }
 }

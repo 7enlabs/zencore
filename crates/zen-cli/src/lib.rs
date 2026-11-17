@@ -15,6 +15,7 @@ pub mod eventlog;
 pub mod export;
 pub mod git;
 pub mod github;
+pub mod hook_watch;
 pub mod mentions;
 pub mod models;
 pub mod ollama;
@@ -264,6 +265,14 @@ pub async fn run_with_home(cli: Cli, cwd: &Path, home: Option<&Path>) -> Result<
 
     if let Some(sub) = cli.subcommand.clone() {
         return run_subcommand(&cli, cwd, home, &sub).await;
+    }
+
+    if cli.init_only {
+        return run_init_only(&cli, cwd, home).await;
+    }
+    if (cli.init || cli.maintenance) && !cli.print {
+        eprintln!("error: --init and --maintenance require -p (non-interactive mode)");
+        return Ok(exit_code::VALIDATION);
     }
 
     if cli.print {
@@ -760,6 +769,19 @@ fn untrusted_notice(skipped: &[String]) -> String {
     )
 }
 
+/// `--init-only`: run Setup hooks (trigger `"init"`), then SessionStart
+/// with the startup matcher, print any SessionStart feedback, and exit
+/// without starting a conversation.
+async fn run_init_only(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result<i32> {
+    let cfg = settings::resolve_config_with_home(cli, cwd, home)?;
+    let session_id = session::new_session_id();
+    let feedback = agent_run::run_init_only_hooks(cli, &cfg, &session_id, cwd).await;
+    if let Some(text) = feedback.filter(|s| !s.trim().is_empty()) {
+        println!("{text}");
+    }
+    Ok(0)
+}
+
 async fn run_headless(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result<i32> {
     use std::io::IsTerminal;
 
@@ -821,6 +843,31 @@ async fn run_headless(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result<i32>
     }
 
     let (session_id, transcript_path, history_from) = resolve_session(cli, cwd, home)?;
+
+    // `--init` / `--maintenance`: run Setup hooks before the headless
+    // run (the trigger is the matcher for the Setup hooks).
+    if cli.init {
+        agent_run::run_setup(
+            cli,
+            &cfg,
+            &session_id,
+            transcript_path.as_deref(),
+            cwd,
+            "init",
+        )
+        .await;
+    }
+    if cli.maintenance {
+        agent_run::run_setup(
+            cli,
+            &cfg,
+            &session_id,
+            transcript_path.as_deref(),
+            cwd,
+            "maintenance",
+        )
+        .await;
+    }
 
     if cli.plan {
         return agent_run::run_plan_flow(
@@ -1259,6 +1306,322 @@ mod tests {
         // happens to contain a status-shaped substring.
         let err = coded_error(exit_code::VALIDATION, "HTTP 429 shaped but coded");
         assert_eq!(exit_code_for_error(&err), exit_code::VALIDATION);
+    }
+
+    #[tokio::test]
+    async fn run_with_home_init_or_maintenance_require_print() {
+        // Pins the `(cli.init || cli.maintenance) && !cli.print` guard
+        // in run_with_home, one row per side of each operator:
+        // - `||` -> `&&` (#22) is caught by the init-only and
+        //   maintenance-only rows, which must still be validation.
+        // - deleting the `!` (#23) is caught by the same rows (the
+        //   mutant falls through instead of returning validation)
+        //   and by the init-with-print row (the mutant returns
+        //   validation instead of falling through to the headless run).
+        // A fall-through never reaches the agent here: with no API key
+        // for the default route the REPL / headless path fails fast
+        // with an auth error, so it must never return the validation
+        // code. The temp home/cwd keep the run hermetic, and the key
+        // env vars are cleared so a developer's shell cannot smuggle
+        // a key into the fall-through path.
+        unsafe {
+            std::env::remove_var("ZEN_API_KEY");
+            std::env::remove_var("ZEN_BASE_URL");
+        }
+        // (init, maintenance, print, expect_validation)
+        let cases = [
+            (true, false, false, true),
+            (false, true, false, true),
+            (true, true, false, true),
+            (true, false, true, false),
+            (false, false, false, false),
+        ];
+        for (init, maintenance, print, expect_validation) in cases {
+            let dir = std::env::temp_dir().join(format!("zen_lib_init_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut args: Vec<&str> = vec!["zen"];
+            if init {
+                args.push("--init");
+            }
+            if maintenance {
+                args.push("--maintenance");
+            }
+            if print {
+                args.push("-p");
+            }
+            let cli = Cli::parse_from(args);
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                run_with_home(cli, &dir, Some(&dir)),
+            )
+            .await
+            .expect("run_with_home must not hang");
+            if expect_validation {
+                assert_eq!(
+                    result.unwrap(),
+                    exit_code::VALIDATION,
+                    "init={init} maintenance={maintenance} print={print} must be validation"
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "init={init} maintenance={maintenance} print={print} must fall through \
+                     and fail fast without an API key, got {result:?}"
+                );
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// Split a `zen` binary path into the cargo target dir, the
+    /// profile, and the canonical `<target>/<profile>/zen` path.
+    ///
+    /// Cargo normally lays the binary out as
+    /// `<target>/<profile>/zen`, but on CI `CARGO_BIN_EXE_zen` can
+    /// resolve to the build-script output dir
+    /// `<target>/<profile>/build/zen-cli/<hash>/zen`, where the
+    /// parent dir name is a hash, not a profile — passing that hash
+    /// to `cargo build --profile` fails with `<hash> is not defined`.
+    /// Walk up to the `target` dir instead and take the profile as
+    /// the component right after it, so both layouts resolve to the
+    /// same canonical binary. Paths with no `target` component fall
+    /// back to the old layout (parent dir = profile, grandparent =
+    /// target dir, binary path unchanged).
+    fn resolve_zen_build_dirs(bin: &Path) -> (PathBuf, String, PathBuf) {
+        let file_name = bin
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_else(|| std::ffi::OsString::from("zen"));
+        for ancestor in bin.ancestors() {
+            if ancestor.file_name().is_some_and(|n| n == "target")
+                && let Ok(rel) = bin.strip_prefix(ancestor)
+                && rel.components().count() >= 2
+                && let Some(profile) = rel.components().next().and_then(|c| c.as_os_str().to_str())
+            {
+                let canonical = ancestor.join(profile).join(&file_name);
+                return (ancestor.to_path_buf(), profile.to_string(), canonical);
+            }
+        }
+        // Fallback: no `target` component (e.g. a relocated binary).
+        let profile_dir = bin.parent().unwrap_or_else(|| Path::new(""));
+        let target_dir = profile_dir.parent().unwrap_or_else(|| Path::new(""));
+        let profile = profile_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("debug")
+            .to_string();
+        (target_dir.to_path_buf(), profile, bin.to_path_buf())
+    }
+
+    /// Build the `zen` binary when the test runner did not build it:
+    /// plain `cargo test -p zen-cli --lib` compiles only the lib test
+    /// binary, so `target/debug/zen` does not exist yet, and CI runs
+    /// `cargo test --workspace` on a fresh machine with no prebuilt
+    /// binary either. Building here (same target dir and profile as
+    /// the test binary, deps already fresh) keeps the test
+    /// self-contained instead of depending on how cargo was invoked.
+    fn ensure_zen_binary_built(bin: PathBuf) -> PathBuf {
+        if bin.is_file() {
+            return bin;
+        }
+        // The binary lives in <target>/<profile>/zen; build it into
+        // that same directory. Resolve the layout via
+        // resolve_zen_build_dirs: on CI CARGO_BIN_EXE_zen can point at
+        // the build-script dir
+        // <target>/<profile>/build/zen-cli/<hash>/zen, whose parent
+        // dir name is a hash, not a profile.
+        let (target_dir, profile, canonical_bin) = resolve_zen_build_dirs(&bin);
+        let mut cmd = std::process::Command::new(env!("CARGO"));
+        cmd.arg("build")
+            .arg("-p")
+            .arg("zen-cli")
+            .arg("--bin")
+            .arg("zen")
+            .arg("--target-dir")
+            .arg(&target_dir);
+        if profile == "release" {
+            cmd.arg("--release");
+        } else if profile != "debug" {
+            cmd.arg("--profile").arg(&profile);
+        }
+        let output = cmd
+            .output()
+            .expect("spawn `cargo build -p zen-cli --bin zen`");
+        assert!(
+            output.status.success(),
+            "cargo build -p zen-cli --bin zen failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let built_bin = pick_built_binary(&canonical_bin);
+        assert!(
+            built_bin.is_file(),
+            "zen binary still not built at {} after `cargo build`",
+            built_bin.display()
+        );
+        built_bin
+    }
+
+    /// Pick the built binary path: on Windows cargo lays it out as
+    /// `zen.exe`, but the path resolved from the test fallback
+    /// carries no extension, so the plain path does not exist even
+    /// though the build succeeded. Prefer the path that exists,
+    /// trying the `.exe` spelling before giving up.
+    fn pick_built_binary(canonical_bin: &Path) -> PathBuf {
+        if canonical_bin.is_file() {
+            return canonical_bin.to_path_buf();
+        }
+        let exe_bin = canonical_bin.with_extension("exe");
+        if exe_bin.is_file() {
+            exe_bin
+        } else {
+            canonical_bin.to_path_buf()
+        }
+    }
+
+    #[test]
+    fn resolve_zen_build_dirs_handles_build_script_hash_dir() {
+        // Normal layout: profile is the dir after `target`.
+        assert_eq!(
+            resolve_zen_build_dirs(Path::new("/x/target/debug/zen")),
+            (
+                PathBuf::from("/x/target"),
+                "debug".to_string(),
+                PathBuf::from("/x/target/debug/zen"),
+            )
+        );
+        // CI layout (lib.rs:1413 failure): CARGO_BIN_EXE_zen resolves
+        // to the build-script dir; the hash must NOT become the
+        // profile, and the canonical binary is target/debug/zen.
+        assert_eq!(
+            resolve_zen_build_dirs(Path::new(
+                "/x/target/debug/build/zen-cli/9f3a1b2c4d5e6f7a/zen"
+            )),
+            (
+                PathBuf::from("/x/target"),
+                "debug".to_string(),
+                PathBuf::from("/x/target/debug/zen"),
+            )
+        );
+        // Release and custom profiles keep working.
+        assert_eq!(
+            resolve_zen_build_dirs(Path::new("/x/target/release/zen")),
+            (
+                PathBuf::from("/x/target"),
+                "release".to_string(),
+                PathBuf::from("/x/target/release/zen"),
+            )
+        );
+        assert_eq!(
+            resolve_zen_build_dirs(Path::new("/x/target/profiling/zen")),
+            (
+                PathBuf::from("/x/target"),
+                "profiling".to_string(),
+                PathBuf::from("/x/target/profiling/zen"),
+            )
+        );
+        // No `target` component: fall back to parent = profile,
+        // grandparent = target dir, binary path unchanged.
+        assert_eq!(
+            resolve_zen_build_dirs(Path::new("/tmp/zenbin/zen")),
+            (
+                PathBuf::from("/tmp"),
+                "zenbin".to_string(),
+                PathBuf::from("/tmp/zenbin/zen"),
+            )
+        );
+    }
+
+    #[test]
+    fn pick_built_binary_prefers_exe_variant() {
+        // Windows layout (CI run 43973996062): only `zen.exe`
+        // exists, the plain `zen` path does not — the old
+        // `canonical_bin.is_file()` assert panicked even though
+        // the build had succeeded.
+        let dir = std::env::temp_dir().join(format!("zen_lib_exe_pick_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("zen");
+        let exe = dir.join("zen.exe");
+        std::fs::write(&exe, b"fake").unwrap();
+        assert_eq!(pick_built_binary(&plain), exe);
+        // Plain binary wins when it exists (Linux/macOS layout).
+        std::fs::write(&plain, b"fake").unwrap();
+        assert_eq!(pick_built_binary(&plain), plain);
+        // Neither exists: return the canonical path so the caller's
+        // assert reports the path it looked for.
+        std::fs::remove_file(&plain).unwrap();
+        std::fs::remove_file(&exe).unwrap();
+        assert_eq!(pick_built_binary(&plain), plain);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn run_init_only_prints_nonempty_session_start_feedback() {
+        // Pins the `!s.trim().is_empty()` filter in run_init_only:
+        // deleting the `!` keeps only empty feedback, so a
+        // SessionStart hook that prints text would print nothing.
+        // The print is stdout-only, so this runs the real binary as a
+        // subprocess and reads its stdout. The binary is built here
+        // when the test runner did not build it (plain
+        // `cargo test -p zen-cli --lib` compiles only the lib test
+        // binary, and CI has no prebuilt binary).
+        let bin = option_env!("CARGO_BIN_EXE_zen")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::current_exe().ok().and_then(|exe| {
+                    exe.parent().and_then(|p| p.parent()).map(|p| {
+                        // Windows lays the binary out as
+                        // `zen.exe`; the fallback must carry the
+                        // extension or the resolved path does not
+                        // exist (EXE_EXTENSION is "" on Unix).
+                        p.join("zen")
+                            .with_extension(std::env::consts::EXE_EXTENSION)
+                    })
+                })
+            })
+            .expect("could not locate the zen binary");
+        let bin = ensure_zen_binary_built(bin);
+        let marker = format!("INIT-FEEDBACK-{}", uuid::Uuid::new_v4());
+        let home =
+            std::env::temp_dir().join(format!("zen_lib_initonly_home_{}", uuid::Uuid::new_v4()));
+        let cwd =
+            std::env::temp_dir().join(format!("zen_lib_initonly_cwd_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(home.join(".zen")).unwrap();
+        let settings = cwd.join(".zen").join("settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings,
+            format!(
+                r#"{{"hooks": {{"SessionStart": [{{"matcher": "startup", "hooks": [{{"type": "command", "command": "echo {marker}", "timeout": 5}}]}}]}}}}"#
+            ),
+        )
+        .unwrap();
+        let output = tokio::time::timeout(
+            Duration::from_secs(60),
+            tokio::process::Command::new(&bin)
+                .arg("--init-only")
+                .arg("--setting-sources")
+                .arg("project")
+                .current_dir(&cwd)
+                .env("HOME", &home)
+                .env("ZEN_TRUST_FOLDER", "1")
+                .output(),
+        )
+        .await
+        .expect("zen --init-only must not hang")
+        .expect("spawn zen binary");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&marker),
+            "--init-only must print non-empty SessionStart feedback {marker}; stdout was {stdout:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&cwd).ok();
     }
 
     #[test]

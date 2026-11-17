@@ -326,6 +326,16 @@ pub struct Agent {
     /// LSP feedback rounds already appended per file in this run
     /// (path string -> count), enforcing `MAX_LSP_FEEDBACK_PER_FILE`.
     pub lsp_feedback_counts: HashMap<String, usize>,
+
+    /// Hook context waiting to be delivered with the next user prompt
+    /// (PostModelSwitch `additionalContext`, DirectoryAdded
+    /// `systemMessage`). Drained at the start of `run_turn`.
+    pub pending_hook_context: Vec<String>,
+
+    /// Dynamic FileChanged watch list from `watchPaths` returned by
+    /// CwdChanged / FileChanged hooks. The REPL merges this with the
+    /// static matcher paths when it polls for file changes.
+    pub dynamic_watch_paths: Vec<std::path::PathBuf>,
 }
 
 impl Agent {
@@ -362,6 +372,8 @@ impl Agent {
             prune_stats: PruneStats::default(),
             env_deltas: env_context::DeltaStore::new(),
             lsp_feedback_counts: HashMap::new(),
+            pending_hook_context: vec![],
+            dynamic_watch_paths: vec![],
         }
     }
 
@@ -444,7 +456,17 @@ impl Agent {
         }
     }
 
-    fn record_denial(&mut self, tool_name: &str, tool_use_id: &str, input: &Value) {
+    /// A permission denial: record it, emit the sink event, and fire the
+    /// `PermissionDenied` hook (matcher: tool name). The hook cannot undo
+    /// the denial; its `hookSpecificOutput.retry: true` is returned so the
+    /// caller can tell the model it may retry the call.
+    async fn record_denial(
+        &mut self,
+        tool_name: &str,
+        tool_use_id: &str,
+        input: &Value,
+        reason: &str,
+    ) -> HookOutcome {
         let denial = PermissionDenial {
             tool_name: tool_name.to_string(),
             tool_use_id: tool_use_id.to_string(),
@@ -452,6 +474,21 @@ impl Agent {
         };
         self.sink.emit(AgentEvent::PermissionDenied(denial.clone()));
         self.denials.push(denial);
+        let outcome = self
+            .hooks
+            .run(
+                HookEvent::PermissionDenied,
+                tool_name,
+                json!({
+                    "tool_name": tool_name,
+                    "tool_input": input,
+                    "tool_use_id": tool_use_id,
+                    "reason": reason,
+                }),
+            )
+            .await;
+        self.emit_system_message(HookEvent::PermissionDenied, &outcome);
+        outcome
     }
 
     async fn notify_permission_prompt(&self, tool_name: &str) {
@@ -478,6 +515,168 @@ impl Agent {
                 text: text.clone(),
             });
         }
+    }
+
+    /// Map a model-call error to a `StopFailure` matcher value
+    /// (`rate_limit`, `overloaded`, `authentication_failed`, ...).
+    fn classify_api_error(err: &str) -> &'static str {
+        let e = err.to_ascii_lowercase();
+        if e.contains("rate limit") || e.contains("429") || e.contains("too many requests") {
+            "rate_limit"
+        } else if e.contains("overloaded") || e.contains("529") || e.contains("503") {
+            "overloaded"
+        } else if e.contains("auth") || e.contains("401") || e.contains("403") {
+            "authentication_failed"
+        } else if e.contains("billing") || e.contains("payment") || e.contains("402") {
+            "billing_error"
+        } else if e.contains("model not found") || e.contains("404") {
+            "model_not_found"
+        } else if e.contains("max_output_tokens") || e.contains("max tokens") {
+            "max_output_tokens"
+        } else if e.contains("invalid request") || e.contains("400") {
+            "invalid_request"
+        } else if e.contains("server error") || e.contains("500") {
+            "server_error"
+        } else {
+            "unknown"
+        }
+    }
+
+    /// Emit an assistant message, running `MessageDisplay` first when the
+    /// message has text. A hook's replacement text changes only what is
+    /// shown: the message already pushed to `self.messages` keeps the
+    /// original text, so the model never sees the replacement.
+    async fn emit_assistant(&self, message: &ChatMessage, turn_id: &str) {
+        let mut display = message.clone();
+        let text = message.text();
+        if !text.trim().is_empty() {
+            let outcome = self
+                .hooks
+                .run(
+                    HookEvent::MessageDisplay,
+                    "",
+                    json!({
+                        "turn_id": turn_id,
+                        "index": 0,
+                        "final": true,
+                        "delta": text,
+                    }),
+                )
+                .await;
+            self.emit_system_message(HookEvent::MessageDisplay, &outcome);
+            if let Some(replacement) = outcome.display_replacement
+                && matches!(message.content, Some(MessageContent::Text(_)))
+            {
+                display = ChatMessage::assistant(Some(replacement), message.tool_calls.clone());
+            }
+        }
+        self.sink.emit(AgentEvent::Assistant {
+            message: display,
+            parent_tool_use_id: self.parent_tool_use_id.clone(),
+        });
+    }
+
+    /// `PostToolBatch`: once per batch, after every call resolved. The
+    /// entries carry the tool name, input, id, and the exact result text
+    /// the model received. A block (exit 2 / decision block) or
+    /// `continue: false` stops the loop before the next model call and
+    /// returns the stop reason; `additionalContext` is injected as a user
+    /// message for the next model call.
+    async fn run_post_tool_batch(
+        &mut self,
+        tool_calls: &[ToolCall],
+        msgs_before: usize,
+    ) -> Option<String> {
+        let mut entries: Vec<Value> = Vec::new();
+        for tc in tool_calls {
+            let response = self.messages[msgs_before..]
+                .iter()
+                .find(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some(tc.id.as_str()))
+                .map(|m| m.text())
+                .unwrap_or_default();
+            let input: Value = serde_json::from_str(&tc.function.arguments)
+                .unwrap_or_else(|_| Value::String(tc.function.arguments.clone()));
+            entries.push(json!({
+                "tool_name": tc.function.name,
+                "tool_input": input,
+                "tool_use_id": tc.id,
+                "tool_response": response,
+            }));
+        }
+        if entries.is_empty() {
+            return None;
+        }
+        let outcome = self
+            .hooks
+            .run(
+                HookEvent::PostToolBatch,
+                "",
+                json!({ "tool_calls": entries }),
+            )
+            .await;
+        self.emit_system_message(HookEvent::PostToolBatch, &outcome);
+        if outcome.blocked || outcome.stop_run {
+            return Some(
+                outcome
+                    .stop_reason
+                    .or(outcome.feedback)
+                    .unwrap_or_else(|| "stopped by PostToolBatch hook".into()),
+            );
+        }
+        if let Some(fb) = outcome.feedback.filter(|s| !s.trim().is_empty()) {
+            self.messages.push(ChatMessage::user(fb));
+        }
+        None
+    }
+
+    /// `TaskCreated` / `TaskCompleted` for a TodoWrite that is about to
+    /// run: diff the requested list against the current one and fire one
+    /// event per new / newly-completed item. Returns the veto reason when
+    /// a hook blocks a creation or a completion.
+    async fn check_task_hooks(&self, args: &Value) -> Option<String> {
+        let new_list = args.get("todos").and_then(|v| v.as_array())?;
+        let old = {
+            let Ok(guard) = self.ctx.todos.lock() else {
+                return None;
+            };
+            guard.clone()
+        };
+        for (i, item) in new_list.iter().enumerate() {
+            let content = item.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            if content.trim().is_empty() {
+                continue;
+            }
+            let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            let task_id = format!("todo-{i}");
+            let mut payload = json!({
+                "task_id": task_id,
+                "task_subject": content,
+            });
+            if let Some(desc) = item.get("activeForm").and_then(|v| v.as_str()) {
+                payload["task_description"] = json!(desc);
+            }
+            let prev = old.iter().find(|t| t.content == content);
+            let event = match prev {
+                None => Some(HookEvent::TaskCreated),
+                Some(p) if p.status != "completed" && status == "completed" => {
+                    Some(HookEvent::TaskCompleted)
+                }
+                _ => None,
+            };
+            let Some(event) = event else { continue };
+            let out = self.hooks.run(event, "", payload).await;
+            self.emit_system_message(event, &out);
+            if out.blocked {
+                return Some(out.feedback.unwrap_or_else(|| {
+                    format!(
+                        "{} blocked by hook: {}",
+                        event.as_str(),
+                        content.chars().take(120).collect::<String>()
+                    )
+                }));
+            }
+        }
+        None
     }
 
     fn emit_tool_result(&self, tool_use_id: &str, content: &str, is_error: bool, parallel: bool) {
@@ -567,6 +766,14 @@ impl Agent {
         {
             user_content.push_str("\n\n");
             user_content.push_str(&extra);
+        }
+        // Context stashed by hooks since the last turn (PostModelSwitch
+        // additionalContext, DirectoryAdded systemMessage).
+        for pending in std::mem::take(&mut self.pending_hook_context) {
+            if !pending.trim().is_empty() {
+                user_content.push_str("\n\n");
+                user_content.push_str(&pending);
+            }
         }
         self.messages.push(ChatMessage::user(user_content));
 
@@ -687,10 +894,28 @@ impl Agent {
                     continue;
                 }
                 Err(e) => {
+                    // `StopFailure`: the turn ends on an API error, not on
+                    // a model decision. Hooks run for logging/alerting only;
+                    // their output cannot change the outcome.
+                    let err_text = e.to_string();
+                    let error_kind = Self::classify_api_error(&err_text);
+                    let failure = self
+                        .hooks
+                        .run(
+                            HookEvent::StopFailure,
+                            error_kind,
+                            json!({
+                                "error": error_kind,
+                                "error_details": err_text,
+                                "last_assistant_message": err_text,
+                            }),
+                        )
+                        .await;
+                    self.emit_system_message(HookEvent::StopFailure, &failure);
                     return self.run_result(
                         "error_during_execution",
                         true,
-                        e.to_string(),
+                        err_text,
                         started.elapsed().as_millis() as u64,
                         duration_api_ms,
                         num_turns,
@@ -716,10 +941,11 @@ impl Agent {
                 let text = resp.message.text();
                 if !text.trim().is_empty() {
                     self.messages.push(resp.message.clone());
-                    self.sink.emit(AgentEvent::Assistant {
-                        message: resp.message.clone(),
-                        parent_tool_use_id: self.parent_tool_use_id.clone(),
-                    });
+                    self.emit_assistant(
+                        &resp.message,
+                        &format!("{}:{num_turns}", self.ctx.session_id),
+                    )
+                    .await;
                     if let Some(j) = &self.journal {
                         j.assistant(&resp.message);
                     }
@@ -746,10 +972,8 @@ impl Agent {
 
                     if !text.is_empty() {
                         self.messages.push(msg.clone());
-                        self.sink.emit(AgentEvent::Assistant {
-                            message: msg.clone(),
-                            parent_tool_use_id: self.parent_tool_use_id.clone(),
-                        });
+                        self.emit_assistant(&msg, &format!("{}:{num_turns}", self.ctx.session_id))
+                            .await;
                         if let Some(j) = &self.journal {
                             j.assistant(&msg);
                         }
@@ -821,10 +1045,11 @@ impl Agent {
             }
 
             self.messages.push(resp.message.clone());
-            self.sink.emit(AgentEvent::Assistant {
-                message: resp.message.clone(),
-                parent_tool_use_id: self.parent_tool_use_id.clone(),
-            });
+            self.emit_assistant(
+                &resp.message,
+                &format!("{}:{num_turns}", self.ctx.session_id),
+            )
+            .await;
 
             let assistant = &resp.message;
             let tool_calls = assistant.tool_calls.clone().unwrap_or_default();
@@ -939,10 +1164,12 @@ impl Agent {
 
             let mut stop_run: Option<String> = None;
             let mut batch: Vec<Slot> = Vec::new();
-            for tc in tool_calls {
+            let cwd_before = self.ctx.cwd();
+            let msgs_before = self.messages.len();
+            for tc in &tool_calls {
                 let slot = self
                     .prepare_call(
-                        &tc,
+                        tc,
                         text_call_id.as_deref(),
                         plan_mode,
                         &stop_run,
@@ -988,6 +1215,35 @@ impl Agent {
                 &final_text,
             )
             .await;
+            // `CwdChanged`: a Bash `cd` in this batch moved the session
+            // working directory (the Bash tool persists `$PWD` into the
+            // context). `watchPaths` from the hook replaces the dynamic
+            // FileChanged watch list for the REPL.
+            let cwd_after = self.ctx.cwd();
+            if cwd_after != cwd_before {
+                let changed = self
+                    .hooks
+                    .run(
+                        HookEvent::CwdChanged,
+                        "",
+                        json!({
+                            "old_cwd": cwd_before.display().to_string(),
+                            "new_cwd": cwd_after.display().to_string(),
+                        }),
+                    )
+                    .await;
+                self.emit_system_message(HookEvent::CwdChanged, &changed);
+                if let Some(paths) = changed.watch_paths {
+                    self.dynamic_watch_paths = paths.iter().map(std::path::PathBuf::from).collect();
+                }
+            }
+            // `PostToolBatch`: once per batch, after every call resolved
+            // and before the next model call.
+            if let Some(text) = self.run_post_tool_batch(&tool_calls, msgs_before).await
+                && stop_run.is_none()
+            {
+                stop_run = Some(text);
+            }
             if let Some(stuck) = loop_guard.take_stuck().or_else(|| loop_guard.end_turn()) {
                 let (text, api_ms) = self.summarize_runaway(&stuck.message()).await;
                 duration_api_ms += api_ms;
@@ -1216,7 +1472,32 @@ impl Agent {
             && self
                 .permissions
                 .ask_rule_matches(&tool_name, &args, &self.ctx);
-        let decision = combine_permission(checked, pre.permission_override.clone(), ask_rule);
+        let mut decision = combine_permission(checked, pre.permission_override.clone(), ask_rule);
+        // `PermissionRequest`: a permission prompt is about to be shown.
+        // A hook may decide the request itself (allow/deny/ask) or block
+        // it (exit 2 / decision block) instead of asking the user.
+        if matches!(decision, PermissionDecision::Ask) {
+            let req = self
+                .hooks
+                .run(
+                    HookEvent::PermissionRequest,
+                    &tool_name,
+                    json!({
+                        "tool_name": tool_name,
+                        "tool_input": args,
+                        "tool_use_id": tool_use_id,
+                    }),
+                )
+                .await;
+            self.emit_system_message(HookEvent::PermissionRequest, &req);
+            if req.blocked {
+                decision = PermissionDecision::Deny(req.feedback.unwrap_or_else(|| {
+                    format!("Permission request for '{tool_name}' blocked by hook")
+                }));
+            } else if let Some(po) = req.permission_override {
+                decision = po;
+            }
+        }
         let mut allowed = true;
         let mut deny_reason = String::new();
         match decision {
@@ -1252,12 +1533,33 @@ impl Agent {
             },
         }
         if !allowed {
-            self.record_denial(&tool_name, &tool_use_id, &args);
+            let denied = self
+                .record_denial(&tool_name, &tool_use_id, &args, &deny_reason)
+                .await;
+            if denied.allow_retry {
+                deny_reason.push_str(
+                    "\n[hook: a PermissionDenied hook says you may retry this tool call]",
+                );
+            }
             // A repeated denial is a loop too: the model keeps asking for
             // a permission it will not get (including a user who already
             // answered No, and headless runs with no prompter).
             loop_guard.observe_rejected(&tool_name, &args, loop_guard::rejection_reason::DENIED);
             return Slot::Done(tool_use_id, deny_reason, true);
+        }
+        // `TaskCreated` / `TaskCompleted`: a TodoWrite that will run is
+        // diffed against the current list first; a hook may veto a
+        // creation or a completion (exit 2 / decision block) and the
+        // whole TodoWrite is rejected with the reason.
+        if tool_name == "TodoWrite"
+            && let Some(veto) = self.check_task_hooks(&args).await
+        {
+            loop_guard.observe_rejected(
+                &tool_name,
+                &args,
+                loop_guard::rejection_reason::HOOK_BLOCKED,
+            );
+            return Slot::Done(tool_use_id, veto, true);
         }
         let parallel = read_only && is_parallel_safe(&tool_name);
         Slot::Run(PendingCall {
@@ -1702,7 +2004,9 @@ pub(crate) fn combine_permission(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{FakePerms, MockLlm, base_cfg, build_agent, registry_with};
+    use crate::testutil::{
+        FakeHooks, FakePerms, MockLlm, base_cfg, build_agent, registry_with, resp,
+    };
 
     fn agent_with(messages: Vec<ChatMessage>) -> Agent {
         let (mut agent, _sink, _hooks) = build_agent(
@@ -1787,6 +2091,213 @@ mod tests {
     fn plan_text_returns_none_without_assistant_text() {
         let agent = agent_with(vec![ChatMessage::user("do it")]);
         assert_eq!(agent.plan_text(), None);
+    }
+
+    #[test]
+    fn classify_api_error_matches_each_single_signal() {
+        // Pins every `||` in classify_api_error (agent.rs:501-515):
+        // each case matches exactly ONE disjunct of its branch, so
+        // swapping any `||` for `&&` drops the branch and the test
+        // fails. A case matching two disjuncts at once would NOT kill
+        // the mutant, so keep each input to a single signal.
+        let cases: &[(&str, &str)] = &[
+            ("rate limit exceeded", "rate_limit"),
+            ("error 429", "rate_limit"),
+            ("too many requests", "rate_limit"),
+            ("RATE LIMIT", "rate_limit"),
+            ("model overloaded", "overloaded"),
+            ("error 529", "overloaded"),
+            ("error 503", "overloaded"),
+            ("auth error", "authentication_failed"),
+            ("error 401", "authentication_failed"),
+            ("error 403", "authentication_failed"),
+            ("billing issue", "billing_error"),
+            ("payment required", "billing_error"),
+            ("error 402", "billing_error"),
+            ("model not found", "model_not_found"),
+            ("error 404", "model_not_found"),
+            ("max_output_tokens reached", "max_output_tokens"),
+            ("max tokens exceeded", "max_output_tokens"),
+            ("invalid request", "invalid_request"),
+            ("error 400", "invalid_request"),
+            ("server error", "server_error"),
+            ("error 500", "server_error"),
+            ("something went wrong", "unknown"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                Agent::classify_api_error(input),
+                *expected,
+                "classify_api_error({input:?})"
+            );
+        }
+    }
+
+    fn agent_with_hooks() -> (Agent, Arc<FakeHooks>) {
+        let (agent, _sink, hooks) = build_agent(
+            MockLlm::new(vec![]),
+            registry_with(vec![]),
+            FakePerms::new(PermissionDecision::Allow),
+            base_cfg(),
+        );
+        (agent, hooks)
+    }
+
+    fn post_tool_batch_response(hooks: &FakeHooks) -> String {
+        let calls = hooks.calls.lock().unwrap();
+        let payload = calls
+            .iter()
+            .find(|(ev, _, _)| *ev == HookEvent::PostToolBatch)
+            .map(|(_, _, payload)| payload.clone())
+            .expect("PostToolBatch hook should run");
+        payload["tool_calls"][0]["tool_response"]
+            .as_str()
+            .expect("entry should carry a tool_response string")
+            .to_string()
+    }
+
+    fn tool_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "Read".into(),
+                arguments: "{}".into(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn post_tool_batch_matches_tool_response_by_call_id() {
+        // Pins the `&&` in run_post_tool_batch's `.find(|m| m.role ==
+        // "tool" && m.tool_call_id == Some(tc.id))`: each scenario
+        // satisfies exactly ONE conjunct in the wrong place, so
+        // swapping `&&` for `||` returns the wrong response text.
+        // (a) An earlier tool message with a different id: it
+        // satisfies the role conjunct only and must not match.
+        let (mut agent, hooks) = agent_with_hooks();
+        agent.set_messages(vec![
+            ChatMessage::tool("call-first", "WRONG-first-response"),
+            ChatMessage::tool("call-second", "RIGHT-second-response"),
+        ]);
+        let stop = agent
+            .run_post_tool_batch(&[tool_call("call-second")], 0)
+            .await;
+        assert_eq!(stop, None);
+        assert_eq!(post_tool_batch_response(&hooks), "RIGHT-second-response");
+
+        // (b) A non-tool message carrying the wanted id: it satisfies
+        // the id conjunct only and must not match.
+        let (mut agent, hooks) = agent_with_hooks();
+        agent.set_messages(vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: Some(MessageContent::Text("WRONG-assistant-text".into())),
+                tool_call_id: Some("call-second".into()),
+                ..Default::default()
+            },
+            ChatMessage::tool("call-second", "RIGHT-second-response"),
+        ]);
+        let stop = agent
+            .run_post_tool_batch(&[tool_call("call-second")], 0)
+            .await;
+        assert_eq!(stop, None);
+        assert_eq!(post_tool_batch_response(&hooks), "RIGHT-second-response");
+    }
+
+    #[tokio::test]
+    async fn check_task_hooks_fires_task_completed_only_on_transition_to_completed() {
+        // Pins the match guard `p.status != "completed" &&
+        // status == "completed"` in check_task_hooks: each row
+        // exercises exactly ONE side of the guard, so replacing the
+        // guard with `true` or `&&` with `||` fires TaskCompleted
+        // where the original fires nothing (and vice versa the
+        // positive rows prove the event fires at all).
+        let cases: &[(Option<&str>, &str, Option<HookEvent>)] = &[
+            // Already completed, still completed: no transition.
+            (Some("completed"), "completed", None),
+            // Not completed before, still not completed: no transition.
+            (Some("in_progress"), "pending", None),
+            // Not completed before, now completed: the transition.
+            (
+                Some("in_progress"),
+                "completed",
+                Some(HookEvent::TaskCompleted),
+            ),
+            // Brand-new item: creation, not completion.
+            (None, "pending", Some(HookEvent::TaskCreated)),
+        ];
+        for (prev_status, new_status, expected) in cases {
+            let (agent, hooks) = agent_with_hooks();
+            if let Some(prev) = prev_status {
+                agent.ctx.todos.lock().unwrap().push(TodoItem {
+                    content: "Write tests".into(),
+                    status: (*prev).into(),
+                    active_form: None,
+                });
+            }
+            let veto = agent
+                .check_task_hooks(
+                    &json!({ "todos": [{ "content": "Write tests", "status": new_status }] }),
+                )
+                .await;
+            assert_eq!(veto, None, "no hook blocks in case {cases:?}");
+            let fired: Vec<HookEvent> = hooks
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(ev, _, _)| *ev)
+                .collect();
+            match expected {
+                Some(event) => assert!(
+                    fired.contains(event),
+                    "expected {event:?} to fire for prev={prev_status:?} new={new_status}, got {fired:?}"
+                ),
+                None => assert!(
+                    !fired.contains(&HookEvent::TaskCompleted)
+                        && !fired.contains(&HookEvent::TaskCreated),
+                    "expected no task hook to fire for prev={prev_status:?} new={new_status}, got {fired:?}"
+                ),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_turn_appends_only_non_empty_pending_hook_context() {
+        // Pins the `!` in run_turn's `if !pending.trim().is_empty()`:
+        // a non-empty pending note must reach the user message, while
+        // a blank one must not. Dropping the `!` flips both, so each
+        // row on its own kills the mutant.
+        let cases: &[(&[&str], &str)] = &[
+            (&["hook context note"], "do the thing\n\nhook context note"),
+            (
+                &["first note", "second note"],
+                "do the thing\n\nfirst note\n\nsecond note",
+            ),
+            (&["   "], "do the thing"),
+            (&[""], "do the thing"),
+        ];
+        for (pending, expected) in cases {
+            let llm = MockLlm::new(vec![resp("done")]);
+            let (mut agent, _sink, _hooks) = build_agent(
+                llm.clone(),
+                registry_with(vec![]),
+                FakePerms::new(PermissionDecision::Allow),
+                base_cfg(),
+            );
+            agent.pending_hook_context = pending.iter().map(|s| (*s).to_string()).collect();
+            let result = agent.run_turn("do the thing").await;
+            assert_eq!(result.subtype, "success");
+            assert_eq!(agent.messages()[0].text(), *expected, "pending={pending:?}");
+            let requests = llm.requests();
+            let sent = requests[0]
+                .messages
+                .iter()
+                .find(|m| m.role == "user")
+                .expect("a user message should be sent to the model");
+            assert_eq!(sent.text(), *expected, "pending={pending:?}");
+        }
     }
 
     #[test]

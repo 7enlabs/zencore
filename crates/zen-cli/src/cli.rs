@@ -122,6 +122,20 @@ pub struct Cli {
     #[arg(short = 'p', long = "print")]
     pub print: bool,
 
+    /// Run Setup hooks (and SessionStart with the startup matcher),
+    /// then exit without starting a conversation
+    #[arg(long = "init-only")]
+    pub init_only: bool,
+
+    /// Run Setup hooks before the headless run (requires -p)
+    #[arg(long = "init")]
+    pub init: bool,
+
+    /// Run Setup hooks as a maintenance run before the headless run
+    /// (requires -p)
+    #[arg(long = "maintenance")]
+    pub maintenance: bool,
+
     /// Serve the Agent Client Protocol (ACP) over stdio
     #[arg(long = "acp")]
     pub acp: bool,

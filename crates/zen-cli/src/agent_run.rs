@@ -1491,6 +1491,39 @@ pub fn descendants_of(root: u32) -> Vec<u32> {
     out
 }
 
+/// `--init-only` flow: Setup hooks (trigger `"init"`), then SessionStart
+/// with the startup matcher. Returns the SessionStart feedback.
+pub(crate) async fn run_init_only_hooks(
+    cli: &Cli,
+    cfg: &ResolvedConfig,
+    session_id: &str,
+    cwd: &Path,
+) -> Option<String> {
+    run_setup(cli, cfg, session_id, None, cwd, "init").await;
+    let hooks = build_hooks(cli, cfg, session_id, None, cwd);
+    run_session_start(&hooks, session_id, cwd, cfg, "startup").await
+}
+
+/// Run the `Setup` hooks for one trigger (`"init"` or `"maintenance"`).
+/// Setup hooks cannot block the session; their output is discarded.
+pub(crate) async fn run_setup(
+    cli: &Cli,
+    cfg: &ResolvedConfig,
+    session_id: &str,
+    transcript_path: Option<&Path>,
+    cwd: &Path,
+    trigger: &str,
+) {
+    let hooks = build_hooks(cli, cfg, session_id, transcript_path, cwd);
+    let _ = hooks
+        .run(
+            zen_core::HookEvent::Setup,
+            trigger,
+            serde_json::json!({ "trigger": trigger }),
+        )
+        .await;
+}
+
 pub(crate) async fn run_session_start(
     hooks: &Arc<dyn HookRunner>,
     session_id: &str,
@@ -1506,11 +1539,48 @@ pub(crate) async fn run_session_start(
         "source": source,
     });
 
-    hooks
+    let feedback = hooks
         .run(HookEvent::SessionStart, source, payload)
         .await
         .feedback
-        .filter(|s| !s.trim().is_empty())
+        .filter(|s| !s.trim().is_empty());
+
+    // `InstructionsLoaded`: one event per memory file (ZEN.md / AGENTS.md
+    // / rules) loaded into context at session start. The matcher filters
+    // on the load reason (`session_start` here).
+    for (path, _) in zen_ext::memory_files(cwd, None) {
+        let _ = hooks
+            .run(
+                HookEvent::InstructionsLoaded,
+                "session_start",
+                serde_json::json!({
+                    "file_path": path.display().to_string(),
+                    "memory_type": memory_type_for(&path),
+                    "load_reason": "session_start",
+                }),
+            )
+            .await;
+    }
+
+    feedback
+}
+
+/// Scope of a memory file for `InstructionsLoaded`: the managed file is
+/// `Managed`, `ZEN.local.md` is `Local`, anything under `~/.zen` is
+/// `User`, the rest is `Project`.
+fn memory_type_for(path: &Path) -> &'static str {
+    if path == Path::new(zen_ext::MANAGED_MEMORY_PATH) {
+        return "Managed";
+    }
+    if path.file_name().and_then(|n| n.to_str()) == Some("ZEN.local.md") {
+        return "Local";
+    }
+    if let Some(home) = dirs::home_dir()
+        && path.starts_with(home.join(".zen"))
+    {
+        return "User";
+    }
+    "Project"
 }
 
 pub(crate) async fn run_session_end(
@@ -2349,5 +2419,54 @@ mod lsp_provider_tests {
             .unwrap();
         let _ = std::fs::remove_dir_all(&base);
         assembly
+    }
+}
+
+#[cfg(test)]
+mod memory_type_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn memory_type_for_distinguishes_each_branch() {
+        // Pins both `==` in memory_type_for (agent_run.rs:1543, 1546)
+        // and the whole-function return: each case matches exactly one
+        // branch, so flipping either `==` to `!=` moves a case to a
+        // different branch, and replacing the body with "" or "xyzzy"
+        // fails every case. A case matching two branches at once would
+        // NOT kill the mutant, so each path below is crafted to hit a
+        // single branch: the managed path only, a ZEN.local.md file
+        // name that is NOT the managed path, a path under ~/.zen whose
+        // file name is NOT ZEN.local.md, and the rest.
+        let home = dirs::home_dir().expect("tests need a home directory");
+        let cases: Vec<(PathBuf, &str)> = vec![
+            // Managed: exactly the managed path.
+            (PathBuf::from(zen_ext::MANAGED_MEMORY_PATH), "Managed"),
+            // Local: file name ZEN.local.md in a project dir.
+            (PathBuf::from("/tmp/some-project/ZEN.local.md"), "Local"),
+            // Local wins over User: ZEN.local.md under ~/.zen.
+            (home.join(".zen").join("ZEN.local.md"), "Local"),
+            // User: under ~/.zen, file name is not ZEN.local.md.
+            (home.join(".zen").join("ZEN.md"), "User"),
+            (home.join(".zen").join("sub").join("ZEN.md"), "User"),
+            // Project: plain project file, neither managed nor local
+            // nor under ~/.zen.
+            (PathBuf::from("/tmp/some-project/ZEN.md"), "Project"),
+            (PathBuf::from("/tmp/some-project/notes.md"), "Project"),
+            // Project: under $HOME but outside ~/.zen.
+            (home.join("some-project").join("ZEN.md"), "Project"),
+            // Project: ~/.zen2 is a sibling of ~/.zen, not under it.
+            (home.join(".zen2").join("ZEN.md"), "Project"),
+            // Project: near-miss file name, not ZEN.local.md.
+            (
+                PathBuf::from("/tmp/some-project/ZEN.local.md.bak"),
+                "Project",
+            ),
+            // Project: near-miss managed path, different file name.
+            (PathBuf::from("/etc/zen/other.md"), "Project"),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(memory_type_for(&path), expected, "path: {}", path.display());
+        }
     }
 }

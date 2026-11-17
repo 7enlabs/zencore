@@ -264,15 +264,64 @@ exit 0
 
 ### Other events
 
+All 33 events (the full set from the Claude Code hooks reference):
+
 | Event | When it fires | Matcher target |
 |---|---|---|
-| `SessionStart` | session begins | `"startup"` / `"resume"` / `"clear"` |
-| `SessionEnd` | session ends | - |
-| `SubagentStart` / `SubagentStop` | a sub-agent starts / finishes | agent type |
-| `PostCompact` | compaction finished | `"manual"` / `"auto"` |
+| `SessionStart` | session begins | `"startup"` / `"resume"` / `"clear"` / `"compact"` / `"fork"` |
+| `Setup` | `--init-only`, or `-p --init` / `-p --maintenance` before the run | `"init"` / `"maintenance"` |
+| `UserPromptSubmit` | the user submits a prompt, before the model sees it | - |
+| `UserPromptExpansion` | a `/review` or `/init` slash command expands into a prompt (REPL) | command name (`"review"`, `"init"`) |
+| `PreToolUse` | before a tool runs | tool name |
 | `PermissionRequest` | a permission prompt is about to be shown | tool name |
 | `PermissionDenied` | a tool call was denied by permissions | tool name |
+| `PostToolUse` | after a tool runs | tool name |
+| `PostToolUseFailure` | a tool returned an error result | tool name |
+| `PostToolBatch` | after a batch of tool calls resolves | - |
 | `Notification` | a notification is sent | - |
+| `MessageDisplay` | an assistant message is about to be shown | - |
+| `SubagentStart` / `SubagentStop` | a sub-agent starts / finishes | agent type |
+| `TaskCreated` / `TaskCompleted` | a TodoWrite creates / completes a task | - |
+| `Stop` | the agent finished a turn | - |
+| `StopFailure` | a model call failed (rate limit, auth, server error, …) | error type |
+| `TeammateIdle` | (no trigger: ZenCode has no agent-team concept) | - |
+| `InstructionsLoaded` | a memory file (ZEN.md / AGENTS.md / rules) loads at session start | load reason (`"session_start"`) |
+| `ConfigChange` | a settings / hooks / skills file changed on disk (REPL polling) | change source (`"user_settings"`, `"project_settings"`, `"local_settings"`, `"skills"`) |
+| `CwdChanged` | the working directory changed during a turn | - |
+| `DirectoryAdded` | `/add-dir` added a directory (REPL) | `"slash_command"` |
+| `FileChanged` | a watched file changed (REPL polling) | filename (literal segment) |
+| `WorktreeCreate` / `WorktreeRemove` | `/worktree` create / remove (REPL) | - |
+| `PreCompact` / `PostCompact` | before / after compaction | `"manual"` / `"auto"` |
+| `PreModelSwitch` / `PostModelSwitch` | before / after a model switch (REPL); Post also fires for automatic changes | model id |
+| `Elicitation` / `ElicitationResult` | (no trigger: ZenCode has no MCP elicitation) | - |
+| `SessionEnd` | session ends | reason (`"clear"` / `"resume"` / `"logout"` / `"prompt_input_exit"` / `"other"`) |
+
+Notes and deviations from the reference:
+
+- `TeammateIdle`, `Elicitation`, `ElicitationResult` are defined and
+  runnable through the generic runner, but nothing in ZenCode triggers
+  them yet.
+- `PermissionDenied` fires on every recorded denial; the reference
+  restricts it to auto-mode classifier denials.
+- `ConfigChange` fires for audit/logging only: ZenCode loads settings
+  once at startup and never hot-reloads, so a block is a no-op.
+- `FileChanged` is driven by mtime polling in the REPL loop (not during
+  turns, not in `-p` mode). `*` as a matcher segment means "match all,
+  watch nothing" (not a file literally named `*`).
+- `DirectoryAdded` runs inline in the REPL; the reference runs it in the
+  background.
+- `MessageDisplay` replacement changes only the displayed message; the
+  stored history and the final `-p` result keep the original text.
+- `UserPromptExpansion` payload omits `command_source` (not established
+  from the reference).
+- `TaskCreated` / `TaskCompleted` use `task_id` `"todo-{index}"` in the
+  new list; `task_description` is the todo's `activeForm`.
+- `PostToolBatch` entries carry `tool_name` / `tool_input` /
+  `tool_use_id` / `tool_response` (no `is_error`); the tool name is as
+  the model called it, before any repair.
+- `CwdChanged` fires after a turn whose tools changed the working
+  directory; a `watchPaths` answer replaces the dynamic FileChanged
+  watch list.
 
 ## Payload schema (stdin)
 
@@ -304,7 +353,7 @@ above **plus** these standard fields:
 | Exit | Meaning |
 |---|---|
 | `0` | Success. Stdout: parsed as JSON if it's a JSON object (see below); otherwise plain text becomes extra context **only** for `UserPromptSubmit` / `SessionStart`, ignored for other events. |
-| `2` | **Block / intervene.** For `PreToolUse`, `UserPromptSubmit`, `Stop`, `SubagentStop`, `PreCompact`, `PermissionRequest`: stderr is the reason; the event is blocked (tool doesn't run / prompt rejected / turn continues / compaction skipped). For `PostToolUse` / `PostToolUseFailure`: stderr is fed back to the model (the tool already ran - nothing to block). For other events: non-blocking error, stderr to the user only. |
+| `2` | **Block / intervene.** For `PreToolUse`, `UserPromptSubmit`, `UserPromptExpansion`, `Stop`, `SubagentStop`, `PreCompact`, `PermissionRequest`, `TaskCreated`, `TaskCompleted`, `ConfigChange`, `PreModelSwitch`, `WorktreeCreate`, `PostToolBatch`: stderr is the reason; the event is blocked (tool doesn't run / prompt rejected / turn continues / compaction skipped / task vetoed / model switch cancelled / worktree not created / loop stops). For `PostToolUse` / `PostToolUseFailure`: stderr is fed back to the model (the tool already ran - nothing to block). For other events: non-blocking error, stderr to the user only. |
 | other non-zero | Non-blocking error: stderr goes to the user, the agent loop continues. |
 | timeout | Process killed, output discarded, never blocks (unless the hook sets `"onFailure": "block"`). |
 
@@ -324,7 +373,11 @@ On exit `0`, a JSON object on stdout controls the outcome:
     "permissionDecisionReason": "…",
     "updatedInput": { "command": "ls -la" },   // PreToolUse: replace tool args
     "updatedToolOutput": "[redacted]",         // PostToolUse: replace what the model sees
-    "additionalContext": "…"                   // extra context; for Stop/SubagentStop it re-prompts the model
+    "additionalContext": "…"                   // extra context; for Stop/SubagentStop/PostToolBatch it re-prompts the model
+    "watchPaths": ["src/"],                   // CwdChanged/FileChanged: replace the dynamic watch list
+    "worktreePath": "/tmp/wt-x",               // WorktreeCreate: path of the created worktree
+    "retry": true,                            // PermissionDenied: the model may retry the denied call
+    "displayText": "…"                        // MessageDisplay: text shown instead of the assistant message
   }
 }
 ```
@@ -415,7 +468,9 @@ as an unanchored regex (an invalid regex matches nothing). For tool events the m
 compared against the tool name (`Edit`, `Bash`, …); for `SessionStart` the conventional
 matcher target is `"startup"`; for `SessionEnd` it is the reason (`clear`,
 `prompt_input_exit`, `other`); for `PreCompact`/`PostCompact` it is the trigger
-(`manual` or `auto`).
+(`manual` or `auto`). For `FileChanged` the matcher segments are literal
+filenames (split on `|` or `,`); `*` or an absent matcher matches every
+change but watches no file.
 
 Matching commands of one event run concurrently; identical command+args pairs are
 deduplicated and run once.
@@ -431,7 +486,7 @@ Environment: settings `env` plus `ZEN_PROJECT_DIR`.
 | Exit | Meaning |
 |---|---|
 | `0` | success - see "JSON output" below |
-| `2` | **block** - for `PreToolUse`, `UserPromptSubmit`, `Stop`, `SubagentStop`, `PreCompact`, `PermissionRequest` the action is vetoed and stderr becomes the reason shown to the model/user. For `PostToolUse`/`PostToolUseFailure` stderr is fed back to the model as context instead of blocking. Anywhere else it is a non-blocking error (stderr to the user only). |
+| `2` | **block** - for `PreToolUse`, `UserPromptSubmit`, `UserPromptExpansion`, `Stop`, `SubagentStop`, `PreCompact`, `PermissionRequest`, `TaskCreated`, `TaskCompleted`, `ConfigChange`, `PreModelSwitch`, `WorktreeCreate`, `PostToolBatch` the action is vetoed and stderr becomes the reason shown to the model/user. For `PostToolUse`/`PostToolUseFailure` stderr is fed back to the model as context instead of blocking. Anywhere else it is a non-blocking error (stderr to the user only). |
 | other | non-blocking error - stderr is shown to the user, the run continues |
 | timeout | the process is killed and its output discarded; never blocks unless `onFailure: "block"` |
 
@@ -445,8 +500,12 @@ stdout is treated as additional context for `UserPromptSubmit`/`SessionStart` on
 | `systemMessage` | warning shown to the user (stderr in the REPL, a `system`/`hook_message` line in `--output-format stream-json`) |
 | `hookSpecificOutput.updatedInput` | (`PreToolUse`) replace the tool input before execution |
 | `hookSpecificOutput.updatedToolOutput` | (`PostToolUse`) replace the tool result text |
-| `hookSpecificOutput.permissionDecision` | (`PreToolUse`) force `allow` / `deny` / `ask`, with optional `permissionDecisionReason` |
-| `hookSpecificOutput.additionalContext` | (`Stop`/`SubagentStop`) continue the run with this as feedback |
+| `hookSpecificOutput.permissionDecision` | (`PreToolUse`, `PreModelSwitch`) force `allow` / `deny` / `ask`, with optional `permissionDecisionReason` |
+| `hookSpecificOutput.additionalContext` | (`Stop`/`SubagentStop`/`PostToolBatch`) continue the run with this as feedback |
+| `hookSpecificOutput.watchPaths` | (`CwdChanged` / `FileChanged`) replace the dynamic watch list |
+| `hookSpecificOutput.worktreePath` | (`WorktreeCreate`) path of the created worktree |
+| `hookSpecificOutput.retry` | (`PermissionDenied`) `true` tells the model it may retry the denied call |
+| `hookSpecificOutput.displayText` (or `replacement`) | (`MessageDisplay`) text shown instead of the assistant message |
 | `suppressOutput` | accepted, no-op (parity) |
 
 Hook output fed back to the model or user is capped at 10,000 characters per hook.
@@ -459,16 +518,31 @@ order wins; feedback and system messages are joined with newlines.
 | Event | When | stdin payload (plus the common fields) |
 |---|---|---|
 | `SessionStart` | a session begins (`-p` run or REPL start); matcher target is the source | `session_id`, `cwd`, `permission_mode`, `source` |
-| `SessionEnd` | a session ends; matcher target is the reason | `session_id`, `cwd`, `permission_mode`, `reason` (`clear` \| `prompt_input_exit` \| `other`) |
+| `Setup` | `--init-only`, or `-p --init` / `-p --maintenance` before the run; matcher target is the trigger | `trigger` (`init` \| `maintenance`) |
+| `SessionEnd` | a session ends; matcher target is the reason | `session_id`, `cwd`, `permission_mode`, `reason` (`clear` \| `resume` \| `logout` \| `prompt_input_exit` \| `other`) |
 | `UserPromptSubmit` | the user submits a prompt (REPL) | `prompt` |
+| `UserPromptExpansion` | a `/review` or `/init` slash command expands into a prompt (REPL); matcher target is the command name | `expansion_type` (`slash_command`), `command_name`, `command_args`, `prompt` |
 | `PreToolUse` | before a tool runs; matcher target is the tool name | `tool_name`, `tool_input`, `tool_use_id` |
 | `PostToolUse` | after a tool runs | `tool_name`, `tool_input`, `tool_use_id`, `tool_output` |
 | `PostToolUseFailure` | a tool returned an error result | same as `PostToolUse` |
+| `PostToolBatch` | after a batch of tool calls resolves; exit 2 / `continue: false` stops the loop | `tool_calls` (each: `tool_name`, `tool_input`, `tool_use_id`, `tool_response`) |
 | `PreCompact` | before auto/manual compaction; may veto (exit 2) | `trigger` (`manual` \| `auto`), `pre_tokens` |
 | `PostCompact` | after compaction; matcher target is the trigger | `trigger`, `pre_tokens`, `post_tokens` |
 | `Stop` | the agent finished a turn | `reason` |
+| `StopFailure` | a model call failed; matcher target is the error type | `error`, `error_details`, `last_assistant_message` |
+| `MessageDisplay` | an assistant message is about to be shown | `turn_id`, `index`, `final`, `delta` |
 | `SubagentStart` / `SubagentStop` | a sub-agent starts / stops; matcher target is the agent type | agent fields |
-| `PermissionRequest` / `PermissionDenied` | a permission prompt is about to be decided / was denied | `tool_name`, `tool_input` |
+| `TaskCreated` / `TaskCompleted` | a TodoWrite creates / completes a task; exit 2 vetoes the whole TodoWrite | `task_id`, `task_subject`, `task_description` |
+| `TeammateIdle` | no trigger yet (ZenCode has no agent-team concept) | - |
+| `InstructionsLoaded` | a memory file loads at session start; matcher target is the load reason | `file_path`, `memory_type`, `load_reason` |
+| `ConfigChange` | a settings / hooks / skills file changed on disk (REPL polling); matcher target is the change source | `source`, `file_path` |
+| `CwdChanged` | the working directory changed during a turn | `old_cwd`, `new_cwd` |
+| `DirectoryAdded` | `/add-dir` added a directory (REPL); matcher target is `slash_command` | `directory`, `source` |
+| `FileChanged` | a watched file changed (REPL polling); matcher target is the filename | `file_path`, `event` (`change` \| `add` \| `unlink`) |
+| `WorktreeCreate` / `WorktreeRemove` | `/worktree` create / remove (REPL) | `worktree_path` (create), `worktree` (remove) |
+| `PreModelSwitch` / `PostModelSwitch` | before / after a model switch (REPL); Post also fires for automatic changes | `from_model`, `to_model`, `requested_model`, `source`, `context_tokens` |
+| `Elicitation` / `ElicitationResult` | no trigger yet (ZenCode has no MCP elicitation) | - |
+| `PermissionRequest` / `PermissionDenied` | a permission prompt is about to be decided / was denied | `tool_name`, `tool_input`, `tool_use_id` (+ `reason` for `PermissionDenied`) |
 | `Notification` | the CLI wants the user's attention | `message` |
 
 ### Security
