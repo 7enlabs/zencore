@@ -1374,7 +1374,8 @@ mod tests {
     }
 
     /// Split a `zen` binary path into the cargo target dir, the
-    /// profile, and the canonical `<target>/<profile>/zen` path.
+    /// profile, the canonical `<target>/<profile>/zen` path, and the
+    /// target triple when the build used `--target <triple>`.
     ///
     /// Cargo normally lays the binary out as
     /// `<target>/<profile>/zen`, but on CI `CARGO_BIN_EXE_zen` can
@@ -1384,10 +1385,21 @@ mod tests {
     /// to `cargo build --profile` fails with `<hash> is not defined`.
     /// Walk up to the `target` dir instead and take the profile as
     /// the component right after it, so both layouts resolve to the
-    /// same canonical binary. Paths with no `target` component fall
+    /// same canonical binary.
+    ///
+    /// With `--target <triple>` the layout gains a level,
+    /// `<target>/<triple>/<profile>/zen`, and the component right
+    /// after `target` is the triple, not the profile. Taking it as
+    /// the profile passes `--profile <triple>` to `cargo build`,
+    /// which fails with `profile '<triple>' is not defined` (main
+    /// CI run 43994224352). A component after `target` is a triple
+    /// when the next component is a `debug`/`release` profile, or
+    /// when it looks like a target triple itself (so custom profiles
+    /// under a triple keep working too). The canonical binary keeps
+    /// the triple in its path. Paths with no `target` component fall
     /// back to the old layout (parent dir = profile, grandparent =
-    /// target dir, binary path unchanged).
-    fn resolve_zen_build_dirs(bin: &Path) -> (PathBuf, String, PathBuf) {
+    /// target dir, binary path unchanged, no triple).
+    fn resolve_zen_build_dirs(bin: &Path) -> (PathBuf, String, PathBuf, Option<String>) {
         let file_name = bin
             .file_name()
             .map(|n| n.to_os_string())
@@ -1395,11 +1407,32 @@ mod tests {
         for ancestor in bin.ancestors() {
             if ancestor.file_name().is_some_and(|n| n == "target")
                 && let Ok(rel) = bin.strip_prefix(ancestor)
-                && rel.components().count() >= 2
-                && let Some(profile) = rel.components().next().and_then(|c| c.as_os_str().to_str())
             {
-                let canonical = ancestor.join(profile).join(&file_name);
-                return (ancestor.to_path_buf(), profile.to_string(), canonical);
+                let parts: Vec<&str> = rel
+                    .components()
+                    .filter_map(|c| c.as_os_str().to_str())
+                    .collect();
+                if parts.len() >= 2 {
+                    let (triple, profile) = if parts.len() >= 3
+                        && (parts[1] == "debug"
+                            || parts[1] == "release"
+                            || looks_like_target_triple(parts[0]))
+                    {
+                        (Some(parts[0].to_string()), parts[1])
+                    } else {
+                        (None, parts[0])
+                    };
+                    let canonical = match &triple {
+                        Some(t) => ancestor.join(t).join(profile).join(&file_name),
+                        None => ancestor.join(profile).join(&file_name),
+                    };
+                    return (
+                        ancestor.to_path_buf(),
+                        profile.to_string(),
+                        canonical,
+                        triple,
+                    );
+                }
             }
         }
         // Fallback: no `target` component (e.g. a relocated binary).
@@ -1410,7 +1443,33 @@ mod tests {
             .and_then(|n| n.to_str())
             .unwrap_or("debug")
             .to_string();
-        (target_dir.to_path_buf(), profile, bin.to_path_buf())
+        (target_dir.to_path_buf(), profile, bin.to_path_buf(), None)
+    }
+
+    /// True when `name` looks like a cargo target triple
+    /// (`<arch>-<vendor>-<os>`), so it can be told apart from a
+    /// profile name after `target/`. Profile names are single words;
+    /// a triple always starts with a known CPU architecture followed
+    /// by a dash.
+    fn looks_like_target_triple(name: &str) -> bool {
+        const ARCHES: [&str; 13] = [
+            "x86_64",
+            "aarch64",
+            "i686",
+            "i586",
+            "armv7",
+            "arm",
+            "riscv64",
+            "wasm32",
+            "powerpc64",
+            "s390x",
+            "loongarch64",
+            "mips64",
+            "sparc64",
+        ];
+        ARCHES
+            .iter()
+            .any(|arch| name.starts_with(arch) && name[arch.len()..].starts_with('-'))
     }
 
     /// Build the `zen` binary when the test runner did not build it:
@@ -1424,13 +1483,14 @@ mod tests {
         if bin.is_file() {
             return bin;
         }
-        // The binary lives in <target>/<profile>/zen; build it into
-        // that same directory. Resolve the layout via
+        // The binary lives in <target>/<profile>/zen (or
+        // <target>/<triple>/<profile>/zen with --target); build it
+        // into that same directory. Resolve the layout via
         // resolve_zen_build_dirs: on CI CARGO_BIN_EXE_zen can point at
         // the build-script dir
         // <target>/<profile>/build/zen-cli/<hash>/zen, whose parent
         // dir name is a hash, not a profile.
-        let (target_dir, profile, canonical_bin) = resolve_zen_build_dirs(&bin);
+        let (target_dir, profile, canonical_bin, triple) = resolve_zen_build_dirs(&bin);
         let mut cmd = std::process::Command::new(env!("CARGO"));
         cmd.arg("build")
             .arg("-p")
@@ -1439,6 +1499,9 @@ mod tests {
             .arg("zen")
             .arg("--target-dir")
             .arg(&target_dir);
+        if let Some(triple) = &triple {
+            cmd.arg("--target").arg(triple);
+        }
         if profile == "release" {
             cmd.arg("--release");
         } else if profile != "debug" {
@@ -1487,6 +1550,7 @@ mod tests {
                 PathBuf::from("/x/target"),
                 "debug".to_string(),
                 PathBuf::from("/x/target/debug/zen"),
+                None,
             )
         );
         // CI layout (lib.rs:1413 failure): CARGO_BIN_EXE_zen resolves
@@ -1500,6 +1564,53 @@ mod tests {
                 PathBuf::from("/x/target"),
                 "debug".to_string(),
                 PathBuf::from("/x/target/debug/zen"),
+                None,
+            )
+        );
+        // `--target <triple>` layout (main CI run 43994224352):
+        // the triple must NOT become the profile; the profile is
+        // the component after the triple, and the canonical binary
+        // keeps the triple in its path.
+        assert_eq!(
+            resolve_zen_build_dirs(Path::new("/x/target/x86_64-pc-windows-msvc/debug/zen")),
+            (
+                PathBuf::from("/x/target"),
+                "debug".to_string(),
+                PathBuf::from("/x/target/x86_64-pc-windows-msvc/debug/zen"),
+                Some("x86_64-pc-windows-msvc".to_string()),
+            )
+        );
+        assert_eq!(
+            resolve_zen_build_dirs(Path::new(
+                "/x/target/aarch64-apple-darwin/debug/build/zen-cli/9f3a1b2c4d5e6f7a/zen"
+            )),
+            (
+                PathBuf::from("/x/target"),
+                "debug".to_string(),
+                PathBuf::from("/x/target/aarch64-apple-darwin/debug/zen"),
+                Some("aarch64-apple-darwin".to_string()),
+            )
+        );
+        assert_eq!(
+            resolve_zen_build_dirs(Path::new("/x/target/aarch64-apple-darwin/release/zen")),
+            (
+                PathBuf::from("/x/target"),
+                "release".to_string(),
+                PathBuf::from("/x/target/aarch64-apple-darwin/release/zen"),
+                Some("aarch64-apple-darwin".to_string()),
+            )
+        );
+        // Custom profile under a triple: the triple is recognised
+        // by shape, so the profile stays a profile.
+        assert_eq!(
+            resolve_zen_build_dirs(Path::new(
+                "/x/target/x86_64-unknown-linux-musl/profiling/zen"
+            )),
+            (
+                PathBuf::from("/x/target"),
+                "profiling".to_string(),
+                PathBuf::from("/x/target/x86_64-unknown-linux-musl/profiling/zen"),
+                Some("x86_64-unknown-linux-musl".to_string()),
             )
         );
         // Release and custom profiles keep working.
@@ -1509,6 +1620,7 @@ mod tests {
                 PathBuf::from("/x/target"),
                 "release".to_string(),
                 PathBuf::from("/x/target/release/zen"),
+                None,
             )
         );
         assert_eq!(
@@ -1517,6 +1629,7 @@ mod tests {
                 PathBuf::from("/x/target"),
                 "profiling".to_string(),
                 PathBuf::from("/x/target/profiling/zen"),
+                None,
             )
         );
         // No `target` component: fall back to parent = profile,
@@ -1527,6 +1640,7 @@ mod tests {
                 PathBuf::from("/tmp"),
                 "zenbin".to_string(),
                 PathBuf::from("/tmp/zenbin/zen"),
+                None,
             )
         );
     }
