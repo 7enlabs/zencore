@@ -1,5 +1,5 @@
 {
   "min_rust_tests": 1820,
-  "max_runtime_allows": 15,
+  "max_runtime_allows": 14,
   "min_line_coverage": 88
 }

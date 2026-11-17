@@ -187,19 +187,26 @@ pub struct StreamJsonSink {
     folder_trusted: Mutex<Option<bool>>,
 }
 
+/// Parameters shared by `StreamJsonSink::new` / `with_partial`: one struct
+/// instead of eight positional arguments (clippy::too_many_arguments).
+pub struct StreamJsonSinkParams {
+    pub buf: Arc<Buffered>,
+    pub session_id: String,
+    pub cwd: String,
+    pub model: String,
+    pub tools: Vec<String>,
+    pub mcp_servers: Vec<(String, String)>,
+    pub permission_mode: String,
+    pub slash_commands: Vec<String>,
+}
+
 impl StreamJsonSink {
-    #[allow(clippy::too_many_arguments)] // floor-guard: params-struct refactor deferred
-    pub fn new(
-        buf: Arc<Buffered>,
-        session_id: String,
-        cwd: String,
-        model: String,
-        tools: Vec<String>,
-        mcp_servers: Vec<(String, String)>,
-        permission_mode: String,
-        slash_commands: Vec<String>,
-    ) -> Self {
-        Self::with_partial(
+    pub fn new(params: StreamJsonSinkParams) -> Self {
+        Self::with_partial(params, false)
+    }
+
+    pub fn with_partial(params: StreamJsonSinkParams, include_partial: bool) -> Self {
+        let StreamJsonSinkParams {
             buf,
             session_id,
             cwd,
@@ -208,22 +215,7 @@ impl StreamJsonSink {
             mcp_servers,
             permission_mode,
             slash_commands,
-            false,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)] // floor-guard: params-struct refactor deferred
-    pub fn with_partial(
-        buf: Arc<Buffered>,
-        session_id: String,
-        cwd: String,
-        model: String,
-        tools: Vec<String>,
-        mcp_servers: Vec<(String, String)>,
-        permission_mode: String,
-        slash_commands: Vec<String>,
-        include_partial: bool,
-    ) -> Self {
+        } = params;
         Self {
             buf,
             session_id,
@@ -546,16 +538,16 @@ mod tests {
     #[test]
     fn stream_json_init_line_shape() {
         let buf = Arc::new(Buffered::new());
-        let sink = StreamJsonSink::new(
-            buf.clone(),
-            "sess-id".into(),
-            "/tmp/wd".into(),
-            "mock-model".into(),
-            vec!["Read".into(), "Bash".into()],
-            vec![("srv1".to_string(), "connected".to_string())],
-            "default".into(),
-            vec!["/help".into(), "/compact".into()],
-        );
+        let sink = StreamJsonSink::new(StreamJsonSinkParams {
+            buf: buf.clone(),
+            session_id: "sess-id".into(),
+            cwd: "/tmp/wd".into(),
+            model: "mock-model".into(),
+            tools: vec!["Read".into(), "Bash".into()],
+            mcp_servers: vec![("srv1".to_string(), "connected".to_string())],
+            permission_mode: "default".into(),
+            slash_commands: vec!["/help".into(), "/compact".into()],
+        });
 
         let msg = ChatMessage::assistant(Some("hi".into()), None);
         let _ = msg;
@@ -593,16 +585,16 @@ mod tests {
     #[test]
     fn stream_json_user_tool_result_shape() {
         let buf = Arc::new(Buffered::new());
-        let sink = StreamJsonSink::new(
-            buf.clone(),
-            "s".into(),
-            "/w".into(),
-            "m".into(),
-            vec![],
-            vec![],
-            "default".into(),
-            vec![],
-        );
+        let sink = StreamJsonSink::new(StreamJsonSinkParams {
+            buf: buf.clone(),
+            session_id: "s".into(),
+            cwd: "/w".into(),
+            model: "m".into(),
+            tools: vec![],
+            mcp_servers: vec![],
+            permission_mode: "default".into(),
+            slash_commands: vec![],
+        });
         sink.emit(AgentEvent::Assistant {
             message: ChatMessage::assistant(
                 None,
@@ -640,16 +632,16 @@ mod tests {
     #[test]
     fn stream_json_retries_and_compact() {
         let buf = Arc::new(Buffered::new());
-        let sink = StreamJsonSink::new(
-            buf.clone(),
-            "s".into(),
-            "/w".into(),
-            "m".into(),
-            vec![],
-            vec![],
-            "default".into(),
-            vec![],
-        );
+        let sink = StreamJsonSink::new(StreamJsonSinkParams {
+            buf: buf.clone(),
+            session_id: "s".into(),
+            cwd: "/w".into(),
+            model: "m".into(),
+            tools: vec![],
+            mcp_servers: vec![],
+            permission_mode: "default".into(),
+            slash_commands: vec![],
+        });
         sink.emit(AgentEvent::ApiRetry {
             attempt: 1,
             max_retries: 4,
@@ -745,16 +737,16 @@ mod tests {
     fn c7_3_init_lists_mcp_server_errors_only_when_present() {
         let mk = || {
             let buf = Arc::new(Buffered::new());
-            let sink = StreamJsonSink::new(
-                buf.clone(),
-                "s".into(),
-                "/w".into(),
-                "m".into(),
-                vec![],
-                vec![],
-                "default".into(),
-                vec![],
-            );
+            let sink = StreamJsonSink::new(StreamJsonSinkParams {
+                buf: buf.clone(),
+                session_id: "s".into(),
+                cwd: "/w".into(),
+                model: "m".into(),
+                tools: vec![],
+                mcp_servers: vec![],
+                permission_mode: "default".into(),
+                slash_commands: vec![],
+            });
             (buf, sink)
         };
         let (buf, sink) = mk();
@@ -869,14 +861,16 @@ mod tests {
     fn stream_json_every_line_has_version() {
         let buf = Arc::new(Buffered::new());
         let sink = StreamJsonSink::with_partial(
-            buf.clone(),
-            "s".into(),
-            "/w".into(),
-            "m".into(),
-            vec![],
-            vec![],
-            "default".into(),
-            vec![],
+            StreamJsonSinkParams {
+                buf: buf.clone(),
+                session_id: "s".into(),
+                cwd: "/w".into(),
+                model: "m".into(),
+                tools: vec![],
+                mcp_servers: vec![],
+                permission_mode: "default".into(),
+                slash_commands: vec![],
+            },
             true,
         );
         sink.emit(AgentEvent::Assistant {
@@ -932,16 +926,16 @@ mod tests {
     #[test]
     fn stream_json_tool_progress_shape() {
         let buf = Arc::new(Buffered::new());
-        let sink = StreamJsonSink::new(
-            buf.clone(),
-            "s".into(),
-            "/w".into(),
-            "m".into(),
-            vec![],
-            vec![],
-            "default".into(),
-            vec![],
-        );
+        let sink = StreamJsonSink::new(StreamJsonSinkParams {
+            buf: buf.clone(),
+            session_id: "s".into(),
+            cwd: "/w".into(),
+            model: "m".into(),
+            tools: vec![],
+            mcp_servers: vec![],
+            permission_mode: "default".into(),
+            slash_commands: vec![],
+        });
         sink.emit(AgentEvent::ToolProgress {
             tool_use_id: "call_9".into(),
             tool_name: "Bash".into(),
@@ -963,16 +957,16 @@ mod tests {
     #[test]
     fn c3_set_prompt_input_stores_prompt() {
         let buf = Arc::new(Buffered::new());
-        let sink = StreamJsonSink::new(
-            buf.clone(),
-            "s".into(),
-            "/w".into(),
-            "m".into(),
-            vec![],
-            vec![],
-            "default".into(),
-            vec![],
-        );
+        let sink = StreamJsonSink::new(StreamJsonSinkParams {
+            buf: buf.clone(),
+            session_id: "s".into(),
+            cwd: "/w".into(),
+            model: "m".into(),
+            tools: vec![],
+            mcp_servers: vec![],
+            permission_mode: "default".into(),
+            slash_commands: vec![],
+        });
         assert_eq!(
             lock_or_recover(&sink.prompt_input, "prompt input").as_deref(),
             None
