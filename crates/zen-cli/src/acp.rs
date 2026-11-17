@@ -604,6 +604,63 @@ mod tests {
             .collect()
     }
 
+    /// Probe entry point for the write_response stdout test below.
+    /// Same current_exe + env-var pattern as __acp_probe_emit_assistant:
+    /// reads a {"id": ..., "result": ...} response from ACP_PROBE_RESPONSE
+    /// and writes it through write_response, so the parent can assert the
+    /// JSON-RPC line actually reaches stdout. Without the env var it is a
+    /// no-op. If write_response were replaced with Ok(()), the probe
+    /// would write nothing and the parent test would fail.
+    #[test]
+    fn __acp_probe_write_response() {
+        let Ok(json) = std::env::var("ACP_PROBE_RESPONSE") else {
+            return;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&json) else {
+            return;
+        };
+        let resp = RpcResponse::ok(
+            v.get("id").cloned().unwrap_or(Value::Null),
+            v.get("result").cloned().unwrap_or(Value::Null),
+        );
+        write_response(&Arc::new(Mutex::new(std::io::stdout())), &resp).unwrap();
+    }
+
+    fn probe_write_response(response_json: &str) -> Vec<serde_json::Value> {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .args([
+                "acp::tests::__acp_probe_write_response",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("ACP_PROBE_RESPONSE", response_json)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "probe run failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        stdout
+            .lines()
+            .filter(|l| l.starts_with("{\"jsonrpc\""))
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn write_response_writes_jsonrpc_line() {
+        // Pins write_response: replacing its body with Ok(()) would
+        // emit no line and fail the len assertion below.
+        let lines = probe_write_response(r#"{"id":7,"result":{"ok":true}}"#);
+        assert_eq!(lines.len(), 1, "lines: {lines:?}");
+        assert_eq!(lines[0]["jsonrpc"], "2.0");
+        assert_eq!(lines[0]["id"], 7);
+        assert_eq!(lines[0]["result"]["ok"], true);
+    }
+
     #[test]
     fn emit_assistant_sends_nonempty_text_chunk() {
         // Pins the `.filter(|t| !t.is_empty())`: negating the check
