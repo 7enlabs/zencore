@@ -694,3 +694,181 @@ mod tests {
         assert!(v.get("result").is_none());
     }
 }
+
+// Tests added for Việc A (floor coverage 88%): the AcpSink::emit arms
+// (driven through a subprocess probe like __acp_probe_emit_assistant),
+// write_response, the prompt_text resource arm, and the cheap error paths
+// of handle_prompt / handle_cancel / handle_session_new. The stdio loop
+// in run_acp_server is not drivable in-process and stays uncovered.
+#[cfg(test)]
+mod viec_a_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Probe entry point for the emit test below, mirroring
+    /// __acp_probe_emit_assistant: the parent test runs this test as a
+    /// subprocess and asserts on the JSON-RPC lines it writes to stdout.
+    /// AgentEvent has no Deserialize impl, so the events are built here
+    /// in code instead of coming from an env var.
+    #[test]
+    fn __acp_probe_emit() {
+        let sink = AcpSink {
+            out: Arc::new(Mutex::new(std::io::stdout())),
+            session_id: "probe".into(),
+            tools: Arc::new(Mutex::new(HashMap::new())),
+        };
+        sink.emit(AgentEvent::TextDelta { text: "hi".into() });
+        sink.emit(AgentEvent::ToolResult {
+            tool_use_id: "t1".into(),
+            content: "ok".into(),
+            is_error: false,
+            parent_tool_use_id: None,
+            parallel: false,
+        });
+        sink.emit(AgentEvent::ToolResult {
+            tool_use_id: "t2".into(),
+            content: "boom".into(),
+            is_error: true,
+            parent_tool_use_id: None,
+            parallel: false,
+        });
+        sink.emit(AgentEvent::SystemMessage {
+            event: "notice".into(),
+            text: "sys".into(),
+        });
+        // An assistant message with no text and no tool calls emits
+        // nothing, but still exercises the Assistant arm.
+        sink.emit(AgentEvent::Assistant {
+            message: ChatMessage::assistant(None, None),
+            parent_tool_use_id: None,
+        });
+        // Retries and compaction boundaries are swallowed silently.
+        sink.emit(AgentEvent::ApiRetry {
+            attempt: 1,
+            max_retries: 3,
+            retry_delay_ms: 100,
+            error_status: None,
+            error: "x".into(),
+        });
+        sink.emit(AgentEvent::CompactBoundary {
+            trigger: "t".into(),
+            pre_tokens: 10,
+        });
+    }
+
+    fn probe_emit() -> Vec<serde_json::Value> {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .args([
+                "acp::viec_a_tests::__acp_probe_emit",
+                "--exact",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "probe run failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        stdout
+            .lines()
+            .filter(|l| l.starts_with("{\"jsonrpc\""))
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn emit_covers_text_tool_result_and_system_arms() {
+        let lines = probe_emit();
+        assert_eq!(lines.len(), 4, "lines: {lines:?}");
+        assert_eq!(
+            lines[0]["params"]["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
+        assert_eq!(lines[0]["params"]["update"]["content"]["text"], "hi");
+        assert_eq!(
+            lines[1]["params"]["update"]["sessionUpdate"],
+            "tool_call_update"
+        );
+        assert_eq!(lines[1]["params"]["update"]["toolCallId"], "t1");
+        assert_eq!(lines[1]["params"]["update"]["status"], "completed");
+        assert_eq!(lines[2]["params"]["update"]["status"], "failed");
+        assert_eq!(lines[2]["params"]["update"]["toolCallId"], "t2");
+        assert_eq!(
+            lines[3]["params"]["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
+        assert_eq!(lines[3]["params"]["update"]["content"]["text"], "sys");
+    }
+
+    #[test]
+    fn write_response_writes_json_line() {
+        let out = Arc::new(Mutex::new(std::io::stdout()));
+        write_response(&out, &RpcResponse::ok(json!(1), json!({"a": 1}))).unwrap();
+        write_response(
+            &out,
+            &RpcResponse::err(json!(2), -32601, "method not found: x"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn prompt_text_resource_blocks() {
+        let params = json!({
+            "content": [
+                { "type": "resource_link", "uri": "file:///x.md" },
+                { "type": "resource", "uri": "file:///y.md" },
+                { "type": "text", "text": "hi" },
+            ]
+        });
+        assert_eq!(
+            prompt_text(&params),
+            "[resource: file:///x.md]\n[resource: file:///y.md]\nhi"
+        );
+        // A block without a type (or a resource without a uri) is skipped.
+        assert_eq!(prompt_text(&json!({"content": [{"text": "no type"}]})), "");
+        assert_eq!(
+            prompt_text(&json!({"content": [{"type": "resource_link"}]})),
+            ""
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_prompt_missing_and_unknown_session() {
+        let mut sessions: HashMap<String, AcpSession> = HashMap::new();
+        let err = handle_prompt(&mut sessions, &json!({}))
+            .await
+            .expect_err("missing sessionId must error");
+        assert!(err.to_string().contains("missing sessionId"), "{err}");
+        let err = handle_prompt(&mut sessions, &json!({"sessionId": "nope"}))
+            .await
+            .expect_err("unknown sessionId must error");
+        assert!(err.to_string().contains("unknown sessionId"), "{err}");
+    }
+
+    #[test]
+    fn handle_cancel_unknown_session_is_noop() {
+        let sessions: HashMap<String, AcpSession> = HashMap::new();
+        handle_cancel(&sessions, &json!({"sessionId": "nope"}));
+        handle_cancel(&sessions, &json!({}));
+    }
+
+    #[tokio::test]
+    async fn handle_session_new_rejects_relative_cwd() {
+        let cli = Cli::try_parse_from(["zen"]).unwrap();
+        let out = Arc::new(Mutex::new(std::io::stdout()));
+        let cwd = std::env::temp_dir();
+        let err = match handle_session_new(&cli, &cwd, None, &json!({"cwd": "relative/path"}), &out)
+            .await
+        {
+            Ok(_) => panic!("relative cwd must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("ACP requires absolute paths"),
+            "{err}"
+        );
+    }
+}
