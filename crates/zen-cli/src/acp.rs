@@ -70,6 +70,14 @@ impl RpcResponse {
 
 const PROTOCOL_VERSION: u64 = 1;
 
+// JSON-RPC 2.0 error codes (ACP v1 uses the standard JSON-RPC codes;
+// -32000..-32099 is the implementation-defined range).
+const ERR_PARSE: i64 = -32700;
+const ERR_INVALID_REQUEST: i64 = -32600;
+const ERR_METHOD_NOT_FOUND: i64 = -32601;
+const ERR_INVALID_PARAMS: i64 = -32602;
+const ERR_INTERNAL: i64 = -32603;
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionUpdateParams {
@@ -226,7 +234,7 @@ pub async fn run_acp_server(cli: &Cli) -> Result<i32> {
             Err(e) => {
                 write_response(
                     &out,
-                    &RpcResponse::err(Value::Null, -32700, format!("parse error: {e}")),
+                    &RpcResponse::err(Value::Null, ERR_PARSE, format!("parse error: {e}")),
                 )?;
                 continue;
             }
@@ -235,7 +243,7 @@ pub async fn run_acp_server(cli: &Cli) -> Result<i32> {
             if let Some(id) = req.id.clone() {
                 write_response(
                     &out,
-                    &RpcResponse::err(id, -32600, "invalid JSON-RPC version"),
+                    &RpcResponse::err(id, ERR_INVALID_REQUEST, "invalid JSON-RPC version"),
                 )?;
             }
             continue;
@@ -243,47 +251,44 @@ pub async fn run_acp_server(cli: &Cli) -> Result<i32> {
         let is_notification = req.id.is_none();
         let id = req.id.clone().unwrap_or(Value::Null);
 
-        let response = match req.method.as_str() {
-            "initialize" => {
-                initialized = true;
-                Some(handle_initialize(id, &req.params))
+        // Requests other than initialize (and the local shutdown/exit
+        // lifecycle) before a successful initialize are rejected with
+        // -32600; pre-init notifications get no response at all.
+        match pre_init_decision(initialized, &req.method, is_notification, &id) {
+            PreInit::Dispatch => {}
+            PreInit::Reject(resp) => {
+                write_response(&out, &resp)?;
+                continue;
             }
+            PreInit::Ignore => continue,
+        }
+
+        let response = match req.method.as_str() {
+            "initialize" => Some(apply_initialize(&mut initialized, id, &req.params)),
             "authenticate" => Some(RpcResponse::ok(id, json!({}))),
             "session/new" => {
-                if !initialized {
-                    Some(RpcResponse::err(id, -32002, "server not initialized"))
-                } else {
-                    match handle_session_new(cli, &default_cwd, home.as_deref(), &req.params, &out)
-                        .await
-                    {
-                        Ok((session_id, session)) => {
-                            sessions.insert(session_id.clone(), session);
-                            Some(RpcResponse::ok(id, json!({ "sessionId": session_id })))
-                        }
-                        Err(e) => Some(RpcResponse::err(
-                            id,
-                            -32603,
-                            format!("session/new failed: {e:#}"),
-                        )),
+                match handle_session_new(cli, &default_cwd, home.as_deref(), &req.params, &out)
+                    .await
+                {
+                    Ok((session_id, session)) => {
+                        sessions.insert(session_id.clone(), session);
+                        Some(RpcResponse::ok(id, json!({ "sessionId": session_id })))
                     }
+                    Err(e) => Some(RpcResponse::err(
+                        id,
+                        ERR_INTERNAL,
+                        format!("session/new failed: {e:#}"),
+                    )),
                 }
             }
-            "session/prompt" => {
-                if !initialized {
-                    Some(RpcResponse::err(id, -32002, "server not initialized"))
-                } else {
-                    match handle_prompt(&mut sessions, &req.params).await {
-                        Ok(stop_reason) => {
-                            Some(RpcResponse::ok(id, json!({ "stopReason": stop_reason })))
-                        }
-                        Err(e) => Some(RpcResponse::err(
-                            id,
-                            -32603,
-                            format!("session/prompt failed: {e:#}"),
-                        )),
-                    }
-                }
-            }
+            "session/prompt" => match handle_prompt(&mut sessions, &req.params).await {
+                Ok(stop_reason) => Some(RpcResponse::ok(id, json!({ "stopReason": stop_reason }))),
+                Err(e) => Some(RpcResponse::err(
+                    id,
+                    ERR_INTERNAL,
+                    format!("session/prompt failed: {e:#}"),
+                )),
+            },
             "session/cancel" => {
                 handle_cancel(&sessions, &req.params);
                 if is_notification {
@@ -304,7 +309,7 @@ pub async fn run_acp_server(cli: &Cli) -> Result<i32> {
                 } else {
                     Some(RpcResponse::err(
                         id,
-                        -32601,
+                        ERR_METHOD_NOT_FOUND,
                         format!("method not found: {}", req.method),
                     ))
                 }
@@ -325,25 +330,102 @@ fn write_response(out: &Arc<Mutex<std::io::Stdout>>, resp: &RpcResponse) -> Resu
     Ok(())
 }
 
+/// Outcome of the pre-initialize gate in `run_acp_server`.
+enum PreInit {
+    /// Dispatch the request normally.
+    Dispatch,
+    /// Send this error response instead of dispatching.
+    Reject(RpcResponse),
+    /// Drop the message silently (a pre-init notification has no response).
+    Ignore,
+}
+
+/// Gate for requests arriving before a successful `initialize` (ACP v1:
+/// the client must initialize first; any other request is invalid,
+/// -32600). `shutdown`/`exit` stay usable so a client can always quit.
+fn pre_init_decision(
+    initialized: bool,
+    method: &str,
+    is_notification: bool,
+    id: &Value,
+) -> PreInit {
+    if initialized || matches!(method, "initialize" | "shutdown" | "exit") {
+        return PreInit::Dispatch;
+    }
+    if is_notification {
+        return PreInit::Ignore;
+    }
+    PreInit::Reject(RpcResponse::err(
+        id.clone(),
+        ERR_INVALID_REQUEST,
+        "not initialized: send initialize first",
+    ))
+}
+
+/// Applies an `initialize` request to the connection state. A repeat
+/// `initialize` after a successful one is rejected with -32600 (exactly
+/// one initialize per connection); `initialized` is set only when
+/// negotiation succeeds, so a failed attempt can be retried.
+fn apply_initialize(initialized: &mut bool, id: Value, params: &Value) -> RpcResponse {
+    if *initialized {
+        return RpcResponse::err(id, ERR_INVALID_REQUEST, "already initialized");
+    }
+    let resp = handle_initialize(id, params);
+    if resp.error.is_none() {
+        *initialized = true;
+    }
+    resp
+}
+
 fn handle_initialize(id: Value, params: &Value) -> RpcResponse {
-    let _client_version = params
+    // protocolVersion is required (ACP v1 InitializeRequest) and must be
+    // an integer major version; anything else is malformed params.
+    if params
         .get("protocolVersion")
         .and_then(Value::as_u64)
-        .unwrap_or(0);
+        .is_none()
+    {
+        return RpcResponse::err(
+            id,
+            ERR_INVALID_PARAMS,
+            "invalid params: protocolVersion must be an integer",
+        );
+    }
 
+    // Version negotiation (ACP v1): answer the client's version when we
+    // support it, otherwise our latest supported version; the client
+    // disconnects when it cannot speak the answered version. We speak
+    // v1 only, so the answer is always 1, even for a newer request (2)
+    // or an unknown one (0). v1 negotiation never errors, so there is
+    // no -32022 here; revisit if v2 is ever added (see Q2).
     let version = PROTOCOL_VERSION;
+
     RpcResponse::ok(
         id,
         json!({
             "protocolVersion": version,
             "agentCapabilities": {
-                "promptCapabilities": { "image": false, "audio": false },
+                // Only what M1 actually implements is advertised; the
+                // rest (session/load, MCP servers, session list/resume/
+                // close/delete, auth) arrives with M5/M7. An omitted or
+                // false capability means unsupported.
+                // Modes are NOT advertised here: ACP v1 puts them in the
+                // session/new response (M4). When M4 advertises them it
+                // must list exactly default/plan/acceptEdits and never
+                // bypassPermissions or dontAsk (Leader Q3, tin 15113).
+                "loadSession": false,
+                "promptCapabilities": { "image": false, "audio": false, "embeddedContext": false },
+                "mcpCapabilities": { "http": false, "sse": false },
+                "sessionCapabilities": {},
+                "auth": {},
             },
             "agentInfo": {
                 "name": "zencore",
                 "title": "Zen",
                 "version": env!("CARGO_PKG_VERSION"),
             },
+            // No authentication is required.
+            "authMethods": [],
         }),
     )
 }
@@ -484,6 +566,131 @@ mod tests {
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["result"]["protocolVersion"], 1);
         assert_eq!(v["result"]["agentInfo"]["name"], "zencore");
+    }
+
+    #[test]
+    fn initialize_advertises_v1_capabilities() {
+        let resp = handle_initialize(
+            json!(1),
+            &json!({"protocolVersion": 1, "clientCapabilities": {}}),
+        );
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["result"]["protocolVersion"], 1);
+        let caps = &v["result"]["agentCapabilities"];
+        assert_eq!(caps["loadSession"], false);
+        assert_eq!(caps["promptCapabilities"]["image"], false);
+        assert_eq!(caps["promptCapabilities"]["audio"], false);
+        assert_eq!(caps["promptCapabilities"]["embeddedContext"], false);
+        assert_eq!(caps["mcpCapabilities"]["http"], false);
+        assert_eq!(caps["mcpCapabilities"]["sse"], false);
+        assert_eq!(caps["sessionCapabilities"], json!({}));
+        assert_eq!(caps["auth"], json!({}));
+        assert_eq!(v["result"]["authMethods"], json!([]));
+    }
+
+    #[test]
+    fn initialize_newer_client_version_negotiates_down_to_v1() {
+        // ACP v1: a client asking for 2 gets our latest supported version.
+        let resp = handle_initialize(json!(2), &json!({"protocolVersion": 2}));
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["result"]["protocolVersion"], 1);
+        assert!(v.get("error").is_none());
+    }
+
+    #[test]
+    fn initialize_version_zero_still_answers_v1() {
+        // ACP v1 has no -32022 in negotiation: even a request for 0 is
+        // answered with our latest version; the client disconnects when
+        // it cannot speak it.
+        let resp = handle_initialize(json!(3), &json!({"protocolVersion": 0}));
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["result"]["protocolVersion"], 1);
+        assert!(v.get("error").is_none());
+    }
+
+    #[test]
+    fn initialize_missing_or_non_integer_version_is_invalid_params() {
+        for params in [
+            json!({}),
+            json!({"protocolVersion": "1"}),
+            json!({"protocolVersion": 1.5}),
+            json!({"protocolVersion": null}),
+        ] {
+            let resp = handle_initialize(json!(4), &params);
+            let v = serde_json::to_value(&resp).unwrap();
+            assert_eq!(v["error"]["code"], -32602, "params: {params}");
+            assert!(v.get("result").is_none());
+        }
+    }
+
+    #[test]
+    fn apply_initialize_sets_flag_only_on_success() {
+        let mut initialized = false;
+        let resp = apply_initialize(&mut initialized, json!(5), &json!({"protocolVersion": 1}));
+        assert!(serde_json::to_value(&resp).unwrap().get("error").is_none());
+        assert!(initialized);
+
+        // A repeat initialize is rejected and leaves the flag set.
+        let resp = apply_initialize(&mut initialized, json!(6), &json!({"protocolVersion": 1}));
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["error"]["code"], -32600);
+        assert!(initialized);
+    }
+
+    #[test]
+    fn apply_initialize_failed_attempt_leaves_flag_clear() {
+        let mut initialized = false;
+        let resp = apply_initialize(&mut initialized, json!(7), &json!({}));
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["error"]["code"], -32602);
+        assert!(!initialized);
+
+        // Retrying with a good request then succeeds.
+        let resp = apply_initialize(&mut initialized, json!(8), &json!({"protocolVersion": 1}));
+        assert!(serde_json::to_value(&resp).unwrap().get("error").is_none());
+        assert!(initialized);
+    }
+
+    #[test]
+    fn pre_init_decision_gates_requests_but_not_initialize() {
+        // Uninitialized: session requests are rejected with -32600.
+        let d = pre_init_decision(false, "session/new", false, &json!(9));
+        let PreInit::Reject(resp) = d else {
+            panic!("expected Reject, got Dispatch/Ignore");
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["error"]["code"], -32600);
+        assert_eq!(v["id"], 9);
+
+        // Uninitialized: pre-init notifications are dropped silently.
+        assert!(matches!(
+            pre_init_decision(false, "session/cancel", true, &json!(10)),
+            PreInit::Ignore
+        ));
+
+        // Uninitialized: initialize, shutdown and exit still dispatch.
+        assert!(matches!(
+            pre_init_decision(false, "initialize", false, &json!(11)),
+            PreInit::Dispatch
+        ));
+        assert!(matches!(
+            pre_init_decision(false, "shutdown", false, &json!(12)),
+            PreInit::Dispatch
+        ));
+        assert!(matches!(
+            pre_init_decision(false, "exit", true, &json!(13)),
+            PreInit::Dispatch
+        ));
+
+        // Initialized: everything dispatches.
+        assert!(matches!(
+            pre_init_decision(true, "session/new", false, &json!(14)),
+            PreInit::Dispatch
+        ));
+        assert!(matches!(
+            pre_init_decision(true, "session/prompt", false, &json!(15)),
+            PreInit::Dispatch
+        ));
     }
 
     #[test]
@@ -699,7 +906,8 @@ mod tests {
 // (driven through a subprocess probe like __acp_probe_emit_assistant),
 // write_response, the prompt_text resource arm, and the cheap error paths
 // of handle_prompt / handle_cancel / handle_session_new. The stdio loop
-// in run_acp_server is not drivable in-process and stays uncovered.
+// in run_acp_server is not drivable in-process; it is covered end to end
+// by crates/zen-cli/tests/acp_server.rs instead.
 #[cfg(test)]
 mod viec_a_tests {
     use super::*;
