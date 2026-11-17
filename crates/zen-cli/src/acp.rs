@@ -268,7 +268,7 @@ struct AcpServerState {
     /// Requests the agent sent to the client and is still waiting on,
     /// keyed by the request id we generated.
     pending: Mutex<HashMap<String, oneshot::Sender<ClientResponse>>>,
-    #[allow(dead_code)] // M2: kept intentionally; first production caller is M4 (session/request_permission).
+    #[allow(dead_code)] // floor-guard: kept intentionally; first production caller is M4 (session/request_permission).
     /// Counter for agent-initiated request ids ("zen-1", "zen-2", ...).
     next_request_id: AtomicU64,
     /// Set once `initialize` succeeds (M1).
@@ -293,7 +293,7 @@ impl AcpServerState {
     /// disconnects while waiting. Callers without a custom timeout pass
     /// 30 seconds; M4's `session/request_permission` uses that default
     /// and treats a timeout as a refusal (fail closed, Leader Q4).
-    #[allow(dead_code)] // M2: kept intentionally; first production caller is M4 (session/request_permission).
+    #[allow(dead_code)] // floor-guard: kept intentionally; first production caller is M4 (session/request_permission).
     async fn send_client_request(
         &self,
         method: &str,
