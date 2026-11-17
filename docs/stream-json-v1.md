@@ -202,7 +202,7 @@ Always the last line.
 | field | type | notes |
 |---|---|---|
 | `type` | `"result"` | |
-| `subtype` | string | `success`, `error_max_turns`, `error_during_execution` |
+| `subtype` | string | `success`, `error_max_turns`, `error_max_tokens`, `error_refusal`, `error_during_execution` |
 | `is_error` | bool | |
 | `duration_ms` | number | wall time of the turn |
 | `duration_api_ms` | number | time spent in model requests |
@@ -218,7 +218,7 @@ Always the last line.
 
 A reply stopped by the provider's content filter (`finish_reason: "content_filter"`) is not
 requeried: any partial text is sent as an `assistant` record, then the turn ends with an
-`error_during_execution` result whose `result` starts with `Blocked by the provider's content filter`.
+`error_refusal` result whose `result` starts with `Blocked by the provider's content filter`.
 
 Exit code: `0` when `is_error` is false, `1` when true, `130` after SIGINT (with an
 `error_during_execution` result `"Interrupted by user"`), `143` after SIGTERM (with the same
@@ -233,7 +233,7 @@ Exit code: `0` when `is_error` is false, `1` when true, `130` after SIGINT (with
 | `subagent.ndjson` | `Task` call; the sub-agent's assistant message has `parent_tool_use_id: "call_task_1"` |
 | `api_retry.ndjson` | HTTP 500 → `api_retry` → successful answer |
 | `permission_denied.ndjson` | Write in default headless mode → `permission_denied` + error tool_result; `result.permission_denials` |
-| `content_filter.ndjson` | `finish_reason: "content_filter"` with no text → one request, `error_during_execution` result |
+| `content_filter.ndjson` | `finish_reason: "content_filter"` with no text → one request, `error_refusal` result |
 | `mid_response_retry.ndjson` | 200 with `finish_reason: "error"` (429) → `api_retry` (`error_status: 429`) → successful answer |
 | `mid_response_error.ndjson` | four 200s with `finish_reason: "error"` (502) → three `api_retry` → `error_during_execution` result naming `HTTP 502 (provider_unavailable)` |
 | `truncation_note.ndjson` | two cut-off replies with `maxContinuations: 1` → two `assistant` pieces → `hook_message` `Truncation` note; `result.result` is the stitched text |

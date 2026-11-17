@@ -393,7 +393,7 @@ async fn p0_5_agent_reports_content_filter_without_requery() {
     );
     let res = agent.run_turn("hi").await;
     assert!(res.is_error);
-    assert_eq!(res.subtype, "error_during_execution");
+    assert_eq!(res.subtype, "error_refusal");
     assert!(res.result.contains("content filter"), "{}", res.result);
     assert_eq!(llm.requests().len(), 1, "no empty-reply requery");
 }

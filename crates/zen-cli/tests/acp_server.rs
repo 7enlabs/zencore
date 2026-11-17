@@ -194,3 +194,41 @@ fn acp_exit_notification_exits_zero() {
     );
     assert_eq!(lines[0]["result"]["protocolVersion"], 1);
 }
+
+#[test]
+fn acp_session_prompt_empty_returns_invalid_params() {
+    let home = TempDir::new("acp_home");
+    let cwd = TempDir::new("acp_cwd");
+    let input = lines(&[
+        initialize_req(1),
+        req(
+            2,
+            "session/prompt",
+            json!({"sessionId": "does-not-exist", "prompt": []}),
+        ),
+    ]);
+    let (out, stderr, code) = run_acp(&home, &cwd, &input);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(out.len(), 2, "expected two response lines: {out:?}");
+    assert_eq!(out[1]["id"], 2);
+    assert_eq!(out[1]["error"]["code"], -32602);
+}
+
+#[test]
+fn acp_session_prompt_unsupported_content_returns_invalid_params() {
+    let home = TempDir::new("acp_home");
+    let cwd = TempDir::new("acp_cwd");
+    let input = lines(&[
+        initialize_req(1),
+        req(
+            2,
+            "session/prompt",
+            json!({"sessionId": "does-not-exist", "prompt": [{"type": "image", "data": "x"}]}),
+        ),
+    ]);
+    let (out, stderr, code) = run_acp(&home, &cwd, &input);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(out.len(), 2, "expected two response lines: {out:?}");
+    assert_eq!(out[1]["id"], 2);
+    assert_eq!(out[1]["error"]["code"], -32602);
+}

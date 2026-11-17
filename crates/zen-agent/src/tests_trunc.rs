@@ -222,7 +222,7 @@ async fn trunc_cap_reached_on_tool_call_is_a_clear_error_and_nothing_runs() {
     );
     let res = agent.run_turn("go").await;
     assert!(res.is_error);
-    assert_eq!(res.subtype, "error_during_execution");
+    assert_eq!(res.subtype, "error_max_tokens");
     assert!(
         res.result
             .contains("tool call was cut off by the output token limit 2 time(s)"),
