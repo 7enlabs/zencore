@@ -643,6 +643,7 @@ esac
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_success_failure_and_missing_program() {
         assert!(run(Path::new("/bin/true"), &[], None).is_ok());

@@ -1032,6 +1032,7 @@ esac
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_gh_with_success_and_failure_paths() {
         let dir = temp_dir("run_gh_with");
