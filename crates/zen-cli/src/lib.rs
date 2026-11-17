@@ -1531,6 +1531,16 @@ mod tests {
         } else if profile != "debug" {
             cmd.arg("--profile").arg(&profile);
         }
+        // Never let the outer coverage runner leak into the nested
+        // build: under `cargo llvm-cov` the test process inherits
+        // RUSTC_WRAPPER=cargo-llvm-cov (plus coverage RUSTFLAGS and
+        // LLVM_PROFILE_FILE), which would build an instrumented
+        // binary and could fail the nested build outright when the
+        // wrapper env is incomplete. Build a plain binary instead.
+        cmd.env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env_remove("LLVM_PROFILE_FILE");
         let output = cmd
             .output()
             .expect("spawn `cargo build -p zen-cli --bin zen`");
