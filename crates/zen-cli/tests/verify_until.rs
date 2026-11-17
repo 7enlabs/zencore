@@ -198,3 +198,44 @@ async fn plan_mode_plans_first_then_executes_with_yes() {
 
     assert_eq!(last_result(&stdout)["result"], "executed");
 }
+
+/// The plan turn must NOT run `--until` verification: run_plan_flow
+/// clears `until` on the plan-phase Cli, so a failing verify command
+/// only gates the execution turn. If the plan turn verified, the
+/// failing command would abort the plan before anything executes
+/// (and the run would make only 1 request instead of 2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_turn_does_not_run_until_verification() {
+    let home = TempDir::new("plan_until_home");
+    let cwd = TempDir::new("plan_until_cwd");
+    let server = MockServer::start(vec![
+        Reply::text("1. Create foo.txt\n2. Done\nExitPlanMode"),
+        Reply::text("executed"),
+    ])
+    .await;
+    let (stdout, stderr, code) = tokio::time::timeout(TEST_TIMEOUT, async {
+        ZenRun::new("plan_until", &home, &cwd)
+            .args(base_args())
+            .args([
+                "--plan",
+                "--yes",
+                "--until",
+                "exit 1",
+                "--max-verify-retries",
+                "0",
+            ])
+            .mock("mock-model", &server)
+            .arg("make foo")
+            .run_output()
+    })
+    .await
+    .expect("timed out");
+    // The execution turn ran and its verify failed: exit 1, and the
+    // result is the exec turn's output plus the verify failure note.
+    assert_eq!(code, 1, "stderr: {}", stderr);
+    let reqs = server.finish().await;
+    assert_eq!(reqs.len(), 2, "plan turn + execution turn");
+    let result = last_result(&stdout)["result"].as_str().unwrap().to_string();
+    assert!(result.contains("executed"), "{result}");
+    assert!(result.contains("Verify failed"), "{result}");
+}

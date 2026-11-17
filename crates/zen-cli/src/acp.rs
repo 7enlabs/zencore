@@ -1649,6 +1649,228 @@ mod tests {
             "{lines:?}"
         );
     }
+    /// Display for SendRequestError must name the failure: the messages
+    /// surface in M4 permission errors, so an empty string would hide
+    /// why the client request failed.
+    #[test]
+    fn send_request_error_display_strings() {
+        assert_eq!(
+            SendRequestError::ClientError {
+                code: -32601,
+                message: "no such method".into(),
+            }
+            .to_string(),
+            "client request failed: -32601 no such method"
+        );
+        assert_eq!(
+            SendRequestError::Timeout.to_string(),
+            "client request timed out"
+        );
+        assert_eq!(
+            SendRequestError::Disconnected.to_string(),
+            "client disconnected while waiting"
+        );
+        assert_eq!(
+            SendRequestError::WriteFailed("broken pipe".into()).to_string(),
+            "failed to write client request: broken pipe"
+        );
+    }
+
+    /// `id_key` must keep string and number JSON-RPC ids apart: the
+    /// pending table keys both generations and lookups through it, so
+    /// `"1"` and `1` colliding would route a client response to the
+    /// wrong waiter.
+    #[test]
+    fn id_key_distinguishes_string_and_number_ids() {
+        assert_eq!(id_key(&json!("zen-1")), "\"zen-1\"");
+        assert_eq!(id_key(&json!(1)), "1");
+        assert_ne!(id_key(&json!("1")), id_key(&json!(1)));
+        assert_ne!(id_key(&json!("zen-1")), id_key(&json!("zen-2")));
+    }
+
+    /// `authenticate` is a no-op success in v1 (M4 will add real auth):
+    /// the arm must answer, not fall through to method-not-found.
+    #[tokio::test]
+    async fn authenticate_returns_empty_ok() {
+        let (state, buf) = test_state();
+        let run = drive_dispatcher(
+            Arc::clone(&state),
+            vec![
+                init_line(1),
+                json!({"jsonrpc": "2.0", "id": 2, "method": "authenticate", "params": {}})
+                    .to_string(),
+            ],
+        );
+        run.await.unwrap().unwrap();
+        let lines = read_output_lines(&buf);
+        let auth = find_response(&lines, 2).expect("authenticate must be answered");
+        assert_eq!(auth["result"], json!({}), "{lines:?}");
+    }
+
+    /// A line with an id but neither method nor result/error is an
+    /// invalid request: it must be answered with -32600, not silently
+    /// swallowed as a stray client response.
+    #[tokio::test]
+    async fn bare_id_without_method_is_invalid_request() {
+        let (state, buf) = test_state();
+        let run = drive_dispatcher(
+            Arc::clone(&state),
+            vec![init_line(1), json!({"jsonrpc": "2.0", "id": 9}).to_string()],
+        );
+        run.await.unwrap().unwrap();
+        let lines = read_output_lines(&buf);
+        let resp = find_response(&lines, 9).expect("bare id must be answered with an error");
+        assert_eq!(resp["error"]["code"], -32600, "{lines:?}");
+    }
+
+    /// A prompt turn emits a UsageUpdate whose `used` is the SUM of the
+    /// turn's input and output tokens: the delayed fake LLM reports 10
+    /// prompt + 5 completion tokens, so the client must see 15.
+    #[tokio::test]
+    async fn prompt_turn_reports_usage_update_with_summed_tokens() {
+        let (state, buf) = test_state();
+        fake_session(&state, "s1", 0);
+        let run = drive_dispatcher(
+            Arc::clone(&state),
+            vec![
+                init_line(1),
+                json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": "s1", "content": [{"type": "text", "text": "hi"}]}})
+                    .to_string(),
+            ],
+        );
+        run.await.unwrap().unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some()
+        })
+        .await;
+        let prompt = find_response(&lines, 2).unwrap();
+        assert_eq!(prompt["result"]["stopReason"], "end_turn", "{lines:?}");
+        let usage = lines
+            .iter()
+            .find(|l| {
+                l.get("method").and_then(Value::as_str) == Some("session/update")
+                    && l["params"]["update"]["sessionUpdate"].as_str() == Some("usage_update")
+            })
+            .expect("usage update must be emitted");
+        assert_eq!(usage["params"]["update"]["used"], 15, "{lines:?}");
+    }
+
+    /// A second prompt on the same session AFTER the first turn finished
+    /// must be accepted: PromptRunningGuard's Drop clears
+    /// `prompt_running`, so the session is free again. (A prompt sent
+    /// while a turn is still running is still rejected; see
+    /// second_prompt_for_busy_session_is_rejected.)
+    #[tokio::test]
+    async fn prompt_after_completed_turn_is_accepted() {
+        let (state, buf) = test_state();
+        fake_session(&state, "s1", 0);
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        let cli = Cli::try_parse_from(["zen"]).unwrap();
+        let run = tokio::spawn(run_dispatcher(
+            cli,
+            std::env::temp_dir(),
+            None,
+            Arc::clone(&state),
+            rx,
+        ));
+        tx.send(init_line(1)).unwrap();
+        tx.send(
+            json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": "s1", "content": [{"type": "text", "text": "one"}]}})
+                .to_string(),
+        )
+        .unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some()
+        })
+        .await;
+        assert_eq!(
+            find_response(&lines, 2).unwrap()["result"]["stopReason"],
+            "end_turn",
+            "{lines:?}"
+        );
+        // Wait for the first turn's task to drop its guard and clear
+        // prompt_running before sending the second prompt.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let running = {
+                let sessions = lock_or_recover(&state.sessions, "acp sessions");
+                sessions
+                    .get("s1")
+                    .map(|s| s.prompt_running.load(Ordering::SeqCst))
+                    .unwrap_or(false)
+            };
+            if !running {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "prompt_running never cleared after the first turn"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tx.send(
+            json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {"sessionId": "s1", "content": [{"type": "text", "text": "two"}]}})
+                .to_string(),
+        )
+        .unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 3).is_some()
+        })
+        .await;
+        let second = find_response(&lines, 3).unwrap();
+        assert_eq!(second["result"]["stopReason"], "end_turn", "{lines:?}");
+        drop(tx);
+        run.await.unwrap().unwrap();
+    }
+
+    /// A client response carrying only `result` (no `error`) must be
+    /// routed to its waiter through the dispatcher: the pending
+    /// request tests call `route_client_response` directly, so only a
+    /// test that answers through `dispatch_line` pins the routing
+    /// condition down.
+    #[tokio::test]
+    async fn dispatcher_routes_result_only_client_response() {
+        let (state, buf) = test_state();
+        let asked = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                state
+                    .send_client_request(
+                        "session/request_permission",
+                        json!({}),
+                        Duration::from_secs(5),
+                    )
+                    .await
+            }
+        });
+        // The fake client: read the request the server wrote, answer it.
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            ls.iter().any(|l| l.get("method").is_some())
+        })
+        .await;
+        let request = lines
+            .iter()
+            .find(|l| l.get("method").is_some())
+            .expect("request must be written");
+        let id = request["id"].clone();
+        // Answer through the dispatcher, not by calling
+        // route_client_response directly.
+        let run = drive_dispatcher(
+            Arc::clone(&state),
+            vec![json!({"jsonrpc": "2.0", "id": id, "result": {"outcome": "ok"}}).to_string()],
+        );
+        run.await.unwrap().unwrap();
+        assert_eq!(asked.await.unwrap().unwrap(), json!({"outcome": "ok"}));
+        // The answer must not have been treated as an invalid request.
+        let lines = read_output_lines(&buf);
+        assert!(
+            !lines.iter().any(|l| l
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .is_some_and(|c| c == &json!(-32600))),
+            "{lines:?}"
+        );
+    }
 }
 
 // Tests added for Việc A (floor coverage 88%): the AcpSink::emit arms
