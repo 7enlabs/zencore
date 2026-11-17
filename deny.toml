@@ -6,7 +6,12 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+# RUSTSEC-2026-0543: chrono is unmaintained (all versions affected, no
+# patched release). The advisory is about maintenance status, not an
+# exploitable flaw, and chrono is only used here for timestamps and
+# formatting (Utc::now, to_rfc3339, Duration). Accepted as a documented
+# exception so CI stays green; follow-up is migrating chrono to jiff.
+ignore = ["RUSTSEC-2026-0543"]
 
 [licenses]
 version = 2
