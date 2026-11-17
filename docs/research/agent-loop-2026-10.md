@@ -1,4 +1,4 @@
-# Agent Loop Research - Preparing ZenCode Phase 1
+# Agent Loop Research - Preparing Zen Phase 1
 
 **Date:** 2026-10-20
 **Author:** ZC Developer (team CLI)
@@ -124,11 +124,11 @@ authors inject domain context into the summary prompt or replace it.
 
 ---
 
-## 2. Design proposal for ZenCode
+## 2. Design proposal for Zen
 
-ZenCode already has per-turn checkpoints (`/undo`, `/diff --turn`) and a
+Zen already has per-turn checkpoints (`/undo`, `/diff --turn`) and a
 `zen-agent` crate. Phase 1 should add a production-grade agent loop reusing
-proven mechanics, adapted to ZenCode's constraints (free-first, any
+proven mechanics, adapted to Zen's constraints (free-first, any
 OpenAI-compatible endpoint, clean-room implementation).
 
 ### 2.1 Loop core (borrow from Claude Code + OpenCode)

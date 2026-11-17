@@ -1,8 +1,8 @@
-# Terminal-Bench runner for ZenCode
+# Terminal-Bench runner for Zen
 
 Runs a subset of [Terminal-Bench 2.0](https://github.com/laude-institute/terminal-bench-2)
 tasks against the `zen` CLI using a **free model** ($0), producing citable
-benchmark numbers for ZenCode's "harness optimized for weak models" story.
+benchmark numbers for Zen's "harness optimized for weak models" story.
 
 ## Prerequisites
 

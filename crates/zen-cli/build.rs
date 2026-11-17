@@ -40,10 +40,10 @@ fn embed_windows_version_info() {
     let mut res = winresource::WindowsResource::new();
     res.set("FileVersion", &version);
     res.set("ProductVersion", &version);
-    res.set("ProductName", "ZenCode");
+    res.set("ProductName", "Zen");
     res.set(
         "FileDescription",
-        "ZenCode CLI - a coding agent for the terminal",
+        "Zen CLI - a coding agent for the terminal",
     );
     res.set("CompanyName", "7EN Labs");
     res.set("OriginalFilename", "zen.exe");

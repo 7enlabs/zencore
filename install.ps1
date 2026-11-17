@@ -1,10 +1,10 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  Install ZenCode CLI (zen.exe) on Windows from the prebuilt release binary.
+  Install Zen CLI (zen.exe) on Windows from the prebuilt release binary.
 
 .DESCRIPTION
-  Downloads the Windows x86-64 build of ZenCode CLI from the GitHub
+  Downloads the Windows x86-64 build of Zen CLI from the GitHub
   release, verifies its SHA-256 before and after copying, and installs
   it for the current user. No build tools are required, and no
   administrator rights are needed.
@@ -21,7 +21,7 @@
   Provenance: CI re-checks the pinned hash against the live release
   asset whenever install.ps1 changes (scripts/check_install_hash.py).
 
-  Install location: %LOCALAPPDATA%\Programs\ZenCode (override with
+  Install location: %LOCALAPPDATA%\Programs\Zen (override with
   -InstallDir). The folder is added to the user PATH when missing.
 
   The final check re-hashes the installed copy, then smoke-tests it
@@ -46,7 +46,7 @@
   Default: the v0.1.0 zen.exe hash.
 
 .PARAMETER InstallDir
-  Target directory. Default: %LOCALAPPDATA%\Programs\ZenCode
+  Target directory. Default: %LOCALAPPDATA%\Programs\Zen
 
 .EXAMPLE
   .\install.ps1
@@ -61,7 +61,7 @@ param(
   [string]$Url = 'https://github.com/7enlabs/zencore/releases/download/v0.1.0/zen-x86_64-pc-windows-msvc.zip',
   [string]$File,
   [string]$Sha256 = 'eb27ec87c348587423c172710c4b11c86efa18a4454ff8a48fb3cd7128699239',
-  [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\ZenCode')
+  [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\Zen')
 )
 
 Set-StrictMode -Version Latest
@@ -84,7 +84,7 @@ if ($File) {
   $Url = ''
 }
 
-$workDir = Join-Path ([System.IO.Path]::GetTempPath()) ('zencode-install-' + [guid]::NewGuid().ToString('N'))
+$workDir = Join-Path ([System.IO.Path]::GetTempPath()) ('zencore-install-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $workDir | Out-Null
 
 try {

@@ -6,16 +6,16 @@ pub const DEFAULT_REPO: &str = "https://github.com/7enlabs/zencore.git";
 pub const DEFAULT_BRANCH: &str = "main";
 
 pub fn default_src_dir(home: Option<&Path>) -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("ZENCODE_SRC_DIR")
+    if let Ok(dir) = std::env::var("ZENCORE_SRC_DIR")
         && !dir.is_empty()
     {
         return Some(PathBuf::from(dir));
     }
-    home.map(|h| h.join(".local").join("share").join("zencode"))
+    home.map(|h| h.join(".local").join("share").join("zencore"))
 }
 
 fn repo_url() -> String {
-    std::env::var("ZENCODE_REPO").unwrap_or_else(|_| DEFAULT_REPO.to_string())
+    std::env::var("ZENCORE_REPO").unwrap_or_else(|_| DEFAULT_REPO.to_string())
 }
 
 fn find_cargo(home: Option<&Path>) -> Option<PathBuf> {
@@ -101,7 +101,7 @@ fn built_binary_name() -> &'static str {
 }
 
 /// Whether `exe` runs from the prebuilt release layout:
-/// `%LOCALAPPDATA%\Programs\ZenCode` (Windows). A binary running from
+/// `%LOCALAPPDATA%\Programs\Zen` (Windows). A binary running from
 /// there is a prebuilt install, not a source checkout build.
 fn is_prebuilt_install_dir(exe: &Path) -> bool {
     let Some(parent) = exe.parent() else {
@@ -109,7 +109,7 @@ fn is_prebuilt_install_dir(exe: &Path) -> bool {
     };
     let mut parts = parent.components().rev();
     let is_dir = |c: Option<std::path::Component<'_>>, want: &str| matches!(c, Some(std::path::Component::Normal(n)) if n == want);
-    is_dir(parts.next(), "ZenCode") && is_dir(parts.next(), "Programs")
+    is_dir(parts.next(), "Zen") && is_dir(parts.next(), "Programs")
 }
 
 /// Whether the running binary is a prebuilt install: a `.zen-prebuilt`
@@ -151,7 +151,7 @@ pub fn run_update(
         );
     }
     let Some(src_dir) = default_src_dir(home) else {
-        anyhow::bail!("cannot determine home directory; set ZENCODE_SRC_DIR");
+        anyhow::bail!("cannot determine home directory; set ZENCORE_SRC_DIR");
     };
     let git = "git";
     if Command::new(git).arg("--version").output().is_err() {
@@ -349,7 +349,21 @@ mod tests {
     #[test]
     fn default_src_dir_uses_home() {
         let dir = default_src_dir(Some(Path::new("/home/test")));
-        assert_eq!(dir, Some(PathBuf::from("/home/test/.local/share/zencode")));
+        assert_eq!(dir, Some(PathBuf::from("/home/test/.local/share/zencore")));
+    }
+
+    #[test]
+    fn repo_url_defaults_and_env_override() {
+        let _env = crate::settings::env_lock();
+        let old = std::env::var("ZENCORE_REPO").ok();
+        unsafe { std::env::remove_var("ZENCORE_REPO") };
+        assert_eq!(repo_url(), DEFAULT_REPO);
+        unsafe { std::env::set_var("ZENCORE_REPO", "https://example.com/custom.git") };
+        assert_eq!(repo_url(), "https://example.com/custom.git");
+        match old {
+            Some(v) => unsafe { std::env::set_var("ZENCORE_REPO", v) },
+            None => unsafe { std::env::remove_var("ZENCORE_REPO") },
+        }
     }
 
     #[test]
@@ -364,11 +378,11 @@ mod tests {
 
     #[test]
     fn run_update_check_without_checkout_returns_zero() {
-        // No ZENCODE_SRC_DIR override and no checkout under home:
+        // No ZENCORE_SRC_DIR override and no checkout under home:
         // --check reports nothing to do and exits 0.
         let _env = crate::settings::env_lock();
-        let old = std::env::var("ZENCODE_SRC_DIR").ok();
-        unsafe { std::env::remove_var("ZENCODE_SRC_DIR") };
+        let old = std::env::var("ZENCORE_SRC_DIR").ok();
+        unsafe { std::env::remove_var("ZENCORE_SRC_DIR") };
         let home =
             std::env::temp_dir().join(format!("zen_update_nocheckout_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
@@ -377,8 +391,8 @@ mod tests {
         assert_eq!(code, 0);
         let _ = std::fs::remove_dir_all(&home);
         match old {
-            Some(v) => unsafe { std::env::set_var("ZENCODE_SRC_DIR", v) },
-            None => unsafe { std::env::remove_var("ZENCODE_SRC_DIR") },
+            Some(v) => unsafe { std::env::set_var("ZENCORE_SRC_DIR", v) },
+            None => unsafe { std::env::remove_var("ZENCORE_SRC_DIR") },
         }
     }
 
@@ -387,11 +401,11 @@ mod tests {
         // A checkout with an untracked file must refuse to update
         // (and never reach the network) - an error, not Ok(0).
         let _env = crate::settings::env_lock();
-        let old = std::env::var("ZENCODE_SRC_DIR").ok();
-        unsafe { std::env::remove_var("ZENCODE_SRC_DIR") };
+        let old = std::env::var("ZENCORE_SRC_DIR").ok();
+        unsafe { std::env::remove_var("ZENCORE_SRC_DIR") };
         let home = std::env::temp_dir().join(format!("zen_update_dirty_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        let src = home.join(".local").join("share").join("zencode");
+        let src = home.join(".local").join("share").join("zencore");
         std::fs::create_dir_all(&src).unwrap();
         let status = std::process::Command::new("git")
             .args(["init", "-q"])
@@ -408,30 +422,28 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&home);
         match old {
-            Some(v) => unsafe { std::env::set_var("ZENCODE_SRC_DIR", v) },
-            None => unsafe { std::env::remove_var("ZENCODE_SRC_DIR") },
+            Some(v) => unsafe { std::env::set_var("ZENCORE_SRC_DIR", v) },
+            None => unsafe { std::env::remove_var("ZENCORE_SRC_DIR") },
         }
     }
 
     #[test]
     fn is_prebuilt_install_dir_matches_release_layout() {
         assert!(is_prebuilt_install_dir(Path::new(
-            "C:/Users/u/AppData/Local/Programs/ZenCode/zen.exe"
+            "C:/Users/u/AppData/Local/Programs/Zen/zen.exe"
         )));
         assert!(!is_prebuilt_install_dir(Path::new(
-            "/home/u/.local/share/zencode/target/release/zen"
+            "/home/u/.local/share/zencore/target/release/zen"
         )));
         assert!(!is_prebuilt_install_dir(Path::new(
             "/home/u/.local/bin/zen"
         )));
         assert!(!is_prebuilt_install_dir(Path::new(
-            "/home/u/.local/share/Programs/ZenCode"
+            "/home/u/.local/share/Programs/Zen"
         )));
         // Exactly one half matching must not count as prebuilt (mutant
-        // :112 `&&` -> `||`): a ZenCode dir under a non-Programs parent.
-        assert!(!is_prebuilt_install_dir(Path::new(
-            "/x/Other/ZenCode/zen.exe"
-        )));
+        // :112 `&&` -> `||`): a Zen dir under a non-Programs parent.
+        assert!(!is_prebuilt_install_dir(Path::new("/x/Other/Zen/zen.exe")));
     }
 
     #[test]
@@ -440,7 +452,7 @@ mod tests {
         // mutant (:121) are only visible when a marker exists next to
         // the running binary: point the marker at this test binary's own
         // directory for the duration of the call. The release-layout half
-        // is false here (deps/ is not Programs/ZenCode), so :121 needs
+        // is false here (deps/ is not Programs/Zen), so :121 needs
         // the marker half alone to be true.
         let exe = std::env::current_exe().expect("current_exe");
         let marker = exe.with_file_name(".zen-prebuilt");

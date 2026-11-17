@@ -48,11 +48,11 @@ sideload test build, pass identity overrides:
 ```powershell
 # Sideload test only: identity must match the test certificate subject.
 .\build-msix.ps1 -ExePath .\zen.exe `
-  -NameOverride Contoso.ZenCodeTest -PublisherOverride "CN=ZenCodeTest" `
+  -NameOverride Contoso.ZenTest -PublisherOverride "CN=ZenTest" `
   -PfxPath .\test-cert.pfx -PfxPassword <password>
 ```
 
-Output: `build\ZenCode_<version>_x64.msix` next to this README.
+Output: `build\Zen_<version>_x64.msix` next to this README.
 Store submissions do not need self-signing - Microsoft re-signs the
 package. Self-signing is only for the local sideload test below.
 
@@ -63,11 +63,11 @@ package. Self-signing is only for the local sideload test below.
    (`New-SelfSignedCertificate -Type CodeSigningCert`).
 2. Trust it on the test machine (`Trusted People` store), sign the
    package with `build-msix.ps1 -PfxPath/-PfxPassword`.
-3. Install: `Add-AppxPackage -Path .\ZenCode_0.1.0.0_x64.msix`
+3. Install: `Add-AppxPackage -Path .\Zen_0.1.0.0_x64.msix`
    (or `Add-AppxPackage -Register AppxManifest.xml` from a staging
    folder to test the unpacked layout).
 4. Verify in a **new** terminal: `zen --version`, `zen --help`;
-   `Get-AppxPackage -Name *ZenCode*` lists the package; the alias
+   `Get-AppxPackage -Name *Zen*` lists the package; the alias
    disappears again after `Remove-AppxPackage <PackageFullName>`.
 5. Record the result (machine, Windows build, pass/fail per step)
    with the submission notes.

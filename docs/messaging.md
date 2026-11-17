@@ -1,6 +1,6 @@
-# ZenCode Messaging Guidelines
+# Zen Messaging Guidelines
 
-**Status:** Required reading before writing any public ZenCode content (2026-10-17)
+**Status:** Required reading before writing any public Zen content (2026-10-17)
 **Applies to:** README, docs, launch posts, social media, issue replies, talks.
 **Foundation:** `docs/positioning.md` (the argument), `docs/faq.md` (the answers).
 
@@ -8,7 +8,7 @@
 
 ## The core message (say this, in your own words)
 
-> ZenCode is the AI coding agent that costs $0 - **by design, not by promotion**.
+> Zen is the AI coding agent that costs $0 - **by design, not by promotion**.
 > No backend to shut off, no free tier to rug-pull. Your keys, your models, your
 > machine - with a harness engineered to make free models actually work.
 
@@ -51,7 +51,7 @@ Every public statement should be traceable to one of:
 
 ## DO NOT
 
-- **NEVER market ZenCode as a "Claude Code clone"** (or Codex/Gemini/OpenCode
+- **NEVER market Zen as a "Claude Code clone"** (or Codex/Gemini/OpenCode
   clone). Three reasons:
   1. *Legal risk* - "clone" invites scrutiny of exactly what was copied, even
      when the implementation is clean-room.
@@ -92,7 +92,7 @@ Every public statement should be traceable to one of:
 | They say | We say |
 |---|---|
 | "Free models are dumb." | "Alone, often. With a harness that gives test-and-retry feedback: 15/15 vs paid models in an October 2026 experiment. The harness is the product - try `zen` on your repo and read the ledger." |
-| "This will rug-pull like the rest." | "There's nothing to pull. No ZenCode backend exists - your keys, your models, or Ollama on your hardware. `zen export` your sessions; the format is open." |
+| "This will rug-pull like the rest." | "There's nothing to pull. No Zen backend exists - your keys, your models, or Ollama on your hardware. `zen export` your sessions; the format is open." |
 | "How do you make money?" | "We don't, currently - see `docs/faq.md`. That's the point: no funnel, no conversion metrics, nothing to optimize against you." |
 | "Why not just use OpenCode?" | "OpenCode is a good tool. Two differences: their free tier is locked to their app and rotates (Sep 2026); ours is structural. And our harness is optimized for weak models - verify loop, prompt budget, eval - with published methodology." |
 | "Is this legal / a Claude Code copy?" | "Clean-room implementation: observable behavior only, no copied code, prompts, or tool descriptions. We never market it as a clone - it's the free-first agent, its own category." |
@@ -102,11 +102,11 @@ Every public statement should be traceable to one of:
 
 **Good:**
 > "Gemini CLI died on June 18 with zero notice. 6,000 community PRs now underpin
-> a closed successor. ZenCode's answer isn't a better free tier - it's no tier
-> at all. There is no ZenCode backend to shut off. Here's the architecture: …"
+> a closed successor. Zen's answer isn't a better free tier - it's no tier
+> at all. There is no Zen backend to shut off. Here's the architecture: …"
 
 **Bad:**
-> "🚀 Introducing ZenCode - the REVOLUTIONARY AI coding agent that's 100% FREE
+> "🚀 Introducing Zen - the REVOLUTIONARY AI coding agent that's 100% FREE
 > FOREVER! Better than Claude Code and costs NOTHING! ⭐ Star us now!"
 
 The difference: facts vs adjectives, receipts vs promises, respect vs hype.
@@ -119,7 +119,7 @@ The difference: facts vs adjectives, receipts vs promises, respect vs hype.
 - [ ] Does it contain the word "clone"? → Remove it.
 - [ ] Does it claim something the benchmarks don't support? → Soften or cut.
 - [ ] Would a Gemini-CLI-burned developer find it credible? (The skeptic test.)
-- [ ] Is it in English? (ZenCode is a global project; public materials are
+- [ ] Is it in English? (Zen is a global project; public materials are
       English. Community translations welcome, maintainers publish English.)
 
 ---

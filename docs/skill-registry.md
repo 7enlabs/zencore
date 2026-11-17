@@ -1,6 +1,6 @@
-# ZenCode Skill Registry
+# Zen Skill Registry
 
-The community skill registry is the **discoverability layer** for ZenCode
+The community skill registry is the **discoverability layer** for Zen
 skills. The skills system ([`docs/skills.md`](skills.md)) handles install trust;
 the registry answers "what skills exist?".
 
@@ -46,7 +46,7 @@ future open HTTP registry safe to browse.
       "name": "tdd",
       "description": "Test-driven development workflow - write the failing test first",
       "version": "1.0.0",
-      "author": "ZenCode",
+      "author": "Zen",
       "tier": "verified",
       "tags": ["testing", "workflow", "quality"],
       "permissions": {
@@ -97,7 +97,7 @@ exact tag (40) > description substring (20); ties break alphabetically.
 
 The schema is designed so a hosted registry is a drop-in replacement:
 
-1. **Transport**: `GET https://registry.zencodego.com/v1/registry.json`
+1. **Transport**: `GET https://registry.runzen.dev/v1/registry.json`
    returning the same document. Client sends `If-None-Match` with the cached
    ETag; the server answers `304 Not Modified` when nothing changed.
 2. **Cache**: `~/.zen/skill-registry-cache.json` + ETag, refreshed at most once

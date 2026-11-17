@@ -1,4 +1,4 @@
-# Security model - ZenCode CLI
+# Security model - Zen CLI
 
 Status: draft for review. Z Red reviews this as critic once it is a PR.
 Scope: the `zen` CLI (crates `zen-cli`, `zen-agent`, `zen-core`, `zen-tools`, `zen-ext`, `zen-mcp`).
@@ -18,7 +18,7 @@ or enforced; a control with no such pointer is listed under open questions, not 
 | Repo to config | `~/.zen/` (always loads) | project `.zen/settings*.json`, `.mcp.json`, hooks, project commands and skills (load only in a trusted folder) |
 | Repo to prompt | the system prompt | file contents, READMEs, comments, MCP and web fetch results (no prompt text marks them as data yet, see open question 7) |
 | CLI to network | the configured provider endpoint | provider responses, MCP server results, web fetch results |
-| Skill install | ed25519-signed ZenCode skills | community skills (hash-pinned after your approval) and unverified skills (sandboxed: read-only, no network) |
+| Skill install | ed25519-signed Zen skills | community skills (hash-pinned after your approval) and unverified skills (sandboxed: read-only, no network) |
 | Source to binary | this repo at a reviewed commit | whatever `install.sh` / `zen update` fetches from the branch it is told to build |
 
 ## Assets
@@ -73,7 +73,7 @@ Checked against `main` at 647fcc0.
    environment variables only (`ZEN_API_KEY`, `OPENAI_API_KEY`, or the variable named by `apiKeyEnv`).
    `docs/faq.md` and `docs/threat-model.md` now say so. OS keyring support, if wanted, is a separate
    roadmap item.
-2. Install source is unpinned. `install.sh` builds the tip of `main` by default (`ZENCODE_BRANCH`),
+2. Install source is unpinned. `install.sh` builds the tip of `main` by default (`ZENCORE_BRANCH`),
    and `zen update` rebuilds from source. There is no tag, commit or checksum check.
 3. Binary release v0.1.0 exists (published 2026-11-10) and the Windows installer verifies
    the downloaded binary by SHA-256 (the default hash is pinned in `install.ps1`). There is

@@ -11,7 +11,7 @@
 //! Opt out at any time through any of:
 //! - `zen telemetry off` (writes "telemetry": "off" to ~/.zen/settings.json)
 //! - DO_NOT_TRACK=1
-//! - ZENCODE_TELEMETRY=0
+//! - ZENCORE_TELEMETRY=0
 //! - "telemetry": "off" in ~/.zen/settings.json (the file the command writes)
 //!
 //! The design doc (OPT-OUT, §2/§3) names the same opt-out paths.
@@ -27,10 +27,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_ENDPOINT: &str = "https://count.runzen.dev";
-pub const ENDPOINT_ENV: &str = "ZENCODE_COUNTER_URL";
+pub const ENDPOINT_ENV: &str = "ZENCORE_COUNTER_URL";
 pub const PING_INTERVAL_SECS: u64 = 24 * 60 * 60;
 pub const STATE_FILE_NAME: &str = "user-counter.json";
-pub const FIRST_RUN_NOTICE: &str = "ZenCode counts anonymous usage (opt out: zen telemetry off, DO_NOT_TRACK=1, or ZENCODE_TELEMETRY=0).";
+pub const FIRST_RUN_NOTICE: &str = "Zen counts anonymous usage (opt out: zen telemetry off, DO_NOT_TRACK=1, or ZENCORE_TELEMETRY=0).";
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CounterState {
@@ -62,7 +62,7 @@ pub fn state_path(home: &Path) -> PathBuf {
 pub enum TelemetryState {
     /// DO_NOT_TRACK=1 is set.
     OptedOutDoNotTrack,
-    /// ZENCODE_TELEMETRY=0 is set.
+    /// ZENCORE_TELEMETRY=0 is set.
     OptedOutEnv,
     /// The merged settings say "telemetry": "off".
     OptedOutSetting,
@@ -75,7 +75,7 @@ impl TelemetryState {
     pub fn source(self) -> &'static str {
         match self {
             TelemetryState::OptedOutDoNotTrack => "DO_NOT_TRACK=1",
-            TelemetryState::OptedOutEnv => "ZENCODE_TELEMETRY=0",
+            TelemetryState::OptedOutEnv => "ZENCORE_TELEMETRY=0",
             TelemetryState::OptedOutSetting => "\"telemetry\": \"off\" in settings",
             TelemetryState::On => "default",
         }
@@ -101,7 +101,7 @@ pub fn effective_state(
     if get_env("DO_NOT_TRACK").as_deref() == Some("1") {
         return TelemetryState::OptedOutDoNotTrack;
     }
-    if get_env("ZENCODE_TELEMETRY").as_deref() == Some("0") {
+    if get_env("ZENCORE_TELEMETRY").as_deref() == Some("0") {
         return TelemetryState::OptedOutEnv;
     }
     if setting.is_some_and(|s| s.trim().eq_ignore_ascii_case("off")) {
@@ -287,8 +287,8 @@ mod tests {
     }
 
     #[test]
-    fn opt_out_by_zencode_telemetry_zero() {
-        let env = |k: &str| (k == "ZENCODE_TELEMETRY").then(|| "0".to_string());
+    fn opt_out_by_zencore_telemetry_zero() {
+        let env = |k: &str| (k == "ZENCORE_TELEMETRY").then(|| "0".to_string());
         assert!(opted_out(None, env));
     }
 
@@ -302,7 +302,7 @@ mod tests {
     fn not_opted_out_by_default() {
         assert!(!opted_out(None, no_env));
         assert!(!opted_out(Some("on"), no_env));
-        let env = |k: &str| (k == "ZENCODE_TELEMETRY").then(|| "1".to_string());
+        let env = |k: &str| (k == "ZENCORE_TELEMETRY").then(|| "1".to_string());
         assert!(!opted_out(None, env));
     }
 
@@ -443,7 +443,7 @@ mod tests {
             effective_state(Some("on"), env),
             TelemetryState::OptedOutDoNotTrack
         );
-        let env = |k: &str| (k == "ZENCODE_TELEMETRY").then(|| "0".to_string());
+        let env = |k: &str| (k == "ZENCORE_TELEMETRY").then(|| "0".to_string());
         assert_eq!(
             effective_state(Some("on"), env),
             TelemetryState::OptedOutEnv
@@ -468,7 +468,7 @@ mod tests {
         );
         assert_eq!(
             status_message(TelemetryState::OptedOutEnv),
-            "Telemetry: off (opted out via ZENCODE_TELEMETRY=0)"
+            "Telemetry: off (opted out via ZENCORE_TELEMETRY=0)"
         );
         assert_eq!(
             status_message(TelemetryState::OptedOutSetting),

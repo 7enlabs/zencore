@@ -1,6 +1,6 @@
 # ztask (MVP-0)
 
-Team task channel for ZenCode (Task 10). Append-only, SHA-256 hash-chained
+Team task channel for Zen (Task 10). Append-only, SHA-256 hash-chained
 event log in SQLite (WAL); task state is a rebuildable projection.
 Python 3 stdlib only, no dependencies. Design: [DESIGN.md](DESIGN.md).
 Plan: [PLAN.md](PLAN.md).

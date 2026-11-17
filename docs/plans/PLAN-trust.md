@@ -1,6 +1,6 @@
 # PLAN: folder trust (branch feat/folder-trust)
 
-Policy (Zen, 2026-10-17): in an UNTRUSTED folder ZenCode does not load project-level config that can
+Policy (Zen, 2026-10-17): in an UNTRUSTED folder Zen does not load project-level config that can
 execute things or widen permissions. User-level (~/.zen) config always loads.
 
 ## Design

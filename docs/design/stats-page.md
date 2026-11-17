@@ -1,7 +1,7 @@
 # Public Stats Page - Design Doc
 
 **Status:** Draft (leader proposal, 2026-10-20)
-**URL:** `zencodego.com/stats` (ships with the website, after v1.0.0)
+**URL:** `runzen.dev/stats` (ships with the website, after v1.0.0)
 **Data source:** anonymous user counter API - see `docs/design/user-counter.md`
 **References:** Homebrew analytics (formulae.brew.sh/analytics), pypistats, star-history, npmtrends.
 
@@ -36,7 +36,7 @@
 
 ## 5. Badges & embeds
 
-- shields.io **endpoint badge**: `GET count.zencodego.com/badge/installs.json` → `{"schemaVersion":1,"label":"users","message":"12.4k","color":"brightgreen"}` - used in README, self-updating, free.
+- shields.io **endpoint badge**: `GET count.runzen.dev/badge/installs.json` → `{"schemaVersion":1,"label":"users","message":"12.4k","color":"brightgreen"}` - used in README, self-updating, free.
 - shields.io **dynamic JSON** badge for MAU straight from `/stats` (no extra code).
 - **OG/social card** for `/stats` rendering the hero numbers - makes the page shareable on X/LinkedIn during launch.
 - After the repo goes public (v1.0.0): star-history chart embedded alongside user stats.

@@ -227,7 +227,7 @@ pub fn load_manifest(dir: &Path) -> Result<PluginManifest> {
     Ok(manifest)
 }
 
-pub const ZENCODE_SIGNING_PUBKEY_HEX: &str =
+pub const ZENCORE_SIGNING_PUBKEY_HEX: &str =
     "622c8cfc675dc43143a47fe69d6046e0411ba659aa647a9bfe1bea905db41bd5";
 
 fn hex_decode(s: &str) -> Result<Vec<u8>> {
@@ -250,7 +250,7 @@ fn hex_decode(s: &str) -> Result<Vec<u8>> {
 pub fn verify_signature(message: &[u8], signature_hex: &str) -> bool {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     let (Ok(pubkey_bytes), Ok(sig_bytes)) = (
-        hex_decode(ZENCODE_SIGNING_PUBKEY_HEX),
+        hex_decode(ZENCORE_SIGNING_PUBKEY_HEX),
         hex_decode(signature_hex),
     ) else {
         return false;
@@ -271,7 +271,7 @@ pub fn verify_signature(message: &[u8], signature_hex: &str) -> bool {
 }
 
 /// Trust ladder: builtins are verified by construction; a fetched skill is
-/// verified only with a valid ZenCode signature over its canonical manifest
+/// verified only with a valid Zen signature over its canonical manifest
 /// bytes. An unsigned manifest is community, and no manifest at all is
 /// unverified - a missing signature is never treated as verified.
 pub fn assign_tier(source: &InstallSource, manifest: Option<&PluginManifest>) -> TrustTier {
@@ -589,7 +589,7 @@ pub fn install_builtin(home: &Path, name: &str) -> Result<RegistryEntry> {
         Some(sig) if verify_signature(&manifest.canonical_bytes(), sig) => {}
         _ => {
             return Err(anyhow!(
-                "embedded manifest for {:?} has no valid ZenCode signature",
+                "embedded manifest for {:?} has no valid Zen signature",
                 name
             ));
         }
@@ -1392,6 +1392,17 @@ fn format_skill_list(registry: &Registry, discovered: &[zen_core::SkillInfo]) ->
     out
 }
 
+/// Note printed after the permission preview when the skill to install
+/// carries a valid ed25519 signature. A pure function so the
+/// Verified-only branch stays unit-testable.
+fn verified_signature_note(tier: &TrustTier) -> Option<&'static str> {
+    if *tier == TrustTier::Verified {
+        Some("signature: valid (signed by Zen)")
+    } else {
+        None
+    }
+}
+
 fn cmd_install(
     home: &Path,
     source: &str,
@@ -1449,8 +1460,8 @@ fn cmd_install(
                 tier.badge(),
                 tier.as_str()
             );
-            if tier == TrustTier::Verified {
-                println!("signature: valid (signed by ZenCode)");
+            if let Some(note) = verified_signature_note(&tier) {
+                println!("{note}");
             }
         }
         None => {
@@ -1530,7 +1541,7 @@ pub fn skills_prompt_with_tiers(home: Option<&Path>, skills: &[zen_core::SkillIn
     // them adds no permission filtering (see docs/skills.md). Only
     // registry-installed unverified skills are sandboxed. Text only;
     // enforcement is unchanged.
-    out.push_str("Trust: [✓ verified] = audited + signed by ZenCode; [community] = user-approved; [⚠ unverified] = advisory for plain skill directories (no permission filtering); installed unverified skills are sandboxed.");
+    out.push_str("Trust: [✓ verified] = audited + signed by Zen; [community] = user-approved; [⚠ unverified] = advisory for plain skill directories (no permission filtering); installed unverified skills are sandboxed.");
     out
 }
 
@@ -2441,6 +2452,30 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cmd_install_builtin_installs_skill() {
+        let home = tmp_home("cmd-install-builtin");
+        cmd_install(&home, "builtin:tdd", true, None).unwrap();
+        assert!(skills_root(&home).join("tdd").join("SKILL.md").exists());
+        assert!(
+            skills_root(&home)
+                .join("tdd")
+                .join("zen-plugin.json")
+                .exists()
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn verified_signature_note_only_for_verified() {
+        assert_eq!(
+            verified_signature_note(&TrustTier::Verified),
+            Some("signature: valid (signed by Zen)")
+        );
+        assert_eq!(verified_signature_note(&TrustTier::Community), None);
+        assert_eq!(verified_signature_note(&TrustTier::Unverified), None);
     }
 
     fn test_skill_info(name: &str, description: &str) -> zen_core::SkillInfo {

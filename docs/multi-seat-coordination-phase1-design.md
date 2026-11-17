@@ -1,4 +1,4 @@
-# Phase 1 design: Multi-seat coordination (Scout/Worker/Reviewer) for the zencode CLI
+# Phase 1 design: Multi-seat coordination (Scout/Worker/Reviewer) for the zencore CLI
 
 - Status: Leader approved the design (message 10525, 12/11/2026). Phase 1 is design only, no code implementation. Phase 2 is in progress: the first PR is the `delegate` tool (branch `feature/multi-seat-coord`).
 - Branch: `feature/multi-seat-coord`, base main `2e7beaf` (rebased from `1786049` on 12/11/2026).

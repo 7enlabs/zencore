@@ -1,6 +1,6 @@
 # Hooks
 
-ZenCode hooks are **guarantees the model can't skip**: shell commands that run at
+Zen hooks are **guarantees the model can't skip**: shell commands that run at
 fixed points of the agent loop - before/after tool calls, when a prompt is
 submitted, when a turn ends, before compaction. Use them for validation,
 auto-linting, context injection, end-of-turn checks, and backups.

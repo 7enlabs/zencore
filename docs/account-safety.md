@@ -1,13 +1,13 @@
 # Account Safety
 
-ZenCode is designed to be a **good API citizen** so your paid accounts
+Zen is designed to be a **good API citizen** so your paid accounts
 (OpenAI, Anthropic, Google) stay in good standing.
 
 > **Honest disclaimer:** No tool can guarantee your account won't be flagged -
-> providers use automated systems with false positives. ZenCode minimizes the
+> providers use automated systems with false positives. Zen minimizes the
 > risk factors within its control and warns you about the rest.
 
-## What ZenCode does automatically
+## What Zen does automatically
 
 - **Exponential backoff with jitter** on rate limits (base 1s, doubling, ±25%
   jitter, capped at 60s), max 3 retries per request and at most 10 s of
@@ -21,8 +21,8 @@ ZenCode is designed to be a **good API citizen** so your paid accounts
 - **Classifies errors before retrying:** 429 rate-limit → backoff + retry;
   529 (Anthropic overloaded) → backoff + suggest a fallback provider;
   other 4xx → fail fast, no retry.
-- **Identifies itself** with a versioned `User-Agent: ZenCode/<version>
-  (+https://zencodego.com)` on every API request, so providers can reach out
+- **Identifies itself** with a versioned `User-Agent: Zen/<version>
+  (+https://runzen.dev)` on every API request, so providers can reach out
   about issues instead of banning first.
 - **Request pacing:** a per-provider token bucket enforces a 100 ms minimum
   interval between requests and slows down proactively at ~80% of the detected
@@ -37,7 +37,7 @@ ZenCode is designed to be a **good API citizen** so your paid accounts
   the same key from multiple IPs/geographies looks like account sharing/resale
   to automated abuse detection.
 - **Don't run many parallel sessions on a single key.** Agentic loops fire many
-  requests per minute; ZenCode warns you when more than 2 sessions share one key.
+  requests per minute; Zen warns you when more than 2 sessions share one key.
 - **Keep payment methods current.** Chargebacks and payment disputes trigger
   automatic suspensions at several providers.
 - **If a key may be compromised** (committed to a repo, pasted somewhere),
@@ -84,7 +84,7 @@ bypasses the User-Agent. It only acknowledges *volume* risk you choose to take.
 ## Provider-specific notes
 
 - **OpenAI:** 429s come in two flavors - `rate_limit_exceeded` (slow down, retry)
-  vs `insufficient_quota` (out of money - ZenCode stops immediately). Keep
+  vs `insufficient_quota` (out of money - Zen stops immediately). Keep
   `max_tokens` tight: the token limit counts what you *request*, not just what
   is used.
 - **Anthropic:** 429 means *you* hit a limit (respect `retry-after`); 529 means
@@ -96,9 +96,9 @@ bypasses the User-Agent. It only acknowledges *volume* risk you choose to take.
 
 ## FAQ
 
-**Will ZenCode get my account banned?**
+**Will Zen get my account banned?**
 No evidence suggests normal usage within rate limits gets accounts banned.
-ZenCode stays well inside limits, backs off automatically, and warns you about
+Zen stays well inside limits, backs off automatically, and warns you about
 the patterns that do cause problems (shared keys, parallel-session storms,
 ignoring rate limits).
 

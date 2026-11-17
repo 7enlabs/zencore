@@ -1,6 +1,6 @@
-# REVIEW.md - what matters when reviewing ZenCode
+# REVIEW.md - what matters when reviewing Zen
 
-ZenCode is a Rust coding-agent CLI. A review exists to stop changes that break users, not to polish style.
+Zen is a Rust coding-agent CLI. A review exists to stop changes that break users, not to polish style.
 
 ## What failure looks like here
 - **Tools:** a tool runs something the user did not ask for, loses output, hangs past its timeout, or leaves child processes behind.

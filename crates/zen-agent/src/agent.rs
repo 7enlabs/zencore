@@ -41,7 +41,7 @@ pub fn is_truncated(finish_reason: Option<&str>) -> bool {
 
 pub fn content_filter_message(partial: &str) -> String {
     let mut m = String::from(
-        "Blocked by the provider's content filter (finish_reason: content_filter). The model's reply was stopped; ZenCode did not retry. Rephrase the request or use another model.",
+        "Blocked by the provider's content filter (finish_reason: content_filter). The model's reply was stopped; Zen did not retry. Rephrase the request or use another model.",
     );
     if !partial.trim().is_empty() {
         m.push_str(" Partial reply: ");

@@ -1,4 +1,4 @@
-# ZenCode - Behavioral Specification (clean-room)
+# Zen - Behavioral Specification (clean-room)
 
 By 7EN Labs. Last updated: 2026-11-11.
 
@@ -131,7 +131,7 @@ Custom commands: Markdown files in `.zen/commands/*.md` (project) and `~/.zen/co
 ## 8. MCP client
 - Config sources: `.mcp.json` in project root (`{"mcpServers": {name: cfg}}`), `~/.zen.json`/`~/.zen/mcp.json` user, `--mcp-config` files/JSON strings. `--strict-mcp-config` = only CLI ones.
 - Server config: stdio `{ "command", "args"?, "env"? }` (type `stdio` default) or HTTP `{ "type": "http", "url", "headers"? }` (streamable HTTP; MVP may stub SSE).
-- Protocol: JSON-RPC 2.0. `initialize` (protocolVersion, capabilities, clientInfo{name:"ZenCode"}) → `notifications/initialized` → `tools/list` → `tools/call {name, arguments}`. Results' `content[]` text parts joined as tool result; `isError` respected.
+- Protocol: JSON-RPC 2.0. `initialize` (protocolVersion, capabilities, clientInfo{name:"Zen"}) → `notifications/initialized` → `tools/list` → `tools/call {name, arguments}`. Results' `content[]` text parts joined as tool result; `isError` respected.
 - Tools exposed to the model as `mcp__<server>__<tool>` with the server's inputSchema.
 - Startup timeout `MCP_TIMEOUT` (default 30 s); failed servers reported with status `failed` in `/mcp` and in stream-json init `mcp_servers: [{name, status}]`.
 - `zen mcp add <name> -- <cmd> [args]`, `zen mcp add --transport http <name> <url>`, `zen mcp list`, `zen mcp remove <name>`; `-s local|project|user` scope.
@@ -328,7 +328,7 @@ Nothing here changes Appendix C: the parity checklist stays the 2026-10-14 basel
 re-measured. Items below are directions or contracts, not claims of shipped behavior.
 
 ### D1 Assistant engine direction (decided 2026-10-28)
-- D1.1 ZenCode is an execution engine under the user's personal assistant, not a replacement
+- D1.1 Zen is an execution engine under the user's personal assistant, not a replacement
   for the assistant. The core stays clean; features attach as modules through protocols and ports.
 
 ### D2 Companion-host contract v1 (decided 2026-10-31; contract plus schema tests only, no transport code)

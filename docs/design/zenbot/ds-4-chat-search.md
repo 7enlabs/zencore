@@ -33,7 +33,7 @@ This design therefore does **not** rest on the dossier for the search
 mechanics. Section 2 below is new primary-source work: the upstream source
 was read directly for this design (commit cited there). **Resolved by Leader
 tin 5742 §3:** the section 7/8 reference was to the main dossier
-`study-ds-bot-2026-11-05.md` (§7 Áp dụng cho ZenCode, §8 Verdict), not to the
+`study-ds-bot-2026-11-05.md` (§7 Áp dụng cho Zen, §8 Verdict), not to the
 fei2411 file above; the unclear reference was the Leader's error, corrected
 there. That main dossier file has not reached this VM yet, so its §7/§8 were
 not read for this design. Treat every "dossier section 7/8" claim in the
@@ -42,7 +42,7 @@ assignment as referring to the main dossier, not the fei2411 file.
 ## 1. Goal
 
 Let a user find an old chat again by words: `zen sessions search <query>`
-(and the same search from ZenCode Desktop) returns the matching messages,
+(and the same search from Zen Desktop) returns the matching messages,
 oldest first, with enough context to recognise them, and a way to open the
 full message and its neighbours. Search covers all sessions the user owns on
 this machine, across all project directories - not only the current
@@ -57,7 +57,7 @@ Non-goals (explicit):
   and no change to how sessions are written, resumed, or exported.
 - No copy of upstream code. DS-Bot is Apache-2.0 and obelisk (the other
   reference in the assignment) is AGPL-3.0; this design borrows **ideas only**
-  and every implementation must be written from scratch for ZenCode.
+  and every implementation must be written from scratch for Zen.
   The upstream code was read to learn the design, not to reuse it.
 
 ## 2. What DS-Bot actually does (primary source, read for this design)
@@ -167,7 +167,7 @@ Rules worth borrowing, and one quirk worth fixing:
    LIKE, not FTS5 - even though the trigram tokenizer could match it
    (`test/history.test.js:70-76` expects `LIKE '%会议%'`). The trigram claim
    "Chinese needs no word splitting" is therefore only true for terms of 3+
-   characters. A ZenCode design should not copy this quirk blindly; see 4.5.
+   characters. A Zen design should not copy this quirk blindly; see 4.5.
 
 ### 2.4 Reads around a hit
 
@@ -198,14 +198,14 @@ short terms; AND-then-OR fallback; excerpt centred on the first match;
 anchors (`session#seq`); hidden-current-turn exclusion; WAL; versioned schema
 with rebuild on mismatch.
 
-Do not take: Node's `node:sqlite` (ZenCode is Rust - see section 5);
-indexing only the current bot's own chat (ZenCode has no bot/user split - it
+Do not take: Node's `node:sqlite` (Zen is Rust - see section 5);
+indexing only the current bot's own chat (Zen has no bot/user split - it
 indexes the user's own sessions); the 2-character-CJK-to-LIKE quirk; the
 no-pagination limit; storing the index as the only copy of anything (DS-Bot
-already doesn't - the logs are the truth; ZenCode must keep the same rule
+already doesn't - the logs are the truth; Zen must keep the same rule
 with its JSONL journals).
 
-## 3. Where ZenCode stands today (primary source, repo at 647fcc0)
+## 3. Where Zen stands today (primary source, repo at 647fcc0)
 
 - Sessions are **JSONL journals**, one file per session:
   `~/.zen/projects/<encoded-cwd>/<session-id>.jsonl`
@@ -408,10 +408,10 @@ ORDER BY rank LIMIT <limit>;          -- BM25 when any long term exists
 - Session filter: optional `--session <id>` (one session) or
   `--project <encoded-cwd>` (one project dir); default is all sessions.
   Implemented as `m.session_id = ?` / `m.project = ?` on the indexed
-  `messages` table - not DS-Bot's `json_each` session list, because ZenCode
+  `messages` table - not DS-Bot's `json_each` session list, because Zen
   does not have a small fixed session list: it has every session on disk.
 - **Fix 1 - the CJK quirk:** DS-Bot counts characters, so 2-character CJK
-  words fall to LIKE (section 2.3.6). ZenCode instead defines "long" by
+  words fall to LIKE (section 2.3.6). Zen instead defines "long" by
   **trigram count**: a term is long if it yields at least one trigram, i.e.
   it has >= 3 characters **in the tokenizer's terms** - which for CJK means
   >= 3 code points still. The honest fix is different: treat a term as long
@@ -577,7 +577,7 @@ inside the same transaction; the read paths that users hit constantly
 
 - Size scales ~linearly with message text: 100k short messages -> 33.76 MiB,
   so **~340 MiB per 1M messages** of this shape is the planning figure
-  (extrapolated, not measured). Real ZenCode messages are longer than the
+  (extrapolated, not measured). Real Zen messages are longer than the
   ~70-char synthetic ones (tool outputs especially), so the honest planning
   assumption is **larger**, and the design caps indexed tool output at 4,000
   chars (section 4.3) precisely to bound this.
@@ -599,7 +599,7 @@ inside the same transaction; the read paths that users hit constantly
 | R3 | FTS5 query syntax errors from user input (`"`, `*`, `^`, unbalanced quotes). | Bound `MATCH ?` parameter + term quoting (double `"`), same as DS-Bot; malformed query returns exit code 2 with the offending term named. |
 | R4 | LIKE fallback on a rare short term is a full scan (5.3 caveat). | Time it at implementation; if it exceeds budget, restrict short-term search to the current session or require a long term alongside. |
 | R5 | Two writers (CLI + Desktop) on one WAL file. | `busy_timeout` 5 s + single-writer discipline + watermark re-check (4.4); search never blocks past the timeout. |
-| R6 | Index staleness: a session edited while ZenCode is running (external edit, crash mid-write). | Watermark is (mtime, length, through_seq); a journal that shrank or changed mid-read is re-indexed from scratch for that session. |
+| R6 | Index staleness: a session edited while Zen is running (external edit, crash mid-write). | Watermark is (mtime, length, through_seq); a journal that shrank or changed mid-read is re-indexed from scratch for that session. |
 | R7 | Privacy: the index duplicates conversation text in a second file. | Same directory, same permissions as journals; listed with private files; deleted with the session (4.3). No redaction inside the index - redaction happens at output time (`--redact`). |
 | R8 | `rusqlite` version drift: FTS5 verified only for bundled SQLite 3.50.2 (5.1). | Re-run the `/tmp/fts5-check` harness when the version is pinned at implementation; fail the build if the trigram table cannot be created (a test, not a hope). |
 | R9 | Scope: is Desktop search in DS-4 or a follow-up? | This design guarantees the shared engine only (4.7). Desktop UI needs its own design + Leader decision. |
@@ -643,7 +643,7 @@ inside the same transaction; the read paths that users hit constantly
   Note the dossier itself says its upstream claims are `[INFERRED]` from
   docs, not from source (section 4, critic 1) - this design replaces those
   with the primary-source reading above.
-- [S] ZenCode repo @ `647fcc0`: `crates/zen-cli/src/session.rs`
+- [S] Zen repo @ `647fcc0`: `crates/zen-cli/src/session.rs`
   (`encode_cwd`, `session_path`, `find_session_path`,
   `list_sessions_for_cwd`), `crates/zen-cli/src/session_mgmt.rs`
   (`SessionInfo`, `list_all_sessions`, `short_id`), `crates/zen-cli/src/cli.rs`
@@ -655,7 +655,7 @@ inside the same transaction; the read paths that users hit constantly
   are its output.
 - [M] SQLite FTS5 documentation (trigram tokenizer, external-content tables,
   BM25 `rank`): background for section 4.2/4.5; the design's claims about
-  ZenCode rest on the measured harness, not on the docs alone.
+  Zen rest on the measured harness, not on the docs alone.
 - [I] Size extrapolation to 1M messages (5.5) and the 4,000-char tool-output
   cap (4.3) are judgement calls, labelled as such, pending the measurements
   in section 8.

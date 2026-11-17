@@ -1,4 +1,4 @@
-# Ephemeral self-hosted runner (ZenCode CI)
+# Ephemeral self-hosted runner (Zen CI)
 
 One container registers one GitHub Actions runner with `--ephemeral`, takes
 exactly one job, then exits and is removed. Nothing from a job survives into
@@ -80,14 +80,14 @@ socket gives the job root on the host.
 
 ```ini
 [Unit]
-Description=ZenCode ephemeral GitHub runner
+Description=Zen ephemeral GitHub runner
 After=docker.service
 Requires=docker.service
 
 [Service]
 User=user
 EnvironmentFile=/etc/zc-runner.env
-ExecStart=/data/home/work/zencode/ci/runner/run-ephemeral.sh --loop
+ExecStart=/data/home/work/zencore/ci/runner/run-ephemeral.sh --loop
 Restart=on-failure
 RestartSec=60
 

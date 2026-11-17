@@ -17,5 +17,5 @@ module.exports = {
       : process.env.RENOVATE_DRY_RUN || 'full',
   onboarding: false,
   requireConfig: 'optional',
-  gitAuthor: 'ZC Developer <zc-developer@zencode.local>',
+  gitAuthor: 'ZC Developer <zc-developer@zencore.local>',
 };

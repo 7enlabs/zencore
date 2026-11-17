@@ -1,4 +1,4 @@
-# cargo-deny policy for the ZenCode CLI workspace (buffer task #8).
+# cargo-deny policy for the Zen CLI workspace (buffer task #8).
 # Run locally: cargo deny check
 [graph]
 all-features = true

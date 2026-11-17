@@ -28,7 +28,7 @@ pub fn doctor_safety_checklist(version: &str) -> String {
     let mut out = String::new();
     out.push_str("  account-safety:\n");
     out.push_str(&format!(
-        "    - User-Agent identifies ZenCode/{version} on all requests: yes\n"
+        "    - User-Agent identifies Zen/{version} on all requests: yes\n"
     ));
     out.push_str(&format!(
         "    - exponential backoff with jitter (max {} attempts): enabled\n",

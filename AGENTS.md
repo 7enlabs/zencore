@@ -1,4 +1,4 @@
-# AGENTS.md - instructions for coding agents working on ZenCode
+# AGENTS.md - instructions for coding agents working on Zen
 
 Short version of the rules. Details live in [CONTRIBUTING.md](CONTRIBUTING.md),
 [REVIEW.md](REVIEW.md) and [SPEC.md](SPEC.md). If this file and CONTRIBUTING.md

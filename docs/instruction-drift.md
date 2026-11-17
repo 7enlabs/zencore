@@ -5,7 +5,7 @@ code as tool output. When the two disagree, agents mostly follow the stale file:
 (Xu and Wu, preprint, Python projects only) agents followed the outdated file in about 90% of choices,
 and one added line saying the existing code takes precedence moved that to about 91% following the code.
 This check keeps our instruction files honest, and the second half of this page says how to measure
-whether the precedence line helps on ZenCode.
+whether the precedence line helps on Zen.
 
 ## What the check does
 
@@ -48,7 +48,7 @@ python3 -m unittest scripts/test_check_instruction_drift.py
 It checks names, not meaning. A file that says "use `anyhow`" in a crate that uses `thiserror` passes.
 Semantic conventions are what the measurement below is for.
 
-## Measuring the code-precedence line on ZenCode
+## Measuring the code-precedence line on Zen
 
 Goal: show whether the line in `AGENTS.md` telling agents that existing code wins over a conflicting
 instruction changes what `zen` does on this repo, without making it ignore instructions that are right.

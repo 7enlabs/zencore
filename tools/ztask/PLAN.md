@@ -8,7 +8,7 @@ Note: the repo `.gitignore` ignores `/PLAN.md` at the root, so this plan lives a
 
 ## Repo facts that shape the plan
 
-- ZenCode is a Rust workspace (`crates/zen-*`, edition 2021 in Cargo.toml).
+- Zen is a Rust workspace (`crates/zen-*`, edition 2021 in Cargo.toml).
   Workspace deps have no SQLite crate and no `sha2` (sha2 0.10.9 is only a
   transitive entry in Cargo.lock).
 - `tools/` holds standalone scripts: bash benches and a Python tool with a
@@ -38,7 +38,7 @@ Note: the repo `.gitignore` ignores `/PLAN.md` at the root, so this plan lives a
 4. Add `tools/ztask/README.md` with usage.
 5. Run tests on the box; capture real output.
 6. If tests pass and only `tools/ztask/` changed: commit locally as
-   "ZC Platform <zc-platform@zencode.local>". Otherwise leave uncommitted.
+   "ZC Platform <zc-platform@zencore.local>". Otherwise leave uncommitted.
 7. Report: files, outline, test output, git status, diff --stat, commit hash,
    open decisions.
 
