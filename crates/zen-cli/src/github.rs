@@ -888,6 +888,7 @@ mod viec_a_tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     use std::path::PathBuf;
 
     #[cfg(unix)]
