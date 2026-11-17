@@ -20,3 +20,4 @@ fuzz/artifacts/
 
 # cargo-mutants local output
 mutants.out/
+mutants.out.old/

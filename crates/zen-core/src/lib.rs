@@ -685,10 +685,36 @@ pub trait PermissionChecker: Send + Sync {
     fn ask_rule_matches(&self, _tool_name: &str, _input: &Value, _ctx: &ToolContext) -> bool {
         false
     }
+
+    /// Switch the mode permission decisions are evaluated under (M4,
+    /// Phase 2 #9): `session/set_mode` calls this so the checker follows
+    /// the session mode instead of the mode it was built with. Default
+    /// no-op: a checker that bakes no mode in has nothing to update.
+    fn set_mode(&self, mode: PermissionMode) {
+        let _ = mode;
+    }
 }
 
 pub trait Prompter: Send + Sync {
     fn ask_permission(&self, tool_name: &str, input: &Value) -> PromptAnswer;
+}
+
+/// Async counterpart of [`Prompter`] for hosts that answer permission
+/// questions over an async channel instead of a terminal (M4, Phase 2
+/// #9): the ACP server round-trips `session/request_permission` to the
+/// client and awaits the outcome. `tool_call_id` is the id the client
+/// already saw in the `tool_call` session update for this call, so the
+/// client can match the request to it; `read_only` is the tool's own
+/// read-only flag, used to pick the ACP tool kind.
+#[async_trait]
+pub trait AsyncPrompter: Send + Sync {
+    async fn ask_permission(
+        &self,
+        tool_name: &str,
+        input: &Value,
+        tool_call_id: &str,
+        read_only: bool,
+    ) -> PromptAnswer;
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum PromptAnswer {

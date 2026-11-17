@@ -232,3 +232,169 @@ fn acp_session_prompt_unsupported_content_returns_invalid_params() {
     assert_eq!(out[1]["id"], 2);
     assert_eq!(out[1]["error"]["code"], -32602);
 }
+
+/// Interactive `zen --acp` driver (M4): spawn the binary with piped
+/// stdin/stdout, send request lines one at a time, and read response
+/// lines with a deadline. A reader thread forwards stdout lines into a
+/// channel, so a missing response fails the test instead of blocking.
+struct AcpInteractive {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    rx: std::sync::mpsc::Receiver<String>,
+}
+
+impl AcpInteractive {
+    fn spawn(home: &TempDir, cwd: &TempDir) -> Self {
+        let mut child = ZenRun::new("acp", home, cwd).arg("--acp").spawn_piped();
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(stdout);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) => {
+                        if tx.send(l).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self { child, stdin, rx }
+    }
+
+    fn send(&mut self, value: &Value) {
+        let line = value.to_string() + "\n";
+        self.stdin.write_all(line.as_bytes()).expect("write stdin");
+        self.stdin.flush().expect("flush stdin");
+    }
+
+    fn next_line(&self) -> Value {
+        let line = self
+            .rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("timed out waiting for a response line");
+        serde_json::from_str(&line).expect("response line must be JSON")
+    }
+
+    fn finish(mut self) -> i32 {
+        drop(self.stdin);
+        let status = self.child.wait().expect("wait for child");
+        status.code().unwrap_or(-1)
+    }
+}
+
+#[test]
+fn acp_session_new_advertises_modes_and_model() {
+    let home = TempDir::new("acp_home");
+    let cwd = TempDir::new("acp_cwd");
+    let mut acp = AcpInteractive::spawn(&home, &cwd);
+    acp.send(&initialize_req(1));
+    assert_eq!(acp.next_line()["result"]["protocolVersion"], 1);
+    acp.send(&req(
+        2,
+        "session/new",
+        json!({"cwd": cwd.path().to_string_lossy()}),
+    ));
+    let resp = acp.next_line();
+    assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+    let session_id = resp["result"]["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
+    assert!(!session_id.is_empty());
+    let modes = &resp["result"]["modes"];
+    assert_eq!(modes["currentModeId"], "default", "{resp}");
+    let ids: Vec<&str> = modes["availableModes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["default", "plan", "acceptEdits"], "{resp}");
+    assert!(
+        !resp.to_string().contains("bypassPermissions") && !resp.to_string().contains("dontAsk"),
+        "{resp}"
+    );
+    let options = resp["result"]["configOptions"]
+        .as_array()
+        .expect("configOptions");
+    assert_eq!(options.len(), 1, "{resp}");
+    assert_eq!(options[0]["id"], "model");
+    assert_eq!(options[0]["type"], "select");
+    let current = options[0]["currentValue"].as_str().unwrap();
+    assert!(
+        options[0]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["id"].as_str() == Some(current)),
+        "{resp}"
+    );
+    assert_eq!(acp.finish(), 0);
+}
+
+#[test]
+fn acp_set_mode_and_set_config_option_roundtrip() {
+    let home = TempDir::new("acp_home");
+    let cwd = TempDir::new("acp_cwd");
+    let mut acp = AcpInteractive::spawn(&home, &cwd);
+    acp.send(&initialize_req(1));
+    let _ = acp.next_line();
+    acp.send(&req(
+        2,
+        "session/new",
+        json!({"cwd": cwd.path().to_string_lossy()}),
+    ));
+    let resp = acp.next_line();
+    let session_id = resp["result"]["sessionId"].as_str().unwrap().to_string();
+    // set_mode to plan succeeds with an empty result.
+    acp.send(&req(
+        3,
+        "session/set_mode",
+        json!({"sessionId": session_id, "modeId": "plan"}),
+    ));
+    let resp = acp.next_line();
+    assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+    assert_eq!(resp["result"], json!({}));
+    // set_mode to a mode the agent never advertised is rejected.
+    acp.send(&req(
+        4,
+        "session/set_mode",
+        json!({"sessionId": session_id, "modeId": "bypassPermissions"}),
+    ));
+    let resp = acp.next_line();
+    assert_eq!(resp["error"]["code"], -32602, "{resp}");
+    // set_config_option switches the model and answers the full list.
+    acp.send(&req(
+        5,
+        "session/set_config_option",
+        json!({"sessionId": session_id, "configOptionId": "model", "valueId": "qwen/qwen3-coder:free"}),
+    ));
+    let resp = acp.next_line();
+    assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+    assert_eq!(
+        resp["result"]["configOptions"][0]["currentValue"], "qwen/qwen3-coder:free",
+        "{resp}"
+    );
+    // An unknown model is rejected.
+    acp.send(&req(
+        6,
+        "session/set_config_option",
+        json!({"sessionId": session_id, "configOptionId": "model", "valueId": "no-such-model"}),
+    ));
+    let resp = acp.next_line();
+    assert_eq!(resp["error"]["code"], -32602, "{resp}");
+    // An unknown session is -32002.
+    acp.send(&req(
+        7,
+        "session/set_mode",
+        json!({"sessionId": "does-not-exist", "modeId": "plan"}),
+    ));
+    let resp = acp.next_line();
+    assert_eq!(resp["error"]["code"], -32002, "{resp}");
+    assert_eq!(acp.finish(), 0);
+}

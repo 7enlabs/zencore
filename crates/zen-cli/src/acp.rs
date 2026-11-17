@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use zen_core::lock_recovery::lock_or_recover;
-use zen_core::{AgentEvent, ChatMessage, EventSink, LlmBackend};
+use zen_core::{AgentEvent, ChatMessage, EventSink, LlmBackend, PermissionMode, PromptAnswer};
 
 use crate::agent_run;
 use crate::cli::Cli;
@@ -83,6 +83,10 @@ const ERR_INVALID_REQUEST: i64 = -32600;
 const ERR_METHOD_NOT_FOUND: i64 = -32601;
 const ERR_INVALID_PARAMS: i64 = -32602;
 const ERR_INTERNAL: i64 = -32603;
+/// Unknown session (ACP v1 implementation-defined range; Session Setup
+/// doc, session/close section). M1-M3 used -32603 for an unknown session
+/// in session/prompt; the new M4 methods use this code instead.
+const ERR_UNKNOWN_SESSION: i64 = -32002;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -281,10 +285,26 @@ struct AcpSession {
     /// JSON-RPC id of the prompt request currently running for this
     /// session, if any (M3): `$/cancel_request` matches on it.
     prompt_request_id: Mutex<Option<Value>>,
+    /// The mode the session runs in (M4): `session/set_mode` writes it,
+    /// `run_prompt_turn` applies it to the agent at turn start.
+    mode: Mutex<PermissionMode>,
+    /// The system prompt before any mode banner is applied (M4):
+    /// `planmode::set_permission_mode` rebuilds from this base, so mode
+    /// switches never stack banners.
+    base_system_prompt: String,
+    /// The model the session runs (gateway id, M4): `set_config_option`
+    /// writes it, `run_prompt_turn` applies it at turn start.
+    model: Mutex<String>,
 }
 
 impl AcpSession {
-    fn new(agent: zen_agent::Agent, sink: Arc<AcpSink>) -> Self {
+    fn new(
+        agent: zen_agent::Agent,
+        sink: Arc<AcpSink>,
+        mode: PermissionMode,
+        base_system_prompt: String,
+        model: String,
+    ) -> Self {
         Self {
             agent: tokio::sync::Mutex::new(agent),
             sink,
@@ -292,7 +312,68 @@ impl AcpSession {
             prompt_running: AtomicBool::new(false),
             cancel_notify: Arc::new(tokio::sync::Notify::new()),
             prompt_request_id: Mutex::new(None),
+            mode: Mutex::new(mode),
+            base_system_prompt,
+            model: Mutex::new(model),
         }
+    }
+
+    /// The mode the session currently runs in (M4).
+    fn current_mode(&self) -> PermissionMode {
+        *lock_or_recover(&self.mode, "acp session mode")
+    }
+
+    /// The model the session currently runs (gateway id, M4).
+    fn current_model(&self) -> String {
+        lock_or_recover(&self.model, "acp session model").clone()
+    }
+
+    /// Record a mode change from `session/set_mode` (M4): the session
+    /// state updates at once; the agent picks it up immediately when
+    /// idle (try_lock succeeds) or at the next turn start when a turn
+    /// is running, so a set_mode during a turn never blocks the
+    /// dispatcher and never races the running turn for the agent.
+    fn set_mode(&self, mode: PermissionMode) {
+        *lock_or_recover(&self.mode, "acp session mode") = mode;
+        if let Ok(mut agent) = self.agent.try_lock() {
+            self.sync_session_state_to_agent(&mut agent);
+        }
+    }
+
+    /// Record a model change from `session/set_config_option` (M4):
+    /// same apply timing as `set_mode`.
+    fn set_model(&self, model: String) {
+        *lock_or_recover(&self.model, "acp session model") = model;
+        if let Ok(mut agent) = self.agent.try_lock() {
+            self.sync_session_state_to_agent(&mut agent);
+        }
+    }
+
+    /// Apply the session's mode and model to the agent (M4): the
+    /// permission mode (system prompt rebuilt from the base prompt),
+    /// the permission checker's mode, and the model. Called at every
+    /// turn start in `run_prompt_turn` and opportunistically from
+    /// `set_mode`/`set_model` when the agent is idle.
+    fn sync_session_state_to_agent(&self, agent: &mut zen_agent::Agent) {
+        let mode = self.current_mode();
+        crate::planmode::set_permission_mode(&mut agent.config, mode, &self.base_system_prompt);
+        agent.permissions.set_mode(mode);
+        agent.config.model = self.current_model();
+    }
+
+    /// The `modes` object for the `session/new` response (M4): exactly
+    /// the three modes Q3 advertises.
+    fn modes_state(&self) -> Value {
+        json!({
+            "currentModeId": self.current_mode().as_str(),
+            "availableModes": advertised_mode_list(),
+        })
+    }
+
+    /// The `configOptions` array for the `session/new` response and the
+    /// `session/set_config_option` response (M4): the `model` select.
+    fn config_options(&self) -> Value {
+        json!([model_config_option(&self.current_model())])
     }
 
     /// Signal a running turn to stop (M3): set the flag the turn
@@ -338,7 +419,6 @@ struct AcpServerState {
     /// Requests the agent sent to the client and is still waiting on,
     /// keyed by the request id we generated.
     pending: Mutex<HashMap<String, oneshot::Sender<ClientResponse>>>,
-    #[allow(dead_code)] // floor-guard: kept intentionally; first production caller is M4 (session/request_permission).
     /// Counter for agent-initiated request ids ("zen-1", "zen-2", ...).
     next_request_id: AtomicU64,
     /// Set once `initialize` succeeds (M1).
@@ -363,7 +443,6 @@ impl AcpServerState {
     /// disconnects while waiting. Callers without a custom timeout pass
     /// 30 seconds; M4's `session/request_permission` uses that default
     /// and treats a timeout as a refusal (fail closed, Leader Q4).
-    #[allow(dead_code)] // floor-guard: kept intentionally; first production caller is M4 (session/request_permission).
     async fn send_client_request(
         &self,
         method: &str,
@@ -407,14 +486,12 @@ impl AcpServerState {
     }
 }
 
-#[allow(dead_code)] // floor-guard: kept intentionally; first production caller is M4 (session/request_permission).
 /// What the client answered to an agent-initiated request.
 enum ClientResponse {
     Result(Value),
     Error { code: i64, message: String },
 }
 
-#[allow(dead_code)] // floor-guard: kept intentionally; first production caller is M4 (session/request_permission).
 /// Why `send_client_request` did not return a result.
 #[derive(Debug, PartialEq)]
 enum SendRequestError {
@@ -631,11 +708,23 @@ async fn dispatch_line(
         "initialize" => Some(apply_initialize(&state.initialized, id, &req.params)),
         "authenticate" => Some(RpcResponse::ok(id, json!({}))),
         "session/new" => {
-            match handle_session_new(cli, default_cwd, home, &req.params, &state.out).await {
+            match handle_session_new(cli, default_cwd, home, &req.params, state).await {
                 Ok((session_id, session)) => {
-                    let mut sessions = lock_or_recover(&state.sessions, "acp sessions");
-                    sessions.insert(session_id.clone(), Arc::new(session));
-                    Some(RpcResponse::ok(id, json!({ "sessionId": session_id })))
+                    let session = Arc::new(session);
+                    let modes = session.modes_state();
+                    let config_options = session.config_options();
+                    {
+                        let mut sessions = lock_or_recover(&state.sessions, "acp sessions");
+                        sessions.insert(session_id.clone(), Arc::clone(&session));
+                    }
+                    Some(RpcResponse::ok(
+                        id,
+                        json!({
+                            "sessionId": session_id,
+                            "modes": modes,
+                            "configOptions": config_options,
+                        }),
+                    ))
                 }
                 Err(e) => Some(RpcResponse::err(
                     id,
@@ -728,6 +817,23 @@ async fn dispatch_line(
                 Some(RpcResponse::ok(id, json!({})))
             }
         }
+        "session/set_mode" => {
+            let sessions = lock_or_recover(&state.sessions, "acp sessions");
+            match handle_set_mode(&sessions, &req.params) {
+                Ok(()) => Some(RpcResponse::ok(id, json!({}))),
+                Err((code, message)) => Some(RpcResponse::err(id, code, message)),
+            }
+        }
+        "session/set_config_option" => {
+            let sessions = lock_or_recover(&state.sessions, "acp sessions");
+            match handle_set_config_option(&sessions, &req.params) {
+                Ok(config_options) => Some(RpcResponse::ok(
+                    id,
+                    json!({ "configOptions": config_options }),
+                )),
+                Err((code, message)) => Some(RpcResponse::err(id, code, message)),
+            }
+        }
         "$/cancel_request" => {
             // A notification in practice: no response is ever sent for
             // it (M3). If a client sends it as a request, answer with
@@ -773,7 +879,6 @@ fn write_response(out: &SharedWriter, resp: &RpcResponse) -> Result<()> {
 /// Every JSON-RPC line the server sends goes through here (responses,
 /// notifications and agent-initiated requests), so a line is never split
 /// by a concurrent writer.
-#[allow(dead_code)] // floor-guard: kept intentionally; first production caller is M4 (session/request_permission).
 fn write_json_line(out: &SharedWriter, value: &Value) -> Result<()> {
     write_line(out, &serde_json::to_string(value)?)
 }
@@ -865,9 +970,9 @@ fn handle_initialize(id: Value, params: &Value) -> RpcResponse {
                 // close/delete, auth) arrives with M5/M7. An omitted or
                 // false capability means unsupported.
                 // Modes are NOT advertised here: ACP v1 puts them in the
-                // session/new response (M4). When M4 advertises them it
-                // must list exactly default/plan/acceptEdits and never
-                // bypassPermissions or dontAsk (Leader Q3, tin 15113).
+                // session/new response (M4), which lists exactly
+                // default/plan/acceptEdits and never bypassPermissions
+                // or dontAsk (Leader Q3, tin 15113).
                 "loadSession": false,
                 "promptCapabilities": { "image": false, "audio": false, "embeddedContext": false },
                 "mcpCapabilities": { "http": false, "sse": false },
@@ -890,7 +995,7 @@ async fn handle_session_new(
     default_cwd: &Path,
     home: Option<&Path>,
     params: &Value,
-    out: &SharedWriter,
+    state: &Arc<AcpServerState>,
 ) -> Result<(String, AcpSession)> {
     let cwd = params
         .get("cwd")
@@ -905,7 +1010,7 @@ async fn handle_session_new(
     let session_id = uuid::Uuid::new_v4().hyphenated().to_string();
 
     let sink = Arc::new(AcpSink {
-        out: out.clone(),
+        out: state.out.clone(),
         session_id: session_id.clone(),
         tools: Arc::new(Mutex::new(HashMap::new())),
         pending_tools: Arc::new(Mutex::new(HashSet::new())),
@@ -919,7 +1024,23 @@ async fn handle_session_new(
     let mut agent_config = agent_run::base_agent_config(&cfg, cli, &system_prompt);
     agent_config.diagnostics_provider = assembly.diagnostics_provider.clone();
     let ctx = agent_run::tool_context_public(&cwd, &cfg, cli, &session_id);
-    let agent = zen_agent::Agent::new(
+    // M4: the session only ever runs an advertised mode. A configured
+    // bypassPermissions/dontAsk mode (CLI flag or settings) is clamped
+    // to Default for ACP sessions: those modes must never be advertised
+    // (Q3) and must never run behind a client that cannot see them.
+    let initial_mode = match agent_config.permission_mode {
+        PermissionMode::Default | PermissionMode::AcceptEdits | PermissionMode::Plan => {
+            agent_config.permission_mode
+        }
+        PermissionMode::BypassPermissions | PermissionMode::DontAsk => {
+            eprintln!(
+                "acp: clamping unadvertised mode {} to default for session {session_id}",
+                agent_config.permission_mode.as_str()
+            );
+            PermissionMode::Default
+        }
+    };
+    let mut agent = zen_agent::Agent::new(
         llm,
         assembly.registry.clone(),
         assembly.permissions.clone(),
@@ -929,10 +1050,23 @@ async fn handle_session_new(
         ctx,
         agent_config,
     );
+    // Apply the (possibly clamped) mode to the agent config, the system
+    // prompt and the permission checker, then install the ACP prompter
+    // so permission questions round-trip to the client (M4).
+    crate::planmode::set_permission_mode(&mut agent.config, initial_mode, &system_prompt);
+    agent.permissions.set_mode(initial_mode);
+    agent.set_async_prompter(Arc::new(AcpPrompter::new(
+        Arc::clone(state),
+        session_id.clone(),
+    )));
 
     let _ = assembly;
 
-    Ok((session_id, AcpSession::new(agent, sink)))
+    let model = agent.config.model.clone();
+    Ok((
+        session_id,
+        AcpSession::new(agent, sink, initial_mode, system_prompt, model),
+    ))
 }
 
 /// One validated prompt turn (M3): the text the agent runs on, plus
@@ -1030,6 +1164,10 @@ async fn run_prompt_turn(
     }
 
     let mut agent = session.agent.lock().await;
+    // M4: apply the session's mode and model (a set_mode or
+    // set_config_option that arrived during the previous turn, or while
+    // this turn was starting) before the turn reads them.
+    session.sync_session_state_to_agent(&mut agent);
     // Snapshots for the cancel path (M3): history, usage and live
     // descendants before the turn, so a cancel restores all three,
     // like the REPL interrupt (`run_turn_interruptible`).
@@ -1106,6 +1244,327 @@ fn handle_cancel(sessions: &HashMap<String, Arc<AcpSession>>, params: &Value) {
         && let Some(s) = sessions.get(sid)
     {
         s.request_cancel();
+    }
+}
+
+/// The advertised mode list for the `session/new` response (M4): exactly
+/// the three modes Q3 allows, never bypassPermissions/dontAsk.
+fn advertised_mode_list() -> Value {
+    json!([
+        {
+            "id": "default",
+            "name": "Default",
+            "description": "Ask for permission before sensitive actions.",
+        },
+        {
+            "id": "plan",
+            "name": "Plan",
+            "description": "Read-only planning: explore and propose a plan without changing files.",
+        },
+        {
+            "id": "acceptEdits",
+            "name": "Accept edits",
+            "description": "Apply file edits without asking; other actions still ask for permission.",
+        },
+    ])
+}
+
+/// The `model` config option advertised in `session/new` (M4): a select
+/// over the CLI's free model catalog plus `auto` routing, with the
+/// current model as the value. The value the client sends back is the
+/// catalog id; the agent runs the catalog entry's `gateway_id`.
+fn model_config_option(current_model: &str) -> Value {
+    let mut options: Vec<Value> = crate::models::FREE_MODEL_CATALOG
+        .iter()
+        .map(|m| json!({ "id": m.id, "name": m.id }))
+        .collect();
+    options.push(json!({ "id": "auto", "name": "auto" }));
+    // The current value must be one of the options: a model outside the
+    // catalog (e.g. a custom model from settings) is listed verbatim so
+    // the client can show it and switch back to it.
+    let current_value = current_model_value_id(current_model);
+    if !options
+        .iter()
+        .any(|o| o.get("id").and_then(Value::as_str) == Some(current_value.as_str()))
+    {
+        options.push(json!({ "id": current_value, "name": current_value }));
+    }
+    json!({
+        "id": "model",
+        "name": "Model",
+        "description": "Language model for this session.",
+        "type": "select",
+        "currentValue": current_value,
+        "options": options,
+    })
+}
+
+/// The option id for the model the agent currently runs: the catalog id
+/// whose gateway id matches, `auto` for auto-routing, the raw model
+/// string for a custom model, or the default catalog entry when the
+/// agent has no model yet (fake/test sessions).
+fn current_model_value_id(model: &str) -> String {
+    if model.is_empty() {
+        return crate::models::FREE_MODEL_CATALOG
+            .first()
+            .map(|m| m.id.to_string())
+            .unwrap_or_default();
+    }
+    if model == "auto" {
+        return "auto".to_string();
+    }
+    if let Some(entry) = crate::models::FREE_MODEL_CATALOG
+        .iter()
+        .find(|m| m.gateway_id == model)
+    {
+        return entry.id.to_string();
+    }
+    model.to_string()
+}
+
+/// The model string the agent runs for a config-option value id: the
+/// catalog entry's gateway id, or the value itself for `auto` and for a
+/// model outside the catalog.
+fn gateway_model_for_value_id(value_id: &str) -> String {
+    match crate::models::catalog_entry(value_id) {
+        Some(entry) => entry.gateway_id.to_string(),
+        None => value_id.to_string(),
+    }
+}
+
+/// Apply `session/set_mode` (M4, ACP v1): the mode must be one of the
+/// advertised modes. `bypassPermissions` and `dontAsk` are rejected even
+/// though Zen knows them: Q3 forbids advertising them, and a mode the
+/// client never saw must never start running. An unknown session is
+/// -32002 (ACP v1 unknown-session code); a bad mode is -32602. The
+/// change applies at once when the agent is idle, or at the next turn
+/// start when a turn is running.
+fn handle_set_mode(
+    sessions: &HashMap<String, Arc<AcpSession>>,
+    params: &Value,
+) -> Result<(), (i64, String)> {
+    let session_id = params.get("sessionId").and_then(Value::as_str).ok_or((
+        ERR_INVALID_PARAMS,
+        "session/set_mode requires a sessionId".to_string(),
+    ))?;
+    let session = sessions.get(session_id).ok_or((
+        ERR_UNKNOWN_SESSION,
+        format!("unknown sessionId: {session_id}"),
+    ))?;
+    let mode_id = params.get("modeId").and_then(Value::as_str).ok_or((
+        ERR_INVALID_PARAMS,
+        "session/set_mode requires a modeId".to_string(),
+    ))?;
+    let mode = match PermissionMode::parse(mode_id) {
+        Some(PermissionMode::BypassPermissions) | Some(PermissionMode::DontAsk) => {
+            return Err((
+                ERR_INVALID_PARAMS,
+                format!("mode not advertised: {mode_id}"),
+            ));
+        }
+        Some(mode) => mode,
+        None => {
+            return Err((ERR_INVALID_PARAMS, format!("unknown mode: {mode_id}")));
+        }
+    };
+    session.set_mode(mode);
+    Ok(())
+}
+
+/// Apply `session/set_config_option` (M4, ACP v1) and return the full
+/// current option list, which the response MUST carry (not just the
+/// changed option). Only the `model` select exists today; a boolean
+/// shape for it, an unknown option id, or an unknown model value are
+/// all -32602. An unknown session is -32002.
+fn handle_set_config_option(
+    sessions: &HashMap<String, Arc<AcpSession>>,
+    params: &Value,
+) -> Result<Value, (i64, String)> {
+    let session_id = params.get("sessionId").and_then(Value::as_str).ok_or((
+        ERR_INVALID_PARAMS,
+        "session/set_config_option requires a sessionId".to_string(),
+    ))?;
+    let session = sessions.get(session_id).ok_or((
+        ERR_UNKNOWN_SESSION,
+        format!("unknown sessionId: {session_id}"),
+    ))?;
+    let option_id = params
+        .get("configOptionId")
+        .and_then(Value::as_str)
+        .ok_or((
+            ERR_INVALID_PARAMS,
+            "session/set_config_option requires a configOptionId".to_string(),
+        ))?;
+    if option_id != "model" {
+        return Err((
+            ERR_INVALID_PARAMS,
+            format!("unknown config option: {option_id}"),
+        ));
+    }
+    if params.get("type").and_then(Value::as_str) == Some("boolean") {
+        return Err((
+            ERR_INVALID_PARAMS,
+            "option model is a select option, not a boolean".to_string(),
+        ));
+    }
+    let value_id = params.get("valueId").and_then(Value::as_str).ok_or((
+        ERR_INVALID_PARAMS,
+        "session/set_config_option for model requires a valueId".to_string(),
+    ))?;
+    // Valid values: the catalog ids, `auto` routing, and the model the
+    // session already runs (a custom model from settings stays
+    // selectable). Anything else is rejected, never silently mapped.
+    let current = session.current_model();
+    let valid = !value_id.is_empty()
+        && (value_id == "auto"
+            || value_id == current
+            || crate::models::catalog_entry(value_id).is_some());
+    if !valid {
+        return Err((ERR_INVALID_PARAMS, format!("unknown model: {value_id}")));
+    }
+    session.set_model(gateway_model_for_value_id(value_id));
+    Ok(session.config_options())
+}
+
+/// Timeout for a `session/request_permission` round-trip (M4): the
+/// default M2 timeout (30 s). A client that does not answer in time is
+/// treated as a refusal (fail closed, Q4), never as approval.
+const PERMISSION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The ACP prompter (M4): answers an agent permission question by
+/// round-tripping `session/request_permission` to the client and mapping
+/// the outcome onto Zen's `PromptAnswer`. The agent owns remembered
+/// decisions (ACP v1 Tool Calls doc): `allow_always` is persisted by the
+/// agent as an allow rule, `reject_always` in this prompter's
+/// per-session set, so neither asks the client again.
+///
+/// STUB (#8): Phase 2 #8 (Z Red) defines Zen's 6-mode permission model
+/// and the permission API #9 calls. That API does not exist in the repo
+/// yet (checked 17/11: no phase2-#8 branch, no permission-model API in
+/// zen-core/zen-agent), so M4 round-trips to the client directly
+/// against `PermissionMode`. When #8 lands, its API plugs in here.
+struct AcpPrompter {
+    state: Arc<AcpServerState>,
+    session_id: String,
+    /// Tools the user rejected with `reject_always` this session.
+    deny_always: Arc<Mutex<HashSet<String>>>,
+}
+
+impl AcpPrompter {
+    fn new(state: Arc<AcpServerState>, session_id: String) -> Self {
+        Self {
+            state,
+            session_id,
+            deny_always: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// The ACP tool kind for a permission request (M4): the agent's
+    /// read-only flag is authoritative for `read`; edit tools map to
+    /// `edit`, the shell to `execute`, everything else to `other` (the
+    /// kind is only a client UI hint).
+    fn tool_kind(tool_name: &str, read_only: bool) -> &'static str {
+        if read_only {
+            "read"
+        } else if zen_tools::permissions::is_edit_tool(tool_name) {
+            "edit"
+        } else if tool_name == "Bash" {
+            "execute"
+        } else {
+            "other"
+        }
+    }
+
+    /// Map a `session/request_permission` result onto a `PromptAnswer`
+    /// (M4): `cancelled` and both reject kinds deny; `allow_once`
+    /// allows this once; `allow_always` allows and the caller persists
+    /// it as an allow rule; `reject_always` denies and is remembered
+    /// here. Anything unrecognised denies: an outcome the agent does
+    /// not understand is never approval (ACP v1 Tool Calls doc,
+    /// security guidance).
+    fn map_permission_outcome(&self, result: &Value, tool_name: &str) -> PromptAnswer {
+        let outcome = result.get("outcome");
+        let kind = outcome
+            .and_then(|o| o.get("type").and_then(Value::as_str))
+            .unwrap_or("");
+        match kind {
+            "selected" => {
+                let option_id = outcome
+                    .and_then(|o| o.get("optionId").and_then(Value::as_str))
+                    .unwrap_or("");
+                match option_id {
+                    "allow_once" => PromptAnswer::Yes,
+                    "allow_always" => PromptAnswer::Always(tool_name.to_string()),
+                    "reject_once" => PromptAnswer::No,
+                    "reject_always" => {
+                        lock_or_recover(&self.deny_always, "acp deny_always")
+                            .insert(tool_name.to_string());
+                        PromptAnswer::No
+                    }
+                    other => {
+                        eprintln!("acp: unknown permission optionId {other:?}, denying");
+                        PromptAnswer::No
+                    }
+                }
+            }
+            "cancelled" => PromptAnswer::No,
+            other => {
+                eprintln!("acp: unknown permission outcome {other:?}, denying");
+                PromptAnswer::No
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl zen_core::AsyncPrompter for AcpPrompter {
+    async fn ask_permission(
+        &self,
+        tool_name: &str,
+        _input: &Value,
+        tool_call_id: &str,
+        read_only: bool,
+    ) -> PromptAnswer {
+        // A remembered reject_always answers without a round-trip: the
+        // agent owns the remembered decision (ACP v1 Tool Calls doc).
+        if lock_or_recover(&self.deny_always, "acp deny_always").contains(tool_name) {
+            return PromptAnswer::No;
+        }
+        // The tool input is not sent: the client already saw this tool
+        // call in the `tool_call` session update, and the request
+        // carries the same id so the client can match them.
+        let tool_call = ToolCallUpdate {
+            tool_call_id: tool_call_id.to_string(),
+            title: tool_name.to_string(),
+            kind: Some(Self::tool_kind(tool_name, read_only).to_string()),
+        };
+        let params = json!({
+            "sessionId": self.session_id,
+            "toolCall": tool_call,
+            "options": [
+                {"id": "allow_once", "name": "Allow once", "kind": "allow_once"},
+                {"id": "allow_always", "name": format!("Allow always for {tool_name}"), "kind": "allow_always"},
+                {"id": "reject_once", "name": "Reject once", "kind": "reject_once"},
+                {"id": "reject_always", "name": format!("Reject always for {tool_name}"), "kind": "reject_always"},
+            ],
+        });
+        match self
+            .state
+            .send_client_request(
+                "session/request_permission",
+                params,
+                PERMISSION_REQUEST_TIMEOUT,
+            )
+            .await
+        {
+            Ok(result) => self.map_permission_outcome(&result, tool_name),
+            Err(e) => {
+                // Fail closed (Q4): a timeout, a client error, or a
+                // disconnect is a refusal, never an approval.
+                eprintln!("acp: permission request for {tool_name} failed ({e}), denying");
+                PromptAnswer::No
+            }
+        }
     }
 }
 
@@ -1925,6 +2384,95 @@ mod tests {
         }
     }
 
+    /// A permission checker that asks for every tool (test double).
+    struct AskAll;
+
+    impl zen_core::PermissionChecker for AskAll {
+        fn check(
+            &self,
+            _tool_name: &str,
+            _input: &Value,
+            _read_only: bool,
+            _ctx: &zen_core::ToolContext,
+        ) -> zen_core::PermissionDecision {
+            zen_core::PermissionDecision::Ask
+        }
+    }
+
+    /// An async prompter that always answers Yes and records that it was
+    /// asked (test double for the ACP round-trip).
+    struct YesPrompter {
+        asked: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl zen_core::AsyncPrompter for YesPrompter {
+        async fn ask_permission(
+            &self,
+            _tool_name: &str,
+            _input: &Value,
+            _tool_call_id: &str,
+            _read_only: bool,
+        ) -> PromptAnswer {
+            self.asked.store(true, Ordering::SeqCst);
+            PromptAnswer::Yes
+        }
+    }
+
+    /// A fake LLM backend that answers with one Slow tool call and then
+    /// plain text (M4): exactly one permission question per turn.
+    struct OneToolCallLlm {
+        calls: AtomicU64,
+    }
+
+    impl Default for OneToolCallLlm {
+        fn default() -> Self {
+            Self {
+                calls: AtomicU64::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmBackend for OneToolCallLlm {
+        async fn chat(
+            &self,
+            _req: zen_core::ChatRequest,
+        ) -> anyhow::Result<zen_core::ChatResponse> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let usage = zen_core::Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            };
+            if n == 0 {
+                Ok(zen_core::ChatResponse {
+                    message: ChatMessage::assistant(
+                        Some("calling slow tool".into()),
+                        Some(vec![zen_core::ToolCall {
+                            id: "c1".into(),
+                            call_type: "function".into(),
+                            function: zen_core::FunctionCall {
+                                name: "Slow".into(),
+                                arguments: "{}".into(),
+                            },
+                        }]),
+                    ),
+                    usage,
+                    finish_reason: Some("stop".into()),
+                })
+            } else {
+                Ok(zen_core::ChatResponse {
+                    message: ChatMessage::assistant(Some("done".into()), None),
+                    usage,
+                    finish_reason: Some("stop".into()),
+                })
+            }
+        }
+    }
+
     /// Build a session backed by the delayed fake LLM and insert it into
     /// the test state, so dispatcher tests can run a real turn without a
     /// live LLM.
@@ -1968,6 +2516,8 @@ mod tests {
             tools: Arc::new(Mutex::new(HashMap::new())),
             pending_tools: Arc::new(Mutex::new(HashSet::new())),
         });
+        let mode = config.permission_mode;
+        let model = config.model.clone();
         let agent = zen_agent::Agent::new(
             llm,
             registry,
@@ -1978,9 +2528,44 @@ mod tests {
             zen_core::ToolContext::new(std::env::temp_dir(), session_id),
             config,
         );
-        let session = Arc::new(AcpSession::new(agent, sink));
+        let session = Arc::new(AcpSession::new(agent, sink, mode, String::new(), model));
         let mut sessions = lock_or_recover(&state.sessions, "acp sessions");
         sessions.insert(session_id.to_string(), session);
+    }
+
+    /// Build a session backed by the given fake LLM, tool registry and
+    /// permission checker, and return it (M4): the caller installs the
+    /// async prompter on the session's agent before driving prompts.
+    fn fake_session_with_checker(
+        state: &Arc<AcpServerState>,
+        session_id: &str,
+        llm: Arc<dyn LlmBackend>,
+        registry: zen_core::ToolRegistry,
+        permissions: Arc<dyn zen_core::PermissionChecker>,
+    ) -> Arc<AcpSession> {
+        let sink = Arc::new(AcpSink {
+            out: state.out.clone(),
+            session_id: session_id.into(),
+            tools: Arc::new(Mutex::new(HashMap::new())),
+            pending_tools: Arc::new(Mutex::new(HashSet::new())),
+        });
+        let config = zen_agent::AgentConfig::default();
+        let mode = config.permission_mode;
+        let model = config.model.clone();
+        let agent = zen_agent::Agent::new(
+            llm,
+            registry,
+            permissions,
+            None,
+            Arc::new(zen_core::NoHooks),
+            sink.clone(),
+            zen_core::ToolContext::new(std::env::temp_dir(), session_id),
+            config,
+        );
+        let session = Arc::new(AcpSession::new(agent, sink, mode, String::new(), model));
+        let mut sessions = lock_or_recover(&state.sessions, "acp sessions");
+        sessions.insert(session_id.to_string(), Arc::clone(&session));
+        session
     }
 
     /// M2 core property: while a prompt turn runs, the dispatcher keeps
@@ -2941,6 +3526,587 @@ mod tests {
         assert_eq!(cancelled.len(), 1, "{lines:?}");
         assert_eq!(cancelled[0]["params"]["update"]["toolCallId"], "c2");
     }
+
+    /// M4: `session/set_mode` switches the session mode, applies it to
+    /// the idle agent at once, and rejects unadvertised modes, unknown
+    /// modes and unknown sessions.
+    #[tokio::test]
+    async fn set_mode_roundtrip_via_dispatcher() {
+        let (state, buf) = test_state();
+        fake_session(&state, "s1", 0);
+        let run = drive_dispatcher(
+            Arc::clone(&state),
+            vec![
+                init_line(1),
+                json!({"jsonrpc": "2.0", "id": 2, "method": "session/set_mode", "params": {"sessionId": "s1", "modeId": "plan"}}).to_string(),
+                json!({"jsonrpc": "2.0", "id": 3, "method": "session/set_mode", "params": {"sessionId": "s1", "modeId": "bypassPermissions"}}).to_string(),
+                json!({"jsonrpc": "2.0", "id": 4, "method": "session/set_mode", "params": {"sessionId": "s1", "modeId": "bogus"}}).to_string(),
+                json!({"jsonrpc": "2.0", "id": 5, "method": "session/set_mode", "params": {"sessionId": "nope", "modeId": "plan"}}).to_string(),
+                json!({"jsonrpc": "2.0", "id": 6, "method": "session/set_mode", "params": {"sessionId": "s1", "modeId": "dontAsk"}}).to_string(),
+            ],
+        );
+        run.await.unwrap().unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 6).is_some()
+        })
+        .await;
+        let ok = find_response(&lines, 2).unwrap();
+        assert!(ok.get("error").is_none(), "{lines:?}");
+        assert_eq!(ok["result"], json!({}));
+        // The session runs in plan mode now, and the idle agent picked
+        // it up at once (config + checker mode).
+        {
+            let sessions = lock_or_recover(&state.sessions, "acp sessions");
+            let s = sessions.get("s1").unwrap();
+            assert_eq!(s.current_mode(), PermissionMode::Plan);
+            let agent = s.agent.try_lock().expect("agent must be idle");
+            assert_eq!(agent.config.permission_mode, PermissionMode::Plan);
+        }
+        let bypass = find_response(&lines, 3).unwrap();
+        assert_eq!(bypass["error"]["code"], -32602, "{lines:?}");
+        assert!(
+            bypass["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not advertised"),
+            "{lines:?}"
+        );
+        let bogus = find_response(&lines, 4).unwrap();
+        assert_eq!(bogus["error"]["code"], -32602, "{lines:?}");
+        assert!(
+            bogus["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown mode"),
+            "{lines:?}"
+        );
+        let unknown = find_response(&lines, 5).unwrap();
+        assert_eq!(unknown["error"]["code"], -32002, "{lines:?}");
+        let dont_ask = find_response(&lines, 6).unwrap();
+        assert_eq!(dont_ask["error"]["code"], -32602, "{lines:?}");
+        assert!(
+            dont_ask["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not advertised"),
+            "{lines:?}"
+        );
+    }
+
+    /// M4: `session/set_config_option` switches the model and answers
+    /// the full option list; bad values are -32602.
+    #[tokio::test]
+    async fn set_config_option_model_roundtrip_via_dispatcher() {
+        let (state, buf) = test_state();
+        fake_session(&state, "s1", 0);
+        let run = drive_dispatcher(
+            Arc::clone(&state),
+            vec![
+                init_line(1),
+                json!({"jsonrpc": "2.0", "id": 2, "method": "session/set_config_option", "params": {"sessionId": "s1", "configOptionId": "model", "valueId": "qwen/qwen3-coder:free"}}).to_string(),
+                json!({"jsonrpc": "2.0", "id": 3, "method": "session/set_config_option", "params": {"sessionId": "s1", "configOptionId": "model", "valueId": "no-such-model"}}).to_string(),
+                json!({"jsonrpc": "2.0", "id": 4, "method": "session/set_config_option", "params": {"sessionId": "s1", "configOptionId": "model", "type": "boolean", "value": true}}).to_string(),
+                json!({"jsonrpc": "2.0", "id": 5, "method": "session/set_config_option", "params": {"sessionId": "s1", "configOptionId": "bogus", "valueId": "x"}}).to_string(),
+                json!({"jsonrpc": "2.0", "id": 6, "method": "session/set_config_option", "params": {"sessionId": "nope", "configOptionId": "model", "valueId": "auto"}}).to_string(),
+            ],
+        );
+        run.await.unwrap().unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 6).is_some()
+        })
+        .await;
+        let ok = find_response(&lines, 2).unwrap();
+        assert!(ok.get("error").is_none(), "{lines:?}");
+        assert_eq!(
+            ok["result"]["configOptions"][0]["currentValue"], "qwen/qwen3-coder:free",
+            "{lines:?}"
+        );
+        {
+            let sessions = lock_or_recover(&state.sessions, "acp sessions");
+            let s = sessions.get("s1").unwrap();
+            assert_eq!(s.current_model(), "qwen/qwen3-coder:free");
+            let agent = s.agent.try_lock().expect("agent must be idle");
+            assert_eq!(agent.config.model, "qwen/qwen3-coder:free");
+        }
+        for (id, msg) in [
+            (3, "unknown model"),
+            (4, "not a boolean"),
+            (5, "unknown config option"),
+        ] {
+            let r = find_response(&lines, id).unwrap();
+            assert_eq!(r["error"]["code"], -32602, "{lines:?}");
+            assert!(
+                r["error"]["message"].as_str().unwrap().contains(msg),
+                "{lines:?}"
+            );
+        }
+        let unknown = find_response(&lines, 6).unwrap();
+        assert_eq!(unknown["error"]["code"], -32002, "{lines:?}");
+    }
+
+    /// M4: `session/set_config_option` accepts `auto` (auto-routing) and
+    /// the session's current model (a custom model from settings stays
+    /// selectable), not only catalog ids.
+    #[tokio::test]
+    async fn set_config_option_accepts_auto_and_current_model() {
+        let (state, buf) = test_state();
+        fake_session(&state, "s1", 0);
+        fake_session_with_config(
+            &state,
+            "s2",
+            Arc::new(DelayedLlm { delay_ms: 0 }),
+            zen_core::ToolRegistry::new(),
+            zen_agent::AgentConfig {
+                model: "my-custom-model".to_string(),
+                ..Default::default()
+            },
+        );
+        let run = drive_dispatcher(
+            Arc::clone(&state),
+            vec![
+                init_line(1),
+                json!({"jsonrpc": "2.0", "id": 2, "method": "session/set_config_option", "params": {"sessionId": "s1", "configOptionId": "model", "valueId": "auto"}}).to_string(),
+                json!({"jsonrpc": "2.0", "id": 3, "method": "session/set_config_option", "params": {"sessionId": "s2", "configOptionId": "model", "valueId": "my-custom-model"}}).to_string(),
+            ],
+        );
+        run.await.unwrap().unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 3).is_some()
+        })
+        .await;
+        let auto = find_response(&lines, 2).unwrap();
+        assert!(auto.get("error").is_none(), "{lines:?}");
+        assert_eq!(
+            auto["result"]["configOptions"][0]["currentValue"], "auto",
+            "{lines:?}"
+        );
+        let custom = find_response(&lines, 3).unwrap();
+        assert!(custom.get("error").is_none(), "{lines:?}");
+        assert_eq!(
+            custom["result"]["configOptions"][0]["currentValue"], "my-custom-model",
+            "{lines:?}"
+        );
+        let sessions = lock_or_recover(&state.sessions, "acp sessions");
+        assert_eq!(sessions.get("s1").unwrap().current_model(), "auto");
+        assert_eq!(
+            sessions.get("s2").unwrap().current_model(),
+            "my-custom-model"
+        );
+    }
+
+    /// M4: a fake session advertises exactly the three Q3 modes and a
+    /// model select whose current value is always one of its options.
+    #[test]
+    fn session_advertises_modes_and_model_option() {
+        let (state, _buf) = test_state();
+        fake_session(&state, "s1", 0);
+        let sessions = lock_or_recover(&state.sessions, "acp sessions");
+        let s = sessions.get("s1").unwrap();
+        let modes = s.modes_state();
+        assert_eq!(modes["currentModeId"], "default", "{modes:?}");
+        let ids: Vec<&str> = modes["availableModes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["default", "plan", "acceptEdits"], "{modes:?}");
+        assert!(
+            !modes.to_string().contains("bypassPermissions")
+                && !modes.to_string().contains("dontAsk"),
+            "{modes:?}"
+        );
+        let options = s.config_options();
+        let model = &options[0];
+        assert_eq!(model["id"], "model");
+        assert_eq!(model["type"], "select");
+        let current = model["currentValue"].as_str().unwrap();
+        assert!(
+            model["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o["id"].as_str() == Some(current)),
+            "{options:?}"
+        );
+        // The fake session has no model, so the value falls back to the
+        // default catalog entry.
+        assert_eq!(current, "deepseek-v4.1-flash", "{options:?}");
+    }
+
+    /// M4: the outcome mapping for `session/request_permission` is
+    /// pure: every shape the client may answer maps to exactly one
+    /// `PromptAnswer`, and anything unrecognised denies.
+    #[test]
+    fn permission_outcome_mapping() {
+        let (state, _buf) = test_state();
+        let prompter = AcpPrompter::new(Arc::clone(&state), "s1".to_string());
+        let selected =
+            |option_id: &str| json!({"outcome": {"type": "selected", "optionId": option_id}});
+        assert_eq!(
+            prompter.map_permission_outcome(&selected("allow_once"), "Read"),
+            PromptAnswer::Yes
+        );
+        assert_eq!(
+            prompter.map_permission_outcome(&selected("allow_always"), "Read"),
+            PromptAnswer::Always("Read".to_string())
+        );
+        assert_eq!(
+            prompter.map_permission_outcome(&selected("reject_once"), "Read"),
+            PromptAnswer::No
+        );
+        assert_eq!(
+            prompter.map_permission_outcome(&selected("reject_always"), "Read"),
+            PromptAnswer::No
+        );
+        assert_eq!(
+            prompter.map_permission_outcome(&json!({"outcome": {"type": "cancelled"}}), "Read"),
+            PromptAnswer::No
+        );
+        assert_eq!(
+            prompter.map_permission_outcome(&selected("bogus"), "Read"),
+            PromptAnswer::No
+        );
+        assert_eq!(
+            prompter.map_permission_outcome(&json!({}), "Read"),
+            PromptAnswer::No
+        );
+        assert_eq!(
+            prompter.map_permission_outcome(&json!({"outcome": {"type": "weird"}}), "Read"),
+            PromptAnswer::No
+        );
+    }
+
+    /// M4: the permission round-trip over a fake client: the request
+    /// carries the session id, the tool call id and the four options,
+    /// and each outcome maps as specified.
+    #[tokio::test]
+    async fn acp_prompter_roundtrip_with_fake_client() {
+        let (state, buf) = test_state();
+        let prompter = Arc::new(AcpPrompter::new(Arc::clone(&state), "s1".to_string()));
+        let mut answered = 0usize;
+        for (result, expected) in [
+            (
+                json!({"outcome": {"type": "selected", "optionId": "allow_once"}}),
+                PromptAnswer::Yes,
+            ),
+            (
+                json!({"outcome": {"type": "selected", "optionId": "allow_always"}}),
+                PromptAnswer::Always("Bash".to_string()),
+            ),
+            (
+                json!({"outcome": {"type": "selected", "optionId": "reject_once"}}),
+                PromptAnswer::No,
+            ),
+            (json!({"outcome": {"type": "cancelled"}}), PromptAnswer::No),
+        ] {
+            let asked = tokio::spawn({
+                let prompter = Arc::clone(&prompter);
+                async move {
+                    use zen_core::AsyncPrompter;
+                    prompter
+                        .ask_permission("Bash", &json!({"command": "ls"}), "c1", false)
+                        .await
+                }
+            });
+            let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+                ls.iter()
+                    .filter(|l| {
+                        l.get("method").and_then(Value::as_str)
+                            == Some("session/request_permission")
+                    })
+                    .count()
+                    > answered
+            })
+            .await;
+            let requests: Vec<&Value> = lines
+                .iter()
+                .filter(|l| {
+                    l.get("method").and_then(Value::as_str) == Some("session/request_permission")
+                })
+                .collect();
+            answered = requests.len();
+            let request = requests.last().expect("permission request must be written");
+            assert_eq!(request["params"]["sessionId"], "s1", "{request:?}");
+            assert_eq!(
+                request["params"]["toolCall"]["toolCallId"], "c1",
+                "{request:?}"
+            );
+            assert_eq!(
+                request["params"]["toolCall"]["title"], "Bash",
+                "{request:?}"
+            );
+            assert_eq!(
+                request["params"]["toolCall"]["kind"], "execute",
+                "{request:?}"
+            );
+            assert_eq!(
+                request["params"]["options"].as_array().unwrap().len(),
+                4,
+                "{request:?}"
+            );
+            let id = request["id"].clone();
+            assert!(route_client_response(
+                &state,
+                &json!({"jsonrpc": "2.0", "id": id, "result": result}),
+            ));
+            assert_eq!(asked.await.unwrap(), expected);
+        }
+    }
+
+    /// M4: `reject_always` is remembered for the session: the second
+    /// identical question is denied without a second round-trip.
+    #[tokio::test]
+    async fn acp_prompter_reject_always_is_remembered() {
+        let (state, buf) = test_state();
+        let prompter = Arc::new(AcpPrompter::new(Arc::clone(&state), "s1".to_string()));
+        let ask_once = |prompter: Arc<AcpPrompter>| {
+            tokio::spawn(async move {
+                use zen_core::AsyncPrompter;
+                prompter
+                    .ask_permission("Bash", &json!({}), "c1", false)
+                    .await
+            })
+        };
+        let first = ask_once(Arc::clone(&prompter));
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            ls.iter().any(|l| {
+                l.get("method").and_then(Value::as_str) == Some("session/request_permission")
+            })
+        })
+        .await;
+        let id = lines
+            .iter()
+            .find(|l| l.get("method").and_then(Value::as_str) == Some("session/request_permission"))
+            .unwrap()["id"]
+            .clone();
+        assert!(route_client_response(
+            &state,
+            &json!({"jsonrpc": "2.0", "id": id, "result": {"outcome": {"type": "selected", "optionId": "reject_always"}}}),
+        ));
+        assert_eq!(first.await.unwrap(), PromptAnswer::No);
+        // Second ask: no request is written at all.
+        let second = ask_once(Arc::clone(&prompter));
+        assert_eq!(second.await.unwrap(), PromptAnswer::No);
+        let lines = read_output_lines(&buf);
+        let requests = lines
+            .iter()
+            .filter(|l| {
+                l.get("method").and_then(Value::as_str) == Some("session/request_permission")
+            })
+            .count();
+        assert_eq!(requests, 1, "{lines:?}");
+    }
+
+    /// M4: a client error answering the permission request denies
+    /// (fail closed, Q4) instead of waiting for an answer that never
+    /// comes.
+    #[tokio::test]
+    async fn acp_prompter_fail_closed_on_client_error() {
+        let (state, buf) = test_state();
+        let prompter = AcpPrompter::new(Arc::clone(&state), "s1".to_string());
+        let asked = tokio::spawn(async move {
+            use zen_core::AsyncPrompter;
+            prompter
+                .ask_permission("Bash", &json!({}), "c1", false)
+                .await
+        });
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            ls.iter().any(|l| {
+                l.get("method").and_then(Value::as_str) == Some("session/request_permission")
+            })
+        })
+        .await;
+        let id = lines
+            .iter()
+            .find(|l| l.get("method").and_then(Value::as_str) == Some("session/request_permission"))
+            .unwrap()["id"]
+            .clone();
+        assert!(route_client_response(
+            &state,
+            &json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "no such method"}}),
+        ));
+        assert_eq!(asked.await.unwrap(), PromptAnswer::No);
+    }
+
+    /// M4: a set_mode that arrives while a turn runs is accepted at
+    /// once and applies at the next turn start (the running turn keeps
+    /// the mode it started with).
+    #[tokio::test]
+    async fn set_mode_during_turn_applies_at_next_turn() {
+        let (state, buf) = test_state();
+        fake_session(&state, "s1", 800);
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        let cli = Cli::try_parse_from(["zen"]).unwrap();
+        let _run = tokio::spawn(run_dispatcher(
+            cli,
+            std::env::temp_dir(),
+            None,
+            Arc::clone(&state),
+            rx,
+        ));
+        tx.send(init_line(1)).unwrap();
+        tx.send(
+            json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": "s1", "prompt": [{"type": "text", "text": "one"}]}})
+                .to_string(),
+        )
+        .unwrap();
+        // The mode switch arrives while the 800 ms turn runs.
+        tx.send(
+            json!({"jsonrpc": "2.0", "id": 3, "method": "session/set_mode", "params": {"sessionId": "s1", "modeId": "plan"}})
+                .to_string(),
+        )
+        .unwrap();
+        // The set_mode answer must not wait for the turn.
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 3).is_some()
+        })
+        .await;
+        let mode_resp = find_response(&lines, 3).unwrap();
+        assert!(mode_resp.get("error").is_none(), "{lines:?}");
+        assert_eq!(mode_resp["result"], json!({}));
+        // The mode is recorded while the turn still runs in Default.
+        {
+            let sessions = lock_or_recover(&state.sessions, "acp sessions");
+            let s = sessions.get("s1").unwrap();
+            assert_eq!(s.current_mode(), PermissionMode::Plan);
+        }
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some()
+        })
+        .await;
+        assert_eq!(
+            find_response(&lines, 2).unwrap()["result"]["stopReason"],
+            "end_turn",
+            "{lines:?}"
+        );
+        // Wait for the turn task to drop its guard before the next prompt.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let running = {
+                let sessions = lock_or_recover(&state.sessions, "acp sessions");
+                sessions
+                    .get("s1")
+                    .map(|s| s.prompt_running.load(Ordering::SeqCst))
+                    .unwrap_or(false)
+            };
+            if !running {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "prompt_running never cleared after the first turn"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tx.send(
+            json!({"jsonrpc": "2.0", "id": 4, "method": "session/prompt", "params": {"sessionId": "s1", "prompt": [{"type": "text", "text": "two"}]}})
+                .to_string(),
+        )
+        .unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 4).is_some()
+        })
+        .await;
+        assert_eq!(
+            find_response(&lines, 4).unwrap()["result"]["stopReason"],
+            "end_turn",
+            "{lines:?}"
+        );
+        // The second turn applied the recorded mode at its start.
+        let sessions = lock_or_recover(&state.sessions, "acp sessions");
+        let s = sessions.get("s1").unwrap();
+        let agent = s.agent.try_lock().expect("agent must be idle");
+        assert_eq!(agent.config.permission_mode, PermissionMode::Plan);
+    }
+
+    /// M4: the agent installed as a session's async prompter is the one
+    /// a turn asks: with an Ask checker and a Yes prompter, the Slow tool
+    /// runs and the turn ends end_turn. (Without the setter the agent has
+    /// no prompter, the Ask denies, and the tool never runs.)
+    #[tokio::test]
+    async fn async_prompter_is_consulted_during_turn() {
+        let (state, buf) = test_state();
+        let asked = Arc::new(AtomicBool::new(false));
+        let mut registry = zen_core::ToolRegistry::new();
+        registry.register(Arc::new(SlowTool { ms: 0 }));
+        let session = fake_session_with_checker(
+            &state,
+            "s1",
+            Arc::new(OneToolCallLlm::default()),
+            registry,
+            Arc::new(AskAll),
+        );
+        {
+            let mut agent = session.agent.lock().await;
+            agent.set_async_prompter(Arc::new(YesPrompter {
+                asked: Arc::clone(&asked),
+            }));
+        }
+        let run = drive_dispatcher(
+            Arc::clone(&state),
+            vec![
+                init_line(1),
+                json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": "s1", "prompt": [{"type": "text", "text": "hi"}]}}).to_string(),
+            ],
+        );
+        run.await.unwrap().unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some()
+        })
+        .await;
+        assert_eq!(
+            find_response(&lines, 2).unwrap()["result"]["stopReason"],
+            "end_turn",
+            "{lines:?}"
+        );
+        assert!(
+            asked.load(Ordering::SeqCst),
+            "the async prompter must have been asked"
+        );
+        // The tool ran: its result is in the tool_call_update stream.
+        assert!(
+            lines
+                .iter()
+                .any(|l| l["params"]["update"]["status"] == "completed"),
+            "{lines:?}"
+        );
+    }
+
+    /// M4: a model outside the catalog is listed verbatim in the model
+    /// config option so the client can show it and switch back to it,
+    /// with no duplicate ids.
+    #[test]
+    fn model_config_option_lists_custom_model_verbatim() {
+        let opt = model_config_option("my-custom-model");
+        assert_eq!(opt["currentValue"], "my-custom-model");
+        let options = opt["options"].as_array().unwrap();
+        let ids: Vec<&str> = options
+            .iter()
+            .filter_map(|o| o.get("id").and_then(Value::as_str))
+            .collect();
+        assert!(ids.contains(&"my-custom-model"), "{ids:?}");
+        assert!(ids.contains(&"auto"), "{ids:?}");
+        let mut seen = ids.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), ids.len(), "no duplicate option ids: {ids:?}");
+    }
+
+    /// M4: a catalog model is listed exactly once in the model config
+    /// option (the verbatim-push guard must not fire for it).
+    #[test]
+    fn model_config_option_lists_catalog_model_once() {
+        let first = crate::models::FREE_MODEL_CATALOG.first().unwrap();
+        let opt = model_config_option(first.gateway_id);
+        assert_eq!(opt["currentValue"], first.id);
+        let options = opt["options"].as_array().unwrap();
+        let count = options
+            .iter()
+            .filter(|o| o.get("id").and_then(Value::as_str) == Some(first.id))
+            .count();
+        assert_eq!(count, 1, "{options:?}");
+    }
 }
 
 // Tests added for Việc A (floor coverage 88%): the AcpSink::emit arms
@@ -3100,13 +4266,15 @@ mod viec_a_tests {
         let out = Arc::new(Mutex::new(
             Box::new(std::io::stdout()) as Box<dyn Write + Send>
         ));
+        let state = Arc::new(AcpServerState::new(out));
         let cwd = std::env::temp_dir();
-        let err = match handle_session_new(&cli, &cwd, None, &json!({"cwd": "relative/path"}), &out)
-            .await
-        {
-            Ok(_) => panic!("relative cwd must fail"),
-            Err(e) => e,
-        };
+        let err =
+            match handle_session_new(&cli, &cwd, None, &json!({"cwd": "relative/path"}), &state)
+                .await
+            {
+                Ok(_) => panic!("relative cwd must fail"),
+                Err(e) => e,
+            };
         assert!(
             err.to_string().contains("ACP requires absolute paths"),
             "{err}"

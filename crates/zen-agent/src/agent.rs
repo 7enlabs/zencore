@@ -291,6 +291,11 @@ pub struct Agent {
 
     pub prompter: Option<Arc<dyn Prompter>>,
 
+    /// Async prompter (M4, Phase 2 #9): set by the ACP server so a
+    /// permission question round-trips to the client instead of the
+    /// terminal. Preferred over `prompter` when present.
+    pub async_prompter: Option<Arc<dyn AsyncPrompter>>,
+
     pub hooks: Arc<dyn HookRunner>,
 
     pub sink: Arc<dyn EventSink>,
@@ -355,6 +360,7 @@ impl Agent {
             tools,
             permissions,
             prompter,
+            async_prompter: None,
             hooks,
             sink,
             ctx,
@@ -394,6 +400,30 @@ impl Agent {
 
     pub fn set_stop_hook_max_continues(&mut self, n: usize) {
         self.stop_hook_max_continues = n.max(1);
+    }
+
+    /// Install the async prompter (M4): the ACP server calls this right
+    /// after construction so permission questions round-trip to the
+    /// client. A later call replaces the prompter.
+    pub fn set_async_prompter(&mut self, prompter: Arc<dyn AsyncPrompter>) {
+        self.async_prompter = Some(prompter);
+    }
+
+    /// Apply a prompter's answer: `None` means the tool may run,
+    /// `Some(reason)` means it is denied. Shared by the sync REPL
+    /// prompter and the async ACP prompter (M4), so both map an
+    /// `Always` answer to a persisted allow rule the same way.
+    fn apply_prompt_answer(&self, answer: PromptAnswer, tool_name: &str) -> Option<String> {
+        match answer {
+            PromptAnswer::Yes => None,
+            PromptAnswer::Always(rules) => {
+                for rule in rules.lines() {
+                    self.permissions.add_allow_rule(rule);
+                }
+                None
+            }
+            PromptAnswer::No => Some(format!("User denied permission for '{tool_name}'")),
+        }
     }
 
     pub fn tools_for_request(&self) -> Vec<ToolDefinition> {
@@ -1510,31 +1540,41 @@ impl Agent {
                 allowed = false;
                 deny_reason = reason;
             }
-            PermissionDecision::Ask => match self.prompter.clone() {
-                Some(p) => {
+            PermissionDecision::Ask => {
+                // The async prompter wins when present (M4): the ACP
+                // server round-trips the question to the client. The
+                // sync terminal prompter is the REPL path; with neither,
+                // a headless run cannot ask, so it denies.
+                let answer = if let Some(ap) = self.async_prompter.clone() {
                     self.notify_permission_prompt(&tool_name).await;
-                    match p.ask_permission(&tool_name, &args) {
-                        PromptAnswer::Yes => {}
-
-                        PromptAnswer::Always(rules) => {
-                            for rule in rules.lines() {
-                                self.permissions.add_allow_rule(rule)
-                            }
+                    Some(
+                        ap.ask_permission(&tool_name, &args, &tool_use_id, read_only)
+                            .await,
+                    )
+                } else {
+                    match self.prompter.clone() {
+                        Some(p) => {
+                            self.notify_permission_prompt(&tool_name).await;
+                            Some(p.ask_permission(&tool_name, &args))
                         }
-                        PromptAnswer::No => {
+                        None => None,
+                    }
+                };
+                match answer {
+                    Some(answer) => {
+                        if let Some(reason) = self.apply_prompt_answer(answer, &tool_name) {
                             allowed = false;
-                            deny_reason = format!("User denied permission for '{}'", tool_name);
+                            deny_reason = reason;
                         }
                     }
+                    None => {
+                        allowed = false;
+                        deny_reason = format!(
+                            "Permission required for '{tool_name}' in non-interactive mode"
+                        );
+                    }
                 }
-                None => {
-                    allowed = false;
-                    deny_reason = format!(
-                        "Permission required for '{}' in non-interactive mode",
-                        tool_name
-                    );
-                }
-            },
+            }
         }
         if !allowed {
             let denied = self

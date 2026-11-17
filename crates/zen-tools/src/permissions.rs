@@ -253,7 +253,9 @@ enum RuleKind {
     Deny,
 }
 
-fn is_edit_tool(name: &str) -> bool {
+/// Whether the named tool edits files (M4: the ACP prompter maps it
+/// to the `edit` tool kind in `session/request_permission`).
+pub fn is_edit_tool(name: &str) -> bool {
     matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit")
 }
 
@@ -546,7 +548,10 @@ fn bash_parts(tool_name: &str, input: &Value) -> Option<Option<Vec<String>>> {
 }
 
 pub struct RulePermissions {
-    pub mode: PermissionMode,
+    /// The mode decisions are evaluated under. A Mutex (not a plain
+    /// field) so `session/set_mode` can change it through the shared
+    /// `Arc<dyn PermissionChecker>` after construction (M4, Phase 2 #9).
+    mode: Mutex<PermissionMode>,
     pub allow: Vec<String>,
     pub ask: Vec<String>,
     pub deny: Vec<String>,
@@ -568,13 +573,18 @@ impl RulePermissions {
         let mut deny = settings.deny.clone();
         deny.extend(cli_deny);
         Self {
-            mode,
+            mode: Mutex::new(mode),
             allow,
             ask: settings.ask.clone(),
             deny,
             local_settings_path,
             dynamic_allow: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The mode decisions are currently evaluated under (M4).
+    pub fn current_mode(&self) -> PermissionMode {
+        *lock_or_recover(&self.mode, "mode")
     }
 
     pub fn effective_allow(&self) -> Vec<String> {
@@ -638,7 +648,7 @@ impl RulePermissions {
             return PermissionDecision::Deny(format!("Denied by rule '{}'", rule));
         }
 
-        if self.mode == PermissionMode::Plan && !read_only {
+        if self.current_mode() == PermissionMode::Plan && !read_only {
             return PermissionDecision::Deny(
                 "plan mode: only read-only tools are available".into(),
             );
@@ -650,7 +660,7 @@ impl RulePermissions {
 
         let allowed = allow_covers(&self.effective_allow(), tool_name, input, &cwd);
 
-        if self.mode == PermissionMode::BypassPermissions {
+        if self.current_mode() == PermissionMode::BypassPermissions {
             return PermissionDecision::Allow;
         }
 
@@ -661,7 +671,7 @@ impl RulePermissions {
         if read_only || tool_is_read_only(tool_name) {
             return PermissionDecision::Allow;
         }
-        match self.mode {
+        match self.current_mode() {
             PermissionMode::AcceptEdits => {
                 let is_edit = is_edit_tool(tool_name);
                 if is_edit && self.path_inside_workdir(input, ctx) {
@@ -685,7 +695,7 @@ impl RulePermissions {
     }
 
     fn resolve_ask(&self, reason: String) -> PermissionDecision {
-        match self.mode {
+        match self.current_mode() {
             PermissionMode::DontAsk => {
                 PermissionDecision::Deny(format!("{} (dontAsk mode denies prompts)", reason))
             }
@@ -710,6 +720,10 @@ impl PermissionChecker for RulePermissions {
 
     fn ask_rule_matches(&self, tool_name: &str, input: &Value, ctx: &ToolContext) -> bool {
         any_rule(&self.ask, tool_name, input, &ctx.cwd(), RuleKind::Ask).is_some()
+    }
+
+    fn set_mode(&self, mode: PermissionMode) {
+        *lock_or_recover(&self.mode, "mode") = mode;
     }
 
     fn add_allow_rule(&self, rule: &str) {
@@ -1392,6 +1406,34 @@ mod permission_tests {
             false,
             &ctx
         )));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M4: `set_mode` moves the checker between modes, so a session
+    /// that switches mode mid-conversation gets the new mode's
+    /// decisions from the next tool call on.
+    #[test]
+    fn set_mode_changes_permission_decisions() {
+        let dir = tmpdir("m4-set-mode");
+        let ctx = ctx_for(&dir);
+        let perms = perms(PermissionMode::Default, &[], &[], &[], None);
+        let edit = serde_json::json!({"file_path": "x.rs"});
+        // Default mode asks for a non-read-only edit tool.
+        assert!(is_ask(&perms.check("Edit", &edit, false, &ctx)));
+        // Plan mode denies it outright (read-only tools only).
+        perms.set_mode(PermissionMode::Plan);
+        assert_eq!(perms.current_mode(), PermissionMode::Plan);
+        assert!(matches!(
+            perms.check("Edit", &edit, false, &ctx),
+            PermissionDecision::Deny(_)
+        ));
+        // AcceptEdits allows an edit inside the workdir...
+        perms.set_mode(PermissionMode::AcceptEdits);
+        assert!(is_allow(&perms.check("Edit", &edit, false, &ctx)));
+        // ...and still asks for a shell command that is not a simple
+        // filesystem command.
+        let bash = serde_json::json!({"command": "cargo test"});
+        assert!(is_ask(&perms.check("Bash", &bash, false, &ctx)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
