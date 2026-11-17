@@ -5162,8 +5162,9 @@ mod tests {
         let sessions = listed["sessions"].as_array().unwrap();
         assert_eq!(sessions.len(), 1, "{listed:?}");
         assert_eq!(sessions[0]["sessionId"], "s1");
+        let absent = std::env::temp_dir().join("nonexistent-dir-xyz");
         let listed =
-            handle_session_list(&state, None, &json!({"cwd": "/nonexistent-dir-xyz"})).unwrap();
+            handle_session_list(&state, None, &json!({"cwd": absent.to_string_lossy()})).unwrap();
         assert_eq!(listed["sessions"], json!([]), "{listed:?}");
     }
 
