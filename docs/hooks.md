@@ -539,7 +539,7 @@ order wins; feedback and system messages are joined with newlines.
 | `CwdChanged` | the working directory changed during a turn | `old_cwd`, `new_cwd` |
 | `DirectoryAdded` | `/add-dir` added a directory (REPL); matcher target is `slash_command` | `directory`, `source` |
 | `FileChanged` | a watched file changed (REPL polling); matcher target is the filename | `file_path`, `event` (`change` \| `add` \| `unlink`) |
-| `WorktreeCreate` / `WorktreeRemove` | `/worktree` create / remove (REPL) | `worktree_path` (create), `worktree` (remove) |
+| `WorktreeCreate` / `WorktreeRemove` | `/worktree` create / remove (REPL) | `worktree_path` (create), `worktree_path` (remove) |
 | `PreModelSwitch` / `PostModelSwitch` | before / after a model switch (REPL); Post also fires for automatic changes | `from_model`, `to_model`, `requested_model`, `source`, `context_tokens` |
 | `Elicitation` / `ElicitationResult` | no trigger yet (ZenCode has no MCP elicitation) | - |
 | `PermissionRequest` / `PermissionDenied` | a permission prompt is about to be decided / was denied | `tool_name`, `tool_input`, `tool_use_id` (+ `reason` for `PermissionDenied`) |
