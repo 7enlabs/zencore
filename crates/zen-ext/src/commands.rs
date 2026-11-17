@@ -246,7 +246,7 @@ fn inline_files(text: &str, base: &Path) -> String {
     let mut prev_ws = true;
     let mut i = 0;
     while i < text.len() {
-        let c = text[i..].chars().next().unwrap();
+        let c = text[i..].chars().next().expect("expected value to be present");
         if c == '@' && prev_ws {
             let end = text[i + 1..]
                 .find(|ch: char| ch.is_whitespace())

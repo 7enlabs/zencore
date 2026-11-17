@@ -674,7 +674,7 @@ fn read_mcp_file(path: &Path) -> Value {
         .unwrap_or(false)
     {
         root.as_object_mut()
-            .unwrap()
+            .expect("expected value to be present")
             .insert("mcpServers".to_string(), Value::Object(Default::default()));
     }
     root

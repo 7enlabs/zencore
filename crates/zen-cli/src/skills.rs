@@ -674,7 +674,7 @@ fn clone_skill_repo(url: &str, dest: &Path) -> Result<(String, Option<String>)> 
         }
     }
     if candidates.len() == 1 {
-        let skill_dir = candidates.pop().unwrap();
+        let skill_dir = candidates.pop().expect("expected value to be present");
         let name = skill_dir
             .file_name()
             .map(|n| n.to_string_lossy().to_string())

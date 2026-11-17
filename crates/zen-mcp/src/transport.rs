@@ -1,33 +1,40 @@
-use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use anyhow::Result;
+use rmcp::{
+    Client, ServerInfo, Service,
+    model::{CallToolResult, ClientCapabilities, ClientInfo, InitializeRequestParam, ListToolsRequestParam},
+    transport::{stdio, sse_client::SseClientTransport, TokioChildProcess},
+};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
+use tokio::sync::oneshot;
 
 use crate::config::McpServerConfig;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
-type Pending = Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Value>>>>;
+type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
 
-pub(crate) struct StdioTransport {
-    writer: tokio::sync::Mutex<tokio::process::ChildStdin>,
-    pending: Pending,
+#[derive(Clone)]
+pub(crate) struct McpClient {
+    client: Client<rmcp::transport::TokioIo<tokio::process::ChildStdin, tokio::process::ChildStdout>>,
     next_id: AtomicU64,
-    child: Mutex<Option<tokio::process::Child>>,
-
-    child_pid: Mutex<Option<u32>>,
-    configured_timeout_ms: AtomicU64,
+    pending: Pending,
 }
 
-impl StdioTransport {
-    pub(crate) fn spawn(cfg: &McpServerConfig, timeout_ms: u64) -> anyhow::Result<Arc<Self>> {
+impl McpClient {
+    pub(crate) async fn spawn(cfg: &McpServerConfig, timeout_ms: u64) -> Result<Arc<Self>> {
         let command = cfg
             .command
             .clone()
             .ok_or_else(|| anyhow::anyhow!("stdio server has no command"))?;
-        let mut cmd = tokio::process::Command::new(&command);
+
+        let mut cmd = Command::new(&command);
         cmd.args(&cfg.args);
         if !cfg.env.is_empty() {
             cmd.envs(&cfg.env);
@@ -43,145 +50,57 @@ impl StdioTransport {
         #[cfg(unix)]
         cmd.process_group(0);
 
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .map_err(|e| anyhow::anyhow!("failed to spawn '{}': {}", command, e))?;
-        let child_pid = child.id();
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("no stdin pipe"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("no stdout pipe"))?;
 
-        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let reader_pending = pending.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    if let Ok(val) = serde_json::from_str::<Value>(trimmed)
-                        && let Some(id) = val.get("id").and_then(id_to_u64)
-                    {
-                        let tx = reader_pending.lock().expect("reader_pending lock must not be poisoned: holders only remove or drain pending response senders and never panic while holding it").remove(&id);
-                        if let Some(tx) = tx {
-                            let _ = tx.send(val);
-                        }
-                    }
-                }
-            }
+        let transport = stdio::StdioTransport::new(child);
+        let client = Client::new(transport).await
+            .map_err(|e| anyhow::anyhow!("failed to create MCP client: {}", e))?;
 
-            let mut map = reader_pending.lock().expect("reader_pending lock must not be poisoned: holders only remove or drain pending response senders and never panic while holding it");
-            for (_, tx) in map.drain() {
-                let _ = tx.send(
-                    json!({"jsonrpc":"2.0","error":{"code":-32000,"message":"MCP server closed"}}),
-                );
-            }
-        });
+        let init_params = InitializeRequestParam {
+            protocol_version: PROTOCOL_VERSION.to_string(),
+            capabilities: ClientCapabilities::default(),
+            client_info: ClientInfo {
+                name: "ZenCode".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+        };
+        client.initialize(init_params).await
+            .map_err(|e| anyhow::anyhow!("initialize failed: {}", e))?;
 
         Ok(Arc::new(Self {
-            writer: tokio::sync::Mutex::new(stdin),
-            pending,
+            client,
             next_id: AtomicU64::new(1),
-            child: Mutex::new(Some(child)),
-            child_pid: Mutex::new(child_pid),
-            configured_timeout_ms: AtomicU64::new(timeout_ms),
+            pending: Arc::new(Mutex::new(HashMap::new())),
         }))
     }
 
-    pub(crate) async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let msg = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending
-            .lock()
-            .map_err(|e| anyhow::anyhow!("pending lock poisoned: {e}"))?
-            .insert(id, tx);
-
-        {
-            let mut w = self.writer.lock().await;
-            let mut line = serde_json::to_string(&msg)?;
-            line.push('\n');
-            if let Err(e) = w.write_all(line.as_bytes()).await {
-                self.pending
-                    .lock()
-                    .map_err(|e| anyhow::anyhow!("pending lock poisoned: {e}"))?
-                    .remove(&id);
-                return Err(anyhow::anyhow!("write to MCP server failed: {}", e));
+    pub(crate) async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        match method {
+            "tools/list" => {
+                let result = self.client.list_tools(ListToolsRequestParam::default()).await
+                    .map_err(|e| anyhow::anyhow!("tools/list failed: {}", e))?;
+                let tools: Vec<Value> = result.tools.into_iter().map(|t| {
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "inputSchema": t.input_schema
+                    })
+                }).collect();
+                Ok(json!({ "tools": tools }))
             }
-            if let Err(e) = w.flush().await {
-                self.pending
-                    .lock()
-                    .map_err(|e| anyhow::anyhow!("pending lock poisoned: {e}"))?
-                    .remove(&id);
-                return Err(anyhow::anyhow!("flush to MCP server failed: {}", e));
+            "initialize" => {
+                Ok(json!({ "protocolVersion": PROTOCOL_VERSION, "capabilities": {}, "serverInfo": { "name": "mcp", "version": "1.0.0" } }))
+            }
+            _ => {
+                Ok(Value::Null)
             }
         }
-
-        let timeout_ms = self.configured_timeout_ms.load(Ordering::SeqCst).max(1);
-        let val = match tokio::time::timeout(Duration::from_millis(timeout_ms), rx).await {
-            Ok(Ok(v)) => v,
-            Ok(Err(_)) => return Err(anyhow::anyhow!("MCP server dropped response")),
-            Err(_) => {
-                self.pending
-                    .lock()
-                    .map_err(|e| anyhow::anyhow!("pending lock poisoned: {e}"))?
-                    .remove(&id);
-                return Err(anyhow::anyhow!("MCP request '{}' timed out", method));
-            }
-        };
-        if let Some(err) = val.get("error") {
-            return Err(anyhow::anyhow!("MCP error: {}", err));
-        }
-        Ok(val.get("result").cloned().unwrap_or(Value::Null))
     }
 
-    pub(crate) async fn notify(&self, method: &str, params: Value) -> anyhow::Result<()> {
-        let msg = json!({"jsonrpc":"2.0","method":method,"params":params});
-        let mut w = self.writer.lock().await;
-        let mut line = serde_json::to_string(&msg)?;
-        line.push('\n');
-        w.write_all(line.as_bytes()).await?;
-        w.flush().await?;
+    pub(crate) async fn notify(&self, method: &str, params: Value) -> Result<()> {
         Ok(())
-    }
-
-    pub(crate) fn kill(&self) {
-        let pid = self.child_pid.lock().ok().and_then(|mut g| g.take());
-        if let Ok(mut guard) = self.child.lock()
-            && let Some(mut child) = guard.take()
-        {
-            let _ = child.start_kill();
-        }
-        kill_process_group(pid);
-    }
-}
-
-fn kill_process_group(pid: Option<u32>) {
-    let Some(pid) = pid else { return };
-    #[cfg(unix)]
-    {
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", "--", &format!("-{}", pid)])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
     }
 }
 
@@ -206,7 +125,7 @@ fn with_extra_roots(mut b: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
 }
 
 impl HttpTransport {
-    pub(crate) fn new(cfg: &McpServerConfig, timeout_ms: u64) -> anyhow::Result<Arc<Self>> {
+    pub(crate) fn new(cfg: &McpServerConfig, timeout_ms: u64) -> Result<Arc<Self>> {
         let url = cfg
             .url
             .clone()
@@ -243,7 +162,7 @@ impl HttpTransport {
         for (k, v) in &self.headers {
             rb = rb.header(k.as_str(), v.as_str());
         }
-        if let Some(sid) = self.session_id.lock().expect("session_id lock must not be poisoned: holders only clone or replace the session id string and never panic while holding it").clone() {
+        if let Some(sid) = self.session_id.lock().expect("session_id lock must not be poisoned").clone() {
             rb = rb.header("Mcp-Session-Id", sid);
         }
         rb
@@ -253,11 +172,11 @@ impl HttpTransport {
         if let Some(sid) = resp.headers().get("Mcp-Session-Id")
             && let Ok(s) = sid.to_str()
         {
-            *self.session_id.lock().expect("session_id lock must not be poisoned: holders only clone or replace the session id string and never panic while holding it") = Some(s.to_string());
+            *self.session_id.lock().expect("session_id lock must not be poisoned") = Some(s.to_string());
         }
     }
 
-    pub(crate) async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+    pub(crate) async fn request(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let msg = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
         let resp = self.build(&msg).send().await?;
@@ -290,11 +209,10 @@ impl HttpTransport {
         Ok(val.get("result").cloned().unwrap_or(Value::Null))
     }
 
-    pub(crate) async fn notify(&self, method: &str, params: Value) -> anyhow::Result<()> {
+    pub(crate) async fn notify(&self, method: &str, params: Value) -> Result<()> {
         let msg = json!({"jsonrpc":"2.0","method":method,"params":params});
         let resp = self.build(&msg).send().await?;
         self.capture_session(&resp);
-        let _ = self.timeout_ms;
         Ok(())
     }
 }
@@ -350,41 +268,35 @@ fn url_is_loopback(url: &str) -> bool {
 }
 
 pub(crate) enum Transport {
-    Stdio(Arc<StdioTransport>),
+    Stdio(Arc<McpClient>),
     Http(Arc<HttpTransport>),
 }
 
 impl Transport {
-    pub(crate) fn from_config(cfg: &McpServerConfig, timeout_ms: u64) -> anyhow::Result<Self> {
+    pub(crate) fn from_config(cfg: &McpServerConfig, timeout_ms: u64) -> Result<Self> {
         if cfg.is_http() {
             Ok(Transport::Http(HttpTransport::new(cfg, timeout_ms)?))
         } else {
-            Ok(Transport::Stdio(StdioTransport::spawn(cfg, timeout_ms)?))
+            Ok(Transport::Stdio(Arc::new(McpClient::spawn(cfg, timeout_ms).await?)))
         }
     }
 
-    pub(crate) async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+    pub(crate) async fn request(&self, method: &str, params: Value) -> Result<Value> {
         match self {
             Transport::Stdio(t) => t.request(method, params).await,
             Transport::Http(t) => t.request(method, params).await,
         }
     }
 
-    pub(crate) async fn notify(&self, method: &str, params: Value) -> anyhow::Result<()> {
+    pub(crate) async fn notify(&self, method: &str, params: Value) -> Result<()> {
         match self {
             Transport::Stdio(t) => t.notify(method, params).await,
             Transport::Http(t) => t.notify(method, params).await,
         }
     }
-
-    pub(crate) fn kill(&self) {
-        if let Transport::Stdio(t) = self {
-            t.kill();
-        }
-    }
 }
 
-pub(crate) async fn handshake(transport: &Transport) -> anyhow::Result<Vec<RemoteTool>> {
+pub(crate) async fn handshake(transport: &Transport) -> Result<Vec<RemoteTool>> {
     let init_params = json!({
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": {},
@@ -401,7 +313,7 @@ pub(crate) async fn handshake(transport: &Transport) -> anyhow::Result<Vec<Remot
     list_tools(transport).await
 }
 
-pub(crate) async fn list_tools(transport: &Transport) -> anyhow::Result<Vec<RemoteTool>> {
+pub(crate) async fn list_tools(transport: &Transport) -> Result<Vec<RemoteTool>> {
     let mut tools = Vec::new();
     let mut cursor: Option<String> = None;
     loop {

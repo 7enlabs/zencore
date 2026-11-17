@@ -42,7 +42,7 @@ impl ReplProgressSink {
     }
 
     fn register_card(&self, id: &str, name: &str, arg: String) -> usize {
-        let mut cards = self.cards.lock().unwrap();
+        let mut cards = self.cards.lock().expect("lock poisoned");
         let n = cards.len() + 1;
         cards.push(ToolCard {
             n,
@@ -54,14 +54,14 @@ impl ReplProgressSink {
         });
         self.by_id
             .lock()
-            .unwrap()
+            .expect("expected value to be present")
             .insert(id.to_string(), cards.len() - 1);
         n
     }
 
     fn attach_result(&self, id: &str, content: &str, is_error: bool) -> Option<usize> {
-        let idx = *self.by_id.lock().unwrap().get(id)?;
-        let mut cards = self.cards.lock().unwrap();
+        let idx = *self.by_id.lock().expect("lock poisoned").get(id)?;
+        let mut cards = self.cards.lock().expect("lock poisoned");
         let card = cards.get_mut(idx)?;
         card.result = Some(store_result(content));
         card.is_error = is_error;
@@ -72,7 +72,7 @@ impl ReplProgressSink {
     /// driven by the /expand REPL command. With no number, the most recent
     /// finished card is toggled. Returns the text the REPL prints.
     pub fn toggle_expand(&self, n: Option<usize>) -> String {
-        let mut cards = self.cards.lock().unwrap();
+        let mut cards = self.cards.lock().expect("lock poisoned");
         let idx = match n {
             Some(n) => cards.iter().position(|c| c.n == n),
             None => cards.iter().rposition(|c| c.result.is_some()),

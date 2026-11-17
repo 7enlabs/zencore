@@ -399,7 +399,7 @@ fn coerce_object(
             continue;
         }
         if let Some(target) = near_miss_key(&key, props, obj) {
-            let v = obj.remove(&key).unwrap();
+            let v = obj.remove(&key).expect("expected value to be present");
             notes.push(format!("renamed field '{}{}' to '{}'", path, key, target));
             obj.insert(target, v);
         } else if closed {

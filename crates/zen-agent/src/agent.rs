@@ -469,7 +469,7 @@ impl Agent {
                 && let Some(c) = &m.content
             {
                 if glue && !parts.is_empty() {
-                    let last = parts.last_mut().unwrap();
+                    let last = parts.last_mut().expect("expected value to be present");
                     last.insert_str(0, c);
                 } else if !c.trim().is_empty() {
                     parts.push(c.clone());

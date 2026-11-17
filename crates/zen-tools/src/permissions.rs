@@ -741,19 +741,19 @@ pub fn persist_allow_rule(path: &Path, rule: &str) -> anyhow::Result<()> {
     if !root.is_object() {
         root = Value::Object(Default::default());
     }
-    let obj = root.as_object_mut().unwrap();
+    let obj = root.as_object_mut().expect("expected value to be present");
     let perms = obj
         .entry("permissions")
         .or_insert_with(|| Value::Object(Default::default()));
     if !perms.is_object() {
         *perms = Value::Object(Default::default());
     }
-    let perms = perms.as_object_mut().unwrap();
+    let perms = perms.as_object_mut().expect("expected value to be present");
     let allow = perms.entry("allow").or_insert_with(|| Value::Array(vec![]));
     if !allow.is_array() {
         *allow = Value::Array(vec![]);
     }
-    let arr = allow.as_array_mut().unwrap();
+    let arr = allow.as_array_mut().expect("expected value to be present");
     let already = arr.iter().any(|v| v.as_str() == Some(rule));
     if !already {
         arr.push(Value::String(rule.to_string()));

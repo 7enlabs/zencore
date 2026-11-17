@@ -45,7 +45,7 @@ impl Buffered {
 
             let _ = so.write_all(bytes).and_then(|_| so.flush());
         } else {
-            g.write_all(bytes).unwrap();
+            g.write_all(bytes).expect("expected value to be present");
         }
     }
 }
@@ -314,7 +314,7 @@ impl StreamJsonSink {
         if let Some(obj) = line.as_object_mut() {
             obj.insert("v".into(), json!(STREAM_JSON_VERSION));
         }
-        self.buf.write_line(&serde_json::to_string(&line).unwrap());
+        self.buf.write_line(&serde_json::to_string(&line).expect("expected value to be present"));
     }
 }
 

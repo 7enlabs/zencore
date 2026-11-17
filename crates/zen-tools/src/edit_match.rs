@@ -275,7 +275,7 @@ pub fn closest_candidates(text: &str, old: &str) -> String {
         })
         .filter(|(s, _)| *s >= MIN_SCORE)
         .collect();
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1)));
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).expect("expected value to be present").then(a.1.cmp(&b.1)));
     let mut picked: Vec<(f64, usize)> = Vec::new();
     for (s, i) in scored {
         if picked.iter().all(|(_, j)| i + n <= *j || *j + n <= i) {

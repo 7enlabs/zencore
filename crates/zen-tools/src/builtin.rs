@@ -1697,7 +1697,7 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 }
 
 fn strip_tag(html: &str, tag: &str) -> String {
-    let re = Regex::new(&format!(r"(?is)<{0}\b[^>]*>.*?</{0}\s*>", tag)).unwrap();
+    let re = Regex::new(&format!(r"(?is)<{0}\b[^>]*>.*?</{0}\s*>", tag)).expect("expected value to be present");
     re.replace_all(html, " ").to_string()
 }
 
@@ -1714,7 +1714,7 @@ fn decode_entities(s: &str) -> String {
 pub fn html_to_text(html: &str) -> String {
     let mut s = html.to_string();
 
-    let comment = Regex::new(r"(?s)<!--.*?-->").unwrap();
+    let comment = Regex::new(r"(?s)<!--.*?-->").expect("expected value to be present");
     s = comment.replace_all(&s, " ").to_string();
     for tag in ["script", "style", "noscript", "svg", "head", "template"] {
         s = strip_tag(&s, tag);
@@ -1723,9 +1723,9 @@ pub fn html_to_text(html: &str) -> String {
     let block = Regex::new(
         r"(?i)</?(p|div|br|li|ul|ol|tr|table|thead|tbody|h[1-6]|section|article|header|footer|nav|pre|blockquote|hr)\b[^>]*>",
     )
-    .unwrap();
+    .expect("expected value to be present");
     s = block.replace_all(&s, "\n").to_string();
-    let tags = Regex::new(r"(?s)<[^>]*>").unwrap();
+    let tags = Regex::new(r"(?s)<[^>]*>").expect("expected value to be present");
     s = tags.replace_all(&s, " ").to_string();
     s = decode_entities(&s);
 

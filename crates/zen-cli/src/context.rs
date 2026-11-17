@@ -344,7 +344,7 @@ fn analyze(parsed: &ParsedSession) -> ContextAnalysis {
                 let names: Vec<String> = m
                     .tool_calls
                     .as_ref()
-                    .unwrap()
+                    .expect("expected value to be present")
                     .iter()
                     .map(|c| tool_call_label(&c.function.name, &c.function.arguments))
                     .collect();

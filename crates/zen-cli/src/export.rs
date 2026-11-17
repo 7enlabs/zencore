@@ -273,7 +273,7 @@ fn redact_assignments_second_pass(s: &str) -> String {
         while let Some(rel) = lower[from..].find(word) {
             let abs = from + rel;
             let left_ok = abs == 0 || {
-                let c = s[..abs].chars().next_back().unwrap();
+                let c = s[..abs].chars().next_back().expect("expected value to be present");
                 !c.is_ascii_alphanumeric() && c != '_'
             };
             if !left_ok {
