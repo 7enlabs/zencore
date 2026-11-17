@@ -11,6 +11,7 @@ Task guard on every pull request (`.github/workflows/floor-guard.yml`).
 - Do not ship stubs: no new `todo!()` or `unimplemented!()`. Check: same command.
 - Do not soften CI: no `continue-on-error: true`, no `|| true`, no removed `-D warnings` in `.github/workflows/`. Check: same command.
 - Do not commit secrets. Check: the `secrets` job in `ci.yml` (gitleaks).
+- Coverage stays at or above the line floor: workspace line coverage never falls below `min_line_coverage` in `ci/floor-baseline.json` (88). Check: the nightly coverage job (`cargo llvm-cov --workspace --summary-only --fail-under-lines 88`).
 - No unmarked inline-disable in runtime Rust code: no `#[allow(...)]` or `#![allow(...)]` in `crates/*/src` outside test files and `#[cfg(test)]` modules unless the line carries `// floor-guard: <reason>`; the count of justified runtime allows never exceeds `max_runtime_allows` in `ci/floor-baseline.json`. Check: `python3 scripts/arch_lint.py`.
 - Do not loosen this file to get a change through: removing or rewording a Floor line, or lowering a number in `ci/floor-baseline.json`, fails the guard. Check: same command.
 

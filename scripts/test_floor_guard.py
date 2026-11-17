@@ -82,6 +82,19 @@ class ConstraintsAndBaseline(unittest.TestCase):
         self.assertEqual(len(found), 1)
         self.assertEqual(fg.check_baseline('{"min_rust_tests": 100}', '{"min_rust_tests": 120}'), [])
 
+    def test_baseline_line_coverage_lowered(self):
+        found = fg.check_baseline(
+            '{"min_line_coverage": 88}', '{"min_line_coverage": 87}'
+        )
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].rule, "F3")
+        self.assertEqual(
+            fg.check_baseline(
+                '{"min_line_coverage": 88}', '{"min_line_coverage": 90}'
+            ),
+            [],
+        )
+
     def test_baseline_max_raised(self):
         found = fg.check_baseline('{"max_runtime_allows": 15}', '{"max_runtime_allows": 16}')
         self.assertEqual(len(found), 1)

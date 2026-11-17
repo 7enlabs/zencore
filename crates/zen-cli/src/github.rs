@@ -879,3 +879,448 @@ mod tests {
         assert_eq!(sample_fetched().total(), 3);
     }
 }
+
+// Tests added for Việc A (floor coverage 88%): the gh shell-out paths
+// (driven by a fake `gh` on PATH) and the pure-formatting branches the
+// existing tests do not reach.
+#[cfg(test)]
+mod viec_a_tests {
+    use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::path::PathBuf;
+
+    #[cfg(unix)]
+    struct EnvRestore {
+        path: Option<String>,
+        gh_mode: Option<String>,
+        gh_dir: Option<String>,
+    }
+
+    #[cfg(unix)]
+    impl EnvRestore {
+        fn capture() -> Self {
+            Self {
+                path: std::env::var("PATH").ok(),
+                gh_mode: std::env::var("FAKE_GH_MODE").ok(),
+                gh_dir: std::env::var("FAKE_GH_DIR").ok(),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                match self.path.take() {
+                    Some(v) => std::env::set_var("PATH", v),
+                    None => std::env::remove_var("PATH"),
+                }
+                match self.gh_mode.take() {
+                    Some(v) => std::env::set_var("FAKE_GH_MODE", v),
+                    None => std::env::remove_var("FAKE_GH_MODE"),
+                }
+                match self.gh_dir.take() {
+                    Some(v) => std::env::set_var("FAKE_GH_DIR", v),
+                    None => std::env::remove_var("FAKE_GH_DIR"),
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("zen_viec_a_gh_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A fake `gh` answering the calls this module makes. FAKE_GH_MODE
+    /// switches failure modes; FAKE_GH_DIR holds fixture JSON files.
+    #[cfg(unix)]
+    fn write_fake_gh(bin_dir: &Path) {
+        std::fs::create_dir_all(bin_dir).unwrap();
+        let script = bin_dir.join("gh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+args="$*"
+case "$FAKE_GH_MODE" in
+  auth-fail) echo "gh: not authenticated, run gh auth login" >&2; exit 1 ;;
+  bad-json) printf 'not json\n'; exit 0 ;;
+  empty-nwo) printf '""\n'; exit 0 ;;
+esac
+case "$args" in
+  *'repo view'*) printf '"7enlabs/zencore"\n'; exit 0 ;;
+  *'pr view'*)
+    if [ "$FAKE_GH_MODE" = "no-pr" ]; then echo "no PR for branch" >&2; exit 1; fi
+    printf '42\n'; exit 0 ;;
+  *'pulls/42/comments'*) cat "$FAKE_GH_DIR/review.json"; exit 0 ;;
+  *'issues/42/comments'*) cat "$FAKE_GH_DIR/issue.json"; exit 0 ;;
+  *'pulls/42'*)
+    if [ "$FAKE_GH_MODE" = "meta-fail" ]; then echo "not found" >&2; exit 1; fi
+    printf '{"number":42,"title":"Fix thing","url":"https://github.com/7enlabs/zencore/pull/42"}\n'; exit 0 ;;
+  *'run list'*) cat "$FAKE_GH_DIR/runs.json"; exit 0 ;;
+  *'run view'*)
+    if [ "$FAKE_GH_MODE" = "log-fail" ]; then echo "no log" >&2; exit 1; fi
+    printf 'line1\nerror: boom failed\nline3\n'; exit 0 ;;
+  *'auth status'*) exit 0 ;;
+  *) echo "unexpected gh call: $args" >&2; exit 1 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Sets up the fake gh on PATH (first, so it wins over a real gh).
+    /// Callers must already hold the env lock. Returns (workdir, restore).
+    #[cfg(unix)]
+    fn setup_fake_gh(tag: &str, mode: &str) -> (PathBuf, EnvRestore) {
+        let base = temp_dir(tag);
+        let bindir = base.join("fakebin");
+        write_fake_gh(&bindir);
+        let fixture = base.join("fixtures");
+        std::fs::create_dir_all(&fixture).unwrap();
+        std::fs::write(
+            fixture.join("review.json"),
+            r#"[{"id":1,"body":"security issue here","path":"src/a.rs","line":10,"diff_hunk":"@@","created_at":"2026-01-01","html_url":"https://example/r1","user":{"login":"alice"}},{"id":2,"body":"consider this","path":null,"line":null,"diff_hunk":null,"created_at":"","html_url":"","user":null}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.join("issue.json"),
+            r#"[{"id":3,"body":"general note","created_at":"","html_url":"","user":{"login":"bob"}}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.join("runs.json"),
+            r#"[{"databaseId":111,"name":"CI","conclusion":"failure","url":"https://example/run/111"},{"databaseId":222,"name":"check","conclusion":"success","url":"https://example/run/222"}]"#,
+        )
+        .unwrap();
+        let restore = EnvRestore::capture();
+        unsafe {
+            std::env::set_var("FAKE_GH_MODE", mode);
+            std::env::set_var("FAKE_GH_DIR", fixture.as_os_str());
+            let old_path = std::env::var("PATH").unwrap_or_default();
+            std::env::set_var("PATH", format!("{}:{}", bindir.display(), old_path));
+        }
+        (base, restore)
+    }
+
+    fn comment(id: u64, author: &str, body: &str, path: Option<&str>) -> PrComment {
+        PrComment {
+            id,
+            author: author.to_string(),
+            body: body.to_string(),
+            kind: CommentKind::Review,
+            path: path.map(str::to_string),
+            line: Some(1),
+            diff_hunk: None,
+            created_at: String::new(),
+            url: String::new(),
+        }
+    }
+
+    fn fetched_with(review: Vec<PrComment>, issue: Vec<PrComment>) -> FetchedComments {
+        FetchedComments {
+            repo: "7enlabs/zencore".to_string(),
+            number: 42,
+            title: "Fix thing".to_string(),
+            url: "https://github.com/7enlabs/zencore/pull/42".to_string(),
+            review_comments: review,
+            issue_comments: issue,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_gh_with_success_and_failure_paths() {
+        let dir = temp_dir("run_gh_with");
+        // Success: stdout is returned.
+        let out = run_gh_with("/bin/echo", &dir, &["hello"]).unwrap();
+        assert_eq!(out, "hello\n");
+        // Non-zero exit with stderr: the stderr text is in the error.
+        let err = run_gh_with("/bin/sh", &dir, &["-c", "echo oops >&2; exit 3"])
+            .expect_err("failing command must error");
+        assert!(err.to_string().contains("failed: oops"), "{err}");
+        // Stderr mentioning auth login maps to the not-authenticated error.
+        let err = run_gh_with(
+            "/bin/sh",
+            &dir,
+            &["-c", "echo 'run gh auth login' >&2; exit 1"],
+        )
+        .expect_err("auth failure must map to the auth error");
+        assert!(err.to_string().contains("not authenticated"), "{err}");
+        // Missing binary: clear install hint.
+        let err = run_gh_with("/nonexistent-gh-xyz", &dir, &["--version"])
+            .expect_err("missing binary must error");
+        assert!(err.to_string().contains("gh CLI not found"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_json_and_available_via_fake_gh() {
+        let _env = crate::settings::env_lock();
+        let (base, _restore) = setup_fake_gh("gh_json", "ok");
+        let v = gh_json(
+            &base,
+            &[
+                "repo",
+                "view",
+                "--json",
+                "nameWithOwner",
+                "--jq",
+                ".nameWithOwner",
+            ],
+        )
+        .unwrap();
+        assert_eq!(v.as_str(), Some("7enlabs/zencore"));
+        assert!(gh_available(&base));
+        let _ = std::fs::remove_dir_all(&base);
+
+        let (_base2, _restore2) = setup_fake_gh("gh_json_bad", "bad-json");
+        let err = gh_json(&_base2, &["repo", "view"]).expect_err("bad JSON must error");
+        assert!(err.to_string().contains("non-JSON"), "{err}");
+        let _ = std::fs::remove_dir_all(&_base2);
+
+        let (_base3, _restore3) = setup_fake_gh("gh_json_auth", "auth-fail");
+        assert!(!gh_available(&_base3));
+        let err = gh_json(&_base3, &["repo", "view"]).expect_err("auth failure must error");
+        assert!(err.to_string().contains("not authenticated"), "{err}");
+        let _ = std::fs::remove_dir_all(&_base3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_pr_variants() {
+        let _env = crate::settings::env_lock();
+        let (base, _restore) = setup_fake_gh("resolve_pr", "ok");
+        assert_eq!(
+            resolve_pr(&base, Some("42")).unwrap(),
+            ("7enlabs/zencore".to_string(), 42)
+        );
+        assert_eq!(
+            resolve_pr(&base, Some("#42")).unwrap(),
+            ("7enlabs/zencore".to_string(), 42)
+        );
+        // No PR arg: falls back to `pr view` for the current branch.
+        assert_eq!(
+            resolve_pr(&base, None).unwrap(),
+            ("7enlabs/zencore".to_string(), 42)
+        );
+        let err = resolve_pr(&base, Some("bad")).expect_err("bad number must error");
+        assert!(err.to_string().contains("invalid PR number"), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
+
+        let (_b2, _r2) = setup_fake_gh("resolve_pr_auth", "auth-fail");
+        let err = resolve_pr(&_b2, Some("42")).expect_err("auth failure must error");
+        assert!(err.to_string().contains("not authenticated"), "{err}");
+        let _ = std::fs::remove_dir_all(&_b2);
+
+        let (_b3, _r3) = setup_fake_gh("resolve_pr_empty", "empty-nwo");
+        let err = resolve_pr(&_b3, Some("42")).expect_err("empty repo must error");
+        assert!(
+            err.to_string()
+                .contains("could not determine the GitHub repo"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&_b3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fetch_pr_comments_full_flow() {
+        let _env = crate::settings::env_lock();
+        let (base, _restore) = setup_fake_gh("fetch_comments", "ok");
+        let f = fetch_pr_comments(&base, Some("42")).unwrap();
+        assert_eq!(f.repo, "7enlabs/zencore");
+        assert_eq!(f.number, 42);
+        assert_eq!(f.title, "Fix thing");
+        assert_eq!(f.total(), 3);
+        assert_eq!(f.review_comments[0].author, "alice");
+        // Missing user falls back to "(unknown)".
+        assert_eq!(f.review_comments[1].author, "(unknown)");
+        assert_eq!(f.issue_comments[0].author, "bob");
+        assert_eq!(f.issue_comments[0].kind, CommentKind::Issue);
+        let _ = std::fs::remove_dir_all(&base);
+
+        let (_b2, _r2) = setup_fake_gh("fetch_comments_meta", "meta-fail");
+        let err = fetch_pr_comments(&_b2, Some("42")).expect_err("meta fetch must error");
+        assert!(err.to_string().contains("could not fetch PR #42"), "{err}");
+        let _ = std::fs::remove_dir_all(&_b2);
+    }
+
+    #[test]
+    fn severity_labels_and_group_sort_cover_all_variants() {
+        assert_eq!(Severity::Critical.label(), "CRITICAL");
+        assert_eq!(Severity::High.label(), "HIGH");
+        assert_eq!(Severity::Medium.label(), "MEDIUM");
+        assert_eq!(Severity::Low.label(), "LOW");
+        assert_eq!(Severity::Nit.label(), "NIT");
+        // Two comments in one file exercise the sort comparator (rank)
+        // and the "(no file)" group.
+        let f = fetched_with(
+            vec![
+                comment(1, "a", "security hole", Some("src/a.rs")),
+                comment(2, "b", "consider renaming", Some("src/a.rs")),
+                comment(3, "c", "looks good", None),
+            ],
+            vec![comment(4, "d", "general note", None)],
+        );
+        let groups = group_comments(&f);
+        assert_eq!(groups.len(), 3);
+        let file_group = groups.iter().find(|g| g.title == "src/a.rs").unwrap();
+        assert_eq!(file_group.comments.len(), 2);
+        // NOTE: the comparator sorts by descending rank number, so the
+        // least severe comment comes first; pinning current behaviour.
+        assert_eq!(file_group.comments[0].body, "consider renaming");
+        assert_eq!(file_group.comments[1].body, "security hole");
+        assert!(groups.iter().any(|g| g.title == "(no file)"));
+        assert!(groups.iter().any(|g| g.title == "General discussion"));
+    }
+
+    #[test]
+    fn format_comments_text_long_body_and_singular() {
+        let long_body = (1..=16)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let f = fetched_with(vec![comment(1, "a", &long_body, Some("src/a.rs"))], vec![]);
+        let text = format_comments_text(&f);
+        assert!(text.contains("1 comment(s):"), "{text}");
+        assert!(text.contains("## src/a.rs (1 comment)\n"), "{text}");
+        assert!(!text.contains("(1 comments)"), "{text}");
+        // Bodies longer than 15 lines are truncated with an ellipsis line.
+        assert!(text.contains("> ..."), "{text}");
+        assert!(text.contains("[MEDIUM] @a:1"), "{text}");
+        // A comment without a URL prints no URL line.
+        let f2 = fetched_with(
+            vec![{
+                let mut c = comment(1, "a", "security hole", Some("src/a.rs"));
+                c.url = "https://example/c1".to_string();
+                c
+            }],
+            vec![],
+        );
+        assert!(format_comments_text(&f2).contains("https://example/c1"));
+    }
+
+    #[test]
+    fn extract_error_lines_max_cap_and_zero_filter() {
+        let log = "0 failed tests\nerror: first\nfailed second\nerror: third\n";
+        let out = extract_error_lines(log, 2);
+        assert_eq!(out.len(), 2);
+        assert!(out[0].contains("first"));
+        assert!(out[1].contains("second"));
+        // "0 failed" lines never count as errors even though they
+        // contain the word "failed".
+        assert!(!out.iter().any(|l| l.contains("0 failed")));
+    }
+
+    #[cfg(unix)]
+    fn git_repo(tag: &str) -> PathBuf {
+        let dir = temp_dir(tag);
+        let run = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .expect("git fixture command");
+            assert!(st.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("README.md"), "hi\n").unwrap();
+        run(&["add", "."]);
+        run(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "init",
+        ]);
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fetch_ci_status_full_flow() {
+        let _env = crate::settings::env_lock();
+        let repo = git_repo("ci_repo");
+        let (_base, _restore) = setup_fake_gh("ci_status", "ok");
+        let status = fetch_ci_status(&repo).unwrap();
+        assert_eq!(status.branch, "main");
+        assert_eq!(status.pr_number, Some(42));
+        assert_eq!(status.failing.len(), 1);
+        assert_eq!(status.failing[0].run_id, 111);
+        let excerpt = status.failing[0].log_excerpt.as_deref().unwrap_or("");
+        assert!(excerpt.contains("boom"), "{excerpt}");
+        let _ = std::fs::remove_dir_all(&repo);
+
+        // No PR for the branch: pr_number is None, the rest still works.
+        let repo2 = git_repo("ci_repo_nopr");
+        let (_b2, _r2) = setup_fake_gh("ci_status_nopr", "no-pr");
+        let status2 = fetch_ci_status(&repo2).unwrap();
+        assert_eq!(status2.pr_number, None);
+        assert_eq!(status2.failing.len(), 1);
+        let _ = std::fs::remove_dir_all(&repo2);
+
+        // The failed log cannot be fetched: excerpt stays None.
+        let repo3 = git_repo("ci_repo_nolog");
+        let (_b3, _r3) = setup_fake_gh("ci_status_nolog", "log-fail");
+        let status3 = fetch_ci_status(&repo3).unwrap();
+        assert_eq!(status3.failing.len(), 1);
+        assert!(status3.failing[0].log_excerpt.is_none());
+        let _ = std::fs::remove_dir_all(&repo3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fetch_ci_status_not_a_repo_errors() {
+        let _env = crate::settings::env_lock();
+        let dir = temp_dir("ci_status_norepo");
+        let (_base, _restore) = setup_fake_gh("ci_status_norepo", "ok");
+        let err = fetch_ci_status(&dir).expect_err("not a repo must error");
+        assert!(err.to_string().contains("not a git repo"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn format_ci_text_failing_variants() {
+        let failing = |excerpt: Option<&str>| FailingCheck {
+            run_id: 111,
+            name: "CI".to_string(),
+            conclusion: "failure".to_string(),
+            url: "https://example/run/111".to_string(),
+            log_excerpt: excerpt.map(str::to_string),
+        };
+        // With error lines: the likely cause is shown.
+        let s = CiStatus {
+            branch: "main".to_string(),
+            pr_number: Some(42),
+            failing: vec![failing(Some("ok\nerror: boom\n"))],
+        };
+        let text = format_ci_text(&s);
+        assert!(text.contains("(PR #42)"), "{text}");
+        assert!(text.contains("likely failure cause:"), "{text}");
+        assert!(text.contains("error: boom"), "{text}");
+        // Excerpt without error keywords: explicit "no clear error" note.
+        let s2 = CiStatus {
+            branch: "main".to_string(),
+            pr_number: None,
+            failing: vec![failing(Some("all quiet here\n"))],
+        };
+        assert!(format_ci_text(&s2).contains("(no clear error lines in the failed log)"));
+        // No excerpt at all: explicit "could not fetch" note.
+        let s3 = CiStatus {
+            branch: "main".to_string(),
+            pr_number: None,
+            failing: vec![failing(None)],
+        };
+        assert!(format_ci_text(&s3).contains("(could not fetch the failed log)"));
+    }
+}

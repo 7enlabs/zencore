@@ -480,3 +480,366 @@ mod tests {
         );
     }
 }
+
+// Tests added for Việc A (floor coverage 88%): cover the helpers and the
+// run_update paths that the existing tests do not reach. The fake `git`
+// below answers every git call run_update makes, so no network and no real
+// checkout is touched.
+#[cfg(test)]
+mod viec_a_tests {
+    use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    #[cfg(unix)]
+    const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// Restores the env vars this module mutates when dropped, so a
+    /// panicking test cannot leak a fake PATH into the rest of the suite.
+    struct EnvRestore {
+        path: Option<String>,
+        src_dir: Option<String>,
+        repo: Option<String>,
+        git_status: Option<String>,
+        git_local: Option<String>,
+        git_remote: Option<String>,
+    }
+
+    impl EnvRestore {
+        fn capture() -> Self {
+            Self {
+                path: std::env::var("PATH").ok(),
+                src_dir: std::env::var("ZENCORE_SRC_DIR").ok(),
+                repo: std::env::var("ZENCORE_REPO").ok(),
+                git_status: std::env::var("FAKE_GIT_STATUS").ok(),
+                git_local: std::env::var("FAKE_GIT_LOCAL").ok(),
+                git_remote: std::env::var("FAKE_GIT_REMOTE").ok(),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            restore_var("PATH", self.path.take());
+            restore_var("ZENCORE_SRC_DIR", self.src_dir.take());
+            restore_var("ZENCORE_REPO", self.repo.take());
+            restore_var("FAKE_GIT_STATUS", self.git_status.take());
+            restore_var("FAKE_GIT_LOCAL", self.git_local.take());
+            restore_var("FAKE_GIT_REMOTE", self.git_remote.take());
+        }
+    }
+
+    fn restore_var(key: &str, value: Option<String>) {
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    fn temp_home(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("zen_viec_a_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn src_dir_of(home: &Path) -> PathBuf {
+        home.join(".local").join("share").join("zencore")
+    }
+
+    /// A fake `git` that answers the calls run_update makes. Behaviour is
+    /// driven by FAKE_GIT_STATUS (porcelain output), FAKE_GIT_LOCAL (HEAD
+    /// SHA) and FAKE_GIT_REMOTE (ls-remote HEAD SHA); fetch/checkout/merge/
+    /// clone always succeed.
+    #[cfg(unix)]
+    fn write_fake_git(bin_dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(bin_dir).unwrap();
+        let script = bin_dir.join("git");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+case "$1" in
+  --version) echo "git version 2.99.0-fake"; exit 0 ;;
+  status) printf '%s' "$FAKE_GIT_STATUS"; exit 0 ;;
+  rev-parse)
+    case "$2" in
+      HEAD) printf '%s' "$FAKE_GIT_LOCAL"; exit 0 ;;
+      --short) printf 'abc1234'; exit 0 ;;
+    esac
+    exit 1 ;;
+  ls-remote) printf '%s\tHEAD\n' "$FAKE_GIT_REMOTE"; exit 0 ;;
+  fetch|checkout|merge|clone) exit 0 ;;
+  *) echo "unexpected git call: $*" >&2; exit 1 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[test]
+    fn default_src_dir_env_override() {
+        let _env = crate::settings::env_lock();
+        let _restore = EnvRestore::capture();
+        unsafe {
+            std::env::set_var("ZENCORE_SRC_DIR", "/tmp/zen-src-override");
+            assert_eq!(
+                default_src_dir(Some(Path::new("/home/test"))),
+                Some(PathBuf::from("/tmp/zen-src-override"))
+            );
+            // An empty override does not count: fall back to the home path.
+            std::env::set_var("ZENCORE_SRC_DIR", "");
+            assert_eq!(
+                default_src_dir(Some(Path::new("/home/test"))),
+                Some(PathBuf::from("/home/test/.local/share/zencore"))
+            );
+            std::env::remove_var("ZENCORE_SRC_DIR");
+            assert_eq!(default_src_dir(None), None);
+        }
+    }
+
+    #[test]
+    fn repo_url_env_override() {
+        let _env = crate::settings::env_lock();
+        let _restore = EnvRestore::capture();
+        unsafe {
+            std::env::set_var("ZENCORE_REPO", "https://example.invalid/r.git");
+            assert_eq!(repo_url(), "https://example.invalid/r.git");
+            std::env::remove_var("ZENCORE_REPO");
+            assert_eq!(repo_url(), DEFAULT_REPO);
+        }
+    }
+
+    #[test]
+    fn find_cargo_from_path_then_home() {
+        let _env = crate::settings::env_lock();
+        let _restore = EnvRestore::capture();
+        let base = temp_home("find_cargo");
+        let bindir = base.join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        std::fs::write(bindir.join("cargo"), "").unwrap();
+        unsafe {
+            std::env::set_var("PATH", bindir.as_os_str());
+            assert_eq!(find_cargo(None), Some(bindir.join("cargo")));
+            // No cargo on PATH: fall back to $home/.cargo/bin/cargo.
+            let home = base.join("home");
+            let cargobin = home.join(".cargo").join("bin");
+            std::fs::create_dir_all(&cargobin).unwrap();
+            std::fs::write(cargobin.join("cargo"), "").unwrap();
+            let empty = base.join("empty");
+            std::fs::create_dir_all(&empty).unwrap();
+            std::env::set_var("PATH", empty.as_os_str());
+            assert_eq!(find_cargo(Some(&home)), Some(cargobin.join("cargo")));
+            // Neither place has cargo.
+            assert_eq!(find_cargo(Some(&base.join("nohome"))), None);
+            assert_eq!(find_cargo(None), None);
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_success_failure_and_missing_program() {
+        assert!(run(Path::new("/bin/true"), &[], None).is_ok());
+        let err = run(Path::new("/bin/false"), &[], None).expect_err("false must fail");
+        assert!(err.to_string().contains("command failed"), "{err}");
+        let err = run(Path::new("/nonexistent-prog-xyz"), &[], None)
+            .expect_err("missing program must fail");
+        assert!(err.to_string().contains("failed to run"), "{err}");
+        // With an explicit working directory.
+        let dir = temp_home("run_cwd");
+        assert!(run(Path::new("/bin/true"), &[], Some(&dir)).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_output_error_branch() {
+        let _env = crate::settings::env_lock();
+        let dir = temp_home("run_output");
+        let out = run_output("echo", &["hi"], &dir).unwrap();
+        assert_eq!(out, "hi\n");
+        let err = run_output("false", &[], &dir).expect_err("false must fail");
+        assert!(err.to_string().contains("false failed"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn built_binary_name_is_zen_on_unix() {
+        assert_eq!(
+            built_binary_name(),
+            if cfg!(windows) { "zen.exe" } else { "zen" }
+        );
+    }
+
+    #[test]
+    fn is_prebuilt_install_dir_root_has_no_parent() {
+        assert!(!is_prebuilt_install_dir(Path::new("/")));
+    }
+
+    /// Sets up a fake git on PATH (keeping the rest of PATH so the real
+    /// cargo stays resolvable). Callers must already hold the env lock
+    /// (`let _env = crate::settings::env_lock();`) before calling this.
+    #[cfg(unix)]
+    fn setup_fake_git(
+        tag: &str,
+        status: &str,
+        local: &str,
+        remote: &str,
+    ) -> (PathBuf, PathBuf, EnvRestore) {
+        let home = temp_home(tag);
+        let bindir = home.join("fakebin");
+        write_fake_git(&bindir);
+        let restore = EnvRestore::capture();
+        unsafe {
+            std::env::remove_var("ZENCORE_SRC_DIR");
+            std::env::set_var("FAKE_GIT_STATUS", status);
+            std::env::set_var("FAKE_GIT_LOCAL", local);
+            std::env::set_var("FAKE_GIT_REMOTE", remote);
+            let old_path = std::env::var("PATH").unwrap_or_default();
+            std::env::set_var("PATH", format!("{}:{}", bindir.display(), old_path));
+        }
+        (home, bindir, restore)
+    }
+
+    #[test]
+    fn run_update_git_missing_bails() {
+        let _env = crate::settings::env_lock();
+        let _restore = EnvRestore::capture();
+        let home = temp_home("git_missing");
+        let empty = home.join("emptybin");
+        std::fs::create_dir_all(&empty).unwrap();
+        unsafe {
+            std::env::remove_var("ZENCORE_SRC_DIR");
+            std::env::set_var("PATH", empty.as_os_str());
+        }
+        let err = run_update(true, Some(&home), true, false, false)
+            .expect_err("without git on PATH this must bail");
+        assert!(err.to_string().contains("git not found"), "{err}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_update_check_no_checkout_json_and_text() {
+        let home = temp_home("check_nocheckout");
+        let bindir = home.join("fakebin");
+        write_fake_git(&bindir);
+        let _env = crate::settings::env_lock();
+        let _restore = EnvRestore::capture();
+        unsafe {
+            std::env::remove_var("ZENCORE_SRC_DIR");
+            let old_path = std::env::var("PATH").unwrap_or_default();
+            std::env::set_var("PATH", format!("{}:{}", bindir.display(), old_path));
+        }
+        // JSON compact, JSON pretty, and plain text all report Ok(0).
+        assert_eq!(run_update(true, Some(&home), true, true, true).unwrap(), 0);
+        assert_eq!(run_update(true, Some(&home), true, true, false).unwrap(), 0);
+        assert_eq!(
+            run_update(true, Some(&home), false, false, false).unwrap(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_update_check_clean_up_to_date() {
+        let _env = crate::settings::env_lock();
+        let (home, _bindir, _restore) = setup_fake_git("check_uptodate", "", SHA_A, SHA_A);
+        std::fs::create_dir_all(src_dir_of(&home).join(".git")).unwrap();
+        assert_eq!(run_update(true, Some(&home), true, true, false).unwrap(), 0);
+        assert_eq!(
+            run_update(true, Some(&home), false, false, false).unwrap(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_update_check_update_available() {
+        let _env = crate::settings::env_lock();
+        let (home, _bindir, _restore) = setup_fake_git("check_available", "", SHA_A, SHA_B);
+        std::fs::create_dir_all(src_dir_of(&home).join(".git")).unwrap();
+        assert_eq!(run_update(true, Some(&home), true, true, true).unwrap(), 0);
+        assert_eq!(
+            run_update(true, Some(&home), false, false, false).unwrap(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_update_no_check_up_to_date_returns_zero() {
+        let _env = crate::settings::env_lock();
+        let (home, _bindir, _restore) = setup_fake_git("nocheck_uptodate", "", SHA_A, SHA_A);
+        std::fs::create_dir_all(src_dir_of(&home).join(".git")).unwrap();
+        // Local == remote and not --check: returns Ok(0) before any build.
+        assert_eq!(
+            run_update(false, Some(&home), true, true, false).unwrap(),
+            0
+        );
+        assert_eq!(
+            run_update(false, Some(&home), false, false, false).unwrap(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_update_behind_fetches_then_build_fails() {
+        let _env = crate::settings::env_lock();
+        let (home, _bindir, _restore) = setup_fake_git("behind_build", "", SHA_A, SHA_B);
+        std::fs::create_dir_all(src_dir_of(&home).join(".git")).unwrap();
+        // fetch/checkout/merge succeed (fake git); the real cargo then
+        // fails because the fake checkout has no Cargo.toml.
+        let err = run_update(false, Some(&home), true, false, false)
+            .expect_err("build of a manifest-less checkout must fail");
+        assert!(err.to_string().contains("command failed"), "{err}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_update_cargo_missing_bails() {
+        let home = temp_home("cargo_missing");
+        let bindir = home.join("fakebin");
+        write_fake_git(&bindir);
+        let _env = crate::settings::env_lock();
+        let _restore = EnvRestore::capture();
+        unsafe {
+            std::env::remove_var("ZENCORE_SRC_DIR");
+            std::env::set_var("FAKE_GIT_STATUS", "");
+            std::env::set_var("FAKE_GIT_LOCAL", SHA_A);
+            std::env::set_var("FAKE_GIT_REMOTE", SHA_B);
+            // PATH with only the fake git dir: git resolves, cargo does not.
+            std::env::set_var("PATH", bindir.as_os_str());
+        }
+        std::fs::create_dir_all(src_dir_of(&home).join(".git")).unwrap();
+        let err = run_update(false, Some(&home), true, false, false)
+            .expect_err("without cargo this must bail");
+        assert!(err.to_string().contains("cargo not found"), "{err}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_update_clone_then_build_fails() {
+        let _env = crate::settings::env_lock();
+        let (home, _bindir, _restore) = setup_fake_git("clone_build", "", SHA_A, SHA_B);
+        // No .git under the src dir: run_update clones (fake git exits 0),
+        // then the real cargo fails on the missing Cargo.toml.
+        let err = run_update(false, Some(&home), true, false, false)
+            .expect_err("clone-then-build of an empty dir must fail");
+        assert!(err.to_string().contains("command failed"), "{err}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
