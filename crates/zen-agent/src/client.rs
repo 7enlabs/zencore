@@ -558,10 +558,7 @@ impl LlmBackend for OpenAiClient {
         loop {
             attempt += 1;
 
-            let pace_wait = self
-                .pacer
-                .lock()
-                .map_err(|e| anyhow::anyhow!("pacer lock poisoned: {e}"))?
+            let pace_wait = lock_or_recover(&self.pacer, "pacer")
                 .as_mut()
                 .map(|p| p.acquire())
                 .unwrap_or(Duration::ZERO);

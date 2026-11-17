@@ -787,6 +787,11 @@ mod tests {
         assert_eq!(r.turn_id, 10);
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "newer\n");
         assert_eq!(c.depth(), 1);
+        // The second undo without force is refused: the dropped t2
+        // wrote "newer" after t1, so the file no longer matches t1's
+        // after-stamp. The refusal must not consume the turn.
+        assert_eq!(c.undo(false), Err(UndoError::Modified(vec![a.clone()])));
+        assert_eq!(c.depth(), 1);
         let r = c.undo(true).unwrap();
         assert_eq!(r.turn_id, 1);
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "old\n");

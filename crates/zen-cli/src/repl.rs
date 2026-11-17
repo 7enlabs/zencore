@@ -6,6 +6,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use zen_core::lock_recovery::lock_or_recover;
 use zen_core::{EventSink, RunResult, UsageStats};
 
 enum LineAction {
@@ -2049,12 +2050,7 @@ async fn handle_slash(
             }
         }
         "/done" => {
-            let todos = agent
-                .ctx
-                .todos
-                .lock()
-                .map_err(|e| anyhow::anyhow!("todos lock poisoned: {e}"))?
-                .clone();
+            let todos = lock_or_recover(&agent.ctx.todos, "todos").clone();
             let checks = crate::doneguard::run_done_checks(cwd, &todos).await;
             let changed = crate::doneguard::changed_files(cwd);
             let violations = repl.scope.violations(&changed);
@@ -2465,12 +2461,7 @@ async fn handle_slash(
             println!("{}", zen_ext::memories_report(cwd, home));
         }
         "/todos" => {
-            let todos = agent
-                .ctx
-                .todos
-                .lock()
-                .map_err(|e| anyhow::anyhow!("todos lock poisoned: {e}"))?
-                .clone();
+            let todos = lock_or_recover(&agent.ctx.todos, "todos").clone();
             if todos.is_empty() {
                 println!("(no todos)");
             } else {

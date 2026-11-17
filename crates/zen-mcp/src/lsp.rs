@@ -403,17 +403,11 @@ impl LspClient {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let msg = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending
-            .lock()
-            .map_err(|e| anyhow::anyhow!("pending lock poisoned: {e}"))?
-            .insert(id, tx);
+        lock_or_recover(&self.pending, "pending").insert(id, tx);
         {
             let mut w = self.writer.lock().await;
             if let Err(e) = write_frame(&mut *w, &msg).await {
-                self.pending
-                    .lock()
-                    .map_err(|e| anyhow::anyhow!("pending lock poisoned: {e}"))?
-                    .remove(&id);
+                lock_or_recover(&self.pending, "pending").remove(&id);
                 return Err(anyhow::anyhow!("write to LSP server failed: {e}"));
             }
         }
@@ -421,10 +415,7 @@ impl LspClient {
             Ok(Ok(v)) => v,
             Ok(Err(_)) => return Err(anyhow::anyhow!("LSP server dropped the response")),
             Err(_) => {
-                self.pending
-                    .lock()
-                    .map_err(|e| anyhow::anyhow!("pending lock poisoned: {e}"))?
-                    .remove(&id);
+                lock_or_recover(&self.pending, "pending").remove(&id);
                 return Err(anyhow::anyhow!(
                     "LSP request '{method}' timed out after {}s",
                     timeout.as_secs()
@@ -544,10 +535,7 @@ impl LspConnection {
             Change(i32),
         }
         let (action, current) = {
-            let mut docs = self
-                .docs
-                .lock()
-                .map_err(|e| anyhow::anyhow!("docs lock poisoned: {e}"))?;
+            let mut docs = lock_or_recover(&self.docs, "docs");
             match docs.get_mut(path) {
                 Some(doc) if doc.mtime == mtime => (Action::None, doc.text.clone()),
                 Some(doc) => {
@@ -1013,20 +1001,11 @@ impl LspManager {
             language: lang,
             root: root.clone(),
         };
-        if let Some(conn) = self
-            .servers
-            .lock()
-            .map_err(|e| anyhow::anyhow!("servers lock poisoned: {e}"))?
-            .get(&key)
-            .cloned()
-        {
+        if let Some(conn) = lock_or_recover(&self.servers, "servers").get(&key).cloned() {
             return Ok(conn);
         }
         let spec = server_spec(lang);
-        let (command, args) = self
-            .overrides
-            .lock()
-            .map_err(|e| anyhow::anyhow!("overrides lock poisoned: {e}"))?
+        let (command, args) = lock_or_recover(&self.overrides, "overrides")
             .get(&lang)
             .cloned()
             .unwrap_or((spec.command.clone(), spec.args.clone()));
@@ -1039,10 +1018,7 @@ impl LspManager {
         let conn = LspConnection::start(lang, &command, &args, &root)
             .await
             .map_err(|e| anyhow::anyhow!("failed to start '{}': {e}", spec.command))?;
-        self.servers
-            .lock()
-            .map_err(|e| anyhow::anyhow!("servers lock poisoned: {e}"))?
-            .insert(key, conn.clone());
+        lock_or_recover(&self.servers, "servers").insert(key, conn.clone());
         Ok(conn)
     }
 
