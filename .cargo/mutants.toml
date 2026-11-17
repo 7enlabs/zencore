@@ -82,7 +82,7 @@ exclude_re = [
   # stores the mode), this mutant stops being equivalent: remove
   # this exclusion and kill it with a test that calls the default
   # set_mode and checks the stored mode.
-  # PR #228, acp.rs collect_listed_sessions (line 1496, col 41):
+  # PR #228, acp.rs collect_listed_sessions (line 1500, col 41):
   # replace `activity > t` with `activity >= t`.
   # EQUIVALENT (waived by ZC Leader, 2026-11-18; verified by
   # independent code review): when activity == t, the original
@@ -94,6 +94,6 @@ exclude_re = [
   # (e.g. it stores something other than activity itself), this
   # mutant stops being equivalent: remove this exclusion and kill
   # it with a test where two sessions share the same activity time.
-  "acp\\.rs:1496:41: replace > with >= in collect_listed_sessions",
+  "acp\\.rs:1500:41: replace > with >= in collect_listed_sessions",
   "lib\\.rs:694:9: replace PermissionChecker::set_mode with \\(\\)",
 ]
