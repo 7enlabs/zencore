@@ -1,7 +1,7 @@
 # Zen architecture
 
 Zen is a small, clean-room terminal coding agent written in Rust. It reproduces the *observable
-behavior* of tools like Claude Code (see `SPEC.md`) without using any of their code, prompts or tool
+behavior* of reference agents (see `SPEC.md`) without using any of their code, prompts or tool
 texts. This document explains how the pieces fit together so you can study the code crate by crate.
 
 ```

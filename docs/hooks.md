@@ -5,7 +5,7 @@ fixed points of the agent loop - before/after tool calls, when a prompt is
 submitted, when a turn ends, before compaction. Use them for validation,
 auto-linting, context injection, end-of-turn checks, and backups.
 
-This mirrors [Claude Code's hooks](https://code.claude.com/docs/en/hooks.md):
+This mirrors the reference agent's hooks (public documentation, studied clean-room):
 command handlers, per-tool matchers, JSON on stdin, exit-code protocol.
 
 ## Configuration
@@ -264,7 +264,7 @@ exit 0
 
 ### Other events
 
-All 33 events (the full set from the Claude Code hooks reference):
+All 33 events (the full set from the reference agent's hooks reference):
 
 | Event | When it fires | Matcher target |
 |---|---|---|

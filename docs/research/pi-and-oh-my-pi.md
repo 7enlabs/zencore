@@ -1,6 +1,6 @@
-# Pi and oh-my-pi: what zen took, what it left
+# Reference agent notes: what zen took, what it left
 
-Notes from reading the public docs of the Pi coding agent and the oh-my-pi fork (2026-10). Only
+Notes from reading the public docs of a reference agent and a reference agent fork (2026-10). Only
 ideas were taken; zen's code, prompts and wording are its own (clean-room rule).
 
 ## Adopted

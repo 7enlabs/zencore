@@ -14,12 +14,12 @@
 |---|---|---|---|---|---|---|
 | B0 | r7 items 1–5 (before C1) | - | 10/10 | 8/10 | 2/10 | baseline |
 | C1 | Syntax-guarded edits (`syntax_guard.rs`) | SWE-agent ACI, arXiv:2405.15793 §3 | 10/10 | 6/10 · 7/10 | - | kept |
-| C2 | Workflow prompt: explore → reproduce → fix → rerun → edge cases, don't edit tests | anthropic.com/engineering/swe-bench-sonnet | 9/10 | 7/10 | - | kept (neutral) |
+| C2 | Workflow prompt: explore → reproduce → fix → rerun → edge cases, don't edit tests | the reference agent vendor's engineering blog (SWE-bench study) | 9/10 | 7/10 | - | kept (neutral) |
 | C3 | Resample 200 responses carrying an error / no choices / empty message | vllm-project/vllm#23567 | 10/10 | 9/10 · 8/10 | - | kept |
 | C3−C2 | ablation: C3 without C2 | - | - | 8/10 · 10/10 | - | (ablation) |
 | C4 | Cut leaked chat-template tokens from tool names | vllm-project/vllm#32587 | 10/10 | 9/10 | - | kept |
 | C5 | Requery after an empty reply (max 2/turn) | swe-agent.com/latest/config/templates (format-error requery) | 8/10 | 10/10 · 10/10 | - | kept |
-| C6 | Requirements review before finishing | code.claude.com/docs/en/best-practices | 6/6 | 9/10 · 10/10 | - | reverted |
+| C6 | Requirements review before finishing | reference agent documentation (best practices) | 6/6 | 9/10 · 10/10 | - | reverted |
 | C7 | Requery when every retry came back unparsed | same as C3/C5 | 10/10 · 5/5 (partial) | 10/10 · 10/10 · 3/10 (RW) (partial) | 3/10 · 0/10 (RW) (partial) | kept (final) |
 
 How to read it: `a/b` = passed / tasks run. Fewer than 10 tasks means the run was cut short (sandbox resets killed in-flight runs twice; a resumed run counts each task once). Free models are noisy: ±1 task between identical runs is normal (compare the two oss runs of C3, or the C3−C2 ablation runs).

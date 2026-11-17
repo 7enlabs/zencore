@@ -94,8 +94,8 @@ You are a read-only scout sub-agent. ...
 
 ```json
 {"tasks": [
-  {"agent": "scout", "task": "Survey how Pi does sub-agents."},
-  {"agent": "scout", "task": "Survey how Claude Code does sub-agents."}
+  {"agent": "scout", "task": "Survey how a reference agent does sub-agents."},
+  {"agent": "scout", "task": "Survey how another reference agent does sub-agents."}
 ]}
 ```
 

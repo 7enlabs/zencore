@@ -2,7 +2,7 @@
 
 This document tells security scanners (human or automated) what to test, which
 inputs are adversarial, what is out of scope, and how to classify severity.
-It follows the threat-model pattern used by Anthropic's OSS Scanner program.
+It follows the threat-model pattern used by a public open-source scanner program.
 
 ## What Zen is
 

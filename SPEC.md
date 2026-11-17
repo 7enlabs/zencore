@@ -2,10 +2,10 @@
 
 By 7EN Labs. Last updated: 2026-11-11.
 
-Status: v1 (2026-10-14). Sources: public docs at code.claude.com/docs (headless, settings, hooks, cli-reference pages),
-`claude --help` output (saved in `claude-help.txt`), and black-box observation via REA on Railway (see Appendix A).
+Status: v1 (2026-10-14). Sources: the reference agent's public documentation (headless, settings, hooks, cli-reference pages; studied clean-room, no code copied),
+reference CLI `--help` output (saved in `claude-help.txt`), and black-box observation via REA on Railway (see Appendix A).
 No vendor source, system prompt, or tool description text was read or copied. All wording is original.
-Naming: `CLAUDE.md` → `ZEN.md`, `.claude/` → `.zen/`, `~/.claude/` → `~/.zen/`, binary `claude` → `zen`.
+Naming: `CLAUDE.md` → `ZEN.md`, `.claude/` → `.zen/`, `~/.claude/` → `~/.zen/`, the reference agent's binary → `zen`.
 
 Implementation target: Rust stable, single binary `zen`. Model access: OpenAI-compatible
 `POST {baseUrl}/chat/completions` with `tools` (function calling) and optional SSE streaming.
@@ -57,7 +57,7 @@ Stdin: when `-p` and stdin is not a TTY, read stdin (cap 10 MB, error if larger)
 - Every turn is persisted to the session transcript (§10).
 
 ## 3. Agent loop
-1. Build request: system prompt (built-in + env info: cwd, OS, date, git status summary, + project snapshot + ZEN.md memory + skills list + `--append-system-prompt`), message history, tool schemas (built-in + MCP + Task). The system prompt is built once per session and sent byte-identical on every request (cache-friendly). **Project snapshot (r7, skipped with `--bare`):** a 2-level file tree (hidden dirs, `node_modules`/`target`/`dist`/`build`/`out`/`__pycache__`/`venv`/`vendor`/`coverage` and plain names from the top-level `.gitignore` omitted; ≤40 lines, ≤8 children per directory), build/test/lint commands detected from `Cargo.toml`, `package.json` scripts (npm/pnpm/yarn/bun by lockfile), `pyproject.toml`/`setup.py`/`requirements.txt`, `go.mod`, `pom.xml`, Gradle and Makefile targets, `--version` of the matching toolchains, test directories, and a line saying the work is judged by those checks; capped at 4000 characters. **Change workflow (r7 bench C2):** the built-in role prompt ends with a 5-step workflow for code changes - explore the relevant files, reproduce the problem (failing test or a tiny script), fix the root cause with the smallest change without editing/deleting/weakening tests unless asked, rerun the reproduction and the project's tests, check the edge cases the task implies - after https://www.anthropic.com/engineering/swe-bench-sonnet. `--system-prompt` replaces it with the rest of the role prompt.
+1. Build request: system prompt (built-in + env info: cwd, OS, date, git status summary, + project snapshot + ZEN.md memory + skills list + `--append-system-prompt`), message history, tool schemas (built-in + MCP + Task). The system prompt is built once per session and sent byte-identical on every request (cache-friendly). **Project snapshot (r7, skipped with `--bare`):** a 2-level file tree (hidden dirs, `node_modules`/`target`/`dist`/`build`/`out`/`__pycache__`/`venv`/`vendor`/`coverage` and plain names from the top-level `.gitignore` omitted; ≤40 lines, ≤8 children per directory), build/test/lint commands detected from `Cargo.toml`, `package.json` scripts (npm/pnpm/yarn/bun by lockfile), `pyproject.toml`/`setup.py`/`requirements.txt`, `go.mod`, `pom.xml`, Gradle and Makefile targets, `--version` of the matching toolchains, test directories, and a line saying the work is judged by those checks; capped at 4000 characters. **Change workflow (r7 bench C2):** the built-in role prompt ends with a 5-step workflow for code changes - explore the relevant files, reproduce the problem (failing test or a tiny script), fix the root cause with the smallest change without editing/deleting/weakening tests unless asked, rerun the reproduction and the project's tests, check the edge cases the task implies - after a published engineering write-up on SWE-bench. `--system-prompt` replaces it with the rest of the role prompt.
 2. Send to model. If response has `tool_calls`: for each call (in order) → run PreToolUse hooks → permission check → execute → PostToolUse hooks → append `role:"tool"` message with `tool_call_id` and textual result (errors returned as text with `is_error`-style prefix, never thrown away).
 3. Loop until the model returns a message without tool calls, or `--max-turns` reached (then result subtype `error_max_turns`).
 4. Run Stop hooks; a Stop hook exit 2 injects its stderr as a user message and continues the loop.
@@ -198,15 +198,15 @@ With `--include-partial-messages`: `{"type":"stream_event","event":{"type":"cont
 IDE integration, Chrome, cloud/teleport/remote-control, background sessions (`--bg`, `attach`), plugins/marketplaces, worktrees, auto-mode classifier, OAuth MCP, image input, voice, status line, output styles, `--json-schema` validation (optional), sandboxed bash.
 
 ## Appendix A - Evidence sources
-- `claude --help` (v2.1.296) captured on Railway box → `claude-help.txt`.
-- https://code.claude.com/docs/en/headless (output formats, result/init fields, retries, continue/resume)
-- https://code.claude.com/docs/en/settings (layers, precedence, list merging)
-- https://code.claude.com/docs/en/hooks (events, exit codes, JSON IO)
-- REA black-box run (Claude Code on google/gemini-4-argon:free via relay) → `SPEC-rea.md` (merged notes in Appendix B).
+- Reference CLI `--help` output (v2.1.296) captured on Railway box → `claude-help.txt`.
+- Reference agent public docs, headless page (output formats, result/init fields, retries, continue/resume)
+- Reference agent public docs, settings page (layers, precedence, list merging)
+- Reference agent public docs, hooks page (events, exit codes, JSON IO)
+- REA black-box run (the reference agent on google/gemini-4-argon:free via relay) → `SPEC-rea.md` (merged notes in Appendix B).
 
 ## Appendix B - REA black-box findings (merged 2026-10-14; raw notes in SPEC-rea.md)
-REA run: Claude Code 2.1.296 on Railway, 34 turns, black-box only (help output, docs pages, `-p` experiments in a scratch dir).
-Model: started on google/gemini-4-argon:free; argon's free allowance ran out mid-run, so the final run was on nvidia/nemotron-3-super-120b-a12b:free (OpenRouter) via the relay chain.
+REA run: the reference agent 2.1.296 on Railway, 34 turns, black-box only (help output, docs pages, `-p` experiments in a scratch dir).
+Model: started on google/gemini-4-argon:free; that model's free allowance ran out mid-run, so the final run was on nvidia/nemotron-3-super-120b-a12b:free (OpenRouter) via the relay chain.
 Changes/additions adopted into zen (override the sections above where they differ):
 - B1 (§1) `--allowed-tools` alias of `--allowedTools`; `--agent <name>` picks a sub-agent definition as the main agent; `zen mcp get <name>` and `zen mcp add-json <name> <json>`; `mcp add -e KEY=VAL` and `--header`.
 - B2 (§6/§7) Custom commands and skills share the `/name` namespace; on a name clash the skill wins. Templates support `$ARGUMENTS`, 0-based positional `$0..$9` / `$ARGUMENTS[N]` (per C5.2), `${ZEN_SKILL_DIR}`, `${ZEN_PROJECT_DIR}`, `${ZEN_SESSION_ID}`, inline `` !`cmd` `` (run with permission checks) and `@path`.
@@ -217,9 +217,9 @@ Changes/additions adopted into zen (override the sections above where they diffe
 
 ## Appendix C - Behavior parity checklist (2026-10-14)
 Sources (formats/behaviors only; nothing copied verbatim, no code or prompt text taken):
-public repo github.com/anthropics/claude-code (README, examples/settings/*.json, examples/hooks/bash_command_validator_example.py,
-plugins/*/.claude-plugin/plugin.json + hooks/hooks.json layout), and docs pages code.claude.com/docs/en/{hooks, settings, permissions,
-memory, headless, commands, sub-agents, skills}. Names translated: CLAUDE.md→ZEN.md, .claude→.zen, CLAUDE_PROJECT_DIR→ZEN_PROJECT_DIR.
+the reference agent's public repository (README, examples/settings/*.json, examples/hooks/bash_command_validator_example.py,
+plugins/*/.claude-plugin/plugin.json + hooks/hooks.json layout), and the reference agent's public documentation pages (hooks, settings, permissions,
+memory, headless, commands, sub-agents, skills), studied clean-room. Names translated: CLAUDE.md→ZEN.md, .claude→.zen, CLAUDE_PROJECT_DIR→ZEN_PROJECT_DIR.
 Priority: P1 = must have for parity of the core loop; P2 = should have; P3 = out of scope for v1.0.0 (documented only).
 Status column is maintained in PLAN.md ("Parity status").
 
