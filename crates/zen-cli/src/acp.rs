@@ -337,14 +337,14 @@ impl AcpServerState {
     }
 }
 
-#[allow(dead_code)] // M2: kept intentionally; first production caller is M4 (session/request_permission).
+#[allow(dead_code)] // floor-guard: kept intentionally; first production caller is M4 (session/request_permission).
 /// What the client answered to an agent-initiated request.
 enum ClientResponse {
     Result(Value),
     Error { code: i64, message: String },
 }
 
-#[allow(dead_code)] // M2: kept intentionally; first production caller is M4 (session/request_permission).
+#[allow(dead_code)] // floor-guard: kept intentionally; first production caller is M4 (session/request_permission).
 /// Why `send_client_request` did not return a result.
 #[derive(Debug, PartialEq)]
 enum SendRequestError {
@@ -679,7 +679,7 @@ fn write_response(out: &SharedWriter, resp: &RpcResponse) -> Result<()> {
 /// Every JSON-RPC line the server sends goes through here (responses,
 /// notifications and agent-initiated requests), so a line is never split
 /// by a concurrent writer.
-#[allow(dead_code)] // M2: kept intentionally; first production caller is M4 (session/request_permission).
+#[allow(dead_code)] // floor-guard: kept intentionally; first production caller is M4 (session/request_permission).
 fn write_json_line(out: &SharedWriter, value: &Value) -> Result<()> {
     write_line(out, &serde_json::to_string(value)?)
 }
