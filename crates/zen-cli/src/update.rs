@@ -646,15 +646,15 @@ esac
     #[cfg(unix)]
     #[test]
     fn run_success_failure_and_missing_program() {
-        assert!(run(Path::new("/bin/true"), &[], None).is_ok());
-        let err = run(Path::new("/bin/false"), &[], None).expect_err("false must fail");
+        assert!(run(Path::new("/usr/bin/true"), &[], None).is_ok());
+        let err = run(Path::new("/usr/bin/false"), &[], None).expect_err("false must fail");
         assert!(err.to_string().contains("command failed"), "{err}");
         let err = run(Path::new("/nonexistent-prog-xyz"), &[], None)
             .expect_err("missing program must fail");
         assert!(err.to_string().contains("failed to run"), "{err}");
         // With an explicit working directory.
         let dir = temp_home("run_cwd");
-        assert!(run(Path::new("/bin/true"), &[], Some(&dir)).is_ok());
+        assert!(run(Path::new("/usr/bin/true"), &[], Some(&dir)).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
