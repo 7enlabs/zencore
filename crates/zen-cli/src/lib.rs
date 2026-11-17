@@ -870,31 +870,31 @@ async fn run_headless(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result<i32>
     }
 
     if cli.plan {
-        return agent_run::run_plan_flow(
+        return agent_run::run_plan_flow(agent_run::AgentRunArgs {
             cli,
             cwd,
             home,
-            &cfg,
-            &system_prompt,
-            &full_prompt,
-            &session_id,
-            transcript_path.as_deref(),
-            history_from.as_deref(),
-        )
+            cfg: &cfg,
+            system_prompt: &system_prompt,
+            prompt: &full_prompt,
+            session_id: &session_id,
+            transcript_path: transcript_path.as_deref(),
+            history_from: history_from.as_deref(),
+        })
         .await;
     }
 
-    let code = agent_run::run_agent_headless(
+    let code = agent_run::run_agent_headless(agent_run::AgentRunArgs {
         cli,
         cwd,
         home,
-        &cfg,
-        &system_prompt,
-        &full_prompt,
-        &session_id,
-        transcript_path.as_deref(),
-        history_from.as_deref(),
-    )
+        cfg: &cfg,
+        system_prompt: &system_prompt,
+        prompt: &full_prompt,
+        session_id: &session_id,
+        transcript_path: transcript_path.as_deref(),
+        history_from: history_from.as_deref(),
+    })
     .await?;
     Ok(code)
 }

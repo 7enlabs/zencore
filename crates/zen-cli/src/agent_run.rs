@@ -1,6 +1,6 @@
 use crate::cli::{Cli, OutputFormat};
 use crate::commands;
-use crate::output::{Buffered, StreamJsonSink, print_result};
+use crate::output::{Buffered, StreamJsonSink, StreamJsonSinkParams, print_result};
 use crate::settings::ResolvedConfig;
 use anyhow::Result;
 use std::path::Path;
@@ -133,7 +133,6 @@ pub fn select_builtin_tools(
         .collect())
 }
 
-#[allow(clippy::too_many_arguments)] // floor-guard: params-struct refactor deferred
 pub async fn assemble(
     cli: &Cli,
     cwd: &Path,
@@ -662,30 +661,26 @@ fn tool_context(cwd: &Path, cfg: &ResolvedConfig, cli: &Cli, session_id: &str) -
     ctx
 }
 
-#[allow(clippy::too_many_arguments)] // floor-guard: params-struct refactor deferred
-pub async fn run_agent_headless(
-    cli: &Cli,
-    cwd: &Path,
-    home: Option<&Path>,
-    cfg: &ResolvedConfig,
-    system_prompt: &str,
-    prompt: &str,
-    session_id: &str,
-    transcript_path: Option<&Path>,
-    history_from: Option<&Path>,
-) -> Result<i32> {
-    let (code, result) = run_agent_with_result(
-        cli,
-        cwd,
-        home,
-        cfg,
-        system_prompt,
-        prompt,
-        session_id,
-        transcript_path,
-        history_from,
-    )
-    .await?;
+/// Parameters shared by the headless run entry points (`run_agent_headless`,
+/// `run_agent_with_result`, `run_plan_flow`): one struct instead of nine
+/// positional arguments (clippy::too_many_arguments). Every field is a
+/// reference, so the struct is `Copy` and a caller overrides only the
+/// fields it changes (`AgentRunArgs { cli: &plan_cli, ..args }`).
+#[derive(Clone, Copy)]
+pub struct AgentRunArgs<'a> {
+    pub cli: &'a Cli,
+    pub cwd: &'a Path,
+    pub home: Option<&'a Path>,
+    pub cfg: &'a ResolvedConfig,
+    pub system_prompt: &'a str,
+    pub prompt: &'a str,
+    pub session_id: &'a str,
+    pub transcript_path: Option<&'a Path>,
+    pub history_from: Option<&'a Path>,
+}
+
+pub async fn run_agent_headless(args: AgentRunArgs<'_>) -> Result<i32> {
+    let (code, result) = run_agent_with_result(args).await?;
     // Core-perfect phase 1 (A3): surface the next step for a provider
     // failure on stderr only — stdout (the JSON/text result contract)
     // is untouched.
@@ -725,18 +720,18 @@ fn slash_pin_model(slash_cmd: &Option<zen_ext::SlashCommand>) -> Option<String> 
         .filter(|m| !m.is_empty() && m != "inherit")
 }
 
-#[allow(clippy::too_many_arguments)] // floor-guard: params-struct refactor deferred
-pub(crate) async fn run_agent_with_result(
-    cli: &Cli,
-    cwd: &Path,
-    home: Option<&Path>,
-    cfg: &ResolvedConfig,
-    system_prompt: &str,
-    prompt: &str,
-    session_id: &str,
-    transcript_path: Option<&Path>,
-    history_from: Option<&Path>,
-) -> Result<(i32, RunResult)> {
+pub(crate) async fn run_agent_with_result(args: AgentRunArgs<'_>) -> Result<(i32, RunResult)> {
+    let AgentRunArgs {
+        cli,
+        cwd,
+        home,
+        cfg,
+        system_prompt,
+        prompt,
+        session_id,
+        transcript_path,
+        history_from,
+    } = args;
     let resume = history_from.is_some();
 
     let mut signals = SignalWatch::install();
@@ -808,14 +803,16 @@ pub(crate) async fn run_agent_with_result(
     let sink: Arc<dyn EventSink> = match cli.effective_output_format() {
         OutputFormat::StreamJson => {
             let s = Arc::new(StreamJsonSink::with_partial(
-                buf.clone(),
-                session_id.to_string(),
-                cwd.display().to_string(),
-                effective_model.clone(),
-                assembly.registry.names(),
-                assembly.mcp_status.clone(),
-                cfg.permission_mode.to_string(),
-                assembly.slash_commands.clone(),
+                StreamJsonSinkParams {
+                    buf: buf.clone(),
+                    session_id: session_id.to_string(),
+                    cwd: cwd.display().to_string(),
+                    model: effective_model.clone(),
+                    tools: assembly.registry.names(),
+                    mcp_servers: assembly.mcp_status.clone(),
+                    permission_mode: cfg.permission_mode.to_string(),
+                    slash_commands: assembly.slash_commands.clone(),
+                },
                 cli.include_partial_messages,
             ));
             s.set_mcp_errors(assembly.mcp_errors.clone());
@@ -1242,18 +1239,14 @@ pub(crate) async fn run_agent_with_result(
     ))
 }
 
-#[allow(clippy::too_many_arguments)] // floor-guard: params-struct refactor deferred
-pub async fn run_plan_flow(
-    cli: &Cli,
-    cwd: &Path,
-    home: Option<&Path>,
-    cfg: &ResolvedConfig,
-    system_prompt: &str,
-    prompt: &str,
-    session_id: &str,
-    transcript_path: Option<&Path>,
-    history_from: Option<&Path>,
-) -> Result<i32> {
+pub async fn run_plan_flow(args: AgentRunArgs<'_>) -> Result<i32> {
+    let AgentRunArgs {
+        cli,
+        cwd,
+        home,
+        prompt,
+        ..
+    } = args;
     let mut plan_cli = cli.clone();
     plan_cli.plan = false;
     plan_cli.until = None;
@@ -1264,17 +1257,11 @@ pub async fn run_plan_flow(
     // plan config itself, or the plan phase sends a catalog id its
     // gateway rejects with the same HTTP 400.
     crate::settings::route_catalog_model(&mut plan_cfg)?;
-    let (plan_code, plan_result) = run_agent_with_result(
-        &plan_cli,
-        cwd,
-        home,
-        &plan_cfg,
-        system_prompt,
-        prompt,
-        session_id,
-        transcript_path,
-        history_from,
-    )
+    let (plan_code, plan_result) = run_agent_with_result(AgentRunArgs {
+        cli: &plan_cli,
+        cfg: &plan_cfg,
+        ..args
+    })
     .await?;
     if plan_result.is_error {
         return Ok(plan_code);
@@ -1292,17 +1279,10 @@ pub async fn run_plan_flow(
     }
 
     let exec_prompt = format!("{prompt}\n\n## Approved plan\n\n{}", plan_result.result);
-    run_agent_headless(
-        cli,
-        cwd,
-        home,
-        cfg,
-        system_prompt,
-        &exec_prompt,
-        session_id,
-        transcript_path,
-        history_from,
-    )
+    run_agent_headless(AgentRunArgs {
+        prompt: &exec_prompt,
+        ..args
+    })
     .await
 }
 
