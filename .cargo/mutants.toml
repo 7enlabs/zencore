@@ -82,5 +82,18 @@ exclude_re = [
   # stores the mode), this mutant stops being equivalent: remove
   # this exclusion and kill it with a test that calls the default
   # set_mode and checks the stored mode.
+  # PR #228, acp.rs collect_listed_sessions (line 1500, col 41):
+  # replace `activity > t` with `activity >= t`.
+  # EQUIVALENT (waived by ZC Leader, 2026-11-18; verified by
+  # independent code review): when activity == t, the original
+  # `activity > t` is false so updated_at stays Some(t); with >= it
+  # is true so updated_at is assigned Some(activity) == Some(t) -
+  # the same value. The assignment is a no-op at equality, so no
+  # test can kill this mutant.
+  # EXPIRY: if the assignment on equality gains a different value
+  # (e.g. it stores something other than activity itself), this
+  # mutant stops being equivalent: remove this exclusion and kill
+  # it with a test where two sessions share the same activity time.
+  "acp\\.rs:1500:41: replace > with >= in collect_listed_sessions",
   "lib\\.rs:694:9: replace PermissionChecker::set_mode with \\(\\)",
 ]
