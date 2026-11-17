@@ -1396,8 +1396,17 @@ mod tests {
     /// when the next component is a `debug`/`release` profile, or
     /// when it looks like a target triple itself (so custom profiles
     /// under a triple keep working too). The canonical binary keeps
-    /// the triple in its path. Paths with no `target` component fall
-    /// back to the old layout (parent dir = profile, grandparent =
+    /// the triple in its path.
+    ///
+    /// `cargo llvm-cov` runs with `--target-dir
+    /// <target>/llvm-cov-target`, so the layout gains a level that is
+    /// a target *directory* name, not a triple:
+    /// `<target>/llvm-cov-target/<profile>/zen`. That name is folded
+    /// into the target dir; passing it as `--target` fails with
+    /// `could not find specification for target "llvm-cov-target"`
+    /// (Nightly coverage run 44068263302). Paths with no `target`
+    /// component fall back to the old layout (parent dir = profile,
+    /// grandparent =
     /// target dir, binary path unchanged, no triple).
     fn resolve_zen_build_dirs(bin: &Path) -> (PathBuf, String, PathBuf, Option<String>) {
         let file_name = bin
@@ -1413,6 +1422,21 @@ mod tests {
                     .filter_map(|c| c.as_os_str().to_str())
                     .collect();
                 if parts.len() >= 2 {
+                    // cargo-llvm-cov target dir (Nightly coverage run
+                    // 44068263302): `llvm-cov-target` is a target
+                    // *directory* name, not a target triple and not a
+                    // profile. The `parts[1] == "debug"` rule below
+                    // would take it for a triple and the nested build
+                    // would fail with `could not find specification
+                    // for target "llvm-cov-target"`. Fold the level
+                    // into the target dir and take the profile from
+                    // the next component.
+                    if parts[0] == "llvm-cov-target" {
+                        let target_dir = ancestor.join(parts[0]);
+                        let profile = parts[1];
+                        let canonical = target_dir.join(profile).join(&file_name);
+                        return (target_dir, profile.to_string(), canonical, None);
+                    }
                     let (triple, profile) = if parts.len() >= 3
                         && (parts[1] == "debug"
                             || parts[1] == "release"
@@ -1611,6 +1635,39 @@ mod tests {
                 "profiling".to_string(),
                 PathBuf::from("/x/target/x86_64-unknown-linux-musl/profiling/zen"),
                 Some("x86_64-unknown-linux-musl".to_string()),
+            )
+        );
+        // cargo-llvm-cov layout (Nightly run 44068263302):
+        // `llvm-cov-target` is a target dir name, NOT a triple and
+        // NOT a profile; the target dir gains the level and the
+        // nested build gets no `--target` flag.
+        assert_eq!(
+            resolve_zen_build_dirs(Path::new("/x/target/llvm-cov-target/debug/zen")),
+            (
+                PathBuf::from("/x/target/llvm-cov-target"),
+                "debug".to_string(),
+                PathBuf::from("/x/target/llvm-cov-target/debug/zen"),
+                None,
+            )
+        );
+        assert_eq!(
+            resolve_zen_build_dirs(Path::new(
+                "/x/target/llvm-cov-target/debug/build/zen-cli/9f3a1b2c4d5e6f7a/zen"
+            )),
+            (
+                PathBuf::from("/x/target/llvm-cov-target"),
+                "debug".to_string(),
+                PathBuf::from("/x/target/llvm-cov-target/debug/zen"),
+                None,
+            )
+        );
+        assert_eq!(
+            resolve_zen_build_dirs(Path::new("/x/target/llvm-cov-target/release/zen")),
+            (
+                PathBuf::from("/x/target/llvm-cov-target"),
+                "release".to_string(),
+                PathBuf::from("/x/target/llvm-cov-target/release/zen"),
+                None,
             )
         );
         // Release and custom profiles keep working.
