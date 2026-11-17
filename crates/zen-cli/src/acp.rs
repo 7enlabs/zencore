@@ -906,7 +906,8 @@ mod tests {
 // (driven through a subprocess probe like __acp_probe_emit_assistant),
 // write_response, the prompt_text resource arm, and the cheap error paths
 // of handle_prompt / handle_cancel / handle_session_new. The stdio loop
-// in run_acp_server is not drivable in-process and stays uncovered.
+// in run_acp_server is not drivable in-process; it is covered end to end
+// by crates/zen-cli/tests/acp_server.rs instead.
 #[cfg(test)]
 mod viec_a_tests {
     use super::*;
