@@ -31,28 +31,28 @@ descriptions, the status line following live model switches) stays.
 
 ## 1. References (design language only, not code)
 
-- Claude Code working screens (screenshots supplied by Zen + public
-  write-ups): LogoV2 dashboard (adaptive full/condensed layout,
-  FeedColumn with Recent Activity / What's New / Onboarding, condensed
+- Working screens of a reference agent (screenshots supplied by Zen + public
+  write-ups): logo dashboard (adaptive full/condensed layout,
+  feed column with Recent Activity / What's New / Onboarding, condensed
   mode when there is nothing to show); `●` assistant marker; tool-call
   timeline with `└` results collapsed to `+N lines`; spinner verbs —
   one playful verb + `…` + elapsed, from a fixed list
   (`src/constants/spinnerVerbs.ts`, ~185–204 verbs, user-overridable);
-  bottom status bar (`? for shortcuts` left, mode right); `ListItem`
+  bottom status bar (`? for shortcuts` left, mode right); `list item`
   `❯` selection marker; tabbed dialogs with a footer
   (`Select: Enter · Back: Esc`).
-- OpenCode TUI (OpenTUI, alternate screen — not copied, only the
+- A reference agent TUI (an open TUI kit, alternate screen — not copied, only the
   information design): home screen = logo + composer + tips + a footer
   line with cwd/branch, MCP status, `/status` hint and version;
   status bar shows active model + mode + connection state; the model
   picker shows model name, provider, token count, context limit, cost
   estimate and latency; dialogs are centred modal overlays.
-- Aider (line-based REPL, the closest structural cousin to Zen):
+- A reference line-based agent (line-based REPL, the closest structural cousin to Zen):
   startup prints version, model and git status as plain lines; model
   switching is CLI-only (`--model`, `--list-models`) — no visual
   picker, which is exactly the gap Zen hit. Lesson: a REPL *can* ship
-  a picker (Zen v1 does); Aider shows what happens without one.
-- Gemini CLI (Ink TUI): `? for shortcuts` hint above the input;
+  a picker (Zen v1 does); the reference line-based agent shows what happens without one.
+- A vendor-hosted agent CLI (Ink TUI): `? for shortcuts` hint above the input;
   window-title status icons (Ready `◇`, Working `✦`, Action `✋`);
   `/model set <name>` with an optional `--persist` flag — the
   session-only vs default distinction is worth copying as a *concept*
@@ -92,8 +92,7 @@ output). Ordered by severity.
 - It is 6 columns wide inside a ~55-column box, so it sits in a sea
   of empty space (see 2.2).
 - Root cause: a 5-row block font is too coarse for a diagonal. Block
-  characters (`█`) are for filled areas, not for strokes. Claude
-  Code's Clawd works because it is a detailed multi-line pixel
+  characters (`█`) are for filled areas, not for strokes. The reference agent's mascot works because it is a detailed multi-line pixel
   character; a 5-line Z cannot compete on the same technique.
 
 ### 2.2 The box is a tall, mostly-empty rectangle [HIGH]
@@ -102,7 +101,7 @@ output). Ordered by severity.
 line — in practice the `cwd` line (`~/workspace/system/cli-aislop-dot2`,
 ~40 chars). Result: a ~55-column box whose content is a 6-column
 mark and short left-aligned lines. ~30 columns of dead space on the
-right of every line. Claude Code's dashboard *fills* its width with
+right of every line. The reference agent's dashboard *fills* its width with
 two columns (logo left, feeds right); v1 has one narrow column in a
 wide box, so the box draws attention to emptiness.
 Fix: cap the width and shorten the cwd (see §5.1).
@@ -112,14 +111,14 @@ Fix: cap the width and shorten the cwd (see §5.1).
 Every line is the same colour and weight: `Zen CLI 0.1.0` (the
 product name — the most important line) looks identical to `model …`
 and `cwd …` (metadata). `welcome_box` does not even take a `Theme` —
-it is plain text. Claude Code uses bold/colour for the version line
+it is plain text. The reference agent uses bold/colour for the version line
 and dim for metadata; Lip Gloss names styles by purpose for the same
 reason. Fix: pass the theme in, paint the brand line accent-bold,
 labels dim, values plain (see §5.1, §6).
 
 ### 2.4 "Welcome back!" is wrong on first run [MEDIUM]
 
-v1 prints it unconditionally. Claude Code shows the full dashboard
+v1 prints it unconditionally. The reference agent shows the full dashboard
 only when there is something to show and falls back to a condensed
 logo otherwise. Zen has the data to do the same:
 `list_sessions_for_cwd(home, cwd)` (`session.rs:451`) already exists.
@@ -152,7 +151,7 @@ the cwd with `…` when the line would exceed ~80 columns (see §5.4).
 the current model with a trailing `  *` — ~30 characters from the
 number, where the eye never lands. No provider column (the id embeds
 it, but the eye must parse the prefix), no context window, no
-latency, no free badge. OpenCode's picker shows name + provider +
+latency, no free badge. The reference agent's picker shows name + provider +
 context + cost + latency for a reason: those are the four facts a
 person uses to choose. Zen already *has* three of them:
 `ModelProbe` (`models.rs:103`) carries `context_window` and
@@ -167,10 +166,9 @@ through and render columns (see §5.3).
 `├─ 1. Bash(cmd)` and `│  -> ok, N lines: …`. The number is good
 (it maps to `/expand`) and must stay. Two problems:
 - The tool name is uncoloured, so at a glance a tool call looks like
-  assistant prose. Claude Code colours the tool line; the eye should
+  assistant prose. The reference agent colours the tool line; the eye should
   land on the tool name first.
-- The result line reads like a log (`│  -> ok, N lines:`). Claude
-  Code uses `└` for the result — a closing corner that visually says
+- The result line reads like a log (`│  -> ok, N lines:`). The reference agent uses `└` for the result — a closing corner that visually says
   "this call is done" — and collapses to `+N lines`. v1's
   `(collapsed - /expand {n} for the full output)` is also wordy.
 - Inconsistency: the final answer gets a `●` prefix (`print_turn`,
@@ -184,16 +182,16 @@ Fix: §5.5.
 been running for {N}s...`. It is long, it restates the tool name
 (already shown in the card), it has no spinner character, and it
 never tells the user how to stop the turn (Zen's interrupt is
-Ctrl-C; a first-time user does not know that). Claude Code's form is
+Ctrl-C; a first-time user does not know that). The reference agent's form is
 one verb + `…` + elapsed, accent-coloured, with `(esc to interrupt)`.
 Fix: §5.6 — including a small *original* Zen verb list (clean-room:
-do not copy Claude's 185-verb list; write our own).
+do not copy the reference agent's 185-verb list; write our own).
 
 ### 2.10 `/todos` is unstyled [LOW]
 
 `repl.rs:1492` prints `[status] content` — raw status strings, no
 marker, no checkbox. The v1 doc already specified `●` header +
-`└ □` / `└ ☑` items (Claude Code's `● Update Todos` pattern); it was
+`└ □` / `└ ☑` items (the reference agent's `● Update Todos` pattern); it was
 never implemented. Fix: §5.7. Low priority because `/todos` is rarely
 on screen.
 
@@ -208,7 +206,7 @@ Fix: §6.
 
 ### 2.12 Box corners are square [LOW]
 
-`┌─┐└─┘` (NormalBorder). Lip Gloss best practice and Claude Code's
+`┌─┐└─┘` (NormalBorder). Lip Gloss best practice and the reference agent's
 dialogs both use rounded corners (`╭╮╰╯`) for emphasis boxes — softer,
 more deliberate. One-character change per corner. Fix with §5.1.
 
@@ -216,13 +214,13 @@ more deliberate. One-character change per corner. Fix with §5.1.
 
 | Source | Lesson for Zen (line-based REPL) |
 | --- | --- |
-| Claude Code LogoV2 | Full dashboard only when there is content; condensed logo otherwise. Two-column fill, never a wide box with one narrow column. Feeds (Recent / What's New) are *data*, not decoration — they exist because the data is cheap to read. |
-| Claude Code spinner verbs | One verb + `…` + elapsed. The verb is personality, not information — keep the list short, original, and deterministic per turn (no random flicker). |
-| Claude Code tool timeline | `● Tool(args)` + `└` result + `+N lines` collapse. The corner character does the work of a whole sentence. |
-| OpenCode picker | A model row answers four questions: name, provider, context, latency/cost. Anything less forces the user to guess. |
-| OpenCode home screen | Footer line carries cwd/branch + version + a hint — the *status line* and the *welcome* share one vocabulary. |
-| Aider | A REPL with no picker is the failure mode Zen already hit. The picker is the feature; the columns are the polish. |
-| Gemini CLI | Session-only vs persisted model switch (`--persist`) is a real user question — answer it in the footer, not in docs. |
+| Reference agent logo | Full dashboard only when there is content; condensed logo otherwise. Two-column fill, never a wide box with one narrow column. Feeds (Recent / What's New) are *data*, not decoration — they exist because the data is cheap to read. |
+| Reference agent spinner verbs | One verb + `…` + elapsed. The verb is personality, not information — keep the list short, original, and deterministic per turn (no random flicker). |
+| Reference agent tool timeline | `● Tool(args)` + `└` result + `+N lines` collapse. The corner character does the work of a whole sentence. |
+| Reference agent picker | A model row answers four questions: name, provider, context, latency/cost. Anything less forces the user to guess. |
+| Reference agent home screen | Footer line carries cwd/branch + version + a hint — the *status line* and the *welcome* share one vocabulary. |
+| A reference line-based agent | A REPL with no picker is the failure mode Zen already hit. The picker is the feature; the columns are the polish. |
+| A vendor-hosted agent CLI | Session-only vs persisted model switch (`--persist`) is a real user question — answer it in the footer, not in docs. |
 | Lip Gloss | Rounded borders for emphasis; adaptive colours per theme; styles named by purpose; TTY check before styling; padding as breathing room. |
 
 ## 4. Design principles for v2
@@ -383,7 +381,7 @@ Rules:
 - **Header**: `Models — current: <short> (<provider>)`, current name
   in Accent. Footer: one line with examples (replaces the bare
   `switch with /model <number> or /model <name>`).
-- **Session vs default**: borrow Gemini CLI's concept — after a
+- **Session vs default**: borrow the vendor CLI's concept — after a
   switch, print `model set to <id> (this session; /model set --default
   to keep it)` only if a `--default` path exists; if it does not
   exist yet, the footer should *not* promise it. For v2, keep the
@@ -413,7 +411,7 @@ Rules:
   exceed 80 columns (keep the first `~/` and the last two path
   segments). Branch stays, Dim.
 - **No new fields in v2**: context % and cost belong here eventually
-  (Claude Code's status bar, OpenCode's composer readout), but they
+  (the reference agent's status bar, the reference agent's composer readout), but they
   need a cheap, always-correct source; `UsageStats` + the model
   context window can supply it — put it in the follow-up list, not
   in v2, so the line stays a one-line change.
@@ -461,14 +459,13 @@ Rules:
   verb in Accent, rest Dim. When no tool is running, omit the tool:
   `{Verb}… {elapsed}s · Ctrl-C to stop`.
 - **Verbs (original, Zen-flavoured — clean-room: do not copy
-  Claude's list)**: `Thinking`, `Composing`, `Weaving`, `Polishing`,
+  the reference agent's list)**: `Thinking`, `Composing`, `Weaving`, `Polishing`,
   `Digging`, `Reading`, `Writing`, `Searching`, `Checking`,
   `Zening`. Pick deterministically per turn (e.g. hash of the tool
   name or the turn index mod list length) so the word does not flicker
   randomly between heartbeats; one verb per turn.
 - **Interrupt hint**: `Ctrl-C to stop` is the point — Zen's
-  interrupt key was never shown anywhere. Keep it short; it is the
-  equivalent of Claude Code's `(esc to interrupt)`.
+  interrupt key was never shown anywhere. Keep it short; it is the equivalent of the reference agent's `(esc to interrupt)`.
 - **Elapsed**: keep the real elapsed seconds from the heartbeat
   (already available as `elapsed_ms`).
 
@@ -600,10 +597,10 @@ nearest; do not use it.)
 
 ## 10. What NOT to do (clean-room + scope)
 
-- Do not copy Claude Code's Clawd mascot, its orange, its exact
+- Do not copy the reference agent's mascot, its orange, its exact
   wording, its 185-verb spinner list, or any of its code/prompts/tool
   descriptions. The Zen verb list in §5.6 is written from scratch.
-- Do not copy OpenCode's/Gemini CLI's fullscreen TUI, sidebar, or
+- Do not copy a reference agent's fullscreen TUI, sidebar, or
   modal overlays. Zen stays a line-based REPL; the status line
   *is* the status bar.
 - Do not add a TUI framework (ratatui, Bubble Tea, Ink, OpenTUI) or
@@ -620,19 +617,18 @@ nearest; do not use it.)
 
 ## 11. Sources consulted (design language only)
 
-- Claude Code LogoV2 / dashboard / design-system write-ups
-  (DeepWiki pages on `LogoV2.tsx`, `FeedColumn`, `ListItem`,
-  `ThemedText`); spinner-verb lists (gist by nitrocode, deepakness,
+- Reference agent logo / dashboard / design-system write-ups
+  (public pages on the logo, feed column, list item, and themed text); spinner-verb lists (gists by nitrocode, deepakness,
   waka-ds, XDA) — vocabulary *described*, not copied.
-- OpenCode TUI skill reference (screen layout, status bar, model
-  picker fields) and the `tui-patterns` OpenCode layout analysis
+- Reference agent TUI skill reference (screen layout, status bar, model
+  picker fields) and the `tui-patterns` reference-agent layout analysis
   (home screen, composer, footer line).
-- Aider terminal guide (BetterStack) and the agent-UI competition
-  scan (chump PRODUCT-011) — Aider's CLI-only model switching as the
+- Reference line-based agent terminal guide (BetterStack) and the agent-UI competition
+  scan (chump PRODUCT-011) — the reference line-based agent's CLI-only model switching as the
   negative example.
-- Gemini CLI settings schema (window-title status icons, `? for
+- Vendor-hosted agent CLI settings schema (window-title status icons, `? for
   shortcuts`, `/model set --persist`) and the 9-command comparison
-  across Claude Code / Codex / Gemini CLI / OpenCode (dev.to).
+  across reference agents (dev.to).
 - Charmbracelet Lip Gloss README + the gh-aw terminal-stylist
   analysis (rounded borders, adaptive colours, purpose-named styles,
   TTY checks) and the snappy TUI modernisation plan.

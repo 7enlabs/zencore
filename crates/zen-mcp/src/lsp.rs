@@ -16,12 +16,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Default cap for waiting on `publishDiagnostics` after an edit.
 /// This is a CAP, not a fixed wait: the wait resolves as soon as the
 /// server's batches settle (see `DIAGNOSTICS_DEBOUNCE`), and only runs
-/// the full cap when the server stays silent (OpenCode
+/// the full cap when the server stays silent (a reference agent's
 /// `waitForDiagnostics` wraps its debounce in `withTimeout(..., 3000)`).
 const DIAGNOSTICS_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Quiet period after the last diagnostics batch before the wait
-/// resolves (OpenCode `DIAGNOSTICS_DEBOUNCE_MS = 150`).
+/// resolves (a reference agent's `DIAGNOSTICS_DEBOUNCE_MS = 150`).
 const DIAGNOSTICS_DEBOUNCE: Duration = Duration::from_millis(150);
 
 type Pending = Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Value>>>>;
@@ -660,7 +660,7 @@ impl LspConnection {
     /// Snapshot the diagnostics for `path`, send the edit to the server,
     /// wait for fresh diagnostics, and return only the NEW ones (snapshot
     /// diff). The wait subscribes BEFORE `didChange` is sent so the
-    /// first batch is never missed (OpenCode `touchFile` pattern).
+    /// first batch is never missed (a reference agent's `touchFile` pattern).
     /// `timeout` is a CAP, not a fixed wait: the wait resolves `debounce`
     /// after the last batch, and only runs the full cap when the server
     /// stays silent.

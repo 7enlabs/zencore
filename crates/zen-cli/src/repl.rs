@@ -835,7 +835,7 @@ fn print_turn(result: Option<RunResult>) {
                 eprintln!("  hint: {hint}");
             }
         } else if !r.result.is_empty() {
-            // Claude-Code-style marker: assistant text is prefixed with ●.
+            // Reference-agent-style marker: assistant text is prefixed with ●.
             println!("● {}", r.result);
         }
         // S9 pattern 3: close the turn with the real elapsed time and

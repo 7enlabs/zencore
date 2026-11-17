@@ -2,7 +2,7 @@
 
 Skills are reusable bundles of instructions (methodology, checklists, habits)
 that the agent loads on demand. Zen adopts the **open SKILL.md standard**
-(Anthropic, Oct 2025 - same format as Claude Code / Codex / Cursor, so the
+(Oct 2025 - the same format used by reference agents, so the
 existing skill corpus works here) and adds three things nobody else ships
 together: **declared permissions**, **trust tiers with signatures**, and
 **built-in evals**.
@@ -57,7 +57,7 @@ loads on demand via the Skill tool.
 }
 ```
 
-Permission fields are **declarative and enforced** (Codex-style), not advisory:
+Permission fields are **declarative and enforced** (reference-agent-style), not advisory:
 
 | Field | Meaning |
 |---|---|

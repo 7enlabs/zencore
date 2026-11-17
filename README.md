@@ -3,7 +3,7 @@
 > **Status:** Private until v1.0.0.
 
 A clean-room terminal coding agent written in Rust, built for production use. It mirrors the
-*observable behavior* of tools like Claude Code (REPL, agent loop with tool calling, permissions,
+*observable behavior* of a reference agent, studied clean-room (REPL, agent loop with tool calling, permissions,
 hooks, ZEN.md memory, skills, MCP, sub-agents, headless JSON output, sessions, compaction) without
 using any of their code, prompts or tool descriptions. It talks to any OpenAI-compatible
 `/chat/completions` endpoint and is meant to be used with free models.
@@ -15,12 +15,12 @@ using any of their code, prompts or tool descriptions. It talks to any OpenAI-co
 ## Why Zen
 
 **Free is structural, not promotional.** In 2026, every major "free" AI coding tier got
-narrowed or killed: Gemini CLI shut down overnight (June 18), OpenCode locked free models
-to its app (September), Qwen Code ended its 2,000 req/day free tier (April 15). Zen
+narrowed or killed: A vendor-hosted agent CLI shut down overnight (June 18), a reference agent locked free models
+to its app (September), a reference agent CLI ended its 2,000 req/day free tier (April 15). Zen
 can't rug-pull you - there is no central API to shut off. You bring your own endpoint:
 free cloud models, your paid keys, or Ollama running fully offline on your machine.
 
-**The Four Questions** (after the [Gemini CLI postmortem](https://www.jenariusganlary.com/blog/gemini-cli-shut-down-choosing-ai-coding-tools)):
+**The Four Questions** (after a vendor CLI shutdown postmortem):
 
 | Question | Zen's answer |
 |---|---|
@@ -185,7 +185,7 @@ Anthropic client is available. Pricing feeds the `zen cost` ledger; see
 ### `/diff` (REPL)
 
 In the interactive REPL, `/diff` shows uncommitted changes as `git diff HEAD`, plus a list of
-untracked files (parity with Claude Code and Codex CLI, which both ship `/diff`):
+untracked files (parity with reference agents that ship `/diff`):
 
 - `/diff` - working tree vs HEAD (staged + unstaged), then untracked files
 - `/diff --staged` - staged changes only (`git diff --cached`)
@@ -345,7 +345,7 @@ Large tool results that no later message references are flagged `[PRUNABLE?]`
 (heuristic). Compactions show what each summary kept versus dropped.
 ### `@file` mentions and `!shell` passthrough (REPL)
 
-Two Claude Code-style shortcuts keep you in flow without spending a model round-trip:
+Two reference-agent-style shortcuts keep you in flow without spending a model round-trip:
 
 **`@<glob>` - attach file contents to your prompt.** Mentions are expanded before the
 prompt is sent; each file is wrapped in a `<file path="..." tokens="~N">` block with a
@@ -412,7 +412,7 @@ missing `~/.zen/ZEN.md`. Files support `@path` imports (max 4 hops, cycles safe)
 - `/memory` - list the loaded memory file paths.
 - `/init` - scaffold (or improve) the project `ZEN.md`. If `CLAUDE.md`/`AGENTS.md` files
   written for other agents are found, zen offers to import their content into the new
-  `ZEN.md` (migration path for Claude Code/Codex switchers).
+  `ZEN.md` (migration path for reference-agent switchers).
 ## Prompt caching (paid models)
 
 In a long agent loop the cost driver is rarely the model's answers - it is the

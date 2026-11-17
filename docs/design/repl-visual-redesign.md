@@ -11,15 +11,15 @@ unpolished and `/model` undiscoverable.
 
 ## References (design language only, not code)
 
-Claude Code working screens (screenshots supplied by Zen, 2026-11-06) plus
-public write-ups of its terminal UX (competitive research, DeepWiki pages
-on its Ink/React TUI). We borrow the *visual language* — layout, rhythm,
-markers — and write all Zen code originally. No Claude Code code,
+Working screens of a reference agent (screenshots supplied by Zen, 2026-11-06) plus
+public write-ups of its terminal UX (design research).
+We borrow the *visual language* — layout, rhythm,
+markers — and write all Zen code originally. No reference-agent code,
 prompts or tool descriptions are copied (clean-room rule, AGENTS.md).
 
-## What Claude Code does that Zen should adopt
+## What the reference agent does that Zen should adopt
 
-| Pattern | Claude Code | Zen adaptation (line-based REPL) |
+| Pattern | The reference agent | Zen adaptation (line-based REPL) |
 | --- | --- | --- |
 | Welcome dashboard | Bordered box: version, greeting, pixel mascot, model + plan, cwd; right column Recent activity + What's new; adaptive to terminal width | Bordered box: `Zen CLI vX.Y.Z`, greeting, Zen ASCII mark, model + provider, cwd; Recent activity (last sessions) + What's new (CHANGELOG top items) stacked below when the terminal is narrow; condensed to a minimal header when there is nothing to show |
 | Bottom status bar | `? for shortcuts` left, mode right (`Thinking off (tab to toggle)`); model + session + tokens | A dim rule + status line printed before each prompt: model, cwd, branch, permission mode; `?` hint stays in the welcome text |
@@ -35,9 +35,9 @@ prompts or tool descriptions are copied (clean-room rule, AGENTS.md).
 
 - The fullscreen alternate-screen TUI (React/Ink). Zen stays a
   line-based REPL (rustyline). No ratatui/fullscreen rewrite in this change.
-- Claude Code's mascot (pixel robot), its exact wording, or its orange.
+- The reference agent's mascot (pixel robot), its exact wording, or its orange.
   Zen gets its own ASCII mark and its own blue accent.
-- Any Claude Code code, prompts, or tool descriptions (clean-room).
+- Any reference-agent code, prompts, or tool descriptions (clean-room).
 
 ## Changes in this branch
 

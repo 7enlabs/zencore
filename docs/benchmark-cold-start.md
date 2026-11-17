@@ -75,10 +75,12 @@ script methodology before citing side-by-side):
 | Tool | Runtime | Reported cold start |
 |---|---|---|
 | Zen `zen` | Native Rust binary | see table above |
-| Codex CLI | Native Rust binary | not measured here yet |
-| Claude Code | Node.js | not measured here yet |
-| Gemini CLI | Node.js | not measured here yet |
-| OpenCode | Bun/Node (desktop: Electron) | not measured here yet |
+| Reference agent A | Native Rust binary | not measured here yet |
+| Reference agent B | Node.js | not measured here yet |
+| Reference agent C | Node.js | not measured here yet |
+| Reference agent D | Bun/Node (desktop: Electron) | not measured here yet |
+
+Reference agents A–D are generic labels (brand names removed under the clean-room policy); runtimes are kept as published.
 
 The honest claim we can make today: a native binary has no interpreter/VM warmup, so
 `--version`-class invocations should stay in the low hundreds of milliseconds. The

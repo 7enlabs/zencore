@@ -13,8 +13,8 @@ Yes - and more importantly, **there is no "tier" to take away.**
 
 Most "free tiers" are a vendor's marketing budget: they pay for your tokens hoping
 you'll convert to paid. When the math stops working, the tier gets narrowed
-(Gemini CLI, June 2026), locked to the vendor's app (OpenCode, September 2026), or
-killed outright (Qwen Code's 2,000 req/day tier, April 2026).
+(a vendor-hosted agent CLI, June 2026), locked to the vendor's app (a reference agent, September 2026), or
+killed outright (a reference agent CLI's 2,000 req/day tier, April 2026).
 
 Zen has no central API and no token subsidy. "Free" means:
 
@@ -43,8 +43,8 @@ free at the source.
 - Sessions are portable: `zen export` / `zen import` move a session to a new
   machine or a new tool.
 
-Compare: when Gemini CLI's backend died on June 18, 2026, CI pipelines and cron
-jobs calling `gemini` broke overnight - the open-source repo survived, but *"a repo
+Compare: when a vendor-hosted agent CLI's backend died on June 18, 2026, CI pipelines and cron
+jobs calling the vendor CLI broke overnight - the open-source repo survived, but *"a repo
 without a backend willing to serve it is source code, not a tool."* Zen never
 has a backend, so there is nothing to die.
 
@@ -55,7 +55,7 @@ funnel. There is no paid tier to upsell you to, no "Pro" plan behind the free
 one, no investor demanding conversion metrics.
 
 That is precisely why the free can't be rug-pulled - there is no business model
-depending on converting you. (iFlow CLI shut down mid-2026 with the post-mortem
+depending on converting you. (a reference multi-model agent CLI shut down mid-2026 with the post-mortem
 *"free multi-model aggregation had no visible business model"* - we agree, and
 that's why we don't aggregate: you bring the model, we bring the harness.)
 
@@ -64,18 +64,20 @@ If monetization ever comes, the commitment is: it will be for something *additiv
 architecture makes that promise enforceable: we couldn't take away your local
 models if we wanted to.
 
-## How is Zen different from OpenCode / Pi / Claude Code?
+## How is Zen different from reference agents?
 
-| | Claude Code | OpenCode | Pi | **Zen** |
+*Brand names removed per clean-room policy; reference agents are labelled generically.*
+
+| | Reference agent A | Reference agent B | Reference agent C | **Zen** |
 |---|---|---|---|---|
 | Cost | $20–200/mo, no free tier | Free agent; models BYOK or vendor PAYG | Free, BYOK | **$0 structural** (free models + local) |
-| Free tier rug-pull risk | n/a (paid) | **Real** - Zen free tier locked to app Sep 2026 | Low (no central free tier to pull) | **None** - no central free tier exists |
+| Free tier rug-pull risk | n/a (paid) | **Real** - the vendor free tier locked to app Sep 2026 | Low (no central free tier to pull) | **None** - no central free tier exists |
 | Works fully offline | No | No | With local models | **Yes - Ollama first-class** |
 | Per-run cost visibility | No (#1 complaint) | Basic | `$0.0xx` footer | **`zen cost` ledger + prompt budget** |
 | Harness for weak models | No (frontier-first) | Manual tuning | Minimal by design | **Verify loop + eval + compaction** |
 | Auditability | Closed source | Partial | Partial | **Stream-json, eval, audit, export** |
 
-The short version: Claude Code is the best harness money can buy; **Zen is the
+The short version: a paid reference agent is the best harness money can buy; **Zen is the
 best harness $0 can buy** - engineered specifically to make free and weak models
 succeed, with the receipts to prove it.
 
@@ -102,7 +104,7 @@ you which ones do.
 
 - **Local models (Ollama):** your prompts never leave your machine. Nobody trains
   on them. This is the only setup with a mathematical guarantee.
-- **Free cloud tiers:** many do train on prompts (OpenCode's own docs admit most
+- **Free cloud tiers:** many do train on prompts (a reference agent's own docs admit most
   of their free catalog does; only a few models are zero-retention). Assume yes
   unless the provider says otherwise.
 - **Paid APIs:** generally zero-retention by contract.
@@ -117,12 +119,12 @@ with the network cable unplugged: no auth, no quota, no telemetry, no kill
 switch. This isn't a degraded mode; it's a supported configuration we demo
 deliberately.
 
-## Is this a Claude Code clone?
+## Is this a clone of a reference agent?
 
 **No - and we never market it as one.** Zen is a clean-room implementation:
 it mirrors *observable behavior* (REPL, agent loop, tools, hooks, skills) without
 using anyone's code, prompts, or tool descriptions. But "clone" is the wrong frame
-entirely: the product is *the free-first agent*, not *the free Claude Code*.
+entirely: the product is *the free-first agent*, not *the free reference agent*.
 Positioning as a clone would be both a legal risk and weak positioning - it
 concedes that the original defines the category. It doesn't; the category is
 "agents that cost $0 by design," and we're defining it.
@@ -145,7 +147,7 @@ cent) on the record.
 
 - Developers who want a capable coding agent at **$0/month** - students, hobbyists,
   anyone between jobs, anyone in a region where $20/mo is real money.
-- Developers burned by a rug-pull (Gemini CLI, OpenCode Zen, Qwen Code) who now
+- Developers burned by a rug-pull (a vendor-hosted agent CLI, a reference agent, a reference agent CLI) who now
   evaluate tools with the Four Questions.
 - Privacy-conscious developers: local models, sandboxing, folder trust,
   `zen audit` before the agent touches anything.
@@ -157,7 +159,7 @@ cent) on the record.
 Honesty matters more than conversion:
 
 - If you need the absolute frontier model on every task and never think about
-  cost, Claude Code with Max is a fine product. Zen supports paid models
+  cost, a paid reference agent subscription is a fine product. Zen supports paid models
   too, but our harness is *optimized* for making weaker models succeed.
 - If you need an IDE-native experience today, our VS Code extension is on the
   roadmap - the CLI is the product right now.

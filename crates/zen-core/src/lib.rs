@@ -471,7 +471,7 @@ impl LspDiagnostic {
         matches!(self.severity, 1 | 2)
     }
 
-    /// OpenCode-style one-line render: `Error [line:col] message`.
+    /// Reference-agent-style one-line render: `Error [line:col] message`.
     pub fn pretty(&self) -> String {
         format!(
             "{} [{}:{}] {}",
@@ -726,8 +726,8 @@ pub enum HookEvent {
 
     PermissionDenied,
 
-    // Events added by the Wave 1 #3 hook system, mirroring the Claude
-    // Code hooks reference (33 events). See docs/hooks.md for the
+    // Events added by the Wave 1 #3 hook system, mirroring the reference
+    // agent's hooks reference (33 events). See docs/hooks.md for the
     // ZenCode trigger of each one.
     Setup,
     UserPromptExpansion,

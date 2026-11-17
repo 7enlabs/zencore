@@ -18,11 +18,11 @@ anecdote - it is the pattern that now defines the market:
 
 | Event | Date | What happened |
 |---|---|---|
-| **Qwen Code** free OAuth tier | **April 15, 2026** | The famous ~2,000 requests/day free tier ended (quotas stepped 2,000 → 1,000 → 100 first). Today: bring your own key, metered at $0.11/M input. |
-| **Gemini CLI** personal backend | **June 18, 2026** | Google shut off the free/Pro/Ultra backend with **zero grace period**. 100k+ stars, 6,000 community PRs - dead for personal users overnight. CI pipelines and cron jobs broke. The community called it a *"bait and switch."* |
-| **OpenCode** Zen free tier | **September 2026** | Free models stopped answering external callers (`FreeTierError: "OpenCode's free tier can only be used from within OpenCode"`). The catalog rotates without notice (13 → 11 models in one week), and most free models train on your prompts. |
-| **Trae** free tier | **2026** | Unmetered free access became a **one-time allowance that never resets** - a trial wearing a free tier's clothes. |
-| **iFlow CLI** | **Mid-2026** | Shut down entirely. Post-mortem lesson: *"free multi-model aggregation had no visible business model."* |
+| **A reference agent CLI** free OAuth tier | **April 15, 2026** | The famous ~2,000 requests/day free tier ended (quotas stepped 2,000 → 1,000 → 100 first). Today: bring your own key, metered at $0.11/M input. |
+| **A vendor-hosted agent CLI** personal backend | **June 18, 2026** | The vendor shut off the free/Pro/Ultra backend with **zero grace period**. 100k+ stars, 6,000 community PRs - dead for personal users overnight. CI pipelines and cron jobs broke. The community called it a *"bait and switch."* |
+| **A reference agent** free tier | **September 2026** | Free models stopped answering external callers (`FreeTierError: "OpenCode's free tier can only be used from within OpenCode"`). The catalog rotates without notice (13 → 11 models in one week), and most free models train on your prompts. |
+| **A reference IDE agent** free tier | **2026** | Unmetered free access became a **one-time allowance that never resets** - a trial wearing a free tier's clothes. |
+| **A reference multi-model agent CLI** | **Mid-2026** | Shut down entirely. Post-mortem lesson: *"free multi-model aggregation had no visible business model."* |
 
 The pattern: **every "free" tier in this market is a marketing funnel, and funnels get cut.**
 Developers learned this lesson twice in four months. They are now - rationally - distrustful
@@ -73,7 +73,7 @@ paid paths use. When we say "$0," we show the receipt.
 
 ## 3. The Four Questions
 
-After the Gemini CLI shutdown, developer Jenarius Ganlary published a framework now
+After a vendor CLI shutdown, developer Jenarius Ganlary published a framework now
 widely cited for evaluating AI coding tools. Four questions, answerable *before*
 adopting:
 
@@ -103,7 +103,9 @@ feature, and it cannot be copied without rebuilding the competitor's business mo
 
 ## 4. "What happens if the company dies?" - the comparison
 
-| | Claude Code | OpenCode | Qwen Code | **Zen** |
+*Brand names removed per clean-room policy; reference agents are labelled generically.*
+
+| | Reference agent A | Reference agent B | Reference agent C | **Zen** |
 |---|---|---|---|---|
 | If the vendor dies | **Tool dies.** Proprietary, API-only. | **Free tier dies.** Still needs vendor APIs. | **Free tier already died** (Apr 2026). BYOK survives. | **Nothing breaks.** No vendor backend exists. |
 | Who pays for "free"? | Nobody - no free tier. | The vendor (funnel). | The vendor (funnel, then cut). | **Nobody needs to.** Your keys, your models, or your hardware. |
@@ -134,8 +136,8 @@ Use these verbatim where they fit; do not invent new ones without review
 (see `docs/messaging.md`).
 
 1. *"The AI coding agent that costs $0 - by design, not by promotion."*
-2. *"When your Claude Code quota runs out at 2 PM, Zen keeps going."*
-3. *"Open source where it matters: no backend to shut off. Ask anyone who used Gemini CLI."*
+2. *"When your reference agent quota runs out at 2 PM, Zen keeps going."*
+3. *"Open source where it matters: no backend to shut off. Ask anyone who used a vendor-hosted agent CLI."*
 4. *"The harness that makes free models actually work."*
 5. *"Four questions. One answer: yes."*
 
@@ -143,9 +145,9 @@ Use these verbatim where they fit; do not invent new ones without review
 
 ## 7. What this positioning is NOT
 
-- **Not "a free Claude Code."** Never market Zen as a clone of anything
+- **Not "a free reference agent."** Never market Zen as a clone of anything
   (see `docs/messaging.md` - legal risk and weak positioning). The product is
-  *the free-first agent*, not *the free Claude Code*.
+  *the free-first agent*, not *the free reference agent*.
 - **Not "free models are as good as paid."** Free-model quality variance is real.
   We publish honest benchmarks with methodology and let the numbers speak.
   The community fact-checks within hours - never oversell.

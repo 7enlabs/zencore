@@ -75,7 +75,7 @@ not localhost, unless the endpoint runs on the Docker host with
 
 1. **No score is claimed yet.** See above.
 2. **Subset, not the full benchmark.** 8/89 tasks cannot be compared to
-   published 89-task scores (e.g. Codex CLI 82% on TB 2.0 with GPT-5.5).
+   published 89-task scores (e.g. a reference agent CLI 82% on TB 2.0 with GPT-5.5).
 3. **Single run.** No retries, no error bars when scores land.
 4. **Shared worker.** Durations are not clean performance numbers.
 
