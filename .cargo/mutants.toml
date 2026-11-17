@@ -69,4 +69,18 @@ exclude_re = [
   # equivalent: remove this exclusion and kill it with a test where
   # the turn ends with subtype "success".
   "acp\\.rs:1058:21: delete match arm \"success\" in run_prompt_turn",
+  # PR #227, lib.rs PermissionChecker::set_mode (line 694, col 9):
+  # replace the default set_mode body with ().
+  # EQUIVALENT (waived by ZC Leader, 2026-11-17; verified by
+  # independent code review): the default body is `let _ = mode;`,
+  # a no-op whose only purpose is to suppress the unused-parameter
+  # warning (the doc comment says "Default no-op: a checker that
+  # bakes no mode in has nothing to update"). Replacing the whole
+  # body with () leaves an empty function that also returns () and
+  # does nothing observable, so no test can kill this mutant.
+  # EXPIRY: if the default set_mode gains real behaviour (e.g. it
+  # stores the mode), this mutant stops being equivalent: remove
+  # this exclusion and kill it with a test that calls the default
+  # set_mode and checks the stored mode.
+  "lib\\.rs:694:9: replace PermissionChecker::set_mode with \\(\\)",
 ]

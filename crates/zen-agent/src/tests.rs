@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use serde_json::{Value, json};
 use zen_core::*;
@@ -2885,5 +2886,61 @@ async fn wave1_cwd_changed_fires_when_tool_moves_cwd() {
     assert_eq!(
         agent.dynamic_watch_paths,
         vec![std::path::PathBuf::from("/tmp/watch.env")]
+    );
+}
+
+/// A test async prompter that always answers Yes and records that it
+/// was asked (M4): stands in for the ACP round-trip to the client.
+struct YesAsyncPrompter {
+    asked: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl AsyncPrompter for YesAsyncPrompter {
+    async fn ask_permission(
+        &self,
+        _tool_name: &str,
+        _input: &Value,
+        _tool_call_id: &str,
+        _read_only: bool,
+    ) -> PromptAnswer {
+        self.asked.store(true, Ordering::SeqCst);
+        PromptAnswer::Yes
+    }
+}
+
+#[tokio::test]
+async fn async_prompter_is_consulted_for_asked_tool_call() {
+    // M4: the agent asks its installed async prompter for a tool call
+    // the checker marks Ask, and runs the tool when it answers Yes.
+    // (Without set_async_prompter the Ask denies in non-interactive
+    // mode, the tool never runs, and the turn has no "written" result.)
+    let llm = MockLlm::new(vec![resp_tool("Write", "{}", "c1"), resp("done")]);
+    let reg = registry_with(vec![fake("Write", false, "written")]);
+    let (mut agent, _sink, _h) = build_agent(
+        llm.clone(),
+        reg,
+        FakePerms::new(PermissionDecision::Ask),
+        base_cfg(),
+    );
+    let asked = Arc::new(AtomicBool::new(false));
+    agent.set_async_prompter(Arc::new(YesAsyncPrompter {
+        asked: Arc::clone(&asked),
+    }));
+    let r = agent.run_turn("go").await;
+    assert_eq!(r.subtype, "success");
+    assert!(
+        asked.load(Ordering::SeqCst),
+        "the async prompter must have been asked"
+    );
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .any(|m| m.role == "tool" && m.text_ref() == Some("written")),
+        "the tool must have run, got {:#?}",
+        requests[1].messages
     );
 }
