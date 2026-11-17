@@ -886,15 +886,18 @@ mod tests {
 #[cfg(test)]
 mod viec_a_tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
+    #[cfg(unix)]
     struct EnvRestore {
         path: Option<String>,
         gh_mode: Option<String>,
         gh_dir: Option<String>,
     }
 
+    #[cfg(unix)]
     impl EnvRestore {
         fn capture() -> Self {
             Self {
@@ -905,6 +908,7 @@ mod viec_a_tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for EnvRestore {
         fn drop(&mut self) {
             unsafe {
@@ -933,6 +937,7 @@ mod viec_a_tests {
 
     /// A fake `gh` answering the calls this module makes. FAKE_GH_MODE
     /// switches failure modes; FAKE_GH_DIR holds fixture JSON files.
+    #[cfg(unix)]
     fn write_fake_gh(bin_dir: &Path) {
         std::fs::create_dir_all(bin_dir).unwrap();
         let script = bin_dir.join("gh");
@@ -970,6 +975,7 @@ esac
 
     /// Sets up the fake gh on PATH (first, so it wins over a real gh).
     /// Callers must already hold the env lock. Returns (workdir, restore).
+    #[cfg(unix)]
     fn setup_fake_gh(tag: &str, mode: &str) -> (PathBuf, EnvRestore) {
         let base = temp_dir(tag);
         let bindir = base.join("fakebin");
@@ -1051,6 +1057,7 @@ esac
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn gh_json_and_available_via_fake_gh() {
         let _env = crate::settings::env_lock();
@@ -1083,6 +1090,7 @@ esac
         let _ = std::fs::remove_dir_all(&_base3);
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_pr_variants() {
         let _env = crate::settings::env_lock();
@@ -1119,6 +1127,7 @@ esac
         let _ = std::fs::remove_dir_all(&_b3);
     }
 
+    #[cfg(unix)]
     #[test]
     fn fetch_pr_comments_full_flow() {
         let _env = crate::settings::env_lock();
@@ -1208,6 +1217,7 @@ esac
         assert!(!out.iter().any(|l| l.contains("0 failed")));
     }
 
+    #[cfg(unix)]
     fn git_repo(tag: &str) -> PathBuf {
         let dir = temp_dir(tag);
         let run = |args: &[&str]| {
@@ -1233,6 +1243,7 @@ esac
         dir
     }
 
+    #[cfg(unix)]
     #[test]
     fn fetch_ci_status_full_flow() {
         let _env = crate::settings::env_lock();
@@ -1264,6 +1275,7 @@ esac
         let _ = std::fs::remove_dir_all(&repo3);
     }
 
+    #[cfg(unix)]
     #[test]
     fn fetch_ci_status_not_a_repo_errors() {
         let _env = crate::settings::env_lock();

@@ -488,9 +488,12 @@ mod tests {
 #[cfg(test)]
 mod viec_a_tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(unix)]
     const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    #[cfg(unix)]
     const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     /// Restores the env vars this module mutates when dropped, so a
@@ -544,6 +547,7 @@ mod viec_a_tests {
         dir
     }
 
+    #[cfg(unix)]
     fn src_dir_of(home: &Path) -> PathBuf {
         home.join(".local").join("share").join("zencode")
     }
@@ -552,6 +556,7 @@ mod viec_a_tests {
     /// driven by FAKE_GIT_STATUS (porcelain output), FAKE_GIT_LOCAL (HEAD
     /// SHA) and FAKE_GIT_REMOTE (ls-remote HEAD SHA); fetch/checkout/merge/
     /// clone always succeed.
+    #[cfg(unix)]
     fn write_fake_git(bin_dir: &Path) -> PathBuf {
         std::fs::create_dir_all(bin_dir).unwrap();
         let script = bin_dir.join("git");
@@ -679,6 +684,7 @@ esac
     /// Sets up a fake git on PATH (keeping the rest of PATH so the real
     /// cargo stays resolvable). Callers must already hold the env lock
     /// (`let _env = crate::settings::env_lock();`) before calling this.
+    #[cfg(unix)]
     fn setup_fake_git(
         tag: &str,
         status: &str,
@@ -717,6 +723,7 @@ esac
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_update_check_no_checkout_json_and_text() {
         let home = temp_home("check_nocheckout");
@@ -739,6 +746,7 @@ esac
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_update_check_clean_up_to_date() {
         let _env = crate::settings::env_lock();
@@ -752,6 +760,7 @@ esac
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_update_check_update_available() {
         let _env = crate::settings::env_lock();
@@ -765,6 +774,7 @@ esac
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_update_no_check_up_to_date_returns_zero() {
         let _env = crate::settings::env_lock();
@@ -782,6 +792,7 @@ esac
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_update_behind_fetches_then_build_fails() {
         let _env = crate::settings::env_lock();
@@ -795,6 +806,7 @@ esac
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_update_cargo_missing_bails() {
         let home = temp_home("cargo_missing");
@@ -817,6 +829,7 @@ esac
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_update_clone_then_build_fails() {
         let _env = crate::settings::env_lock();
