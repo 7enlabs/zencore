@@ -928,6 +928,7 @@ mod viec_a_tests {
         }
     }
 
+    #[cfg(unix)]
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("zen_viec_a_gh_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
