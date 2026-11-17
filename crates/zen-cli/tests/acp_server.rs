@@ -13,6 +13,7 @@ mod common;
 use common::*;
 use serde_json::{Value, json};
 use std::io::Write;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 fn req(id: u64, method: &str, params: Value) -> Value {
@@ -66,7 +67,16 @@ fn acp_initialize_roundtrip() {
     assert_eq!(resp["id"], 1);
     assert!(resp.get("error").is_none(), "unexpected error: {resp}");
     assert_eq!(resp["result"]["protocolVersion"], 1);
-    assert_eq!(resp["result"]["agentCapabilities"]["loadSession"], false);
+    assert_eq!(resp["result"]["agentCapabilities"]["loadSession"], true);
+    assert_eq!(
+        resp["result"]["agentCapabilities"]["sessionCapabilities"],
+        json!({
+            "list": {},
+            "resume": {},
+            "close": {},
+            "delete": {},
+        })
+    );
 }
 
 #[test]
@@ -397,4 +407,241 @@ fn acp_set_mode_and_set_config_option_roundtrip() {
     let resp = acp.next_line();
     assert_eq!(resp["error"]["code"], -32002, "{resp}");
     assert_eq!(acp.finish(), 0);
+}
+
+// -- M5: session persistence -----------------------------------------------
+
+/// Seed a session journal under the temp home (M5): mirrors
+/// `session::ensure_session_path` layout (`~/.zen/projects/<encoded
+/// cwd>/<session-id>.jsonl`) so load/resume/list/delete can be driven
+/// without an LLM. The `cwd` field of each record is the raw cwd
+/// string, exactly as `TranscriptWriter` writes it.
+fn seed_journal(home: &TempDir, cwd: &TempDir, session_id: &str) -> PathBuf {
+    let encoded: String = cwd
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '.' | '?' | '*' | '"' | '<' | '>' | '|' => '-',
+            c => c,
+        })
+        .collect();
+    let dir = home.path().join(".zen").join("projects").join(encoded);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{session_id}.jsonl"));
+    let cwd_str = cwd.path().to_string_lossy().to_string();
+    let records = [
+        json!({"type": "user", "uuid": "u1", "parent_uuid": null, "session_id": session_id, "timestamp": "2026-11-17T10:00:00Z", "cwd": cwd_str, "message": {"role": "user", "content": "hello from history"}}),
+        json!({"type": "assistant", "uuid": "u2", "parent_uuid": "u1", "session_id": session_id, "timestamp": "2026-11-17T10:00:01Z", "cwd": cwd_str, "message": {"role": "assistant", "content": "hi back", "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "Bash", "arguments": "{}"}}]}}),
+        json!({"type": "tool", "uuid": "u3", "parent_uuid": "u2", "session_id": session_id, "timestamp": "2026-11-17T10:00:02Z", "cwd": cwd_str, "message": {"role": "tool", "tool_call_id": "call-1", "name": "Bash", "content": "done"}}),
+    ];
+    let mut out = String::new();
+    for r in records {
+        out.push_str(&r.to_string());
+        out.push('\n');
+    }
+    std::fs::write(&path, out).unwrap();
+    path
+}
+
+#[test]
+fn acp_session_list_empty() {
+    let home = TempDir::new("acp_home");
+    let cwd = TempDir::new("acp_cwd");
+    let input = lines(&[initialize_req(1), req(2, "session/list", json!({}))]);
+    let (out, stderr, code) = run_acp(&home, &cwd, &input);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(out.len(), 2, "expected two response lines: {out:?}");
+    assert_eq!(out[1]["id"], 2);
+    assert_eq!(out[1]["result"]["sessions"], json!([]));
+}
+
+#[test]
+fn acp_session_list_shows_seeded_journal() {
+    let home = TempDir::new("acp_home");
+    let cwd = TempDir::new("acp_cwd");
+    seed_journal(&home, &cwd, "seed-1");
+    let cwd_str = cwd.path().to_string_lossy().to_string();
+    let input = lines(&[
+        initialize_req(1),
+        req(2, "session/list", json!({})),
+        req(3, "session/list", json!({"cwd": cwd_str})),
+        req(4, "session/list", json!({"cwd": "/nonexistent-dir-xyz"})),
+    ]);
+    let (out, stderr, code) = run_acp(&home, &cwd, &input);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(out.len(), 4, "expected four response lines: {out:?}");
+    let sessions = out[1]["result"]["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1, "{out:?}");
+    assert_eq!(sessions[0]["sessionId"], "seed-1");
+    assert_eq!(sessions[0]["cwd"], cwd_str);
+    assert!(sessions[0].get("updatedAt").is_some(), "{out:?}");
+    assert_eq!(out[2]["result"]["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(out[3]["result"]["sessions"], json!([]));
+}
+
+#[test]
+fn acp_session_load_replays_history() {
+    let home = TempDir::new("acp_home");
+    let cwd = TempDir::new("acp_cwd");
+    seed_journal(&home, &cwd, "seed-1");
+    let cwd_str = cwd.path().to_string_lossy().to_string();
+    let mut acp = AcpInteractive::spawn(&home, &cwd);
+    acp.send(&initialize_req(1));
+    assert_eq!(acp.next_line()["result"]["protocolVersion"], 1);
+    acp.send(&req(
+        2,
+        "session/load",
+        json!({"sessionId": "seed-1", "cwd": cwd_str, "mcpServers": []}),
+    ));
+    // Replay first, in journal order: user chunk, agent chunk, tool
+    // call, tool result. Then the load response.
+    let n1 = acp.next_line();
+    assert_eq!(n1["method"], "session/update");
+    assert_eq!(
+        n1["params"]["update"]["sessionUpdate"],
+        "user_message_chunk"
+    );
+    assert_eq!(
+        n1["params"]["update"]["content"]["text"],
+        "hello from history"
+    );
+    let n2 = acp.next_line();
+    assert_eq!(
+        n2["params"]["update"]["sessionUpdate"],
+        "agent_message_chunk"
+    );
+    assert_eq!(n2["params"]["update"]["content"]["text"], "hi back");
+    let n3 = acp.next_line();
+    assert_eq!(n3["params"]["update"]["sessionUpdate"], "tool_call");
+    assert_eq!(n3["params"]["update"]["toolCallId"], "call-1");
+    let n4 = acp.next_line();
+    assert_eq!(n4["params"]["update"]["sessionUpdate"], "tool_call_update");
+    assert_eq!(n4["params"]["update"]["status"], "completed");
+    let resp = acp.next_line();
+    assert_eq!(resp["id"], 2);
+    assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+    assert_eq!(resp["result"]["modes"]["currentModeId"], "default");
+    assert_eq!(acp.finish(), 0);
+}
+
+#[test]
+fn acp_session_resume_returns_without_replay() {
+    let home = TempDir::new("acp_home");
+    let cwd = TempDir::new("acp_cwd");
+    seed_journal(&home, &cwd, "seed-1");
+    let cwd_str = cwd.path().to_string_lossy().to_string();
+    let mut acp = AcpInteractive::spawn(&home, &cwd);
+    acp.send(&initialize_req(1));
+    assert_eq!(acp.next_line()["result"]["protocolVersion"], 1);
+    acp.send(&req(
+        2,
+        "session/resume",
+        json!({"sessionId": "seed-1", "cwd": cwd_str, "mcpServers": []}),
+    ));
+    // No notifications: the very next line is the resume response.
+    let resp = acp.next_line();
+    assert_eq!(resp["id"], 2);
+    assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+    assert_eq!(resp["result"]["modes"]["currentModeId"], "default");
+    assert_eq!(acp.finish(), 0);
+}
+
+#[test]
+fn acp_session_close_is_idempotent() {
+    let home = TempDir::new("acp_home");
+    let cwd = TempDir::new("acp_cwd");
+    let cwd_str = cwd.path().to_string_lossy().to_string();
+    let mut acp = AcpInteractive::spawn(&home, &cwd);
+    acp.send(&initialize_req(1));
+    assert_eq!(acp.next_line()["result"]["protocolVersion"], 1);
+    acp.send(&req(2, "session/new", json!({"cwd": cwd_str})));
+    let new_resp = acp.next_line();
+    let session_id = new_resp["result"]["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
+    acp.send(&req(3, "session/close", json!({"sessionId": session_id})));
+    let close1 = acp.next_line();
+    assert_eq!(close1["id"], 3);
+    assert_eq!(close1["result"], json!({}));
+    acp.send(&req(4, "session/close", json!({"sessionId": session_id})));
+    let close2 = acp.next_line();
+    assert_eq!(close2["id"], 4);
+    assert_eq!(close2["result"], json!({}));
+    acp.send(&req(5, "session/close", json!({"sessionId": "ghost"})));
+    let close3 = acp.next_line();
+    assert_eq!(close3["id"], 5);
+    assert_eq!(close3["result"], json!({}));
+    assert_eq!(acp.finish(), 0);
+}
+
+#[test]
+fn acp_session_delete_removes_journal() {
+    let home = TempDir::new("acp_home");
+    let cwd = TempDir::new("acp_cwd");
+    let journal = seed_journal(&home, &cwd, "seed-1");
+    let mut acp = AcpInteractive::spawn(&home, &cwd);
+    acp.send(&initialize_req(1));
+    assert_eq!(acp.next_line()["result"]["protocolVersion"], 1);
+    acp.send(&req(2, "session/delete", json!({"sessionId": "seed-1"})));
+    let resp = acp.next_line();
+    assert_eq!(resp["id"], 2);
+    assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+    assert_eq!(resp["result"], json!({}));
+    acp.send(&req(3, "session/list", json!({})));
+    let list = acp.next_line();
+    assert_eq!(list["result"]["sessions"], json!([]));
+    assert_eq!(acp.finish(), 0);
+    assert!(!journal.exists(), "journal should be deleted");
+    // Deleting again succeeds silently.
+    let input = lines(&[
+        initialize_req(1),
+        req(2, "session/delete", json!({"sessionId": "seed-1"})),
+    ]);
+    let (out, stderr, code) = run_acp(&home, &cwd, &input);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(out[1]["result"], json!({}));
+}
+
+#[test]
+fn acp_session_load_unknown_is_32002() {
+    let home = TempDir::new("acp_home");
+    let cwd = TempDir::new("acp_cwd");
+    let cwd_str = cwd.path().to_string_lossy().to_string();
+    let input = lines(&[
+        initialize_req(1),
+        req(
+            2,
+            "session/load",
+            json!({"sessionId": "ghost", "cwd": cwd_str, "mcpServers": []}),
+        ),
+    ]);
+    let (out, stderr, code) = run_acp(&home, &cwd, &input);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(out.len(), 2, "expected two response lines: {out:?}");
+    assert_eq!(out[1]["error"]["code"], -32002);
+}
+
+#[test]
+fn acp_session_load_cwd_mismatch_is_invalid_params() {
+    let home = TempDir::new("acp_home");
+    let cwd = TempDir::new("acp_cwd");
+    let other = TempDir::new("acp_other_cwd");
+    seed_journal(&home, &cwd, "seed-1");
+    let other_str = other.path().to_string_lossy().to_string();
+    let input = lines(&[
+        initialize_req(1),
+        req(
+            2,
+            "session/load",
+            json!({"sessionId": "seed-1", "cwd": other_str, "mcpServers": []}),
+        ),
+    ]);
+    let (out, stderr, code) = run_acp(&home, &cwd, &input);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(out.len(), 2, "expected two response lines: {out:?}");
+    assert_eq!(out[1]["error"]["code"], -32602);
 }

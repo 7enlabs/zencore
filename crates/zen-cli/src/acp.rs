@@ -8,8 +8,9 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
+use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, oneshot};
 
 use zen_core::lock_recovery::lock_or_recover;
@@ -295,6 +296,17 @@ struct AcpSession {
     /// The model the session runs (gateway id, M4): `set_config_option`
     /// writes it, `run_prompt_turn` applies it at turn start.
     model: Mutex<String>,
+    /// Working directory this session belongs to (M5). Sessions are
+    /// listed and restored per workspace, and the journal is stored
+    /// under the encoded cwd (PR #210).
+    cwd: PathBuf,
+    /// Last activity time: creation or the last completed prompt turn
+    /// (M5). `session/list` sorts by it, newest first.
+    last_activity: Mutex<SystemTime>,
+    /// Writer for the session journal (M5): `None` when the session
+    /// runs without a home dir (in-memory only) or the journal could
+    /// not be created. A failed persist never fails a turn.
+    transcript: Mutex<Option<crate::session::TranscriptWriter>>,
 }
 
 impl AcpSession {
@@ -304,6 +316,8 @@ impl AcpSession {
         mode: PermissionMode,
         base_system_prompt: String,
         model: String,
+        cwd: PathBuf,
+        transcript: Option<crate::session::TranscriptWriter>,
     ) -> Self {
         Self {
             agent: tokio::sync::Mutex::new(agent),
@@ -315,7 +329,27 @@ impl AcpSession {
             mode: Mutex::new(mode),
             base_system_prompt,
             model: Mutex::new(model),
+            cwd,
+            last_activity: Mutex::new(SystemTime::now()),
+            transcript: Mutex::new(transcript),
         }
+    }
+
+    /// Persist a completed turn to the session journal (M5): the
+    /// messages the turn appended, as a transcript diff. A cancelled
+    /// turn is never persisted (its history was rolled back), and a
+    /// persist failure is logged, not reported: the turn already
+    /// succeeded. Takes both snapshots because the agent lives behind
+    /// a tokio Mutex, which this sync method cannot lock.
+    fn persist_turn(&self, before: &[ChatMessage], after: &[ChatMessage]) {
+        let mut guard = lock_or_recover(&self.transcript, "acp session transcript");
+        let Some(writer) = guard.as_mut() else {
+            return;
+        };
+        if let Err(e) = writer.persist_turn(before, after) {
+            eprintln!("acp: failed to persist turn to session journal: {e:#}");
+        }
+        *lock_or_recover(&self.last_activity, "acp session last activity") = SystemTime::now();
     }
 
     /// The mode the session currently runs in (M4).
@@ -707,8 +741,9 @@ async fn dispatch_line(
     let response = match req.method.as_str() {
         "initialize" => Some(apply_initialize(&state.initialized, id, &req.params)),
         "authenticate" => Some(RpcResponse::ok(id, json!({}))),
-        "session/new" => {
-            match handle_session_new(cli, default_cwd, home, &req.params, state).await {
+        "session/new" => match reject_system_prompt(&req.params) {
+            Err((code, msg)) => Some(RpcResponse::err(id, code, msg)),
+            Ok(()) => match handle_session_new(cli, default_cwd, home, &req.params, state).await {
                 Ok((session_id, session)) => {
                     let session = Arc::new(session);
                     let modes = session.modes_state();
@@ -731,8 +766,8 @@ async fn dispatch_line(
                     ERR_INTERNAL,
                     format!("session/new failed: {e:#}"),
                 )),
-            }
-        }
+            },
+        },
         "session/prompt" => {
             // A prompt runs on a spawned task (M2): the dispatcher
             // keeps reading stdin while the turn runs, so session/cancel
@@ -834,6 +869,29 @@ async fn dispatch_line(
                 Err((code, message)) => Some(RpcResponse::err(id, code, message)),
             }
         }
+        "session/list" => match handle_session_list(state, home, &req.params) {
+            // Journal reads are blocking IO, but the journal is
+            // small (one metadata line per entry) and the dispatcher
+            // never holds the sessions lock across this call.
+            Ok(value) => Some(RpcResponse::ok(id, value)),
+            Err((code, message)) => Some(RpcResponse::err(id, code, message)),
+        },
+        "session/load" => match handle_session_load(cli, home, &req.params, state).await {
+            Ok(value) => Some(RpcResponse::ok(id, value)),
+            Err((code, message)) => Some(RpcResponse::err(id, code, message)),
+        },
+        "session/resume" => match handle_session_resume(cli, home, &req.params, state).await {
+            Ok(value) => Some(RpcResponse::ok(id, value)),
+            Err((code, message)) => Some(RpcResponse::err(id, code, message)),
+        },
+        "session/close" => match handle_session_close(state, &req.params) {
+            Ok(()) => Some(RpcResponse::ok(id, json!({}))),
+            Err((code, message)) => Some(RpcResponse::err(id, code, message)),
+        },
+        "session/delete" => match handle_session_delete(state, home, &req.params) {
+            Ok(()) => Some(RpcResponse::ok(id, json!({}))),
+            Err((code, message)) => Some(RpcResponse::err(id, code, message)),
+        },
         "$/cancel_request" => {
             // A notification in practice: no response is ever sent for
             // it (M3). If a client sends it as a request, answer with
@@ -965,18 +1023,23 @@ fn handle_initialize(id: Value, params: &Value) -> RpcResponse {
         json!({
             "protocolVersion": version,
             "agentCapabilities": {
-                // Only what M1 actually implements is advertised; the
-                // rest (session/load, MCP servers, session list/resume/
-                // close/delete, auth) arrives with M5/M7. An omitted or
+                // Only what M1-M5 actually implement is advertised; the
+                // rest (MCP servers, auth) arrives with M7. An omitted or
                 // false capability means unsupported.
                 // Modes are NOT advertised here: ACP v1 puts them in the
                 // session/new response (M4), which lists exactly
                 // default/plan/acceptEdits and never bypassPermissions
                 // or dontAsk (Leader Q3, tin 15113).
-                "loadSession": false,
+                // M5 advertises the persistence capability set of ACP v1.
+                "loadSession": true,
                 "promptCapabilities": { "image": false, "audio": false, "embeddedContext": false },
                 "mcpCapabilities": { "http": false, "sse": false },
-                "sessionCapabilities": {},
+                "sessionCapabilities": {
+                    "list": {},
+                    "resume": {},
+                    "close": {},
+                    "delete": {},
+                },
                 "auth": {},
             },
             "agentInfo": {
@@ -1006,24 +1069,43 @@ async fn handle_session_new(
         anyhow::bail!("ACP requires absolute paths; got: {}", cwd.display());
     }
 
-    let cfg = settings::resolve_config_with_home(cli, &cwd, home)?;
     let session_id = uuid::Uuid::new_v4().hyphenated().to_string();
+    let session = build_acp_session(cli, &cwd, home, state, &session_id, &[]).await?;
+    Ok((session_id, session))
+}
+
+/// Build a live ACP session for a given id, optionally seeded with a
+/// restored history (M5). Shared by `session/new` (fresh id, empty
+/// seed) and `session/load` / `session/resume` (the stored id, the
+/// journal history). The mode and model start at the configured
+/// defaults: neither is persisted in the journal format (v1), so a
+/// restored session restarts with the defaults, not the values it had
+/// when it was saved.
+async fn build_acp_session(
+    cli: &Cli,
+    cwd: &Path,
+    home: Option<&Path>,
+    state: &Arc<AcpServerState>,
+    session_id: &str,
+    seed: &[ChatMessage],
+) -> Result<AcpSession> {
+    let cfg = settings::resolve_config_with_home(cli, cwd, home)?;
 
     let sink = Arc::new(AcpSink {
         out: state.out.clone(),
-        session_id: session_id.clone(),
+        session_id: session_id.to_string(),
         tools: Arc::new(Mutex::new(HashMap::new())),
         pending_tools: Arc::new(Mutex::new(HashSet::new())),
     });
 
-    let assembly = agent_run::assemble(cli, &cwd, home, &cfg, &session_id, None).await?;
+    let assembly = agent_run::assemble(cli, cwd, home, &cfg, session_id, None).await?;
     assembly.subagent_sink.set(sink.clone());
 
-    let system_prompt = crate::build_system_prompt(cli, &cwd, home)?;
+    let system_prompt = crate::build_system_prompt(cli, cwd, home)?;
     let llm: Arc<dyn LlmBackend> = cfg.llm_client(sink.clone());
     let mut agent_config = agent_run::base_agent_config(&cfg, cli, &system_prompt);
     agent_config.diagnostics_provider = assembly.diagnostics_provider.clone();
-    let ctx = agent_run::tool_context_public(&cwd, &cfg, cli, &session_id);
+    let ctx = agent_run::tool_context_public(cwd, &cfg, cli, session_id);
     // M4: the session only ever runs an advertised mode. A configured
     // bypassPermissions/dontAsk mode (CLI flag or settings) is clamped
     // to Default for ACP sessions: those modes must never be advertised
@@ -1057,15 +1139,35 @@ async fn handle_session_new(
     agent.permissions.set_mode(initial_mode);
     agent.set_async_prompter(Arc::new(AcpPrompter::new(
         Arc::clone(state),
-        session_id.clone(),
+        session_id.to_string(),
     )));
+    if !seed.is_empty() {
+        agent.set_messages(seed.to_vec());
+    }
 
     let _ = assembly;
 
     let model = agent.config.model.clone();
-    Ok((
-        session_id,
-        AcpSession::new(agent, sink, initial_mode, system_prompt, model),
+    // The journal writer lives with the session: every completed
+    // turn is appended to the PR #210 journal for this cwd + id.
+    let transcript = match home {
+        Some(home) => match crate::session::ensure_session_path(home, cwd, session_id) {
+            Ok(path) => Some(crate::session::TranscriptWriter::new(path, session_id, cwd)),
+            Err(e) => {
+                eprintln!("acp: session journal unavailable: {e:#}");
+                None
+            }
+        },
+        None => None,
+    };
+    Ok(AcpSession::new(
+        agent,
+        sink,
+        initial_mode,
+        system_prompt,
+        model,
+        cwd.to_path_buf(),
+        transcript,
     ))
 }
 
@@ -1184,6 +1286,14 @@ async fn run_prompt_turn(
     let size = agent.config.context_window;
     match result {
         Some(result) => {
+            // M5: the turn completed, so its messages join the
+            // session journal before the agent is dropped. The
+            // journal mirrors the agent's actual history, including
+            // a turn that finished while a cancel was racing it; a
+            // turn aborted mid-flight (the None arm) restores
+            // `before`, so it is never persisted.
+            let after = agent.messages().to_vec();
+            session.persist_turn(&before, &after);
             drop(agent);
             session.sink.notify(SessionUpdate::UsageUpdate {
                 used: result.usage.input_tokens + result.usage.output_tokens,
@@ -1237,6 +1347,558 @@ impl Drop for PromptRunningGuard<'_> {
         let mut id = lock_or_recover(&self.session.prompt_request_id, "acp prompt request id");
         *id = None;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Session persistence (M5, ACP v1): session/list, session/load,
+// session/resume, session/close, session/delete.
+//
+// The journal is the source of truth across processes:
+// `~/.zen/projects/<encoded-cwd>/<session-id>.jsonl` (PR #210 format).
+// A turn is persisted when it completes (`run_prompt_turn`); a
+// cancelled turn restores history, so nothing new is written. Live
+// sessions also stay in the in-memory map, so `session/list` merges
+// both: a session with no completed turn yet has no journal, but it
+// is still a known session.
+//
+// Two prep-doc claims turned out to be v2-only and do NOT apply to
+// v1 (checked against the v1 schema, 17/11/2026): `session/resume`
+// has no `replayFrom` parameter and there is no `replay_complete`
+// update in v1 — resume never replays, load replays the whole
+// history with `session/update` and then answers. `state_update`
+// is v2-only too (M3).
+// ---------------------------------------------------------------------------
+
+/// Page size for `session/list` (ACP v1 leaves the size to the agent;
+/// the cursor is the offset of the next page, as a decimal string).
+const SESSION_LIST_PAGE_SIZE: usize = 50;
+
+/// One row of a `session/list` result, before serialisation.
+struct ListedSession {
+    id: String,
+    cwd: String,
+    title: Option<String>,
+    updated_at: Option<SystemTime>,
+}
+
+impl ListedSession {
+    fn to_json(&self) -> Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert("sessionId".into(), json!(self.id));
+        obj.insert("cwd".into(), json!(self.cwd));
+        if let Some(title) = &self.title {
+            obj.insert("title".into(), json!(title));
+        }
+        if let Some(updated) = self.updated_at {
+            let dt: DateTime<Utc> = updated.into();
+            obj.insert("updatedAt".into(), json!(dt.to_rfc3339()));
+        }
+        Value::Object(obj)
+    }
+}
+
+/// Read the working directory recorded in a session journal: the
+/// `cwd` field of the first record that carries one. Every record
+/// written by `TranscriptWriter` carries it; usage-only records do
+/// not, so they are skipped.
+fn journal_cwd(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    for line in std::io::BufReader::new(file).lines() {
+        let Ok(line) = line else { continue };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if let Some(cwd) = v.get("cwd").and_then(Value::as_str) {
+            return Some(cwd.to_string());
+        }
+    }
+    None
+}
+
+/// Collect the sessions `session/list` reports (M5): journal sessions
+/// on disk plus live in-memory sessions, newest activity first (ties
+/// break by session id, so pagination is stable). A `cwd` filter
+/// restricts to that working directory; without a filter every known
+/// session is listed. Archived journals are not listed: they are no
+/// longer live sessions.
+fn collect_listed_sessions(
+    state: &AcpServerState,
+    home: Option<&Path>,
+    cwd_filter: Option<&Path>,
+) -> Vec<ListedSession> {
+    let mut by_id: HashMap<String, ListedSession> = HashMap::new();
+    if let Some(home) = home {
+        if let Some(filter) = cwd_filter {
+            for (id, path) in crate::session::list_sessions_for_cwd(home, filter) {
+                let info = crate::session_mgmt::session_info(&path, false);
+                by_id.insert(
+                    id.clone(),
+                    ListedSession {
+                        id,
+                        cwd: filter.display().to_string(),
+                        title: info.title,
+                        updated_at: Some(info.modified),
+                    },
+                );
+            }
+        } else {
+            for info in crate::session_mgmt::list_all_sessions(home, false) {
+                let Some(cwd) = journal_cwd(&info.path) else {
+                    // A journal without a recorded cwd cannot be
+                    // reported (SessionInfo requires cwd). It is a
+                    // corrupt record: log it and skip it instead of
+                    // failing the whole list.
+                    eprintln!(
+                        "acp: skipping journal without cwd in session/list: {}",
+                        info.path.display()
+                    );
+                    continue;
+                };
+                by_id.insert(
+                    info.id.clone(),
+                    ListedSession {
+                        id: info.id,
+                        cwd,
+                        title: info.title,
+                        updated_at: Some(info.modified),
+                    },
+                );
+            }
+        }
+    }
+    // Live sessions with no journal yet (no completed turn) are still
+    // known sessions; a live session with a journal refreshes the
+    // activity time when its last turn ended after the last persist.
+    let live: Vec<(String, PathBuf, SystemTime)> = {
+        let sessions = lock_or_recover(&state.sessions, "acp sessions");
+        sessions
+            .iter()
+            .map(|(id, s)| {
+                (
+                    id.clone(),
+                    s.cwd.clone(),
+                    *lock_or_recover(&s.last_activity, "acp session last activity"),
+                )
+            })
+            .collect()
+    };
+    for (id, cwd, activity) in live {
+        if cwd_filter.is_some_and(|f| cwd.as_path() != f) {
+            continue;
+        }
+        match by_id.get_mut(&id) {
+            Some(existing) => {
+                let newer = match existing.updated_at {
+                    Some(t) => activity > t,
+                    None => true,
+                };
+                if newer {
+                    existing.updated_at = Some(activity);
+                }
+            }
+            None => {
+                by_id.insert(
+                    id.clone(),
+                    ListedSession {
+                        id,
+                        cwd: cwd.display().to_string(),
+                        title: None,
+                        updated_at: Some(activity),
+                    },
+                );
+            }
+        }
+    }
+    let mut out: Vec<ListedSession> = by_id.into_values().collect();
+    out.sort_by(|a, b| {
+        b.updated_at
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+            .cmp(&a.updated_at.unwrap_or(SystemTime::UNIX_EPOCH))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    out
+}
+
+/// Handle `session/list` (M5, ACP v1): optional `cursor` (opaque,
+/// the offset of the next page) and `cwd` (absolute path filter).
+/// Returns `{"sessions": [...]}` plus `nextCursor` when another page
+/// follows; `nextCursor` is omitted on the last page.
+fn handle_session_list(
+    state: &AcpServerState,
+    home: Option<&Path>,
+    params: &Value,
+) -> Result<Value, (i64, String)> {
+    let cwd_filter: Option<PathBuf> = match params.get("cwd").and_then(Value::as_str) {
+        Some(cwd) => {
+            let path = PathBuf::from(cwd);
+            if !path.is_absolute() {
+                return Err((
+                    ERR_INVALID_PARAMS,
+                    "session/list requires an absolute cwd".to_string(),
+                ));
+            }
+            Some(path)
+        }
+        None => None,
+    };
+    let offset: usize = match params.get("cursor").and_then(Value::as_str) {
+        Some(cursor) => cursor.parse().map_err(|_| {
+            (
+                ERR_INVALID_PARAMS,
+                format!("session/list got an invalid cursor: {cursor}"),
+            )
+        })?,
+        None => 0,
+    };
+    let listed = collect_listed_sessions(state, home, cwd_filter.as_deref());
+    let total = listed.len();
+    let page: Vec<Value> = listed
+        .iter()
+        .skip(offset)
+        .take(SESSION_LIST_PAGE_SIZE)
+        .map(ListedSession::to_json)
+        .collect();
+    let mut result = json!({ "sessions": page });
+    if offset + SESSION_LIST_PAGE_SIZE < total {
+        result["nextCursor"] = json!((offset + SESSION_LIST_PAGE_SIZE).to_string());
+    }
+    Ok(result)
+}
+
+/// Reject a client-provided `systemPrompt` on a lifecycle request
+/// (M5): the agent does not advertise `sessionCapabilities.systemPrompt`,
+/// so a compliant client never sends one. ACP v1 requires an agent
+/// that cannot apply it to return an error instead of creating,
+/// loading or resuming the session; -32602 is the recommended code.
+fn reject_system_prompt(params: &Value) -> Result<(), (i64, String)> {
+    if params.get("systemPrompt").is_some_and(|v| !v.is_null()) {
+        return Err((
+            ERR_INVALID_PARAMS,
+            "systemPrompt is not supported by this agent".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the working directory for a `session/load` / `session/resume`
+/// request (M5). The schema marks `cwd` required; when it is absent
+/// the stored session cwd is used instead (it is authoritative). A
+/// relative `cwd`, or one that does not match the stored session cwd,
+/// is rejected with -32602: a session belongs to the workspace it was
+/// created in.
+fn resolve_lifecycle_cwd(params: &Value, stored_cwd: &Path) -> Result<PathBuf, (i64, String)> {
+    match params.get("cwd").and_then(Value::as_str) {
+        Some(cwd) => {
+            let path = PathBuf::from(cwd);
+            if !path.is_absolute() {
+                return Err((
+                    ERR_INVALID_PARAMS,
+                    "session/load and session/resume require an absolute cwd".to_string(),
+                ));
+            }
+            if path != stored_cwd {
+                return Err((
+                    ERR_INVALID_PARAMS,
+                    format!(
+                        "cwd {} does not match the session working directory {}",
+                        path.display(),
+                        stored_cwd.display()
+                    ),
+                ));
+            }
+            Ok(path)
+        }
+        None => Ok(stored_cwd.to_path_buf()),
+    }
+}
+
+/// Restore a persisted session (M5): find its journal, seed a live
+/// session from the stored history, and register it. Returns the live
+/// session and the history it was seeded with. A session that is
+/// already active in this connection is returned as-is: resuming a
+/// running session syncs the current state instead of replaying, and
+/// loading replays the journal (a stable snapshot of the completed
+/// turns) rather than the live agent, whose history may change
+/// mid-replay while a turn runs.
+async fn restore_session(
+    cli: &Cli,
+    home: Option<&Path>,
+    params: &Value,
+    state: &Arc<AcpServerState>,
+) -> Result<(Arc<AcpSession>, Vec<ChatMessage>), (i64, String)> {
+    let session_id = params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            (
+                ERR_INVALID_PARAMS,
+                "session/load and session/resume require a sessionId".to_string(),
+            )
+        })?
+        .to_string();
+    reject_system_prompt(params)?;
+    // Already active in this connection: reuse it.
+    if let Some(live) = {
+        let sessions = lock_or_recover(&state.sessions, "acp sessions");
+        sessions.get(&session_id).cloned()
+    } {
+        resolve_lifecycle_cwd(params, &live.cwd)?;
+        // History for a load replay: prefer the journal (a stable
+        // snapshot of the completed turns). Without a usable journal,
+        // take the live history when the agent is idle; a running
+        // turn holds the agent lock, so loading mid-turn is rejected
+        // instead of replaying a history that changes under it.
+        let history =
+            match home.and_then(|h| crate::session_mgmt::find_managed_session(h, &session_id)) {
+                Some((journal, false)) => crate::session::load_history(&journal).map_err(|e| {
+                    (
+                        ERR_INTERNAL,
+                        format!("failed to read session history: {e:#}"),
+                    )
+                })?,
+                _ => match live.agent.try_lock() {
+                    Ok(agent) => agent.messages().to_vec(),
+                    Err(_) => {
+                        return Err((
+                            ERR_INVALID_REQUEST,
+                            "session has a prompt running".to_string(),
+                        ));
+                    }
+                },
+            };
+        return Ok((live, history));
+    }
+    // Not active: the journal is the only source. Without a home dir
+    // there is nowhere a journal could live.
+    let Some(home_path) = home else {
+        return Err((
+            ERR_UNKNOWN_SESSION,
+            format!("unknown session: {session_id}"),
+        ));
+    };
+    let Some((journal, archived)) =
+        crate::session_mgmt::find_managed_session(home_path, &session_id)
+    else {
+        return Err((
+            ERR_UNKNOWN_SESSION,
+            format!("unknown session: {session_id}"),
+        ));
+    };
+    if archived {
+        // An archived session is no longer a live session: it does
+        // not come back through load/resume (restore it via the CLI
+        // first, like any other archived session).
+        return Err((
+            ERR_UNKNOWN_SESSION,
+            format!("unknown session: {session_id}"),
+        ));
+    }
+    let stored_cwd = journal_cwd(&journal).ok_or_else(|| {
+        (
+            ERR_INTERNAL,
+            format!("session journal has no recorded cwd: {}", journal.display()),
+        )
+    })?;
+    let cwd = resolve_lifecycle_cwd(params, Path::new(&stored_cwd))?;
+    let history = crate::session::load_history(&journal).map_err(|e| {
+        (
+            ERR_INTERNAL,
+            format!("failed to read session history: {e:#}"),
+        )
+    })?;
+    let session = build_acp_session(cli, &cwd, Some(home_path), state, &session_id, &history)
+        .await
+        .map_err(|e| (ERR_INTERNAL, format!("failed to restore session: {e:#}")))?;
+    let session = Arc::new(session);
+    {
+        let mut sessions = lock_or_recover(&state.sessions, "acp sessions");
+        sessions.insert(session_id, Arc::clone(&session));
+    }
+    Ok((session, history))
+}
+
+/// Handle `session/load` (M5, ACP v1): restore the session and replay
+/// its whole history as `session/update` notifications, then answer
+/// with the session's modes and config options. The response is sent
+/// only after every history entry has been streamed, so the client
+/// can continue the conversation as if it was never interrupted.
+/// Live-only notices are never replayed (there are none to replay
+/// yet: notices arrive in M6).
+async fn handle_session_load(
+    cli: &Cli,
+    home: Option<&Path>,
+    params: &Value,
+    state: &Arc<AcpServerState>,
+) -> Result<Value, (i64, String)> {
+    let (session, history) = restore_session(cli, home, params, state).await?;
+    replay_history(&session, &history);
+    Ok(json!({
+        "modes": session.modes_state(),
+        "configOptions": session.config_options(),
+    }))
+}
+
+/// Handle `session/resume` (M5, ACP v1): restore the session without
+/// replaying any history. The response carries the session's current
+/// modes and config options, which is the state sync for a session
+/// that was already active in this connection.
+async fn handle_session_resume(
+    cli: &Cli,
+    home: Option<&Path>,
+    params: &Value,
+    state: &Arc<AcpServerState>,
+) -> Result<Value, (i64, String)> {
+    let (session, _) = restore_session(cli, home, params, state).await?;
+    Ok(json!({
+        "modes": session.modes_state(),
+        "configOptions": session.config_options(),
+    }))
+}
+
+/// Replay a restored history to the client as `session/update`
+/// notifications (M5, ACP v1 `session/load`): one `user_message_chunk`
+/// per user message and one `agent_message_chunk` per assistant text,
+/// each user chunk with a fresh `messageId` (the journal stores no
+/// message ids), plus `tool_call` / `tool_call_update` for the
+/// recorded tool calls and their results, matched by tool call id. A
+/// tool call announced but never answered in the journal is closed
+/// as `completed` at the end, so the client never leaves it hanging
+/// in progress. Messages with no text are skipped; `system` messages
+/// are not in the journal history (`load_history` drops them).
+fn replay_history(session: &Arc<AcpSession>, history: &[ChatMessage]) {
+    let mut announced: Vec<String> = vec![];
+    let mut resolved: HashSet<String> = HashSet::new();
+    for message in history {
+        match message.role.as_str() {
+            "user" => {
+                let text = message.text();
+                if text.trim().is_empty() {
+                    continue;
+                }
+                session.sink.notify(SessionUpdate::UserMessageChunk {
+                    content: ContentBlock::Text { text },
+                    message_id: uuid::Uuid::new_v4().hyphenated().to_string(),
+                });
+            }
+            "assistant" => {
+                let text = message.text();
+                if !text.trim().is_empty() {
+                    session.sink.notify(SessionUpdate::AgentMessageChunk {
+                        content: ContentBlock::Text { text },
+                    });
+                }
+                if let Some(calls) = message.tool_calls.as_deref() {
+                    for call in calls {
+                        announced.push(call.id.clone());
+                        session.sink.notify(SessionUpdate::ToolCall(ToolCallUpdate {
+                            tool_call_id: call.id.clone(),
+                            title: call.function.name.clone(),
+                            kind: None,
+                        }));
+                    }
+                }
+            }
+            "tool" => {
+                let Some(id) = &message.tool_call_id else {
+                    continue;
+                };
+                if !announced.contains(id) {
+                    announced.push(id.clone());
+                    session.sink.notify(SessionUpdate::ToolCall(ToolCallUpdate {
+                        tool_call_id: id.clone(),
+                        title: message.name.clone().unwrap_or_else(|| "tool".to_string()),
+                        kind: None,
+                    }));
+                }
+                resolved.insert(id.clone());
+                let text = message.text();
+                session
+                    .sink
+                    .notify(SessionUpdate::ToolCallUpdate(ToolCallResult {
+                        tool_call_id: id.clone(),
+                        status: "completed",
+                        content: if text.trim().is_empty() {
+                            None
+                        } else {
+                            Some(vec![ContentBlock::Text { text }])
+                        },
+                    }));
+            }
+            _ => {}
+        }
+    }
+    for id in announced {
+        if !resolved.contains(&id) {
+            session
+                .sink
+                .notify(SessionUpdate::ToolCallUpdate(ToolCallResult {
+                    tool_call_id: id,
+                    status: "completed",
+                    content: None,
+                }));
+        }
+    }
+}
+
+/// Handle `session/close` (M5, ACP v1): cancel any ongoing work for
+/// the session as if `session/cancel` had been called, then drop it
+/// from the live map. The journal stays on disk, so the session can
+/// be loaded or resumed later. Closing is idempotent: an unknown or
+/// already-closed session answers with the same empty result (the
+/// spec explicitly says so; clients also treat -32002 as success).
+fn handle_session_close(state: &AcpServerState, params: &Value) -> Result<(), (i64, String)> {
+    let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
+        return Err((
+            ERR_INVALID_PARAMS,
+            "session/close requires a sessionId".to_string(),
+        ));
+    };
+    let session = {
+        let mut sessions = lock_or_recover(&state.sessions, "acp sessions");
+        sessions.remove(session_id)
+    };
+    if let Some(session) = session {
+        // The prompt task keeps its own Arc and answers the in-flight
+        // prompt as `cancelled`; close does not wait for it, so the
+        // dispatcher stays responsive while the turn aborts.
+        session.request_cancel();
+    }
+    Ok(())
+}
+
+/// Handle `session/delete` (M5, ACP v1): remove the session from
+/// future `session/list` results by deleting its journal (and scratch
+/// dir). An active session is closed first, so no turn keeps writing
+/// to a deleted journal. Deleting a missing or already-deleted
+/// session succeeds silently, as the spec requires.
+fn handle_session_delete(
+    state: &AcpServerState,
+    home: Option<&Path>,
+    params: &Value,
+) -> Result<(), (i64, String)> {
+    let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
+        return Err((
+            ERR_INVALID_PARAMS,
+            "session/delete requires a sessionId".to_string(),
+        ));
+    };
+    {
+        let mut sessions = lock_or_recover(&state.sessions, "acp sessions");
+        if let Some(session) = sessions.remove(session_id) {
+            session.request_cancel();
+        }
+    }
+    if let Some(home) = home
+        && crate::session_mgmt::find_managed_session(home, session_id).is_some()
+    {
+        crate::session_mgmt::delete_session(home, session_id)
+            .map_err(|e| (ERR_INTERNAL, format!("session/delete failed: {e:#}")))?;
+    }
+    Ok(())
 }
 
 fn handle_cancel(sessions: &HashMap<String, Arc<AcpSession>>, params: &Value) {
@@ -1621,13 +2283,21 @@ mod tests {
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["result"]["protocolVersion"], 1);
         let caps = &v["result"]["agentCapabilities"];
-        assert_eq!(caps["loadSession"], false);
+        assert_eq!(caps["loadSession"], true);
         assert_eq!(caps["promptCapabilities"]["image"], false);
         assert_eq!(caps["promptCapabilities"]["audio"], false);
         assert_eq!(caps["promptCapabilities"]["embeddedContext"], false);
         assert_eq!(caps["mcpCapabilities"]["http"], false);
         assert_eq!(caps["mcpCapabilities"]["sse"], false);
-        assert_eq!(caps["sessionCapabilities"], json!({}));
+        assert_eq!(
+            caps["sessionCapabilities"],
+            json!({
+                "list": {},
+                "resume": {},
+                "close": {},
+                "delete": {},
+            })
+        );
         assert_eq!(caps["auth"], json!({}));
         assert_eq!(v["result"]["authMethods"], json!([]));
     }
@@ -2528,7 +3198,15 @@ mod tests {
             zen_core::ToolContext::new(std::env::temp_dir(), session_id),
             config,
         );
-        let session = Arc::new(AcpSession::new(agent, sink, mode, String::new(), model));
+        let session = Arc::new(AcpSession::new(
+            agent,
+            sink,
+            mode,
+            String::new(),
+            model,
+            std::env::temp_dir(),
+            None,
+        ));
         let mut sessions = lock_or_recover(&state.sessions, "acp sessions");
         sessions.insert(session_id.to_string(), session);
     }
@@ -2562,7 +3240,15 @@ mod tests {
             zen_core::ToolContext::new(std::env::temp_dir(), session_id),
             config,
         );
-        let session = Arc::new(AcpSession::new(agent, sink, mode, String::new(), model));
+        let session = Arc::new(AcpSession::new(
+            agent,
+            sink,
+            mode,
+            String::new(),
+            model,
+            std::env::temp_dir(),
+            None,
+        ));
         let mut sessions = lock_or_recover(&state.sessions, "acp sessions");
         sessions.insert(session_id.to_string(), Arc::clone(&session));
         session
@@ -4106,6 +4792,457 @@ mod tests {
             .filter(|o| o.get("id").and_then(Value::as_str) == Some(first.id))
             .count();
         assert_eq!(count, 1, "{options:?}");
+    }
+
+    // -- M5: session persistence -------------------------------------
+
+    #[tokio::test]
+    async fn session_list_empty_when_no_sessions() {
+        let (state, buf) = test_state();
+        let run = drive_dispatcher(
+            Arc::clone(&state),
+            vec![
+                init_line(1),
+                json!({"jsonrpc": "2.0", "id": 2, "method": "session/list", "params": {}})
+                    .to_string(),
+            ],
+        );
+        run.await.unwrap().unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some()
+        })
+        .await;
+        let resp = find_response(&lines, 2).unwrap();
+        assert!(resp.get("error").is_none(), "{lines:?}");
+        assert_eq!(resp["result"]["sessions"], json!([]), "{lines:?}");
+        assert!(resp["result"].get("nextCursor").is_none(), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn session_list_reports_live_session() {
+        let (state, buf) = test_state();
+        fake_session(&state, "s1", 0);
+        let run = drive_dispatcher(
+            Arc::clone(&state),
+            vec![
+                init_line(1),
+                json!({"jsonrpc": "2.0", "id": 2, "method": "session/list", "params": {}})
+                    .to_string(),
+            ],
+        );
+        run.await.unwrap().unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some()
+        })
+        .await;
+        let resp = find_response(&lines, 2).unwrap();
+        assert!(resp.get("error").is_none(), "{lines:?}");
+        let sessions = resp["result"]["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1, "{lines:?}");
+        assert_eq!(sessions[0]["sessionId"], "s1");
+        assert_eq!(
+            sessions[0]["cwd"].as_str().unwrap(),
+            std::env::temp_dir().to_str().unwrap()
+        );
+        // One session is a partial page: no nextCursor (a '*' here
+        // would point at a page past the end).
+        assert!(resp["result"].get("nextCursor").is_none(), "{lines:?}");
+    }
+
+    #[test]
+    fn session_list_paginates_with_cursor() {
+        let (state, _buf) = test_state();
+        for i in 0..55 {
+            fake_session(&state, &format!("s{i:02}"), 0);
+        }
+        let page1 = handle_session_list(&state, None, &json!({})).unwrap();
+        assert_eq!(page1["sessions"].as_array().unwrap().len(), 50);
+        assert_eq!(page1["nextCursor"], "50");
+        let page2 = handle_session_list(&state, None, &json!({"cursor": "50"})).unwrap();
+        assert_eq!(page2["sessions"].as_array().unwrap().len(), 5);
+        assert!(page2.get("nextCursor").is_none());
+        let mut ids: Vec<&str> = page1["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(page2["sessions"].as_array().unwrap().iter())
+            .map(|s| s["sessionId"].as_str().unwrap())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 55);
+    }
+
+    #[test]
+    fn session_list_rejects_bad_cursor_and_relative_cwd() {
+        let (state, _buf) = test_state();
+        let err =
+            handle_session_list(&state, None, &json!({"cursor": "not-a-number"})).unwrap_err();
+        assert_eq!(err.0, -32602);
+        let err = handle_session_list(&state, None, &json!({"cwd": "relative/path"})).unwrap_err();
+        assert_eq!(err.0, -32602);
+        // A cursor past the end is an empty last page, not an error.
+        let page = handle_session_list(&state, None, &json!({"cursor": "999"})).unwrap();
+        assert_eq!(page["sessions"], json!([]));
+        assert!(page.get("nextCursor").is_none());
+    }
+
+    #[tokio::test]
+    async fn session_close_is_idempotent() {
+        let (state, buf) = test_state();
+        fake_session(&state, "s1", 0);
+        let run = drive_dispatcher(
+            Arc::clone(&state),
+            vec![
+                init_line(1),
+                json!({"jsonrpc": "2.0", "id": 2, "method": "session/close", "params": {"sessionId": "s1"}}).to_string(),
+                json!({"jsonrpc": "2.0", "id": 3, "method": "session/close", "params": {"sessionId": "s1"}}).to_string(),
+                json!({"jsonrpc": "2.0", "id": 4, "method": "session/close", "params": {"sessionId": "ghost"}}).to_string(),
+            ],
+        );
+        run.await.unwrap().unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 4).is_some()
+        })
+        .await;
+        for id in [2, 3, 4] {
+            let resp = find_response(&lines, id).unwrap();
+            assert!(resp.get("error").is_none(), "{lines:?}");
+            assert_eq!(resp["result"], json!({}), "{lines:?}");
+        }
+        assert!(lock_or_recover(&state.sessions, "acp sessions").is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_delete_unknown_succeeds() {
+        let (state, buf) = test_state();
+        let run = drive_dispatcher(
+            Arc::clone(&state),
+            vec![
+                init_line(1),
+                json!({"jsonrpc": "2.0", "id": 2, "method": "session/delete", "params": {"sessionId": "ghost"}}).to_string(),
+            ],
+        );
+        run.await.unwrap().unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some()
+        })
+        .await;
+        let resp = find_response(&lines, 2).unwrap();
+        assert!(resp.get("error").is_none(), "{lines:?}");
+        assert_eq!(resp["result"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn session_load_unknown_session_is_32002() {
+        let cli = Cli::try_parse_from(["zen"]).unwrap();
+        let (state, _buf) = test_state();
+        let err = handle_session_load(
+            &cli,
+            None,
+            &json!({"sessionId": "ghost", "cwd": "/tmp"}),
+            &state,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, -32002);
+    }
+
+    #[tokio::test]
+    async fn session_resume_unknown_session_is_32002() {
+        let cli = Cli::try_parse_from(["zen"]).unwrap();
+        let (state, _buf) = test_state();
+        let err = handle_session_resume(
+            &cli,
+            None,
+            &json!({"sessionId": "ghost", "cwd": "/tmp"}),
+            &state,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, -32002);
+    }
+
+    #[tokio::test]
+    async fn session_load_missing_session_id_is_invalid_params() {
+        let cli = Cli::try_parse_from(["zen"]).unwrap();
+        let (state, _buf) = test_state();
+        let err = handle_session_load(&cli, None, &json!({"cwd": "/tmp"}), &state)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, -32602);
+    }
+
+    #[tokio::test]
+    async fn session_load_rejects_system_prompt() {
+        let cli = Cli::try_parse_from(["zen"]).unwrap();
+        let (state, _buf) = test_state();
+        let err = handle_session_load(
+            &cli,
+            None,
+            &json!({
+                "sessionId": "ghost",
+                "systemPrompt": {"mode": "append", "content": [{"type": "text", "text": "x"}]},
+            }),
+            &state,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, -32602);
+    }
+
+    #[tokio::test]
+    async fn session_new_rejects_system_prompt() {
+        let (state, buf) = test_state();
+        let run = drive_dispatcher(
+            Arc::clone(&state),
+            vec![
+                init_line(1),
+                json!({"jsonrpc": "2.0", "id": 2, "method": "session/new", "params": {"cwd": "/tmp", "systemPrompt": {"mode": "append", "content": []}}}).to_string(),
+            ],
+        );
+        run.await.unwrap().unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some()
+        })
+        .await;
+        let resp = find_response(&lines, 2).unwrap();
+        assert_eq!(resp["error"]["code"], -32602, "{lines:?}");
+    }
+
+    #[test]
+    fn replay_history_streams_messages_and_tool_calls() {
+        let (state, buf) = test_state();
+        fake_session(&state, "s1", 0);
+        let session = {
+            let sessions = lock_or_recover(&state.sessions, "acp sessions");
+            sessions.get("s1").unwrap().clone()
+        };
+        let history = vec![
+            ChatMessage::user("first question"),
+            ChatMessage::assistant(
+                Some("working on it".to_string()),
+                Some(vec![zen_core::ToolCall {
+                    id: "call-1".to_string(),
+                    call_type: "function".to_string(),
+                    function: zen_core::FunctionCall {
+                        name: "Bash".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+            ),
+            ChatMessage::tool("call-1", "done"),
+        ];
+        replay_history(&session, &history);
+        let lines = read_output_lines(&buf);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        let n1 = &lines[0];
+        assert_eq!(n1["method"], "session/update");
+        assert_eq!(n1["params"]["sessionId"], "s1");
+        assert_eq!(
+            n1["params"]["update"]["sessionUpdate"],
+            "user_message_chunk"
+        );
+        assert_eq!(n1["params"]["update"]["content"]["text"], "first question");
+        assert!(n1["params"]["update"]["messageId"].is_string(), "{lines:?}");
+        let n2 = &lines[1];
+        assert_eq!(
+            n2["params"]["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
+        assert_eq!(n2["params"]["update"]["content"]["text"], "working on it");
+        let n3 = &lines[2];
+        assert_eq!(n3["params"]["update"]["sessionUpdate"], "tool_call");
+        assert_eq!(n3["params"]["update"]["toolCallId"], "call-1");
+        assert_eq!(n3["params"]["update"]["title"], "Bash");
+        let n4 = &lines[3];
+        assert_eq!(n4["params"]["update"]["sessionUpdate"], "tool_call_update");
+        assert_eq!(n4["params"]["update"]["toolCallId"], "call-1");
+        assert_eq!(n4["params"]["update"]["status"], "completed");
+        assert_eq!(n4["params"]["update"]["content"][0]["text"], "done");
+    }
+
+    #[test]
+    fn replay_history_closes_unanswered_tool_call() {
+        let (state, buf) = test_state();
+        fake_session(&state, "s1", 0);
+        let session = {
+            let sessions = lock_or_recover(&state.sessions, "acp sessions");
+            sessions.get("s1").unwrap().clone()
+        };
+        let history = vec![ChatMessage::assistant(
+            Some(String::new()),
+            Some(vec![zen_core::ToolCall {
+                id: "call-9".to_string(),
+                call_type: "function".to_string(),
+                function: zen_core::FunctionCall {
+                    name: "Read".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+        )];
+        replay_history(&session, &history);
+        let lines = read_output_lines(&buf);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0]["params"]["update"]["sessionUpdate"], "tool_call");
+        assert_eq!(
+            lines[1]["params"]["update"]["sessionUpdate"],
+            "tool_call_update"
+        );
+        assert_eq!(lines[1]["params"]["update"]["toolCallId"], "call-9");
+        assert_eq!(lines[1]["params"]["update"]["status"], "completed");
+        assert!(
+            lines[1]["params"]["update"].get("content").is_none(),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn persist_turn_writes_journal_diff() {
+        let (state, _buf) = test_state();
+        fake_session(&state, "s1", 0);
+        let session = {
+            let sessions = lock_or_recover(&state.sessions, "acp sessions");
+            sessions.get("s1").unwrap().clone()
+        };
+        let home = std::env::temp_dir().join("acp-m5-persist-test");
+        let _ = std::fs::remove_dir_all(&home);
+        let cwd = std::env::temp_dir();
+        let path = crate::session::ensure_session_path(&home, &cwd, "s1").unwrap();
+        let writer = crate::session::TranscriptWriter::new(path.clone(), "s1", &cwd);
+        *lock_or_recover(&session.transcript, "acp session transcript") = Some(writer);
+        let before = vec![ChatMessage::user("q1")];
+        let after = vec![
+            ChatMessage::user("q1"),
+            ChatMessage::assistant(Some("a1".to_string()), None),
+        ];
+        session.persist_turn(&before, &after);
+        let history = crate::session::load_history(&path).unwrap();
+        assert_eq!(history.len(), 1, "{history:?}");
+        assert_eq!(history[0].role, "assistant");
+        assert_eq!(history[0].text(), "a1");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn restore_session_seeds_agent_history() {
+        let cli = Cli::try_parse_from(["zen"]).unwrap();
+        let (state, _buf) = test_state();
+        let home = std::env::temp_dir().join("acp-m5-restore-test");
+        let _ = std::fs::remove_dir_all(&home);
+        let cwd = std::env::temp_dir().join("acp-m5-restore-cwd");
+        let _ = std::fs::create_dir_all(&cwd);
+        let session_id = "restore-1";
+        let path = crate::session::ensure_session_path(&home, &cwd, session_id).unwrap();
+        let mut writer = crate::session::TranscriptWriter::new(path, session_id, &cwd);
+        writer
+            .persist_turn(&[], &[ChatMessage::user("hello from history")])
+            .unwrap();
+        drop(writer);
+        let params = json!({"sessionId": session_id, "cwd": cwd.to_string_lossy()});
+        let (session, history) = restore_session(&cli, Some(&home), &params, &state)
+            .await
+            .expect("restore succeeds");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].text(), "hello from history");
+        let agent = session.agent.try_lock().expect("agent idle");
+        assert_eq!(agent.messages().len(), 1);
+        assert_eq!(agent.messages()[0].text(), "hello from history");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn session_list_cwd_filter_keeps_matching_live_session() {
+        let (state, _buf) = test_state();
+        fake_session(&state, "s1", 0);
+        let cwd = std::env::temp_dir();
+        let listed =
+            handle_session_list(&state, None, &json!({"cwd": cwd.to_string_lossy()})).unwrap();
+        let sessions = listed["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1, "{listed:?}");
+        assert_eq!(sessions[0]["sessionId"], "s1");
+        let listed =
+            handle_session_list(&state, None, &json!({"cwd": "/nonexistent-dir-xyz"})).unwrap();
+        assert_eq!(listed["sessions"], json!([]), "{listed:?}");
+    }
+
+    #[test]
+    fn session_list_live_activity_refreshes_journal_time() {
+        let (state, _buf) = test_state();
+        let home = std::env::temp_dir().join("acp-m5-list-time-test");
+        let _ = std::fs::remove_dir_all(&home);
+        let cwd = std::env::temp_dir();
+        let session_id = "s1";
+        let path = crate::session::ensure_session_path(&home, &cwd, session_id).unwrap();
+        let mut writer = crate::session::TranscriptWriter::new(path.clone(), session_id, &cwd);
+        writer
+            .persist_turn(&[], &[ChatMessage::user("hello")])
+            .unwrap();
+        drop(writer);
+        // Age the journal one hour so the live activity is clearly newer.
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        drop(file);
+        fake_session(&state, session_id, 0);
+        let listed = handle_session_list(&state, Some(&home), &json!({})).unwrap();
+        let sessions = listed["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1, "{listed:?}");
+        let updated = sessions[0]["updatedAt"].as_str().unwrap();
+        let dt = DateTime::parse_from_rfc3339(updated).unwrap();
+        assert!(
+            dt.with_timezone(&Utc) > Utc::now() - chrono::Duration::minutes(5),
+            "updatedAt should be the live activity, not the aged journal: {updated}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn session_list_no_next_cursor_on_exact_page() {
+        let (state, _buf) = test_state();
+        for i in 0..50 {
+            fake_session(&state, &format!("s{i:02}"), 0);
+        }
+        let page = handle_session_list(&state, None, &json!({})).unwrap();
+        assert_eq!(page["sessions"].as_array().unwrap().len(), 50);
+        // Exactly one full page: there is no next page, so nextCursor
+        // must be absent (a "<=" here would point at an empty page).
+        assert!(page.get("nextCursor").is_none(), "{page:?}");
+    }
+
+    #[tokio::test]
+    async fn session_load_active_session_replays_journal() {
+        let cli = Cli::try_parse_from(["zen"]).unwrap();
+        let (state, buf) = test_state();
+        let home = std::env::temp_dir().join("acp-m5-load-active-test");
+        let _ = std::fs::remove_dir_all(&home);
+        let cwd = std::env::temp_dir();
+        let session_id = "s1";
+        let path = crate::session::ensure_session_path(&home, &cwd, session_id).unwrap();
+        let mut writer = crate::session::TranscriptWriter::new(path, session_id, &cwd);
+        writer
+            .persist_turn(&[], &[ChatMessage::user("journal hello")])
+            .unwrap();
+        drop(writer);
+        fake_session(&state, session_id, 0);
+        let params = json!({"sessionId": session_id, "cwd": cwd.to_string_lossy()});
+        let result = handle_session_load(&cli, Some(&home), &params, &state).await;
+        assert!(result.is_ok(), "{result:?}");
+        let lines = read_output_lines(&buf);
+        // The replay comes from the journal, not the live agent (whose
+        // history is empty): one user chunk with the journal text.
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(
+            lines[0]["params"]["update"]["sessionUpdate"],
+            "user_message_chunk"
+        );
+        assert_eq!(
+            lines[0]["params"]["update"]["content"]["text"],
+            "journal hello"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
 
