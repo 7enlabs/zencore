@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -97,6 +97,18 @@ enum SessionUpdate {
     AgentMessageChunk {
         content: ContentBlock,
     },
+    /// Echo of the client's prompt blocks (M3, ACP v1): one chunk per
+    /// block, all sharing the turn's `messageId`, so the client can
+    /// render the user message it sent. `messageId` is optional in the
+    /// v1 schema, but always set here so chunks of one turn group
+    /// together. There is NO `state_update` in ACP v1: `running` /
+    /// `idle` / `requires_action` is a v2-only concept (v2 RFD), so a
+    /// v1 server must not emit it.
+    UserMessageChunk {
+        content: ContentBlock,
+        #[serde(rename = "messageId")]
+        message_id: String,
+    },
     ToolCall(ToolCallUpdate),
     ToolCallUpdate(ToolCallResult),
     #[serde(rename_all = "camelCase")]
@@ -142,6 +154,10 @@ struct AcpSink {
     session_id: String,
 
     tools: Arc<Mutex<HashMap<String, String>>>,
+
+    /// Tool calls announced but not yet finished (M3): a cancelled turn
+    /// reports these as `cancelled` before answering the prompt.
+    pending_tools: Arc<Mutex<HashSet<String>>>,
 }
 
 impl AcpSink {
@@ -159,6 +175,24 @@ impl AcpSink {
             let mut out = lock_or_recover(&self.out, "acp stdout");
             let _ = writeln!(out, "{line}");
             let _ = out.flush();
+        }
+    }
+
+    /// Report every announced-but-unfinished tool call as `cancelled`
+    /// (M3, ACP v1): the turn was aborted, so the client must not
+    /// leave these calls hanging in progress. Called before the prompt
+    /// response, after the turn's resources are closed.
+    fn cancel_pending_tools(&self) {
+        let ids: Vec<String> = {
+            let mut pending = lock_or_recover(&self.pending_tools, "acp pending tools");
+            pending.drain().collect()
+        };
+        for id in ids {
+            self.notify(SessionUpdate::ToolCallUpdate(ToolCallResult {
+                tool_call_id: id,
+                status: "cancelled",
+                content: None,
+            }));
         }
     }
 }
@@ -180,6 +214,10 @@ impl EventSink for AcpSink {
                 is_error,
                 ..
             } => {
+                {
+                    let mut pending = lock_or_recover(&self.pending_tools, "acp pending tools");
+                    pending.remove(&tool_use_id);
+                }
                 let status = if is_error { "failed" } else { "completed" };
                 self.notify(SessionUpdate::ToolCallUpdate(ToolCallResult {
                     tool_call_id: tool_use_id,
@@ -211,8 +249,10 @@ fn emit_assistant(sink: &AcpSink, message: &ChatMessage) {
     }
     if let Some(calls) = message.tool_calls.as_deref() {
         let mut tools = lock_or_recover(&sink.tools, "acp tools");
+        let mut pending = lock_or_recover(&sink.pending_tools, "acp pending tools");
         for call in calls {
             tools.insert(call.id.clone(), call.function.name.clone());
+            pending.insert(call.id.clone());
             sink.notify(SessionUpdate::ToolCall(ToolCallUpdate {
                 tool_call_id: call.id.clone(),
                 title: call.function.name.clone(),
@@ -234,6 +274,36 @@ struct AcpSession {
     /// when done, so a second prompt for a busy session is rejected
     /// instead of racing the first turn for the agent.
     prompt_running: AtomicBool,
+    /// Wakes the prompt task when a cancel arrives mid-turn (M3): the
+    /// task selects on this while `run_turn` runs, so the LLM call is
+    /// aborted instead of running to completion.
+    cancel_notify: Arc<tokio::sync::Notify>,
+    /// JSON-RPC id of the prompt request currently running for this
+    /// session, if any (M3): `$/cancel_request` matches on it.
+    prompt_request_id: Mutex<Option<Value>>,
+}
+
+impl AcpSession {
+    fn new(agent: zen_agent::Agent, sink: Arc<AcpSink>) -> Self {
+        Self {
+            agent: tokio::sync::Mutex::new(agent),
+            sink,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            prompt_running: AtomicBool::new(false),
+            cancel_notify: Arc::new(tokio::sync::Notify::new()),
+            prompt_request_id: Mutex::new(None),
+        }
+    }
+
+    /// Signal a running turn to stop (M3): set the flag the turn
+    /// checks after `run_turn` returns AND wake the task waiting
+    /// mid-turn. The flag is set first: a task that has not started
+    /// waiting yet sees the flag, so a notify sent with no waiter is
+    /// never lost.
+    fn request_cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.cancel_notify.notify_waiters();
+    }
 }
 
 pub async fn run_acp_server(cli: &Cli) -> Result<i32> {
@@ -580,58 +650,71 @@ async fn dispatch_line(
             // and responses to agent requests are processed mid-turn.
             // The session stays in the map for the whole turn, so a
             // cancel sent mid-turn can find it.
-            match req.params.get("sessionId").and_then(Value::as_str) {
-                None => Some(RpcResponse::err(
-                    id,
-                    ERR_INTERNAL,
-                    "session/prompt failed: missing sessionId",
-                )),
-                Some(session_id) => {
-                    let session = {
-                        let sessions = lock_or_recover(&state.sessions, "acp sessions");
-                        sessions.get(session_id).cloned()
-                    };
-                    match session {
-                        None => Some(RpcResponse::err(
-                            id,
-                            ERR_INTERNAL,
-                            "session/prompt failed: unknown sessionId",
-                        )),
-                        Some(session) => {
-                            if session.prompt_running.swap(true, Ordering::SeqCst) {
-                                Some(RpcResponse::err(
-                                    id,
-                                    ERR_INVALID_REQUEST,
-                                    "session already has a prompt running",
-                                ))
-                            } else {
-                                // Reset here, at dispatch time: the
-                                // turn may not start polling until
-                                // later, and a cancel sent in between
-                                // must not be clobbered by the reset.
-                                session.cancelled.store(false, Ordering::SeqCst);
-                                let state2 = Arc::clone(state);
-                                let params = req.params.clone();
-                                tokio::spawn(async move {
-                                    let _guard = PromptRunningGuard { session: &session };
-                                    let resp = match run_prompt_turn(&session, &params).await {
-                                        Ok(stop_reason) => RpcResponse::ok(
-                                            id,
-                                            json!({ "stopReason": stop_reason }),
-                                        ),
-                                        Err(e) => RpcResponse::err(
-                                            id,
-                                            ERR_INTERNAL,
-                                            format!("session/prompt failed: {e:#}"),
-                                        ),
-                                    };
-                                    let _ = write_response(&state2.out, &resp);
-                                });
-                                None
+            //
+            // Validate before the session lookup (M3): an invalid
+            // prompt is rejected without starting a turn, so nothing
+            // is inserted.
+            match validate_prompt(&req.params) {
+                Err(e) => Some(RpcResponse::err(id, ERR_INVALID_PARAMS, e)),
+                Ok(prompt) => match req.params.get("sessionId").and_then(Value::as_str) {
+                    None => Some(RpcResponse::err(
+                        id,
+                        ERR_INTERNAL,
+                        "session/prompt failed: missing sessionId",
+                    )),
+                    Some(session_id) => {
+                        let session = {
+                            let sessions = lock_or_recover(&state.sessions, "acp sessions");
+                            sessions.get(session_id).cloned()
+                        };
+                        match session {
+                            None => Some(RpcResponse::err(
+                                id,
+                                ERR_INTERNAL,
+                                "session/prompt failed: unknown sessionId",
+                            )),
+                            Some(session) => {
+                                if session.prompt_running.swap(true, Ordering::SeqCst) {
+                                    Some(RpcResponse::err(
+                                        id,
+                                        ERR_INVALID_REQUEST,
+                                        "session already has a prompt running",
+                                    ))
+                                } else {
+                                    // Reset here, at dispatch time: the
+                                    // turn may not start polling until
+                                    // later, and a cancel sent in between
+                                    // must not be clobbered by the reset.
+                                    session.cancelled.store(false, Ordering::SeqCst);
+                                    {
+                                        let mut running_id = lock_or_recover(
+                                            &session.prompt_request_id,
+                                            "acp prompt request id",
+                                        );
+                                        *running_id = Some(id.clone());
+                                    }
+                                    let state2 = Arc::clone(state);
+                                    tokio::spawn(async move {
+                                        let _guard = PromptRunningGuard { session: &session };
+                                        let resp = match run_prompt_turn(&session, &prompt).await {
+                                            Ok(stop_reason) => RpcResponse::ok(
+                                                id,
+                                                json!({ "stopReason": stop_reason }),
+                                            ),
+                                            Err(e) => RpcResponse::err(
+                                                id,
+                                                ERR_INTERNAL,
+                                                format!("session/prompt failed: {e:#}"),
+                                            ),
+                                        };
+                                        let _ = write_response(&state2.out, &resp);
+                                    });
+                                    None
+                                }
                             }
                         }
                     }
-                }
+                },
             }
         }
         "session/cancel" => {
@@ -639,6 +722,17 @@ async fn dispatch_line(
                 let sessions = lock_or_recover(&state.sessions, "acp sessions");
                 handle_cancel(&sessions, &req.params);
             }
+            if is_notification {
+                None
+            } else {
+                Some(RpcResponse::ok(id, json!({})))
+            }
+        }
+        "$/cancel_request" => {
+            // A notification in practice: no response is ever sent for
+            // it (M3). If a client sends it as a request, answer with
+            // an empty result after handling it, like session/cancel.
+            handle_dollar_cancel(state, &req.params);
             if is_notification {
                 None
             } else {
@@ -814,6 +908,7 @@ async fn handle_session_new(
         out: out.clone(),
         session_id: session_id.clone(),
         tools: Arc::new(Mutex::new(HashMap::new())),
+        pending_tools: Arc::new(Mutex::new(HashSet::new())),
     });
 
     let assembly = agent_run::assemble(cli, &cwd, home, &cfg, &session_id, None).await?;
@@ -837,39 +932,63 @@ async fn handle_session_new(
 
     let _ = assembly;
 
-    Ok((
-        session_id,
-        AcpSession {
-            agent: tokio::sync::Mutex::new(agent),
-            sink: sink.clone(),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            prompt_running: AtomicBool::new(false),
-        },
-    ))
+    Ok((session_id, AcpSession::new(agent, sink)))
 }
 
-fn prompt_text(params: &Value) -> String {
-    params
-        .get("content")
-        .and_then(Value::as_array)
-        .map(|blocks| {
-            blocks
-                .iter()
-                .filter_map(|b| {
-                    let t = b.get("type")?.as_str()?;
-                    match t {
-                        "text" => b.get("text")?.as_str().map(str::to_string),
-                        "resource_link" | "resource" => b
-                            .get("uri")
-                            .and_then(Value::as_str)
-                            .map(|u| format!("[resource: {u}]")),
-                        _ => None,
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default()
+/// One validated prompt turn (M3): the text the agent runs on, plus
+/// the per-block renderings echoed back as `user_message_chunk`.
+#[derive(Debug)]
+struct ValidatedPrompt {
+    text: String,
+    /// Rendered text of each prompt block, in order.
+    echo_blocks: Vec<String>,
+}
+
+/// Validate a `session/prompt` params value (M3, ACP v1).
+///
+/// The baseline the agent advertises (`promptCapabilities`: image /
+/// audio / embeddedContext all false) MUST support `text` and
+/// `resource_link`. Any other content type is rejected with an
+/// invalid-params error naming the type: the client MUST restrict
+/// content to the advertised capabilities, and silently dropping a
+/// block the user sent would lose their message. An empty prompt
+/// (missing, empty, or no usable content) is rejected the same way:
+/// the agent has nothing to run on.
+fn validate_prompt(params: &Value) -> Result<ValidatedPrompt, String> {
+    let Some(blocks) = params.get("prompt").and_then(Value::as_array) else {
+        return Err("prompt must be a non-empty array of content blocks".into());
+    };
+    if blocks.is_empty() {
+        return Err("prompt must be a non-empty array of content blocks".into());
+    }
+    let mut echo_blocks = Vec::with_capacity(blocks.len());
+    for (i, b) in blocks.iter().enumerate() {
+        let Some(t) = b.get("type").and_then(Value::as_str) else {
+            return Err(format!("prompt block {i} has no content type"));
+        };
+        match t {
+            "text" => {
+                let Some(text) = b.get("text").and_then(Value::as_str) else {
+                    return Err(format!("text block {i} has no text"));
+                };
+                echo_blocks.push(text.to_string());
+            }
+            "resource_link" => {
+                let Some(uri) = b.get("uri").and_then(Value::as_str) else {
+                    return Err(format!("resource block {i} has no uri"));
+                };
+                echo_blocks.push(format!("[resource: {uri}]"));
+            }
+            // Unsupported content type: rejected, never silently
+            // dropped (see the doc comment above).
+            other => return Err(format!("unsupported content type: {other}")),
+        }
+    }
+    let text = echo_blocks.join("\n");
+    if text.trim().is_empty() {
+        return Err("prompt must not be empty".into());
+    }
+    Ok(ValidatedPrompt { text, echo_blocks })
 }
 
 /// Run one prompt turn for a session (M2). Called on a spawned task by
@@ -877,31 +996,95 @@ fn prompt_text(params: &Value) -> String {
 /// stdin. The caller guarantees the session exists and no other turn is
 /// running for it (see `prompt_running`), and resets `cancelled` at
 /// dispatch time.
-async fn run_prompt_turn(session: &Arc<AcpSession>, params: &Value) -> Result<&'static str> {
+async fn run_prompt_turn(
+    session: &Arc<AcpSession>,
+    prompt: &ValidatedPrompt,
+) -> Result<&'static str> {
     // The dispatcher resets `cancelled` at dispatch time (before the
     // spawn), not here: a cancel sent between the spawn and the first
     // poll of this task must survive.
-    let text = prompt_text(params);
+    //
+    // A cancel sent between dispatch and the first poll of this task:
+    // arm the wake-up first, then check the flag. The flag is set
+    // before the notify in `request_cancel`, so a notify sent with no
+    // waiter yet is never lost: the flag check catches it.
+    let notified = session.cancel_notify.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    if session.cancelled.load(Ordering::SeqCst) {
+        return Ok("cancelled");
+    }
+
+    // Echo the user message first (M3, ACP v1): one
+    // `user_message_chunk` per prompt block, all sharing one
+    // `messageId` for the turn, so the client can render the message
+    // it sent.
+    let message_id = uuid::Uuid::new_v4().hyphenated().to_string();
+    for block in &prompt.echo_blocks {
+        session.sink.notify(SessionUpdate::UserMessageChunk {
+            content: ContentBlock::Text {
+                text: block.clone(),
+            },
+            message_id: message_id.clone(),
+        });
+    }
+
     let mut agent = session.agent.lock().await;
-    let result = agent.run_turn(&text).await;
-    let size = agent.config.context_window;
-    drop(agent);
-
-    session.sink.notify(SessionUpdate::UsageUpdate {
-        used: result.usage.input_tokens + result.usage.output_tokens,
-        size,
-    });
-
-    let stop_reason = if session.cancelled.load(Ordering::SeqCst) {
-        "cancelled"
-    } else {
-        match result.subtype.as_str() {
-            "success" => "end_turn",
-            "error_max_turns" => "max_turn_requests",
-            _ => "end_turn",
-        }
+    // Snapshots for the cancel path (M3): history, usage and live
+    // descendants before the turn, so a cancel restores all three,
+    // like the REPL interrupt (`run_turn_interruptible`).
+    let before = agent.messages().to_vec();
+    let usage_before = agent.usage.clone();
+    let pre = agent_run::descendants_of(std::process::id());
+    // The select drops the losing future: when the cancel wins, the
+    // in-flight LLM request (and any in-flight tool call) is aborted
+    // right there, not run to completion.
+    let result = tokio::select! {
+        r = agent.run_turn(&prompt.text) => Some(r),
+        () = notified.as_mut() => None,
     };
-    Ok(stop_reason)
+    let size = agent.config.context_window;
+    match result {
+        Some(result) => {
+            drop(agent);
+            session.sink.notify(SessionUpdate::UsageUpdate {
+                used: result.usage.input_tokens + result.usage.output_tokens,
+                size,
+            });
+            if session.cancelled.load(Ordering::SeqCst) {
+                Ok("cancelled")
+            } else {
+                Ok(match result.subtype.as_str() {
+                    "success" => "end_turn",
+                    "error_max_turns" => "max_turn_requests",
+                    "error_max_tokens" => "max_tokens",
+                    "error_refusal" => "refusal",
+                    // V1 has no error stopReason: an execution error
+                    // (e.g. the LLM call failed) still ends the turn,
+                    // with the failure in the streamed content.
+                    _ => "end_turn",
+                })
+            }
+        }
+        None => {
+            // Cancelled mid-turn: the turn future is already dropped
+            // (the select did it), so the LLM call and the tool call
+            // are aborted. Close what the turn started - new child
+            // processes - then restore history, and report the
+            // in-flight tool calls cancelled, all before the prompt
+            // response, as ACP v1 requires.
+            agent_run::kill_new_descendants(&pre);
+            agent.set_messages(before);
+            let used = (agent.usage.input_tokens + agent.usage.output_tokens)
+                - (usage_before.input_tokens + usage_before.output_tokens);
+            drop(agent);
+            session.sink.cancel_pending_tools();
+            session
+                .sink
+                .notify(SessionUpdate::UsageUpdate { used, size });
+            Ok("cancelled")
+        }
+    }
 }
 
 /// Clears a session's `prompt_running` flag when the prompt task ends,
@@ -913,6 +1096,8 @@ struct PromptRunningGuard<'a> {
 impl Drop for PromptRunningGuard<'_> {
     fn drop(&mut self) {
         self.session.prompt_running.store(false, Ordering::SeqCst);
+        let mut id = lock_or_recover(&self.session.prompt_request_id, "acp prompt request id");
+        *id = None;
     }
 }
 
@@ -920,8 +1105,34 @@ fn handle_cancel(sessions: &HashMap<String, Arc<AcpSession>>, params: &Value) {
     if let Some(sid) = params.get("sessionId").and_then(Value::as_str)
         && let Some(s) = sessions.get(sid)
     {
-        s.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        s.request_cancel();
     }
+}
+
+/// Cancel a request by its JSON-RPC id (M3, ACP v1 `$/cancel_request`):
+/// a running prompt turn with this id is cancelled (same as
+/// `session/cancel` for its session); a pending agent-initiated
+/// request with this id has its waiter dropped, so the waiter fails
+/// closed instead of waiting forever. Any other id is ignored: the
+/// request is already done, or was never ours.
+fn handle_dollar_cancel(state: &AcpServerState, params: &Value) {
+    let Some(id) = params.get("id").cloned() else {
+        return;
+    };
+    {
+        let sessions = lock_or_recover(&state.sessions, "acp sessions");
+        for session in sessions.values() {
+            let running = lock_or_recover(&session.prompt_request_id, "acp prompt request id")
+                .as_ref()
+                == Some(&id);
+            if running {
+                session.request_cancel();
+                return;
+            }
+        }
+    }
+    let mut pending = lock_or_recover(&state.pending, "acp pending");
+    pending.remove(&id_key(&id));
 }
 
 #[cfg(test)]
@@ -1075,21 +1286,54 @@ mod tests {
     }
 
     #[test]
-    fn prompt_text_extracts_text_blocks() {
+    fn validate_prompt_extracts_text_blocks() {
         let params = json!({
             "sessionId": "s1",
-            "content": [
+            "prompt": [
                 { "type": "text", "text": "hello" },
                 { "type": "text", "text": "world" },
-                { "type": "image", "data": "ignored-without-capability" },
+                { "type": "resource_link", "uri": "file:///x.md" },
             ]
         });
-        assert_eq!(prompt_text(&params), "hello\nworld");
+        let prompt = validate_prompt(&params).expect("baseline blocks must validate");
+        assert_eq!(prompt.text, "hello\nworld\n[resource: file:///x.md]");
+        assert_eq!(
+            prompt.echo_blocks,
+            ["hello", "world", "[resource: file:///x.md]"]
+        );
     }
 
     #[test]
-    fn prompt_text_empty_without_content() {
-        assert_eq!(prompt_text(&json!({})), "");
+    fn validate_prompt_rejects_empty_prompt() {
+        // Missing prompt, empty array, and content that renders to
+        // nothing are all rejected (M3, ACP v1).
+        assert!(validate_prompt(&json!({})).is_err());
+        assert!(validate_prompt(&json!({ "prompt": [] })).is_err());
+        assert!(
+            validate_prompt(&json!({ "prompt": [{ "type": "text", "text": "   " }] })).is_err()
+        );
+        assert!(validate_prompt(&json!({ "prompt": [{ "type": "text", "text": "" }] })).is_err());
+    }
+
+    #[test]
+    fn validate_prompt_rejects_unsupported_content() {
+        // image/audio are not advertised (promptCapabilities false),
+        // `resource` needs embeddedContext (also false): all are
+        // rejected, never silently dropped (M3, ACP v1).
+        for block in [
+            json!({ "type": "image", "data": "x" }),
+            json!({ "type": "audio", "data": "x" }),
+            json!({ "type": "resource", "resource": { "uri": "file:///y.md" } }),
+            json!({ "type": "video", "data": "x" }),
+        ] {
+            let params = json!({ "prompt": [block] });
+            let err = validate_prompt(&params).expect_err("unsupported type must fail");
+            assert!(err.contains("unsupported content type"), "{err}");
+        }
+        // A block without a type, and blocks without their payload.
+        assert!(validate_prompt(&json!({ "prompt": [{ "text": "no type" }] })).is_err());
+        assert!(validate_prompt(&json!({ "prompt": [{ "type": "text" }] })).is_err());
+        assert!(validate_prompt(&json!({ "prompt": [{ "type": "resource_link" }] })).is_err());
     }
 
     #[test]
@@ -1101,6 +1345,19 @@ mod tests {
         assert_eq!(v["sessionUpdate"], "agent_message_chunk");
         assert_eq!(v["content"]["type"], "text");
         assert_eq!(v["content"]["text"], "hi");
+    }
+
+    #[test]
+    fn user_message_chunk_serialization_shape() {
+        let update = SessionUpdate::UserMessageChunk {
+            content: ContentBlock::Text { text: "hi".into() },
+            message_id: "m1".into(),
+        };
+        let v = serde_json::to_value(&update).unwrap();
+        assert_eq!(v["sessionUpdate"], "user_message_chunk");
+        assert_eq!(v["content"]["type"], "text");
+        assert_eq!(v["content"]["text"], "hi");
+        assert_eq!(v["messageId"], "m1");
     }
 
     #[test]
@@ -1124,6 +1381,7 @@ mod tests {
             )),
             session_id: "probe".into(),
             tools: Arc::new(Mutex::new(HashMap::new())),
+            pending_tools: Arc::new(Mutex::new(HashSet::new())),
         };
         let message = ChatMessage::assistant(
             None,
@@ -1161,6 +1419,7 @@ mod tests {
             )),
             session_id: "probe".into(),
             tools: Arc::new(Mutex::new(HashMap::new())),
+            pending_tools: Arc::new(Mutex::new(HashSet::new())),
         };
         emit_assistant(&sink, &message);
     }
@@ -1406,6 +1665,251 @@ mod tests {
         }
     }
 
+    /// A fake LLM backend that always answers with a content-filter
+    /// finish reason (M3): the agent maps it to `error_refusal`, and
+    /// ACP maps that to stopReason `refusal`.
+    struct ContentFilterLlm;
+
+    #[async_trait::async_trait]
+    impl LlmBackend for ContentFilterLlm {
+        async fn chat(
+            &self,
+            _req: zen_core::ChatRequest,
+        ) -> anyhow::Result<zen_core::ChatResponse> {
+            Ok(zen_core::ChatResponse {
+                message: ChatMessage::assistant(Some("blocked".into()), None),
+                usage: zen_core::Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    total_tokens: 15,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                },
+                finish_reason: Some("content_filter".into()),
+            })
+        }
+    }
+
+    /// A fake LLM backend that always answers with a truncated tool
+    /// call (M3): the agent maps it to `error_max_tokens`, and ACP
+    /// maps that to stopReason `max_tokens`.
+    struct TruncatedToolCallLlm;
+
+    #[async_trait::async_trait]
+    impl LlmBackend for TruncatedToolCallLlm {
+        async fn chat(
+            &self,
+            _req: zen_core::ChatRequest,
+        ) -> anyhow::Result<zen_core::ChatResponse> {
+            Ok(zen_core::ChatResponse {
+                message: ChatMessage::assistant(
+                    Some("partial".into()),
+                    Some(vec![zen_core::ToolCall {
+                        id: "c1".into(),
+                        call_type: "function".into(),
+                        function: zen_core::FunctionCall {
+                            name: "Write".into(),
+                            arguments: "{\"file_path\":\"a\",\"content\":\"xy".into(),
+                        },
+                    }]),
+                ),
+                usage: zen_core::Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    total_tokens: 15,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                },
+                finish_reason: Some("length".into()),
+            })
+        }
+    }
+
+    /// A fake LLM backend that always fails (M3): the agent maps the
+    /// failure to `error_during_execution`, which has no dedicated
+    /// stopReason and falls back to `end_turn`.
+    struct FailingLlm;
+
+    #[async_trait::async_trait]
+    impl LlmBackend for FailingLlm {
+        async fn chat(
+            &self,
+            _req: zen_core::ChatRequest,
+        ) -> anyhow::Result<zen_core::ChatResponse> {
+            Err(anyhow::anyhow!("boom 500"))
+        }
+    }
+
+    /// Guard that records whether the future holding it was dropped
+    /// before it finished (M3): the test LLM holds one across its
+    /// sleep, so the flag proves a cancel really aborted the in-flight
+    /// LLM call instead of letting it run to completion.
+    struct AbortGuard {
+        aborted: Arc<AtomicBool>,
+        finished: Arc<AtomicBool>,
+    }
+
+    impl Drop for AbortGuard {
+        fn drop(&mut self) {
+            if !self.finished.load(Ordering::SeqCst) {
+                self.aborted.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// A fake LLM backend that sleeps before replying and records
+    /// whether its `chat` future was dropped mid-sleep (M3).
+    struct DroppableLlm {
+        aborted: Arc<AtomicBool>,
+        started: Arc<AtomicBool>,
+        delay_ms: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmBackend for DroppableLlm {
+        async fn chat(
+            &self,
+            _req: zen_core::ChatRequest,
+        ) -> anyhow::Result<zen_core::ChatResponse> {
+            let finished = Arc::new(AtomicBool::new(false));
+            let _guard = AbortGuard {
+                aborted: self.aborted.clone(),
+                finished: finished.clone(),
+            };
+            self.started.store(true, Ordering::SeqCst);
+            if self.delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+            }
+            finished.store(true, Ordering::SeqCst);
+            Ok(zen_core::ChatResponse {
+                message: ChatMessage::assistant(Some("done".into()), None),
+                usage: zen_core::Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    total_tokens: 15,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                },
+                finish_reason: Some("stop".into()),
+            })
+        }
+    }
+
+    /// A fake LLM backend that always answers with a tool call for
+    /// the `Slow` tool (M3): the tool sleeps, so a cancel sent while
+    /// it runs proves the in-flight tool call is reported cancelled.
+    struct ToolCallLlm;
+
+    #[async_trait::async_trait]
+    impl LlmBackend for ToolCallLlm {
+        async fn chat(
+            &self,
+            _req: zen_core::ChatRequest,
+        ) -> anyhow::Result<zen_core::ChatResponse> {
+            Ok(zen_core::ChatResponse {
+                message: ChatMessage::assistant(
+                    Some("calling slow tool".into()),
+                    Some(vec![zen_core::ToolCall {
+                        id: "c1".into(),
+                        call_type: "function".into(),
+                        function: zen_core::FunctionCall {
+                            name: "Slow".into(),
+                            arguments: "{}".into(),
+                        },
+                    }]),
+                ),
+                usage: zen_core::Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    total_tokens: 15,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                },
+                finish_reason: Some("stop".into()),
+            })
+        }
+    }
+
+    /// A fake LLM backend that answers text on the first call and a
+    /// Slow tool call on every later call (M3): lets one session run
+    /// a completed turn first, then a turn that can be cancelled
+    /// mid-tool-call.
+    struct TwoPhaseLlm {
+        calls: AtomicU64,
+    }
+
+    impl Default for TwoPhaseLlm {
+        fn default() -> Self {
+            Self {
+                calls: AtomicU64::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmBackend for TwoPhaseLlm {
+        async fn chat(
+            &self,
+            _req: zen_core::ChatRequest,
+        ) -> anyhow::Result<zen_core::ChatResponse> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let usage = zen_core::Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            };
+            if n == 0 {
+                Ok(zen_core::ChatResponse {
+                    message: ChatMessage::assistant(Some("hello".into()), None),
+                    usage,
+                    finish_reason: Some("stop".into()),
+                })
+            } else {
+                Ok(zen_core::ChatResponse {
+                    message: ChatMessage::assistant(
+                        Some("calling slow tool".into()),
+                        Some(vec![zen_core::ToolCall {
+                            id: "c1".into(),
+                            call_type: "function".into(),
+                            function: zen_core::FunctionCall {
+                                name: "Slow".into(),
+                                arguments: "{}".into(),
+                            },
+                        }]),
+                    ),
+                    usage,
+                    finish_reason: Some("stop".into()),
+                })
+            }
+        }
+    }
+
+    struct SlowTool {
+        ms: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl zen_core::Tool for SlowTool {
+        fn name(&self) -> &str {
+            "Slow"
+        }
+        fn description(&self) -> &str {
+            "slow test tool"
+        }
+        fn parameters_schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        fn is_read_only(&self) -> bool {
+            false
+        }
+        async fn call(&self, _args: Value, _ctx: &zen_core::ToolContext) -> zen_core::ToolOutput {
+            tokio::time::sleep(Duration::from_millis(self.ms)).await;
+            zen_core::ToolOutput::ok("finished")
+        }
+    }
+
     /// A permission checker that allows everything (test double).
     struct AllowAll;
 
@@ -1425,27 +1929,56 @@ mod tests {
     /// the test state, so dispatcher tests can run a real turn without a
     /// live LLM.
     fn fake_session(state: &Arc<AcpServerState>, session_id: &str, delay_ms: u64) {
+        fake_session_with(
+            state,
+            session_id,
+            Arc::new(DelayedLlm { delay_ms }),
+            zen_core::ToolRegistry::new(),
+        );
+    }
+
+    /// Build a session backed by the given fake LLM and tool registry
+    /// and insert it into the test state, so dispatcher tests can run
+    /// a real turn without a live LLM.
+    fn fake_session_with(
+        state: &Arc<AcpServerState>,
+        session_id: &str,
+        llm: Arc<dyn LlmBackend>,
+        registry: zen_core::ToolRegistry,
+    ) {
+        fake_session_with_config(
+            state,
+            session_id,
+            llm,
+            registry,
+            zen_agent::AgentConfig::default(),
+        );
+    }
+
+    fn fake_session_with_config(
+        state: &Arc<AcpServerState>,
+        session_id: &str,
+        llm: Arc<dyn LlmBackend>,
+        registry: zen_core::ToolRegistry,
+        config: zen_agent::AgentConfig,
+    ) {
         let sink = Arc::new(AcpSink {
             out: state.out.clone(),
             session_id: session_id.into(),
             tools: Arc::new(Mutex::new(HashMap::new())),
+            pending_tools: Arc::new(Mutex::new(HashSet::new())),
         });
         let agent = zen_agent::Agent::new(
-            Arc::new(DelayedLlm { delay_ms }),
-            zen_core::ToolRegistry::new(),
+            llm,
+            registry,
             Arc::new(AllowAll),
             None,
             Arc::new(zen_core::NoHooks),
             sink.clone(),
             zen_core::ToolContext::new(std::env::temp_dir(), session_id),
-            zen_agent::AgentConfig::default(),
+            config,
         );
-        let session = Arc::new(AcpSession {
-            agent: tokio::sync::Mutex::new(agent),
-            sink,
-            cancelled: Arc::new(AtomicBool::new(false)),
-            prompt_running: AtomicBool::new(false),
-        });
+        let session = Arc::new(AcpSession::new(agent, sink));
         let mut sessions = lock_or_recover(&state.sessions, "acp sessions");
         sessions.insert(session_id.to_string(), session);
     }
@@ -1463,7 +1996,7 @@ mod tests {
             Arc::clone(&state),
             vec![
                 init_line(1),
-                json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": "s1", "content": [{"type": "text", "text": "hi"}]}})
+                json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": "s1", "prompt": [{"type": "text", "text": "hi"}]}})
                     .to_string(),
                 json!({"jsonrpc": "2.0", "id": 3, "method": "bogus/method", "params": {}})
                     .to_string(),
@@ -1502,9 +2035,9 @@ mod tests {
             Arc::clone(&state),
             vec![
                 init_line(1),
-                json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": "s1", "content": [{"type": "text", "text": "one"}]}})
+                json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": "s1", "prompt": [{"type": "text", "text": "one"}]}})
                     .to_string(),
-                json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {"sessionId": "s1", "content": [{"type": "text", "text": "two"}]}})
+                json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {"sessionId": "s1", "prompt": [{"type": "text", "text": "two"}]}})
                     .to_string(),
             ],
         );
@@ -1625,9 +2158,9 @@ mod tests {
             Arc::clone(&state),
             vec![
                 init_line(1),
-                json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {}})
+                json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"prompt": [{"type": "text", "text": "hi"}]}})
                     .to_string(),
-                json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {"sessionId": "nope"}})
+                json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {"sessionId": "nope", "prompt": [{"type": "text", "text": "hi"}]}})
                     .to_string(),
             ],
         );
@@ -1734,7 +2267,7 @@ mod tests {
             Arc::clone(&state),
             vec![
                 init_line(1),
-                json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": "s1", "content": [{"type": "text", "text": "hi"}]}})
+                json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": "s1", "prompt": [{"type": "text", "text": "hi"}]}})
                     .to_string(),
             ],
         );
@@ -1753,6 +2286,54 @@ mod tests {
             })
             .expect("usage update must be emitted");
         assert_eq!(usage["params"]["update"]["used"], 15, "{lines:?}");
+    }
+
+    /// M3: a cancelled turn reports the usage DELTA, not the sum.
+    /// Turn 1 completes (15 tokens); turn 2 is cancelled while its
+    /// tool call runs, with the agent holding 30 tokens at the
+    /// cancel, so the delta is 15 and a sum would report 45.
+    #[tokio::test]
+    async fn cancelled_turn_reports_usage_delta_not_sum() {
+        let (state, buf) = test_state();
+        let mut registry = zen_core::ToolRegistry::new();
+        registry.register(Arc::new(SlowTool { ms: 2000 }));
+        fake_session_with(&state, "s1", Arc::new(TwoPhaseLlm::default()), registry);
+        let (tx, run) = drive_dispatcher_live(Arc::clone(&state));
+        tx.send(init_line(1)).unwrap();
+        tx.send(prompt_line(2, "hi")).unwrap();
+        let _ = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some()
+        })
+        .await;
+        tx.send(prompt_line(3, "hi again")).unwrap();
+        // Wait for the tool call to be announced, then cancel while
+        // the tool is still running.
+        let _ = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            ls.iter().any(is_update("tool_call"))
+        })
+        .await;
+        tx.send(
+            json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": "s1"}})
+                .to_string(),
+        )
+        .unwrap();
+        drop(tx);
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 3).is_some()
+        })
+        .await;
+        let prompt = find_response(&lines, 3).unwrap();
+        assert_eq!(prompt["result"]["stopReason"], "cancelled", "{lines:?}");
+        let usages: Vec<&Value> = lines
+            .iter()
+            .filter(|l| {
+                l.get("method").and_then(Value::as_str) == Some("session/update")
+                    && l["params"]["update"]["sessionUpdate"].as_str() == Some("usage_update")
+            })
+            .collect();
+        assert_eq!(usages.len(), 2, "{lines:?}");
+        assert_eq!(usages[1]["params"]["update"]["used"], 15, "{lines:?}");
+        run.await.unwrap().unwrap();
     }
 
     /// A second prompt on the same session AFTER the first turn finished
@@ -1775,7 +2356,7 @@ mod tests {
         ));
         tx.send(init_line(1)).unwrap();
         tx.send(
-            json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": "s1", "content": [{"type": "text", "text": "one"}]}})
+            json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": "s1", "prompt": [{"type": "text", "text": "one"}]}})
                 .to_string(),
         )
         .unwrap();
@@ -1809,7 +2390,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         tx.send(
-            json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {"sessionId": "s1", "content": [{"type": "text", "text": "two"}]}})
+            json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {"sessionId": "s1", "prompt": [{"type": "text", "text": "two"}]}})
                 .to_string(),
         )
         .unwrap();
@@ -1871,6 +2452,495 @@ mod tests {
             "{lines:?}"
         );
     }
+    /// Drive the dispatcher with a live channel, so the test can send
+    /// lines after observing output (M3): `drive_dispatcher` sends
+    /// everything up front, which cannot time a cancel mid-turn.
+    fn drive_dispatcher_live(
+        state: Arc<AcpServerState>,
+    ) -> (
+        mpsc::UnboundedSender<String>,
+        tokio::task::JoinHandle<Result<i32>>,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        let cli = Cli::try_parse_from(["zen"]).unwrap();
+        let cwd = std::env::temp_dir();
+        let run = tokio::spawn(run_dispatcher(cli, cwd, None, state, rx));
+        (tx, run)
+    }
+
+    fn prompt_line(id: u64, text: &str) -> String {
+        json!({"jsonrpc": "2.0", "id": id, "method": "session/prompt", "params": {"sessionId": "s1", "prompt": [{"type": "text", "text": text}]}})
+            .to_string()
+    }
+
+    fn is_update(variant: &str) -> impl Fn(&Value) -> bool + '_ {
+        move |l: &Value| {
+            l.get("method").and_then(Value::as_str) == Some("session/update")
+                && l["params"]["update"]["sessionUpdate"].as_str() == Some(variant)
+        }
+    }
+
+    /// M3: the prompt is echoed as one `user_message_chunk` per block,
+    /// all sharing one `messageId`, before the agent's reply.
+    #[tokio::test]
+    async fn prompt_echoes_user_message_with_shared_message_id() {
+        let (state, buf) = test_state();
+        fake_session(&state, "s1", 0);
+        let run = drive_dispatcher(
+            Arc::clone(&state),
+            vec![
+                init_line(1),
+                json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": "s1", "prompt": [{"type": "text", "text": "hi"}, {"type": "resource_link", "uri": "file:///x.md"}]}})
+                    .to_string(),
+            ],
+        );
+        run.await.unwrap().unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some()
+        })
+        .await;
+        let prompt = find_response(&lines, 2).unwrap();
+        assert_eq!(prompt["result"]["stopReason"], "end_turn", "{lines:?}");
+        let is_echo = is_update("user_message_chunk");
+        let echoes: Vec<&Value> = lines.iter().filter(|l| is_echo(l)).collect();
+        assert_eq!(echoes.len(), 2, "{lines:?}");
+        let message_id = echoes[0]["params"]["update"]["messageId"]
+            .as_str()
+            .expect("echo must carry a messageId");
+        assert!(!message_id.is_empty());
+        assert_eq!(
+            echoes[1]["params"]["update"]["messageId"].as_str(),
+            Some(message_id),
+            "chunks of one turn share one messageId: {lines:?}"
+        );
+        assert_eq!(echoes[0]["params"]["update"]["content"]["text"], "hi");
+        assert_eq!(
+            echoes[1]["params"]["update"]["content"]["text"],
+            "[resource: file:///x.md]"
+        );
+        // The echo precedes the agent's reply.
+        let echo_pos = lines
+            .iter()
+            .position(is_update("user_message_chunk"))
+            .unwrap();
+        let agent_pos = lines
+            .iter()
+            .position(is_update("agent_message_chunk"))
+            .expect("agent reply must be emitted");
+        assert!(echo_pos < agent_pos, "{lines:?}");
+    }
+
+    /// M3: an empty prompt is rejected with -32602 and no turn starts.
+    #[tokio::test]
+    async fn prompt_empty_returns_invalid_params() {
+        let (state, buf) = test_state();
+        fake_session(&state, "s1", 0);
+        let run = drive_dispatcher(
+            Arc::clone(&state),
+            vec![
+                init_line(1),
+                json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": "s1", "prompt": []}})
+                    .to_string(),
+                json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {"sessionId": "s1"}})
+                    .to_string(),
+            ],
+        );
+        run.await.unwrap().unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some() && find_response(ls, 3).is_some()
+        })
+        .await;
+        for id in [2, 3] {
+            let resp = find_response(&lines, id).unwrap();
+            assert_eq!(resp["error"]["code"], -32602, "{lines:?}");
+        }
+        // No turn started: no user echo was emitted.
+        assert!(
+            !lines.iter().any(is_update("user_message_chunk")),
+            "{lines:?}"
+        );
+    }
+
+    /// M3: image / `resource` / unknown content is rejected with
+    /// -32602, never silently dropped.
+    #[tokio::test]
+    async fn prompt_unsupported_content_returns_invalid_params() {
+        let (state, buf) = test_state();
+        fake_session(&state, "s1", 0);
+        let run = drive_dispatcher(
+            Arc::clone(&state),
+            vec![
+                init_line(1),
+                json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": "s1", "prompt": [{"type": "image", "data": "x"}]}})
+                    .to_string(),
+                json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {"sessionId": "s1", "prompt": [{"type": "resource", "resource": {"uri": "file:///y.md"}}]}})
+                    .to_string(),
+            ],
+        );
+        run.await.unwrap().unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some() && find_response(ls, 3).is_some()
+        })
+        .await;
+        for id in [2, 3] {
+            let resp = find_response(&lines, id).unwrap();
+            assert_eq!(resp["error"]["code"], -32602, "{lines:?}");
+            assert!(
+                resp["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unsupported content type"),
+                "{lines:?}"
+            );
+        }
+    }
+
+    /// M3: a content-filtered turn ends with stopReason `refusal`.
+    #[tokio::test]
+    async fn prompt_refusal_maps_to_stop_reason() {
+        let (state, buf) = test_state();
+        fake_session_with(
+            &state,
+            "s1",
+            Arc::new(ContentFilterLlm),
+            zen_core::ToolRegistry::new(),
+        );
+        let run = drive_dispatcher(Arc::clone(&state), vec![init_line(1), prompt_line(2, "hi")]);
+        run.await.unwrap().unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some()
+        })
+        .await;
+        let prompt = find_response(&lines, 2).unwrap();
+        assert_eq!(prompt["result"]["stopReason"], "refusal", "{lines:?}");
+    }
+
+    /// M3: a turn cut off by the output token limit ends with
+    /// stopReason `max_tokens`.
+    #[tokio::test]
+    async fn prompt_max_tokens_maps_to_stop_reason() {
+        let (state, buf) = test_state();
+        fake_session_with(
+            &state,
+            "s1",
+            Arc::new(TruncatedToolCallLlm),
+            zen_core::ToolRegistry::new(),
+        );
+        let run = drive_dispatcher(Arc::clone(&state), vec![init_line(1), prompt_line(2, "hi")]);
+        run.await.unwrap().unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some()
+        })
+        .await;
+        let prompt = find_response(&lines, 2).unwrap();
+        assert_eq!(prompt["result"]["stopReason"], "max_tokens", "{lines:?}");
+    }
+
+    /// M3: a turn that hits the agent's turn cap maps to stopReason
+    /// `max_turn_requests` (v1). The backend keeps answering with a
+    /// tool call, so the loop would run forever; with max_turns 1 the
+    /// agent stops after the first tool call.
+    #[tokio::test]
+    async fn prompt_max_turns_maps_to_stop_reason() {
+        let (state, buf) = test_state();
+        let mut registry = zen_core::ToolRegistry::new();
+        registry.register(Arc::new(SlowTool { ms: 0 }));
+        fake_session_with_config(
+            &state,
+            "s1",
+            Arc::new(ToolCallLlm),
+            registry,
+            zen_agent::AgentConfig {
+                max_turns: 1,
+                ..Default::default()
+            },
+        );
+        let run = drive_dispatcher(Arc::clone(&state), vec![init_line(1), prompt_line(2, "hi")]);
+        run.await.unwrap().unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some()
+        })
+        .await;
+        let prompt = find_response(&lines, 2).unwrap();
+        assert_eq!(
+            prompt["result"]["stopReason"], "max_turn_requests",
+            "{lines:?}"
+        );
+    }
+
+    /// M3: a turn whose LLM call fails ends the turn (v1 has no error
+    /// stopReason); the failure is in the streamed content.
+    #[tokio::test]
+    async fn prompt_llm_error_falls_back_to_end_turn() {
+        let (state, buf) = test_state();
+        fake_session_with(
+            &state,
+            "s1",
+            Arc::new(FailingLlm),
+            zen_core::ToolRegistry::new(),
+        );
+        let run = drive_dispatcher(Arc::clone(&state), vec![init_line(1), prompt_line(2, "hi")]);
+        run.await.unwrap().unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some()
+        })
+        .await;
+        let prompt = find_response(&lines, 2).unwrap();
+        assert_eq!(prompt["result"]["stopReason"], "end_turn", "{lines:?}");
+    }
+
+    /// M3: a cancel sent while the LLM call is in flight aborts the
+    /// call (the `chat` future is dropped, not run to completion) and
+    /// leaves no trace of the turn in history.
+    #[tokio::test]
+    async fn cancel_aborts_llm_call_and_rolls_back_history() {
+        let (state, buf) = test_state();
+        let aborted = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+        fake_session_with(
+            &state,
+            "s1",
+            Arc::new(DroppableLlm {
+                aborted: aborted.clone(),
+                started: started.clone(),
+                delay_ms: 2000,
+            }),
+            zen_core::ToolRegistry::new(),
+        );
+        let (tx, run) = drive_dispatcher_live(Arc::clone(&state));
+        tx.send(init_line(1)).unwrap();
+        tx.send(prompt_line(2, "hi")).unwrap();
+        // Wait until the LLM call is actually in flight, then cancel:
+        // a cancel sent earlier would be caught by the pre-start check
+        // instead of aborting the call.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if started.load(Ordering::SeqCst) {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("LLM call never started");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let t0 = std::time::Instant::now();
+        tx.send(
+            json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": "s1"}})
+                .to_string(),
+        )
+        .unwrap();
+        drop(tx);
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some()
+        })
+        .await;
+        // The turn must end well before the 2 s LLM delay: the call
+        // was aborted, not awaited.
+        assert!(
+            t0.elapsed() < Duration::from_millis(1500),
+            "cancel must abort the turn early; took {:?}",
+            t0.elapsed()
+        );
+        let prompt = find_response(&lines, 2).unwrap();
+        assert_eq!(prompt["result"]["stopReason"], "cancelled", "{lines:?}");
+        assert!(
+            aborted.load(Ordering::SeqCst),
+            "the in-flight LLM call must be aborted: {lines:?}"
+        );
+        // History rolled back: the cancelled turn left no messages.
+        let session = {
+            let sessions = lock_or_recover(&state.sessions, "acp sessions");
+            sessions.get("s1").unwrap().clone()
+        };
+        let agent = session.agent.lock().await;
+        assert!(
+            agent.messages().is_empty(),
+            "cancelled turn must not leave history"
+        );
+        run.await.unwrap().unwrap();
+    }
+
+    /// M3: a cancel sent while a tool call runs reports the call
+    /// `cancelled` before the prompt response, and never `completed`
+    /// afterwards.
+    #[tokio::test]
+    async fn cancel_marks_in_flight_tool_call_cancelled() {
+        let (state, buf) = test_state();
+        let mut registry = zen_core::ToolRegistry::new();
+        registry.register(Arc::new(SlowTool { ms: 2000 }));
+        fake_session_with(&state, "s1", Arc::new(ToolCallLlm), registry);
+        let (tx, run) = drive_dispatcher_live(Arc::clone(&state));
+        tx.send(init_line(1)).unwrap();
+        tx.send(prompt_line(2, "hi")).unwrap();
+        // Wait for the tool call to be announced, then cancel while
+        // the tool is still running.
+        let _ = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            ls.iter().any(is_update("tool_call"))
+        })
+        .await;
+        tx.send(
+            json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": "s1"}})
+                .to_string(),
+        )
+        .unwrap();
+        drop(tx);
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some()
+        })
+        .await;
+        let prompt = find_response(&lines, 2).unwrap();
+        assert_eq!(prompt["result"]["stopReason"], "cancelled", "{lines:?}");
+        let cancelled = lines.iter().find(|l| {
+            l.get("method").and_then(Value::as_str) == Some("session/update")
+                && l["params"]["update"]["sessionUpdate"].as_str() == Some("tool_call_update")
+                && l["params"]["update"]["toolCallId"].as_str() == Some("c1")
+                && l["params"]["update"]["status"].as_str() == Some("cancelled")
+        });
+        assert!(
+            cancelled.is_some(),
+            "in-flight tool call must be cancelled: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| {
+                l.get("method").and_then(Value::as_str) == Some("session/update")
+                    && l["params"]["update"]["sessionUpdate"].as_str() == Some("tool_call_update")
+                    && l["params"]["update"]["toolCallId"].as_str() == Some("c1")
+                    && l["params"]["update"]["status"].as_str() == Some("completed")
+            }),
+            "cancelled tool call must never complete afterwards: {lines:?}"
+        );
+        run.await.unwrap().unwrap();
+    }
+
+    /// M3: `$/cancel_request` with the running prompt's id cancels
+    /// the turn, like `session/cancel`.
+    #[tokio::test]
+    async fn dollar_cancel_request_cancels_prompt_by_id() {
+        let (state, buf) = test_state();
+        fake_session(&state, "s1", 2000);
+        let run = drive_dispatcher(
+            Arc::clone(&state),
+            vec![
+                init_line(1),
+                prompt_line(2, "hi"),
+                json!({"jsonrpc": "2.0", "method": "$/cancel_request", "params": {"id": 2}})
+                    .to_string(),
+            ],
+        );
+        run.await.unwrap().unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some()
+        })
+        .await;
+        let prompt = find_response(&lines, 2).unwrap();
+        assert_eq!(prompt["result"]["stopReason"], "cancelled", "{lines:?}");
+    }
+
+    /// M3: `$/cancel_request` with an unknown id is ignored: the turn
+    /// runs to completion.
+    #[tokio::test]
+    async fn dollar_cancel_request_ignores_unknown_id() {
+        let (state, buf) = test_state();
+        fake_session(&state, "s1", 0);
+        let run = drive_dispatcher(
+            Arc::clone(&state),
+            vec![
+                init_line(1),
+                prompt_line(2, "hi"),
+                json!({"jsonrpc": "2.0", "method": "$/cancel_request", "params": {"id": 99}})
+                    .to_string(),
+            ],
+        );
+        run.await.unwrap().unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some()
+        })
+        .await;
+        let prompt = find_response(&lines, 2).unwrap();
+        assert_eq!(prompt["result"]["stopReason"], "end_turn", "{lines:?}");
+    }
+
+    /// M3: a session is free again after a cancelled turn: the next
+    /// prompt is accepted, not rejected as busy.
+    #[tokio::test]
+    async fn prompt_after_cancel_is_accepted() {
+        let (state, buf) = test_state();
+        fake_session(&state, "s1", 2000);
+        let (tx, run) = drive_dispatcher_live(Arc::clone(&state));
+        tx.send(init_line(1)).unwrap();
+        tx.send(prompt_line(2, "one")).unwrap();
+        tx.send(
+            json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": "s1"}})
+                .to_string(),
+        )
+        .unwrap();
+        let _ = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some()
+        })
+        .await;
+        tx.send(prompt_line(3, "two")).unwrap();
+        drop(tx);
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 3).is_some()
+        })
+        .await;
+        let second = find_response(&lines, 3).unwrap();
+        assert_eq!(second["result"]["stopReason"], "end_turn", "{lines:?}");
+        run.await.unwrap().unwrap();
+    }
+
+    /// M3: `cancel_pending_tools` reports announced-but-unfinished
+    /// calls as `cancelled`, and skips calls that already finished.
+    #[test]
+    fn cancel_pending_tools_reports_cancelled() {
+        let (state, buf) = test_state();
+        let sink = Arc::new(AcpSink {
+            out: state.out.clone(),
+            session_id: "s1".into(),
+            tools: Arc::new(Mutex::new(HashMap::new())),
+            pending_tools: Arc::new(Mutex::new(HashSet::new())),
+        });
+        let tool_call = |id: &str| {
+            ChatMessage::assistant(
+                None,
+                Some(vec![zen_core::ToolCall {
+                    id: id.into(),
+                    call_type: "function".into(),
+                    function: zen_core::FunctionCall {
+                        name: "Read".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+            )
+        };
+        sink.emit(AgentEvent::Assistant {
+            message: tool_call("c1"),
+            parent_tool_use_id: None,
+        });
+        sink.emit(AgentEvent::Assistant {
+            message: tool_call("c2"),
+            parent_tool_use_id: None,
+        });
+        // c1 finishes: it must not be reported cancelled.
+        sink.emit(AgentEvent::ToolResult {
+            tool_use_id: "c1".into(),
+            content: "ok".into(),
+            is_error: false,
+            parent_tool_use_id: None,
+            parallel: false,
+        });
+        sink.cancel_pending_tools();
+        let lines = read_output_lines(&buf);
+        let cancelled: Vec<&Value> = lines
+            .iter()
+            .filter(|l| {
+                l["params"]["update"]["sessionUpdate"].as_str() == Some("tool_call_update")
+                    && l["params"]["update"]["status"].as_str() == Some("cancelled")
+            })
+            .collect();
+        assert_eq!(cancelled.len(), 1, "{lines:?}");
+        assert_eq!(cancelled[0]["params"]["update"]["toolCallId"], "c2");
+    }
 }
 
 // Tests added for Việc A (floor coverage 88%): the AcpSink::emit arms
@@ -1899,6 +2969,7 @@ mod viec_a_tests {
             )),
             session_id: "probe".into(),
             tools: Arc::new(Mutex::new(HashMap::new())),
+            pending_tools: Arc::new(Mutex::new(HashSet::new())),
         };
         sink.emit(AgentEvent::TextDelta { text: "hi".into() });
         sink.emit(AgentEvent::ToolResult {
@@ -2000,23 +3071,19 @@ mod viec_a_tests {
     }
 
     #[test]
-    fn prompt_text_resource_blocks() {
+    fn validate_prompt_renders_resource_links() {
         let params = json!({
-            "content": [
+            "prompt": [
                 { "type": "resource_link", "uri": "file:///x.md" },
-                { "type": "resource", "uri": "file:///y.md" },
                 { "type": "text", "text": "hi" },
             ]
         });
-        assert_eq!(
-            prompt_text(&params),
-            "[resource: file:///x.md]\n[resource: file:///y.md]\nhi"
-        );
-        // A block without a type (or a resource without a uri) is skipped.
-        assert_eq!(prompt_text(&json!({"content": [{"text": "no type"}]})), "");
-        assert_eq!(
-            prompt_text(&json!({"content": [{"type": "resource_link"}]})),
-            ""
+        let prompt = validate_prompt(&params).expect("resource_link is baseline");
+        assert_eq!(prompt.text, "[resource: file:///x.md]\nhi");
+        // The v1 field is `prompt`: a params value carrying the old
+        // M1 `content` key has no prompt at all (M3 fix).
+        assert!(
+            validate_prompt(&json!({ "content": [{ "type": "text", "text": "hi" }] })).is_err()
         );
     }
 

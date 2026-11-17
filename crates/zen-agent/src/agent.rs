@@ -950,8 +950,10 @@ impl Agent {
                         j.assistant(&resp.message);
                     }
                 }
+                // Distinct subtype (M3, Phase 2 #9): the ACP layer
+                // maps this to stopReason "refusal".
                 return self.run_result(
-                    "error_during_execution",
+                    "error_refusal",
                     true,
                     content_filter_message(&text),
                     started.elapsed().as_millis() as u64,
@@ -982,8 +984,10 @@ impl Agent {
                     if continuations >= self.config.max_continuations {
                         let elapsed = started.elapsed().as_millis() as u64;
                         if broken {
+                            // Distinct subtype (M3, Phase 2 #9): the ACP
+                            // layer maps this to stopReason "max_tokens".
                             return self.run_result(
-                                "error_during_execution",
+                                "error_max_tokens",
                                 true,
                                 format!(
                                     "The model's tool call was cut off by the output token limit {} time(s) in a row; no tool was run. Ask for smaller steps or use a model with a larger output limit.",
