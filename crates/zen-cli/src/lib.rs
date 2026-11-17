@@ -260,7 +260,7 @@ pub async fn run_with_home(cli: Cli, cwd: &Path, home: Option<&Path>) -> Result<
         unsafe { std::env::set_var("NO_COLOR", "1") };
     }
     if cli.acp {
-        return acp::run_acp_server(&cli).await;
+        return acp::run_acp_server(&cli, home).await;
     }
 
     if let Some(sub) = cli.subcommand.clone() {

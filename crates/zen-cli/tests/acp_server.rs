@@ -459,7 +459,11 @@ fn acp_session_list_shows_seeded_journal() {
         initialize_req(1),
         req(2, "session/list", json!({})),
         req(3, "session/list", json!({"cwd": cwd_str})),
-        req(4, "session/list", json!({"cwd": "/nonexistent-dir-xyz"})),
+        req(
+            4,
+            "session/list",
+            json!({"cwd": std::env::temp_dir().join("nonexistent-dir-xyz").to_string_lossy()}),
+        ),
     ]);
     let (out, stderr, code) = run_acp(&home, &cwd, &input);
     assert_eq!(code, 0, "stderr: {stderr}");

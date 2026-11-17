@@ -421,8 +421,12 @@ impl AcpSession {
     }
 }
 
-pub async fn run_acp_server(cli: &Cli) -> Result<i32> {
-    let home = dirs::home_dir();
+pub async fn run_acp_server(cli: &Cli, home: Option<&Path>) -> Result<i32> {
+    // Use the home already resolved by the CLI entry point: it honors
+    // HOME/USERPROFILE, while dirs::home_dir() on Windows ignores HOME,
+    // so the server silently used the real profile instead of the
+    // configured home and never found managed sessions there.
+    let home = home.map(Path::to_path_buf);
     let default_cwd = std::env::current_dir()?;
     let state = Arc::new(AcpServerState::new(Arc::new(Mutex::new(
         Box::new(std::io::stdout()) as Box<dyn Write + Send>,
