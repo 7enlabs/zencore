@@ -56,4 +56,17 @@ exclude_re = [
   # equivalent: remove these exclusions and kill them with tests.
   "env_context\\.rs:359:31: replace \\^ with \\| in sha256_hex",
   "env_context\\.rs:359:41: replace \\^ with \\| in sha256_hex",
+  # PR #226 (M3 Phase 2 #9), acp.rs run_prompt_turn (line 1058, col 21):
+  # delete match arm "success" in run_prompt_turn.
+  # EQUIVALENT (waived by ZC Leader, 2026-11-17; verified by reading
+  # the match at acp.rs:1056-1065): the "success" arm returns
+  # "end_turn", and the catch-all arm `_ => "end_turn"` also returns
+  # "end_turn". Deleting the "success" arm makes "success" fall
+  # through to the catch-all, which returns the same value, so no
+  # observable behaviour changes and no test can kill this mutant.
+  # EXPIRY: if the catch-all arm stops returning "end_turn", or the
+  # "success" arm stops returning "end_turn", this mutant stops being
+  # equivalent: remove this exclusion and kill it with a test where
+  # the turn ends with subtype "success".
+  "acp\\.rs:1058:21: delete match arm \"success\" in run_prompt_turn",
 ]
