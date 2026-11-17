@@ -411,26 +411,17 @@ fn acp_set_mode_and_set_config_option_roundtrip() {
 
 // -- M5: session persistence -----------------------------------------------
 
-/// Seed a session journal under the temp home (M5): mirrors
+/// Seed a session journal under the temp home (M5): uses
 /// `session::ensure_session_path` layout (`~/.zen/projects/<encoded
 /// cwd>/<session-id>.jsonl`) so load/resume/list/delete can be driven
 /// without an LLM. The `cwd` field of each record is the raw cwd
 /// string, exactly as `TranscriptWriter` writes it.
 fn seed_journal(home: &TempDir, cwd: &TempDir, session_id: &str) -> PathBuf {
-    let encoded: String = cwd
-        .path()
-        .canonicalize()
-        .unwrap()
-        .to_string_lossy()
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | '.' | '?' | '*' | '"' | '<' | '>' | '|' => '-',
-            c => c,
-        })
-        .collect();
-    let dir = home.path().join(".zen").join("projects").join(encoded);
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(format!("{session_id}.jsonl"));
+    // Use the real layout helper: hand-rolling the encoding drifted
+    // from encode_cwd (Windows verbatim prefix), so the seeded
+    // journal landed in a different directory than the server looks
+    // in, and load/resume/list/delete saw unknown session.
+    let path = zen_cli::session::ensure_session_path(home.path(), cwd.path(), session_id).unwrap();
     let cwd_str = cwd.path().to_string_lossy().to_string();
     let records = [
         json!({"type": "user", "uuid": "u1", "parent_uuid": null, "session_id": session_id, "timestamp": "2026-11-17T10:00:00Z", "cwd": cwd_str, "message": {"role": "user", "content": "hello from history"}}),
