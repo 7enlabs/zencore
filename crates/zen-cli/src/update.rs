@@ -511,8 +511,8 @@ mod viec_a_tests {
         fn capture() -> Self {
             Self {
                 path: std::env::var("PATH").ok(),
-                src_dir: std::env::var("ZENCODE_SRC_DIR").ok(),
-                repo: std::env::var("ZENCODE_REPO").ok(),
+                src_dir: std::env::var("ZENCORE_SRC_DIR").ok(),
+                repo: std::env::var("ZENCORE_REPO").ok(),
                 git_status: std::env::var("FAKE_GIT_STATUS").ok(),
                 git_local: std::env::var("FAKE_GIT_LOCAL").ok(),
                 git_remote: std::env::var("FAKE_GIT_REMOTE").ok(),
@@ -523,8 +523,8 @@ mod viec_a_tests {
     impl Drop for EnvRestore {
         fn drop(&mut self) {
             restore_var("PATH", self.path.take());
-            restore_var("ZENCODE_SRC_DIR", self.src_dir.take());
-            restore_var("ZENCODE_REPO", self.repo.take());
+            restore_var("ZENCORE_SRC_DIR", self.src_dir.take());
+            restore_var("ZENCORE_REPO", self.repo.take());
             restore_var("FAKE_GIT_STATUS", self.git_status.take());
             restore_var("FAKE_GIT_LOCAL", self.git_local.take());
             restore_var("FAKE_GIT_REMOTE", self.git_remote.take());
@@ -549,7 +549,7 @@ mod viec_a_tests {
 
     #[cfg(unix)]
     fn src_dir_of(home: &Path) -> PathBuf {
-        home.join(".local").join("share").join("zencode")
+        home.join(".local").join("share").join("zencore")
     }
 
     /// A fake `git` that answers the calls run_update makes. Behaviour is
@@ -588,18 +588,18 @@ esac
         let _env = crate::settings::env_lock();
         let _restore = EnvRestore::capture();
         unsafe {
-            std::env::set_var("ZENCODE_SRC_DIR", "/tmp/zen-src-override");
+            std::env::set_var("ZENCORE_SRC_DIR", "/tmp/zen-src-override");
             assert_eq!(
                 default_src_dir(Some(Path::new("/home/test"))),
                 Some(PathBuf::from("/tmp/zen-src-override"))
             );
             // An empty override does not count: fall back to the home path.
-            std::env::set_var("ZENCODE_SRC_DIR", "");
+            std::env::set_var("ZENCORE_SRC_DIR", "");
             assert_eq!(
                 default_src_dir(Some(Path::new("/home/test"))),
-                Some(PathBuf::from("/home/test/.local/share/zencode"))
+                Some(PathBuf::from("/home/test/.local/share/zencore"))
             );
-            std::env::remove_var("ZENCODE_SRC_DIR");
+            std::env::remove_var("ZENCORE_SRC_DIR");
             assert_eq!(default_src_dir(None), None);
         }
     }
@@ -609,9 +609,9 @@ esac
         let _env = crate::settings::env_lock();
         let _restore = EnvRestore::capture();
         unsafe {
-            std::env::set_var("ZENCODE_REPO", "https://example.invalid/r.git");
+            std::env::set_var("ZENCORE_REPO", "https://example.invalid/r.git");
             assert_eq!(repo_url(), "https://example.invalid/r.git");
-            std::env::remove_var("ZENCODE_REPO");
+            std::env::remove_var("ZENCORE_REPO");
             assert_eq!(repo_url(), DEFAULT_REPO);
         }
     }
@@ -696,7 +696,7 @@ esac
         write_fake_git(&bindir);
         let restore = EnvRestore::capture();
         unsafe {
-            std::env::remove_var("ZENCODE_SRC_DIR");
+            std::env::remove_var("ZENCORE_SRC_DIR");
             std::env::set_var("FAKE_GIT_STATUS", status);
             std::env::set_var("FAKE_GIT_LOCAL", local);
             std::env::set_var("FAKE_GIT_REMOTE", remote);
@@ -714,7 +714,7 @@ esac
         let empty = home.join("emptybin");
         std::fs::create_dir_all(&empty).unwrap();
         unsafe {
-            std::env::remove_var("ZENCODE_SRC_DIR");
+            std::env::remove_var("ZENCORE_SRC_DIR");
             std::env::set_var("PATH", empty.as_os_str());
         }
         let err = run_update(true, Some(&home), true, false, false)
@@ -732,7 +732,7 @@ esac
         let _env = crate::settings::env_lock();
         let _restore = EnvRestore::capture();
         unsafe {
-            std::env::remove_var("ZENCODE_SRC_DIR");
+            std::env::remove_var("ZENCORE_SRC_DIR");
             let old_path = std::env::var("PATH").unwrap_or_default();
             std::env::set_var("PATH", format!("{}:{}", bindir.display(), old_path));
         }
@@ -815,7 +815,7 @@ esac
         let _env = crate::settings::env_lock();
         let _restore = EnvRestore::capture();
         unsafe {
-            std::env::remove_var("ZENCODE_SRC_DIR");
+            std::env::remove_var("ZENCORE_SRC_DIR");
             std::env::set_var("FAKE_GIT_STATUS", "");
             std::env::set_var("FAKE_GIT_LOCAL", SHA_A);
             std::env::set_var("FAKE_GIT_REMOTE", SHA_B);
