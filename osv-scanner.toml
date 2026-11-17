@@ -1,0 +1,9 @@
+# OSV scanner policy for the Zen CLI workspace.
+# RUSTSEC-2026-0543: chrono is unmaintained (all versions affected, no
+# patched release). The advisory is about maintenance status, not an
+# exploitable flaw, and chrono is only used here for timestamps and
+# formatting (Utc::now, to_rfc3339, Duration). Accepted as a documented
+# exception so CI stays green; follow-up is migrating chrono to jiff.
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+reason = "chrono unmaintained advisory, not an exploitable flaw; used only for timestamps and formatting; migrate to jiff as follow-up"
