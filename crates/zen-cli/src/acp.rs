@@ -745,7 +745,9 @@ async fn dispatch_line(
     let response = match req.method.as_str() {
         "initialize" => Some(apply_initialize(&state.initialized, id, &req.params)),
         "authenticate" => Some(RpcResponse::ok(id, json!({}))),
-        "session/new" => match reject_system_prompt(&req.params) {
+        "session/new" => match reject_system_prompt(&req.params)
+            .and_then(|()| validate_session_new_cwd(&req.params))
+        {
             Err((code, msg)) => Some(RpcResponse::err(id, code, msg)),
             Ok(()) => match handle_session_new(cli, default_cwd, home, &req.params, state).await {
                 Ok((session_id, session)) => {
@@ -1064,6 +1066,16 @@ async fn handle_session_new(
     params: &Value,
     state: &Arc<AcpServerState>,
 ) -> Result<(String, AcpSession)> {
+    // A `cwd` that is present but not a string (a number, null, ...)
+    // is rejected instead of silently falling back to the default:
+    // silently accepting a malformed client request hides a bug
+    // (TCK run 1, cases 006 and 015). An absent `cwd` still falls
+    // back to the default working directory, as before.
+    if let Some(cwd) = params.get("cwd")
+        && !cwd.is_string()
+    {
+        anyhow::bail!("invalid params: cwd must be a string");
+    }
     let cwd = params
         .get("cwd")
         .and_then(Value::as_str)
@@ -1579,6 +1591,19 @@ fn handle_session_list(
 /// so a compliant client never sends one. ACP v1 requires an agent
 /// that cannot apply it to return an error instead of creating,
 /// loading or resuming the session; -32602 is the recommended code.
+/// A `cwd` that is present in `session/new` params but is not a
+/// string (a number, null, ...) is rejected with -32602 (TCK run 1,
+/// cases 006 and 015). An absent `cwd` is fine: the caller falls back
+/// to the default working directory.
+fn validate_session_new_cwd(params: &Value) -> Result<(), (i64, String)> {
+    if params.get("cwd").is_some_and(|v| !v.is_string()) {
+        return Err((
+            ERR_INVALID_PARAMS,
+            "invalid params: cwd must be a string".to_string(),
+        ));
+    }
+    Ok(())
+}
 fn reject_system_prompt(params: &Value) -> Result<(), (i64, String)> {
     if params.get("systemPrompt").is_some_and(|v| !v.is_null()) {
         return Err((
@@ -5261,6 +5286,36 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    /// TCK run 1, cases 006 and 015: `session/new` with a non-string
+    /// or null `cwd` is rejected on the wire with -32602.
+    #[tokio::test]
+    async fn session_new_non_string_cwd_returns_invalid_params() {
+        let (state, buf) = test_state();
+        let run = drive_dispatcher(
+            Arc::clone(&state),
+            vec![
+                init_line(1),
+                json!({"jsonrpc": "2.0", "id": 2, "method": "session/new", "params": {"cwd": 12345}})
+                    .to_string(),
+                json!({"jsonrpc": "2.0", "id": 3, "method": "session/new", "params": {"cwd": null}})
+                    .to_string(),
+            ],
+        );
+        run.await.unwrap().unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some() && find_response(ls, 3).is_some()
+        })
+        .await;
+        for id in [2, 3] {
+            let resp = find_response(&lines, id).unwrap();
+            assert_eq!(resp["error"]["code"], -32602, "{lines:?}");
+            assert!(
+                resp["error"]["message"].as_str().unwrap().contains("cwd"),
+                "{lines:?}"
+            );
+        }
+    }
 }
 
 // Tests added for Việc A (floor coverage 88%): the AcpSink::emit arms
@@ -5431,6 +5486,48 @@ mod viec_a_tests {
             };
         assert!(
             err.to_string().contains("ACP requires absolute paths"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_session_new_rejects_non_string_cwd() {
+        // TCK run 1, case 006: `cwd: 12345` must fail, not fall back
+        // silently to the default working directory.
+        let cli = Cli::try_parse_from(["zen"]).unwrap();
+        let out = Arc::new(Mutex::new(
+            Box::new(std::io::stdout()) as Box<dyn Write + Send>
+        ));
+        let state = Arc::new(AcpServerState::new(out));
+        let cwd = std::env::temp_dir();
+        let err = match handle_session_new(&cli, &cwd, None, &json!({"cwd": 12345}), &state).await {
+            Ok(_) => panic!("non-string cwd must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string()
+                .contains("invalid params: cwd must be a string"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_session_new_rejects_null_cwd() {
+        // TCK run 1, case 015: `cwd: null` must fail, not fall back
+        // silently to the default working directory.
+        let cli = Cli::try_parse_from(["zen"]).unwrap();
+        let out = Arc::new(Mutex::new(
+            Box::new(std::io::stdout()) as Box<dyn Write + Send>
+        ));
+        let state = Arc::new(AcpServerState::new(out));
+        let cwd = std::env::temp_dir();
+        let err = match handle_session_new(&cli, &cwd, None, &json!({"cwd": null}), &state).await {
+            Ok(_) => panic!("null cwd must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string()
+                .contains("invalid params: cwd must be a string"),
             "{err}"
         );
     }
