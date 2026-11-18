@@ -91,6 +91,7 @@ mod tests {
         assert_eq!(prompt_for(PermissionMode::AcceptEdits), "> ");
         assert_eq!(prompt_for(PermissionMode::BypassPermissions), "> ");
         assert_eq!(prompt_for(PermissionMode::DontAsk), "> ");
+        assert_eq!(prompt_for(PermissionMode::AskAll), "> ");
         assert!(prompt_for(PermissionMode::Plan).contains(PLAN_BADGE));
     }
 

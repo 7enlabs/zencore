@@ -324,7 +324,7 @@ fn acp_session_new_advertises_modes_and_model() {
         .iter()
         .map(|m| m["id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, ["default", "plan", "acceptEdits"], "{resp}");
+    assert_eq!(ids, ["default", "plan", "acceptEdits", "askAll"], "{resp}");
     assert!(
         !resp.to_string().contains("bypassPermissions") && !resp.to_string().contains("dontAsk"),
         "{resp}"

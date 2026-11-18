@@ -142,13 +142,14 @@ Evaluation order for every tool call:
 ```
 deny rule matches?  → Deny            (always wins, even in bypassPermissions)
 ask rule matches?   → Ask
-allow rule matches? → Allow
+allow rule matches? → Allow            (except in askAll, where it never self-allows)
 otherwise           → mode default:
    default            read-only tools Allow, others Ask
    acceptEdits        + Write/Edit inside working dirs, simple fs commands (mkdir/touch/mv/cp)
    plan               non-read-only → Deny
    bypassPermissions  Allow
    dontAsk            anything that would Ask → Deny
+   askAll             everything → Ask, including read-only tools
 ```
 
 Rules come from every settings layer (lists are merged) plus `--allowedTools/--disallowedTools`.

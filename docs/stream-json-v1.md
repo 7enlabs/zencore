@@ -51,7 +51,7 @@ First line of every agent run.
 | `model` | string | effective model for this turn |
 | `tools` | string[] | tool names offered to the model, in registry order (includes MCP tools `mcp__<server>__<tool>`) |
 | `mcp_servers` | `{name, status}`[] | `status` is `"connected"` or `"failed"` |
-| `permissionMode` | string | `default`, `acceptEdits`, `plan`, `bypassPermissions`, `dontAsk` |
+| `permissionMode` | string | `default`, `acceptEdits`, `plan`, `bypassPermissions`, `dontAsk`, `askAll` |
 | `slash_commands` | string[] | built-in and custom commands, with leading `/` |
 | `folder_trusted` | bool | whether the working folder is trusted (add-only, since PR #5). In an untrusted folder project hooks, MCP servers, allow rules, `additionalDirectories`, env and verify are not loaded. `-p` runs are untrusted unless `--trust-folder` / `ZEN_TRUST_FOLDER=1` or the folder is in `~/.zen/trusted-folders.json`; The fixtures run with `ZEN_TRUST_FOLDER=1`, so they show `true` |
 | `mcp_server_errors` | `{name, reason}`[] | **only present** when MCP config entries were skipped by validation |

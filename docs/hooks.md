@@ -335,7 +335,7 @@ above **plus** these standard fields:
   "transcript_path": "/home/u/.zen/sessions/….jsonl",
   "cwd": "/home/u/project",
   "hook_event_name": "PreToolUse",
-  "permission_mode": "default",     // default|acceptEdits|plan|bypassPermissions|dontAsk
+  "permission_mode": "default",     // default|acceptEdits|plan|bypassPermissions|dontAsk|askAll
   "tool_name": "Bash",              // tool events only
   "tool_input": { "command": "ls" },// PreToolUse / PostToolUse only
   "tool_result": "…",               // PostToolUse: "tool_response" (or "error" on failure)
@@ -511,7 +511,10 @@ stdout is treated as additional context for `UserPromptSubmit`/`SessionStart` on
 Hook output fed back to the model or user is capped at 10,000 characters per hook.
 When several hooks match: any block wins; any `continue: false` stops; permission
 precedence is deny > ask > allow; the first `updatedInput`/`updatedToolOutput` in config
-order wins; feedback and system messages are joined with newlines.
+order wins; feedback and system messages are joined with newlines. A mode Deny
+always beats a hook decision, and a hook `allow` never lifts a mode Ask to
+Allow when an ask rule matched - or in `askAll` mode, where a hook may only
+tighten, never loosen.
 
 ### Events
 

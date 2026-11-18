@@ -633,7 +633,7 @@ pub enum FixOffer {
 pub fn fix_offer_for_mode(mode: PermissionMode) -> FixOffer {
     match mode {
         PermissionMode::Plan => FixOffer::Never,
-        PermissionMode::Default => FixOffer::Ask,
+        PermissionMode::Default | PermissionMode::AskAll => FixOffer::Ask,
         PermissionMode::AcceptEdits
         | PermissionMode::BypassPermissions
         | PermissionMode::DontAsk => FixOffer::Auto,
@@ -812,6 +812,7 @@ mod tests {
     fn fix_offer_for_mode_all_modes() {
         assert_eq!(fix_offer_for_mode(PermissionMode::Plan), FixOffer::Never);
         assert_eq!(fix_offer_for_mode(PermissionMode::Default), FixOffer::Ask);
+        assert_eq!(fix_offer_for_mode(PermissionMode::AskAll), FixOffer::Ask);
         assert_eq!(
             fix_offer_for_mode(PermissionMode::AcceptEdits),
             FixOffer::Auto
