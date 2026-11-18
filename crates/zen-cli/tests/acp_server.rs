@@ -255,7 +255,22 @@ struct AcpInteractive {
 
 impl AcpInteractive {
     fn spawn(home: &TempDir, cwd: &TempDir) -> Self {
-        let mut child = ZenRun::new("acp", home, cwd).arg("--acp").spawn_piped();
+        Self::from_run(ZenRun::new("acp", home, cwd).arg("--acp"))
+    }
+
+    /// Spawn with a stub LLM (MockServer): the stub answers every
+    /// completion, so a prompt turn can run a tool call without a real
+    /// model. Used by the permission round-trip tests (TCK Q7).
+    fn spawn_mock(home: &TempDir, cwd: &TempDir, server: &MockServer) -> Self {
+        Self::from_run(
+            ZenRun::new("acp", home, cwd)
+                .arg("--acp")
+                .mock("mock-model", server),
+        )
+    }
+
+    fn from_run(run: ZenRun) -> Self {
+        let mut child = run.spawn_piped();
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -639,4 +654,170 @@ fn acp_session_load_cwd_mismatch_is_invalid_params() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(out.len(), 2, "expected two response lines: {out:?}");
     assert_eq!(out[1]["error"]["code"], -32602);
+}
+
+/// TCK Q7 (Leader tin 16271): the `session/request_permission`
+/// round-trip through the real server. The stub LLM answers the first
+/// completion with a `Write` tool call, so the agent asks the client
+/// for permission; the test client answers, and the turn outcome must
+/// follow the answer. Local stub only (127.0.0.1), no real model.
+fn write_tool_call_reply() -> Reply {
+    Reply::with_tool_calls(
+        "",
+        Some(json!([{
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "Write",
+                "arguments": "{\"file_path\":\"test.txt\",\"content\":\"hello\"}"
+            }
+        }])),
+    )
+}
+
+/// Drive one prompt turn that hits a permission question: send the
+/// prompt, answer the first `session/request_permission` request with
+/// `option_id`, and return that request plus the prompt response.
+/// Any other line is a `session/update` notification.
+fn drive_permission_turn(
+    acp: &mut AcpInteractive,
+    prompt_id: u64,
+    session_id: &str,
+    option_id: &str,
+) -> (Value, Value) {
+    acp.send(&req(
+        prompt_id,
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "write a file"}],
+        }),
+    ));
+    let mut permission_request = None;
+    loop {
+        let line = acp.next_line();
+        if line.get("method").and_then(Value::as_str) == Some("session/request_permission") {
+            assert!(
+                permission_request.is_none(),
+                "expected exactly one permission request, got a second: {line}"
+            );
+            let answer = json!({
+                "jsonrpc": "2.0",
+                "id": line["id"].clone(),
+                "result": {"outcome": {"type": "selected", "optionId": option_id}},
+            });
+            permission_request = Some(line);
+            acp.send(&answer);
+        } else if line.get("id") == Some(&json!(prompt_id)) {
+            let request =
+                permission_request.expect("prompt answered without any session/request_permission");
+            return (request, line);
+        }
+        // Anything else is a session/update notification; keep reading.
+    }
+}
+
+/// The permission request the server sends for a `Write` tool call:
+/// this session, this tool call, kind `edit`, and the four options.
+fn assert_permission_request_shape(request: &Value, session_id: &str) {
+    assert_eq!(request["jsonrpc"], "2.0", "{request}");
+    assert_eq!(request["params"]["sessionId"], session_id, "{request}");
+    let tool_call = &request["params"]["toolCall"];
+    assert_eq!(tool_call["toolCallId"], "call_1", "{request}");
+    assert_eq!(tool_call["title"], "Write", "{request}");
+    assert_eq!(tool_call["kind"], "edit", "{request}");
+    let option_ids: Vec<&str> = request["params"]["options"]
+        .as_array()
+        .expect("options array")
+        .iter()
+        .map(|o| o["id"].as_str().expect("option id"))
+        .collect();
+    assert_eq!(
+        option_ids,
+        ["allow_once", "allow_always", "reject_once", "reject_always"],
+        "{request}"
+    );
+}
+
+/// Start an ACP session backed by the stub LLM, ready for a prompt turn.
+fn start_permission_session(
+    home: &TempDir,
+    cwd: &TempDir,
+    server: &MockServer,
+) -> (AcpInteractive, String) {
+    let mut acp = AcpInteractive::spawn_mock(home, cwd, server);
+    acp.send(&initialize_req(1));
+    assert_eq!(acp.next_line()["result"]["protocolVersion"], 1);
+    acp.send(&req(
+        2,
+        "session/new",
+        json!({"cwd": cwd.path().to_string_lossy()}),
+    ));
+    let resp = acp.next_line();
+    assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+    let session_id = resp["result"]["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
+    (acp, session_id)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_permission_allow_once_runs_write_tool() {
+    let home = TempDir::new("acp_perm_allow_home");
+    let cwd = TempDir::new("acp_perm_allow_cwd");
+    let server = MockServer::start(vec![write_tool_call_reply(), Reply::text("write done")]).await;
+    let (mut acp, session_id) = start_permission_session(&home, &cwd, &server);
+    let (request, response) = drive_permission_turn(&mut acp, 3, &session_id, "allow_once");
+    assert_permission_request_shape(&request, &session_id);
+    assert!(
+        response.get("error").is_none(),
+        "unexpected error: {response}"
+    );
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    assert_eq!(acp.finish(), 0);
+    // The tool really ran: the file the stub LLM asked to write exists.
+    assert_eq!(
+        std::fs::read_to_string(cwd.path().join("test.txt")).expect("test.txt written"),
+        "hello"
+    );
+    let requests = server.finish().await;
+    assert!(
+        requests.len() >= 2,
+        "expected the tool result to reach the LLM again, got {} requests",
+        requests.len()
+    );
+    assert!(
+        requests[1].contains("call_1"),
+        "second LLM request must carry the tool result: {}",
+        requests[1]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_permission_reject_once_denies_write_tool() {
+    let home = TempDir::new("acp_perm_deny_home");
+    let cwd = TempDir::new("acp_perm_deny_cwd");
+    let server =
+        MockServer::start(vec![write_tool_call_reply(), Reply::text("write denied")]).await;
+    let (mut acp, session_id) = start_permission_session(&home, &cwd, &server);
+    let (request, response) = drive_permission_turn(&mut acp, 3, &session_id, "reject_once");
+    assert_permission_request_shape(&request, &session_id);
+    assert!(
+        response.get("error").is_none(),
+        "unexpected error: {response}"
+    );
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    assert_eq!(acp.finish(), 0);
+    // The tool never ran: a denied Write must not create the file.
+    assert!(
+        !cwd.path().join("test.txt").exists(),
+        "denied Write created test.txt"
+    );
+    let requests = server.finish().await;
+    assert!(
+        requests.len() >= 2,
+        "expected the denial to reach the LLM again, got {} requests",
+        requests.len()
+    );
 }
