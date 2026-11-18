@@ -396,7 +396,7 @@ impl AcpSession {
     }
 
     /// The `modes` object for the `session/new` response (M4): exactly
-    /// the three modes Q3 advertises.
+    /// the four modes Q3 advertises.
     fn modes_state(&self) -> Value {
         json!({
             "currentModeId": self.current_mode().as_str(),
@@ -1032,7 +1032,7 @@ fn handle_initialize(id: Value, params: &Value) -> RpcResponse {
                 // false capability means unsupported.
                 // Modes are NOT advertised here: ACP v1 puts them in the
                 // session/new response (M4), which lists exactly
-                // default/plan/acceptEdits and never bypassPermissions
+                // default/plan/acceptEdits/askAll and never bypassPermissions
                 // or dontAsk (Leader Q3, tin 15113).
                 // M5 advertises the persistence capability set of ACP v1.
                 "loadSession": true,
@@ -1115,9 +1115,10 @@ async fn build_acp_session(
     // to Default for ACP sessions: those modes must never be advertised
     // (Q3) and must never run behind a client that cannot see them.
     let initial_mode = match agent_config.permission_mode {
-        PermissionMode::Default | PermissionMode::AcceptEdits | PermissionMode::Plan => {
-            agent_config.permission_mode
-        }
+        PermissionMode::Default
+        | PermissionMode::AcceptEdits
+        | PermissionMode::Plan
+        | PermissionMode::AskAll => agent_config.permission_mode,
         PermissionMode::BypassPermissions | PermissionMode::DontAsk => {
             eprintln!(
                 "acp: clamping unadvertised mode {} to default for session {session_id}",
@@ -1914,7 +1915,9 @@ fn handle_cancel(sessions: &HashMap<String, Arc<AcpSession>>, params: &Value) {
 }
 
 /// The advertised mode list for the `session/new` response (M4): exactly
-/// the three modes Q3 allows, never bypassPermissions/dontAsk.
+/// the four modes Q3 allows, never bypassPermissions/dontAsk. askAll
+/// joins the advertised set (Phase 2 #8): it is the strictest
+/// interactive mode, so a client that sees it can use it safely.
 fn advertised_mode_list() -> Value {
     json!([
         {
@@ -1931,6 +1934,11 @@ fn advertised_mode_list() -> Value {
             "id": "acceptEdits",
             "name": "Accept edits",
             "description": "Apply file edits without asking; other actions still ask for permission.",
+        },
+        {
+            "id": "askAll",
+            "name": "Ask all",
+            "description": "Ask for permission before every tool call, including read-only tools.",
         },
     ])
 }
@@ -4400,7 +4408,11 @@ mod tests {
             .iter()
             .map(|m| m["id"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, ["default", "plan", "acceptEdits"], "{modes:?}");
+        assert_eq!(
+            ids,
+            ["default", "plan", "acceptEdits", "askAll"],
+            "{modes:?}"
+        );
         assert!(
             !modes.to_string().contains("bypassPermissions")
                 && !modes.to_string().contains("dontAsk"),

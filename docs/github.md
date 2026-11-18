@@ -31,6 +31,7 @@ After displaying, zen offers to address the comments with the agent:
 |---|---|
 | `plan` | Read-only: never offers (write tools are withheld anyway) |
 | `default` | Asks `Address these comments with the agent? [y/N]` |
+| `askAll` | Asks `Address these comments with the agent? [y/N]` |
 | `acceptEdits` / `bypassPermissions` / `dontAsk` | Dispatches the fix turn directly |
 
 The fix turn receives every comment (file, line, author, severity) and is told

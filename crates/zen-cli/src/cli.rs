@@ -27,6 +27,8 @@ pub enum PermissionMode {
     BypassPermissions,
     #[value(name = "dontAsk")]
     DontAsk,
+    #[value(name = "askAll")]
+    AskAll,
 }
 
 impl PermissionMode {
@@ -37,6 +39,7 @@ impl PermissionMode {
             PermissionMode::Plan => "plan",
             PermissionMode::BypassPermissions => "bypassPermissions",
             PermissionMode::DontAsk => "dontAsk",
+            PermissionMode::AskAll => "askAll",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
@@ -46,6 +49,7 @@ impl PermissionMode {
             "plan" => PermissionMode::Plan,
             "bypassPermissions" | "bypass-permissions" => PermissionMode::BypassPermissions,
             "dontAsk" | "dont-ask" => PermissionMode::DontAsk,
+            "askAll" | "ask-all" => PermissionMode::AskAll,
             _ => return None,
         })
     }
@@ -67,7 +71,7 @@ pub fn invalid_permission_mode_error(value: &str, source: &str) -> String {
         )
     } else {
         format!(
-            "invalid permission mode '{value}' in {source} (expected one of: default, acceptEdits, accept-edits, plan, bypassPermissions, bypass-permissions, dontAsk, dont-ask)"
+            "invalid permission mode '{value}' in {source} (expected one of: default, acceptEdits, accept-edits, plan, bypassPermissions, bypass-permissions, dontAsk, dont-ask, askAll, ask-all)"
         )
     }
 }
@@ -84,6 +88,7 @@ impl std::fmt::Display for PermissionMode {
             PermissionMode::Plan => "plan",
             PermissionMode::BypassPermissions => "bypassPermissions",
             PermissionMode::DontAsk => "dontAsk",
+            PermissionMode::AskAll => "askAll",
         };
         write!(f, "{}", s)
     }
@@ -242,8 +247,8 @@ pub struct Cli {
     pub provider: Option<String>,
 
     /// Permission mode for tool calls: default, acceptEdits, plan,
-    /// bypassPermissions, dontAsk. Kebab-case spellings (accept-edits,
-    /// bypass-permissions, dont-ask) mean the same mode. 'auto' and
+    /// bypassPermissions, dontAsk, askAll. Kebab-case spellings (accept-edits,
+    /// bypass-permissions, dont-ask, ask-all) mean the same mode. 'auto' and
     /// 'manual' are not modes and are rejected; use 'default'.
     #[arg(long = "permission-mode", value_parser = parse_permission_mode_flag)]
     pub permission_mode: Option<PermissionMode>,
@@ -1237,6 +1242,8 @@ mod tests {
             ("bypass-permissions", PermissionMode::BypassPermissions),
             ("dontAsk", PermissionMode::DontAsk),
             ("dont-ask", PermissionMode::DontAsk),
+            ("askAll", PermissionMode::AskAll),
+            ("ask-all", PermissionMode::AskAll),
         ] {
             assert_eq!(PermissionMode::parse(spelling), Some(mode), "{spelling}");
         }
@@ -1252,6 +1259,26 @@ mod tests {
             "accept_edits",
         ] {
             assert_eq!(PermissionMode::parse(spelling), None, "{spelling}");
+        }
+    }
+
+    #[test]
+    fn permission_mode_as_str_and_display() {
+        // as_str feeds the persisted defaultMode in settings and
+        // Display feeds user-facing mode text: both must spell each
+        // mode exactly. A whole-body replacement ("" / "xyzzy" / an
+        // empty Display) fails every case below.
+        for (mode, name) in [
+            (PermissionMode::Default, "default"),
+            (PermissionMode::AcceptEdits, "acceptEdits"),
+            (PermissionMode::Plan, "plan"),
+            (PermissionMode::BypassPermissions, "bypassPermissions"),
+            (PermissionMode::DontAsk, "dontAsk"),
+            (PermissionMode::AskAll, "askAll"),
+        ] {
+            assert_eq!(mode.as_str(), name);
+            assert_eq!(format!("{mode}"), name);
+            assert_eq!(PermissionMode::parse(mode.as_str()), Some(mode));
         }
     }
 
@@ -1273,6 +1300,14 @@ mod tests {
         assert_eq!(
             parse(&["--permission-mode", "dontAsk"]).permission_mode,
             Some(PermissionMode::DontAsk)
+        );
+        assert_eq!(
+            parse(&["--permission-mode", "ask-all"]).permission_mode,
+            Some(PermissionMode::AskAll)
+        );
+        assert_eq!(
+            parse(&["--permission-mode", "askAll"]).permission_mode,
+            Some(PermissionMode::AskAll)
         );
         // 'auto' and 'manual' are rejected with a pointer at 'default',
         // never silently mapped to it.

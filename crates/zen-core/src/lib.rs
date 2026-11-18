@@ -351,6 +351,7 @@ pub enum PermissionMode {
     Plan,
     BypassPermissions,
     DontAsk,
+    AskAll,
 }
 
 impl PermissionMode {
@@ -361,6 +362,7 @@ impl PermissionMode {
             Self::Plan => "plan",
             Self::BypassPermissions => "bypassPermissions",
             Self::DontAsk => "dontAsk",
+            Self::AskAll => "askAll",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
@@ -370,6 +372,7 @@ impl PermissionMode {
             "plan" => Self::Plan,
             "bypassPermissions" | "bypass-permissions" => Self::BypassPermissions,
             "dontAsk" | "dont-ask" => Self::DontAsk,
+            "askAll" | "ask-all" => Self::AskAll,
             _ => return None,
         })
     }
@@ -1732,6 +1735,7 @@ mod tests {
             "plan",
             "bypassPermissions",
             "dontAsk",
+            "askAll",
         ] {
             assert_eq!(PermissionMode::parse(m).unwrap().as_str(), m);
         }
@@ -1750,6 +1754,7 @@ mod tests {
             PermissionMode::parse("dont-ask").unwrap().as_str(),
             "dontAsk"
         );
+        assert_eq!(PermissionMode::parse("ask-all").unwrap().as_str(), "askAll");
         // 'auto' and 'manual' are not modes and never mean default.
         assert_eq!(PermissionMode::parse("auto"), None);
         assert_eq!(PermissionMode::parse("manual"), None);

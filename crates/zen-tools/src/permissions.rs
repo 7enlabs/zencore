@@ -664,11 +664,16 @@ impl RulePermissions {
             return PermissionDecision::Allow;
         }
 
-        if allowed {
+        // askAll: an allow rule never self-allows, and a read-only tool
+        // never auto-allows. Everything past the deny/ask rules above
+        // falls through to the mode match, which asks.
+        if allowed && self.current_mode() != PermissionMode::AskAll {
             return PermissionDecision::Allow;
         }
 
-        if read_only || tool_is_read_only(tool_name) {
+        if (read_only || tool_is_read_only(tool_name))
+            && self.current_mode() != PermissionMode::AskAll
+        {
             return PermissionDecision::Allow;
         }
         match self.current_mode() {
@@ -688,6 +693,7 @@ impl RulePermissions {
             PermissionMode::DontAsk => {
                 PermissionDecision::Deny("dontAsk mode: permission request suppressed".into())
             }
+            PermissionMode::AskAll => PermissionDecision::Ask,
             PermissionMode::Default | PermissionMode::Plan | PermissionMode::BypassPermissions => {
                 PermissionDecision::Ask
             }
@@ -1434,6 +1440,15 @@ mod permission_tests {
         // filesystem command.
         let bash = serde_json::json!({"command": "cargo test"});
         assert!(is_ask(&perms.check("Bash", &bash, false, &ctx)));
+        // AskAll asks even for a read-only tool.
+        perms.set_mode(PermissionMode::AskAll);
+        assert_eq!(perms.current_mode(), PermissionMode::AskAll);
+        assert!(is_ask(&perms.check(
+            "Read",
+            &serde_json::json!({"file_path": "x.rs"}),
+            true,
+            &ctx
+        )));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1571,6 +1586,137 @@ mod permission_tests {
         assert!(is_allow(&p3.check(
             "Bash",
             &json!({"command": "cargo test"}),
+            false,
+            &ctx
+        )));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ask_all_asks_everything_including_read_only() {
+        let dir = tmpdir("ask-all");
+        let ctx = ctx_for(&dir);
+        let p = perms(PermissionMode::AskAll, &[], &[], &[], None);
+        // Read-only tools ask too: that is the one empty cell askAll fills.
+        assert!(is_ask(&p.check(
+            "Read",
+            &json!({"file_path": "a"}),
+            true,
+            &ctx
+        )));
+        assert!(is_ask(&p.check(
+            "Glob",
+            &json!({"pattern": "**/*.rs"}),
+            true,
+            &ctx
+        )));
+        // Mutating tools ask as well, inside the workdir or outside it.
+        assert!(is_ask(&p.check(
+            "Write",
+            &json!({"file_path": "a", "content": "x"}),
+            false,
+            &ctx
+        )));
+        assert!(is_ask(&p.check(
+            "Edit",
+            &json!({"file_path": "a"}),
+            false,
+            &ctx
+        )));
+        assert!(is_ask(&p.check(
+            "Bash",
+            &json!({"command": "ls"}),
+            false,
+            &ctx
+        )));
+        assert!(is_ask(&p.check(
+            "mcp__server__tool",
+            &json!({}),
+            false,
+            &ctx
+        )));
+        // The same read-only call is allowed in default mode, so the
+        // Ask above comes from the mode, not from the tool.
+        let p2 = perms(PermissionMode::Default, &[], &[], &[], None);
+        assert!(is_allow(&p2.check(
+            "Read",
+            &json!({"file_path": "a"}),
+            true,
+            &ctx
+        )));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ask_all_ignores_allow_rules_but_keeps_deny_rules() {
+        let dir = tmpdir("ask-all-rules");
+        let ctx = ctx_for(&dir);
+        // An allow rule never self-allows in askAll.
+        let p = perms(PermissionMode::AskAll, &["Read", "Bash"], &[], &[], None);
+        assert!(is_ask(&p.check(
+            "Read",
+            &json!({"file_path": "a"}),
+            true,
+            &ctx
+        )));
+        assert!(is_ask(&p.check(
+            "Bash",
+            &json!({"command": "ls"}),
+            false,
+            &ctx
+        )));
+        // A deny rule still wins first, and an ask rule still asks.
+        let p2 = perms(
+            PermissionMode::AskAll,
+            &["Bash"],
+            &["Bash(git push *)"],
+            &["Bash(rm *)"],
+            None,
+        );
+        assert!(matches!(
+            p2.check("Bash", &json!({"command": "rm -rf /"}), false, &ctx),
+            PermissionDecision::Deny(_)
+        ));
+        assert!(is_ask(&p2.check(
+            "Bash",
+            &json!({"command": "git push origin main"}),
+            false,
+            &ctx
+        )));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_only_allow_needs_either_flag_or_tool_list() {
+        let dir = tmpdir("read-only-or");
+        let ctx = ctx_for(&dir);
+        let p = perms(PermissionMode::Default, &[], &[], &[], None);
+        // Either side of the `||` allows on its own: the caller flag
+        // with a tool that is not on the read-only list, and a listed
+        // tool with the flag off. If `||` became `&&`, both would ask.
+        assert!(is_allow(&p.check(
+            "Bash",
+            &json!({"command": "ls"}),
+            true,
+            &ctx
+        )));
+        assert!(is_allow(&p.check(
+            "Read",
+            &json!({"file_path": "a"}),
+            false,
+            &ctx
+        )));
+        // In askAll neither side allows: the mode guard still asks.
+        let p2 = perms(PermissionMode::AskAll, &[], &[], &[], None);
+        assert!(is_ask(&p2.check(
+            "Bash",
+            &json!({"command": "ls"}),
+            true,
+            &ctx
+        )));
+        assert!(is_ask(&p2.check(
+            "Read",
+            &json!({"file_path": "a"}),
             false,
             &ctx
         )));

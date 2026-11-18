@@ -726,7 +726,8 @@ async fn c2_13_hook_allow_cannot_override_rule_deny() {
         combine_permission(
             PermissionDecision::Deny("r".into()),
             Some(PermissionDecision::Allow),
-            false
+            false,
+            PermissionMode::Default
         ),
         PermissionDecision::Deny("r".into())
     );
@@ -734,7 +735,8 @@ async fn c2_13_hook_allow_cannot_override_rule_deny() {
         combine_permission(
             PermissionDecision::Ask,
             Some(PermissionDecision::Allow),
-            false
+            false,
+            PermissionMode::Default
         ),
         PermissionDecision::Allow
     );
@@ -742,7 +744,8 @@ async fn c2_13_hook_allow_cannot_override_rule_deny() {
         combine_permission(
             PermissionDecision::Allow,
             Some(PermissionDecision::Ask),
-            false
+            false,
+            PermissionMode::Default
         ),
         PermissionDecision::Ask
     );
@@ -750,12 +753,18 @@ async fn c2_13_hook_allow_cannot_override_rule_deny() {
         combine_permission(
             PermissionDecision::Allow,
             Some(PermissionDecision::Deny("h".into())),
-            false
+            false,
+            PermissionMode::Default
         ),
         PermissionDecision::Deny("h".into())
     );
     assert_eq!(
-        combine_permission(PermissionDecision::Allow, None, false),
+        combine_permission(
+            PermissionDecision::Allow,
+            None,
+            false,
+            PermissionMode::Default
+        ),
         PermissionDecision::Allow
     );
 
@@ -763,7 +772,8 @@ async fn c2_13_hook_allow_cannot_override_rule_deny() {
         combine_permission(
             PermissionDecision::Ask,
             Some(PermissionDecision::Allow),
-            true
+            true,
+            PermissionMode::Default
         ),
         PermissionDecision::Ask
     );
@@ -781,6 +791,60 @@ async fn c2_13_hook_allow_cannot_override_rule_deny() {
     );
     let r = agent.run_turn("go").await;
     assert_eq!(r.permission_denials.len(), 1);
+}
+
+#[test]
+fn combine_permission_hook_allow_cannot_loosen_ask_all() {
+    // In askAll mode a hook Allow must not lift a mode Ask to Allow:
+    // hooks may only tighten, never loosen. In default mode the same
+    // combination still lifts, so the mode is what decides.
+    assert_eq!(
+        combine_permission(
+            PermissionDecision::Ask,
+            Some(PermissionDecision::Allow),
+            false,
+            PermissionMode::AskAll
+        ),
+        PermissionDecision::Ask
+    );
+    assert_eq!(
+        combine_permission(
+            PermissionDecision::Ask,
+            Some(PermissionDecision::Allow),
+            false,
+            PermissionMode::Default
+        ),
+        PermissionDecision::Allow
+    );
+    // A hook Ask still asks, and a hook Deny still denies, in askAll.
+    assert_eq!(
+        combine_permission(
+            PermissionDecision::Allow,
+            Some(PermissionDecision::Ask),
+            false,
+            PermissionMode::AskAll
+        ),
+        PermissionDecision::Ask
+    );
+    assert_eq!(
+        combine_permission(
+            PermissionDecision::Allow,
+            Some(PermissionDecision::Deny("h".into())),
+            false,
+            PermissionMode::AskAll
+        ),
+        PermissionDecision::Deny("h".into())
+    );
+    // A mode Deny still beats a hook Allow in askAll.
+    assert_eq!(
+        combine_permission(
+            PermissionDecision::Deny("r".into()),
+            Some(PermissionDecision::Allow),
+            false,
+            PermissionMode::AskAll
+        ),
+        PermissionDecision::Deny("r".into())
+    );
 }
 
 struct AskPerms {

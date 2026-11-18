@@ -1506,7 +1506,12 @@ impl Agent {
             && self
                 .permissions
                 .ask_rule_matches(&tool_name, &args, &self.ctx);
-        let mut decision = combine_permission(checked, pre.permission_override.clone(), ask_rule);
+        let mut decision = combine_permission(
+            checked,
+            pre.permission_override.clone(),
+            ask_rule,
+            self.config.permission_mode,
+        );
         // `PermissionRequest`: a permission prompt is about to be shown.
         // A hook may decide the request itself (allow/deny/ask) or block
         // it (exit 2 / decision block) instead of asking the user.
@@ -2032,13 +2037,19 @@ pub(crate) fn combine_permission(
     checked: PermissionDecision,
     hook: Option<PermissionDecision>,
     ask_rule: bool,
+    mode: PermissionMode,
 ) -> PermissionDecision {
     match (checked, hook) {
         (PermissionDecision::Deny(r), _) => PermissionDecision::Deny(r),
         (_, Some(PermissionDecision::Deny(r))) => PermissionDecision::Deny(r),
         (_, Some(PermissionDecision::Ask)) => PermissionDecision::Ask,
 
-        (PermissionDecision::Ask, Some(PermissionDecision::Allow)) if !ask_rule => {
+        // A hook Allow lifts a mode Ask to Allow only when no ask rule
+        // matched - and never in askAll mode, where a hook may only
+        // tighten, never loosen.
+        (PermissionDecision::Ask, Some(PermissionDecision::Allow))
+            if !ask_rule && mode != PermissionMode::AskAll =>
+        {
             PermissionDecision::Allow
         }
         (c, _) => c,

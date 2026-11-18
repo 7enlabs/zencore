@@ -60,6 +60,7 @@ pub fn core_mode(m: crate::cli::PermissionMode) -> PermissionMode {
         crate::cli::PermissionMode::Plan => PermissionMode::Plan,
         crate::cli::PermissionMode::BypassPermissions => PermissionMode::BypassPermissions,
         crate::cli::PermissionMode::DontAsk => PermissionMode::DontAsk,
+        crate::cli::PermissionMode::AskAll => PermissionMode::AskAll,
     }
 }
 
@@ -2041,6 +2042,41 @@ mod verify_tests {
         unsafe { std::env::remove_var("VERIFY_TIMEOUT_SECS") };
         assert!(o.timed_out);
         assert!(!o.success());
+    }
+
+    #[test]
+    fn core_mode_maps_each_cli_mode_to_the_same_core_mode() {
+        // core_mode is the identity map CLI -> core: a whole-body
+        // replacement with Default would silently run every mode as
+        // Default (askAll would stop asking), so each arm is pinned.
+        for (cli, core) in [
+            (
+                crate::cli::PermissionMode::Default,
+                zen_core::PermissionMode::Default,
+            ),
+            (
+                crate::cli::PermissionMode::AcceptEdits,
+                zen_core::PermissionMode::AcceptEdits,
+            ),
+            (
+                crate::cli::PermissionMode::Plan,
+                zen_core::PermissionMode::Plan,
+            ),
+            (
+                crate::cli::PermissionMode::BypassPermissions,
+                zen_core::PermissionMode::BypassPermissions,
+            ),
+            (
+                crate::cli::PermissionMode::DontAsk,
+                zen_core::PermissionMode::DontAsk,
+            ),
+            (
+                crate::cli::PermissionMode::AskAll,
+                zen_core::PermissionMode::AskAll,
+            ),
+        ] {
+            assert_eq!(core_mode(cli), core);
+        }
     }
 }
 
