@@ -111,7 +111,9 @@ struct RawEnvelope {
 fn sha256_hex(data: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(data);
-    format!("{:x}", h.finalize())
+    // sha2 0.11 dropped the LowerHex impl on the digest output, so encode
+    // the bytes manually; output is identical to the old `{:x}` formatting.
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Truncate `text` to at most `ENVELOPE_CAP_BYTES` bytes on a char boundary.
