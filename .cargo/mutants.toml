@@ -96,4 +96,18 @@ exclude_re = [
   # it with a test where two sessions share the same activity time.
   "acp\\.rs:1500:41: replace > with >= in collect_listed_sessions",
   "lib\\.rs:694:9: replace PermissionChecker::set_mode with \\(\\)",
+  # Phase 2 #9 AgentEvent module, acp.rs AcpSink::emit (line 309, col 13):
+  # delete match arm AgentEvent::ApiRetry{..} | AgentEvent::PermissionDenied(_).
+  # EQUIVALENT (waived by ZC Leader, 2026-11-19; verified by reading
+  # the match at acp.rs:309-310): the arm body is an empty block {},
+  # and the catch-all arm `_ => {}` directly below is also an empty
+  # block. Deleting the arm makes ApiRetry and PermissionDenied fall
+  # through to the catch-all, which does the same nothing, so no
+  # observable behaviour changes and no test can kill this mutant.
+  # EXPIRY: if the ApiRetry/PermissionDenied arm gains real behaviour,
+  # or the catch-all arm stops being an empty block, this mutant stops
+  # being equivalent: remove this exclusion and kill it with a test
+  # that emits an ApiRetry or PermissionDenied event and checks the
+  # resulting session update.
+  "acp\\.rs:309:13: delete match arm AgentEvent::ApiRetry.*PermissionDenied.* in <impl EventSink for AcpSink>::emit",
 ]
