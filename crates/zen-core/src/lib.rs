@@ -376,6 +376,29 @@ impl PermissionMode {
             _ => return None,
         })
     }
+
+    /// Whether an ACP client may see and select this mode (M6, Phase 2
+    /// #9): the Q3-advertised subset of #8's 6-mode model.
+    /// `bypassPermissions` and `dontAsk` are never advertised and never
+    /// run behind a client that cannot see them. The ACP layer asks this
+    /// API instead of hardcoding the set.
+    pub fn is_acp_advertised(&self) -> bool {
+        matches!(
+            self,
+            Self::Default | Self::Plan | Self::AcceptEdits | Self::AskAll
+        )
+    }
+
+    /// The ACP-advertised modes in wire order (M6): the order the
+    /// `session/new` response lists them in.
+    pub fn acp_advertised_modes() -> [PermissionMode; 4] {
+        [
+            PermissionMode::Default,
+            PermissionMode::Plan,
+            PermissionMode::AcceptEdits,
+            PermissionMode::AskAll,
+        ]
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1400,6 +1423,34 @@ mod tests {
         }
         assert_eq!(HookEvent::parse_name("NoSuchEvent"), None);
         assert_eq!(HookEvent::parse_name("pretooluse"), None);
+    }
+
+    #[test]
+    fn acp_advertised_modes_are_the_q3_set_in_wire_order() {
+        assert_eq!(
+            PermissionMode::acp_advertised_modes(),
+            [
+                PermissionMode::Default,
+                PermissionMode::Plan,
+                PermissionMode::AcceptEdits,
+                PermissionMode::AskAll,
+            ]
+        );
+        for mode in PermissionMode::acp_advertised_modes() {
+            assert!(mode.is_acp_advertised(), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn unadvertised_modes_are_bypass_and_dont_ask() {
+        assert!(!PermissionMode::BypassPermissions.is_acp_advertised());
+        assert!(!PermissionMode::DontAsk.is_acp_advertised());
+        // The advertised set plus the unadvertised pair is the whole
+        // model: no mode is left out of the classification.
+        let advertised = PermissionMode::acp_advertised_modes();
+        assert_eq!(advertised.len(), 4);
+        assert!(!advertised.contains(&PermissionMode::BypassPermissions));
+        assert!(!advertised.contains(&PermissionMode::DontAsk));
     }
     #[test]
     fn message_serializes_without_nulls() {

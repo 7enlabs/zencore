@@ -1090,6 +1090,21 @@ async fn handle_session_new(
     Ok((session_id, session))
 }
 
+/// Clamp a configured mode to an ACP-advertised one (M6, Phase 2 #9):
+/// modes #8 never advertises fall back to Default, everything else
+/// passes through unchanged.
+fn clamp_initial_mode(mode: PermissionMode, session_id: &str) -> PermissionMode {
+    if mode.is_acp_advertised() {
+        mode
+    } else {
+        eprintln!(
+            "acp: clamping unadvertised mode {} to default for session {session_id}",
+            mode.as_str()
+        );
+        PermissionMode::Default
+    }
+}
+
 /// Build a live ACP session for a given id, optionally seeded with a
 /// restored history (M5). Shared by `session/new` (fresh id, empty
 /// seed) and `session/load` / `session/resume` (the stored id, the
@@ -1122,23 +1137,12 @@ async fn build_acp_session(
     let mut agent_config = agent_run::base_agent_config(&cfg, cli, &system_prompt);
     agent_config.diagnostics_provider = assembly.diagnostics_provider.clone();
     let ctx = agent_run::tool_context_public(cwd, &cfg, cli, session_id);
-    // M4: the session only ever runs an advertised mode. A configured
-    // bypassPermissions/dontAsk mode (CLI flag or settings) is clamped
-    // to Default for ACP sessions: those modes must never be advertised
+    // M6: the session only ever runs an advertised mode. A configured
+    // mode #8 never advertises (CLI flag or settings) is clamped to
+    // Default for ACP sessions: those modes must never be advertised
     // (Q3) and must never run behind a client that cannot see them.
-    let initial_mode = match agent_config.permission_mode {
-        PermissionMode::Default
-        | PermissionMode::AcceptEdits
-        | PermissionMode::Plan
-        | PermissionMode::AskAll => agent_config.permission_mode,
-        PermissionMode::BypassPermissions | PermissionMode::DontAsk => {
-            eprintln!(
-                "acp: clamping unadvertised mode {} to default for session {session_id}",
-                agent_config.permission_mode.as_str()
-            );
-            PermissionMode::Default
-        }
-    };
+    // The advertised set comes from #8's model, not a hardcoded list.
+    let initial_mode = clamp_initial_mode(agent_config.permission_mode, session_id);
     let mut agent = zen_agent::Agent::new(
         llm,
         assembly.registry.clone(),
@@ -1939,33 +1943,46 @@ fn handle_cancel(sessions: &HashMap<String, Arc<AcpSession>>, params: &Value) {
     }
 }
 
-/// The advertised mode list for the `session/new` response (M4): exactly
-/// the four modes Q3 allows, never bypassPermissions/dontAsk. askAll
-/// joins the advertised set (Phase 2 #8): it is the strictest
-/// interactive mode, so a client that sees it can use it safely.
+/// The advertised mode list for the `session/new` response (M4, M6):
+/// exactly the modes #8's model advertises for ACP
+/// (`PermissionMode::acp_advertised_modes`), never bypassPermissions/
+/// dontAsk. askAll is the strictest interactive mode, so a client that
+/// sees it can use it safely. The descriptions are ACP UI strings and
+/// stay here; the *set* comes from the model.
 fn advertised_mode_list() -> Value {
-    json!([
-        {
-            "id": "default",
-            "name": "Default",
-            "description": "Ask for permission before sensitive actions.",
-        },
-        {
-            "id": "plan",
-            "name": "Plan",
-            "description": "Read-only planning: explore and propose a plan without changing files.",
-        },
-        {
-            "id": "acceptEdits",
-            "name": "Accept edits",
-            "description": "Apply file edits without asking; other actions still ask for permission.",
-        },
-        {
-            "id": "askAll",
-            "name": "Ask all",
-            "description": "Ask for permission before every tool call, including read-only tools.",
-        },
-    ])
+    Value::Array(
+        PermissionMode::acp_advertised_modes()
+            .iter()
+            .filter_map(|mode| advertised_mode_entry(*mode))
+            .collect(),
+    )
+}
+
+/// One entry of the advertised mode list (M6): the id comes from the
+/// mode itself, the name and description are the ACP UI strings.
+/// Modes #8 never advertises have no entry.
+fn advertised_mode_entry(mode: PermissionMode) -> Option<Value> {
+    let (name, description) = match mode {
+        PermissionMode::Default => ("Default", "Ask for permission before sensitive actions."),
+        PermissionMode::Plan => (
+            "Plan",
+            "Read-only planning: explore and propose a plan without changing files.",
+        ),
+        PermissionMode::AcceptEdits => (
+            "Accept edits",
+            "Apply file edits without asking; other actions still ask for permission.",
+        ),
+        PermissionMode::AskAll => (
+            "Ask all",
+            "Ask for permission before every tool call, including read-only tools.",
+        ),
+        PermissionMode::BypassPermissions | PermissionMode::DontAsk => return None,
+    };
+    Some(json!({
+        "id": mode.as_str(),
+        "name": name,
+        "description": description,
+    }))
 }
 
 /// The `model` config option advertised in `session/new` (M4): a select
@@ -2054,14 +2071,16 @@ fn handle_set_mode(
         ERR_INVALID_PARAMS,
         "session/set_mode requires a modeId".to_string(),
     ))?;
+    // M6: the advertised set comes from #8's model, not a hardcoded
+    // reject list here: any mode the model does not advertise is refused.
     let mode = match PermissionMode::parse(mode_id) {
-        Some(PermissionMode::BypassPermissions) | Some(PermissionMode::DontAsk) => {
+        Some(mode) if mode.is_acp_advertised() => mode,
+        Some(_) => {
             return Err((
                 ERR_INVALID_PARAMS,
                 format!("mode not advertised: {mode_id}"),
             ));
         }
-        Some(mode) => mode,
         None => {
             return Err((ERR_INVALID_PARAMS, format!("unknown mode: {mode_id}")));
         }
@@ -2137,11 +2156,15 @@ const PERMISSION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// agent as an allow rule, `reject_always` in this prompter's
 /// per-session set, so neither asks the client again.
 ///
-/// STUB (#8): Phase 2 #8 (Z Red) defines Zen's 6-mode permission model
-/// and the permission API #9 calls. That API does not exist in the repo
-/// yet (checked 17/11: no phase2-#8 branch, no permission-model API in
-/// zen-core/zen-agent), so M4 round-trips to the client directly
-/// against `PermissionMode`. When #8 lands, its API plugs in here.
+/// STUB (#8) resolved (M6): Phase 2 #8 (Z Red, PR #230) defines Zen's
+/// 6-mode permission model, and the ACP layer now calls its API: the
+/// advertised-mode set lives on `PermissionMode`
+/// (`is_acp_advertised` / `acp_advertised_modes` in zen-core), and the
+/// per-tool decision comes from the #8 checker
+/// (`PermissionChecker::check` in zen-tools), which the agent consults
+/// before this prompter runs. This prompter only round-trips a question
+/// the checker already answered with Ask, so it carries no mode logic
+/// of its own.
 struct AcpPrompter {
     state: Arc<AcpServerState>,
     session_id: String,
@@ -4316,6 +4339,36 @@ mod tests {
         );
     }
 
+    /// M6: `askAll` is advertised, so `session/set_mode` accepts it
+    /// through the same path that rejects bypassPermissions/dontAsk.
+    #[tokio::test]
+    async fn set_mode_accepts_ask_all_via_dispatcher() {
+        let (state, buf) = test_state();
+        fake_session(&state, "s1", 0);
+        let run = drive_dispatcher(
+            Arc::clone(&state),
+            vec![
+                init_line(1),
+                json!({"jsonrpc": "2.0", "id": 2, "method": "session/set_mode", "params": {"sessionId": "s1", "modeId": "askAll"}}).to_string(),
+            ],
+        );
+        run.await.unwrap().unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some()
+        })
+        .await;
+        let ok = find_response(&lines, 2).unwrap();
+        assert!(ok.get("error").is_none(), "{lines:?}");
+        assert_eq!(ok["result"], json!({}));
+        {
+            let sessions = lock_or_recover(&state.sessions, "acp sessions");
+            let s = sessions.get("s1").unwrap();
+            assert_eq!(s.current_mode(), PermissionMode::AskAll);
+            let agent = s.agent.try_lock().expect("agent must be idle");
+            assert_eq!(agent.config.permission_mode, PermissionMode::AskAll);
+        }
+    }
+
     /// M4: `session/set_config_option` switches the model and answers
     /// the full option list; bad values are -32602.
     #[tokio::test]
@@ -4459,6 +4512,34 @@ mod tests {
         // The fake session has no model, so the value falls back to the
         // default catalog entry.
         assert_eq!(current, "deepseek-v4.1-flash", "{options:?}");
+    }
+
+    /// M6: the session-new clamp passes advertised modes through and
+    /// clamps the modes #8 never advertises to Default.
+    #[test]
+    fn clamp_initial_mode_passes_advertised_and_clamps_the_rest() {
+        for mode in PermissionMode::acp_advertised_modes() {
+            assert_eq!(clamp_initial_mode(mode, "s1"), mode);
+        }
+        assert_eq!(
+            clamp_initial_mode(PermissionMode::BypassPermissions, "s1"),
+            PermissionMode::Default
+        );
+        assert_eq!(
+            clamp_initial_mode(PermissionMode::DontAsk, "s1"),
+            PermissionMode::Default
+        );
+    }
+
+    /// M6: only advertised modes get a list entry; the unadvertised pair
+    /// has none.
+    #[test]
+    fn advertised_mode_entry_returns_none_for_unadvertised() {
+        for mode in PermissionMode::acp_advertised_modes() {
+            assert!(advertised_mode_entry(mode).is_some(), "{mode:?}");
+        }
+        assert!(advertised_mode_entry(PermissionMode::BypassPermissions).is_none());
+        assert!(advertised_mode_entry(PermissionMode::DontAsk).is_none());
     }
 
     /// M4: the outcome mapping for `session/request_permission` is
