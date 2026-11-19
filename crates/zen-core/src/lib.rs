@@ -1011,6 +1011,10 @@ pub enum AgentEvent {
     CompactBoundary {
         trigger: String,
         pre_tokens: u64,
+        /// The compaction summary the agent wrote into history
+        /// (AgentEvent module, Phase 2 #9): the model summary plus
+        /// file references, without the "[Compaction summary ...]" prefix.
+        summary: String,
     },
 
     Pruned {

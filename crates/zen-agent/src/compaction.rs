@@ -109,6 +109,7 @@ pub(crate) async fn compact_impl(
     agent.sink.emit(AgentEvent::CompactBoundary {
         trigger: trigger.to_string(),
         pre_tokens,
+        summary: summary.clone(),
     });
 
     let post = agent

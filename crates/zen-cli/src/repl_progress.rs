@@ -322,6 +322,7 @@ pub fn render(ev: &AgentEvent) -> Vec<String> {
         AgentEvent::CompactBoundary {
             trigger,
             pre_tokens,
+            ..
         } => {
             vec![format!(
                 "context compacted ({trigger}, {pre_tokens} tokens before)"
@@ -467,6 +468,7 @@ mod tests {
         let c = render(&AgentEvent::CompactBoundary {
             trigger: "auto".into(),
             pre_tokens: 1000,
+            summary: "summary".into(),
         });
         assert_eq!(c.len(), 1);
     }
