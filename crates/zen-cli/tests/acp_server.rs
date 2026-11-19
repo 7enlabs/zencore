@@ -821,3 +821,456 @@ async fn acp_permission_reject_once_denies_write_tool() {
         requests.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// M7 (Phase 2 #9): client fs/terminal, per-session MCP servers. These tests
+// drive the real `zen --acp` binary against a fake client: the test answers
+// fs/terminal requests, so a file that exists only on the client can be
+// read, and a write the client performs never touches the local disk.
+// ---------------------------------------------------------------------------
+
+/// `initialize` that advertises the given client capabilities (M7).
+fn initialize_m7_req(id: u64, caps: Value) -> Value {
+    req(
+        id,
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": caps,
+            "clientInfo": {"name": "acp-test", "version": "0"},
+        }),
+    )
+}
+
+/// The stub LLM emits a `Read` call for a file that does not exist locally.
+fn read_tool_call_reply() -> Reply {
+    Reply::with_tool_calls(
+        "",
+        Some(json!([{
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "Read", "arguments": "{\"file_path\":\"ghost.txt\"}"}
+        }])),
+    )
+}
+
+/// The stub LLM emits a `Bash` call.
+fn bash_tool_call_reply() -> Reply {
+    Reply::with_tool_calls(
+        "",
+        Some(json!([{
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "Bash", "arguments": "{\"command\":\"echo client-side\"}"}
+        }])),
+    )
+}
+
+/// The stub LLM emits a call to the fake MCP server `echo` tool (M7).
+fn mcp_echo_tool_call_reply() -> Reply {
+    Reply::with_tool_calls(
+        "",
+        Some(json!([{
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "mcp__fake__echo", "arguments": "{\"message\":\"hello mcp\"}"}
+        }])),
+    )
+}
+
+/// Start an ACP session backed by the stub LLM, advertising `caps` as the
+/// client capabilities. Returns the driver and the session id.
+fn start_m7_session(
+    home: &TempDir,
+    cwd: &TempDir,
+    server: &MockServer,
+    caps: Value,
+) -> (AcpInteractive, String) {
+    let mut acp = AcpInteractive::spawn_mock(home, cwd, server);
+    acp.send(&initialize_m7_req(1, caps));
+    assert_eq!(acp.next_line()["result"]["protocolVersion"], 1);
+    acp.send(&req(
+        2,
+        "session/new",
+        json!({"cwd": cwd.path().to_string_lossy()}),
+    ));
+    let resp = acp.next_line();
+    assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+    let session_id = resp["result"]["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
+    (acp, session_id)
+}
+
+/// Drive one prompt turn, answering the agent client requests as they
+/// arrive. `answer` maps a request method to its result JSON; returning
+/// `None` fails the test (unexpected request). `session/request_permission`
+/// is always answered `allow_once`. Returns the agent requests seen, the
+/// `session/update` notifications, and the prompt response.
+fn drive_client_turn<F: FnMut(&str) -> Option<Value>>(
+    acp: &mut AcpInteractive,
+    prompt_id: u64,
+    session_id: &str,
+    prompt_text: &str,
+    mut answer: F,
+) -> (Vec<Value>, Vec<Value>, Value) {
+    acp.send(&req(
+        prompt_id,
+        "session/prompt",
+        json!({"sessionId": session_id, "prompt": [{"type": "text", "text": prompt_text}]}),
+    ));
+    let mut requests = Vec::new();
+    let mut updates = Vec::new();
+    loop {
+        let line = acp.next_line();
+        if let Some(method) = line.get("method").and_then(Value::as_str) {
+            if line.get("id").is_none() {
+                // Notification (session/update); keep reading.
+                updates.push(line);
+                continue;
+            }
+            if method == "session/request_permission" {
+                let ans = json!({"jsonrpc": "2.0", "id": line["id"].clone(), "result": {"outcome": {"type": "selected", "optionId": "allow_once"}}});
+                requests.push(line);
+                acp.send(&ans);
+            } else if let Some(result) = answer(method) {
+                let ans = json!({"jsonrpc": "2.0", "id": line["id"].clone(), "result": result});
+                requests.push(line);
+                acp.send(&ans);
+            } else {
+                panic!("unexpected agent request: {line}");
+            }
+        } else if line.get("id") == Some(&json!(prompt_id)) {
+            return (requests, updates, line);
+        } else {
+            updates.push(line);
+        }
+    }
+}
+
+/// Join the `session/update` notifications into one searchable text.
+fn updates_text(updates: &[Value]) -> String {
+    updates
+        .iter()
+        .map(|u| u.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Strip the Windows verbatim prefix (M7): on Windows
+/// `std::fs::canonicalize` returns a `\\?\`-prefixed path while the
+/// agent sends the `canonicalize_lenient` path with the prefix
+/// stripped, so both sides must be normalized before comparing.
+/// No-op on other platforms and on paths without the prefix.
+fn without_verbatim_prefix(path: &str) -> String {
+    zen_tools::builtin::strip_verbatim_prefix(std::path::Path::new(path))
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_client_fs_read_serves_file_not_present_locally() {
+    let home = TempDir::new("acp_m7_read_home");
+    let cwd = TempDir::new("acp_m7_read_cwd");
+    let server = MockServer::start(vec![read_tool_call_reply(), Reply::text("read done")]).await;
+    let caps = json!({"fs": {"readTextFile": true, "writeTextFile": false}});
+    let (mut acp, session_id) = start_m7_session(&home, &cwd, &server, caps);
+    let (requests, updates, response) = drive_client_turn(
+        &mut acp,
+        3,
+        &session_id,
+        "read ghost.txt",
+        |method| match method {
+            "fs/read_text_file" => Some(json!({"content": "ghost content\nsecond line\n"})),
+            _ => None,
+        },
+    );
+    // The agent really asked the client for the file, with an absolute path.
+    let read = requests
+        .iter()
+        .find(|r| r["method"] == "fs/read_text_file")
+        .expect("expected an fs/read_text_file request");
+    assert_eq!(read["params"]["sessionId"], session_id);
+    let expected = std::fs::canonicalize(cwd.path())
+        .unwrap()
+        .join("ghost.txt")
+        .to_string_lossy()
+        .to_string();
+    assert_eq!(
+        without_verbatim_prefix(read["params"]["path"].as_str().unwrap()),
+        without_verbatim_prefix(&expected)
+    );
+    // The client content reached the turn: the tool result is echoed in
+    // the tool_call_update notification.
+    let text = updates_text(&updates);
+    assert!(text.contains("ghost content"), "updates: {text}");
+    assert!(
+        response.get("error").is_none(),
+        "unexpected error: {response}"
+    );
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    assert_eq!(acp.finish(), 0);
+    // Nothing was created locally: the file exists only on the client.
+    assert!(!cwd.path().join("ghost.txt").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_client_fs_write_does_not_touch_local_disk() {
+    let home = TempDir::new("acp_m7_write_home");
+    let cwd = TempDir::new("acp_m7_write_cwd");
+    let server = MockServer::start(vec![write_tool_call_reply(), Reply::text("write done")]).await;
+    let caps = json!({"fs": {"readTextFile": false, "writeTextFile": true}});
+    let (mut acp, session_id) = start_m7_session(&home, &cwd, &server, caps);
+    let (requests, _updates, response) = drive_client_turn(
+        &mut acp,
+        3,
+        &session_id,
+        "write a file",
+        |method| match method {
+            "fs/write_text_file" => Some(json!({})),
+            _ => None,
+        },
+    );
+    // The agent really asked the client to write, with the exact content.
+    let write = requests
+        .iter()
+        .find(|r| r["method"] == "fs/write_text_file")
+        .expect("expected an fs/write_text_file request");
+    assert_eq!(write["params"]["sessionId"], session_id);
+    let expected = std::fs::canonicalize(cwd.path())
+        .unwrap()
+        .join("test.txt")
+        .to_string_lossy()
+        .to_string();
+    assert_eq!(
+        without_verbatim_prefix(write["params"]["path"].as_str().unwrap()),
+        without_verbatim_prefix(&expected)
+    );
+    assert_eq!(write["params"]["content"], "hello");
+    assert!(
+        response.get("error").is_none(),
+        "unexpected error: {response}"
+    );
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    assert_eq!(acp.finish(), 0);
+    // The client wrote the file: nothing exists on the local disk.
+    assert!(!cwd.path().join("test.txt").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_client_terminal_runs_bash_via_client() {
+    let home = TempDir::new("acp_m7_bash_home");
+    let cwd = TempDir::new("acp_m7_bash_cwd");
+    let server = MockServer::start(vec![bash_tool_call_reply(), Reply::text("bash done")]).await;
+    let caps = json!({"terminal": true});
+    let (mut acp, session_id) = start_m7_session(&home, &cwd, &server, caps);
+    let (requests, updates, response) = drive_client_turn(
+        &mut acp,
+        3,
+        &session_id,
+        "run echo",
+        |method| match method {
+            "terminal/create" => Some(json!({"terminalId": "t-1"})),
+            "terminal/wait_for_exit" => Some(json!({"exitCode": 0})),
+            "terminal/output" => Some(
+                json!({"output": "client-side\n", "truncated": false, "exitStatus": {"exitCode": 0}}),
+            ),
+            "terminal/release" => Some(json!({})),
+            _ => None,
+        },
+    );
+    // The agent created a client terminal for the command, in the session cwd.
+    let create = requests
+        .iter()
+        .find(|r| r["method"] == "terminal/create")
+        .expect("expected a terminal/create request");
+    assert_eq!(create["params"]["sessionId"], session_id);
+    assert_eq!(create["params"]["command"], "echo client-side");
+    let cwd_sent = create["params"]["cwd"].as_str().expect("cwd string");
+    let canon = std::fs::canonicalize(cwd.path()).unwrap();
+    assert!(
+        cwd_sent == cwd.path().to_string_lossy() || cwd_sent == canon.to_string_lossy(),
+        "unexpected terminal cwd: {cwd_sent}"
+    );
+    // The full terminal lifecycle ran: wait, output, and release.
+    for method in [
+        "terminal/wait_for_exit",
+        "terminal/output",
+        "terminal/release",
+    ] {
+        assert!(
+            requests.iter().any(|r| r["method"] == method),
+            "expected a {method} request: {requests:?}"
+        );
+    }
+    // The client output reached the turn.
+    let text = updates_text(&updates);
+    assert!(text.contains("client-side"), "updates: {text}");
+    assert!(
+        response.get("error").is_none(),
+        "unexpected error: {response}"
+    );
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    assert_eq!(acp.finish(), 0);
+}
+
+#[test]
+fn acp_session_new_mcp_servers_invalid_returns_invalid_params() {
+    let home = TempDir::new("acp_m7_mcp_bad_home");
+    let cwd = TempDir::new("acp_m7_mcp_bad_cwd");
+    let input = lines(&[
+        initialize_req(1),
+        req(
+            2,
+            "session/new",
+            json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "mcpServers": [{"name": "bad", "type": "sse", "url": "https://example.invalid/sse"}],
+            }),
+        ),
+    ]);
+    let (out, stderr, code) = run_acp(&home, &cwd, &input);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(out.len(), 2, "expected two response lines: {out:?}");
+    assert_eq!(out[1]["id"], 2);
+    assert_eq!(out[1]["error"]["code"], -32602);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_session_new_unreachable_http_mcp_server_still_creates_session() {
+    let home = TempDir::new("acp_m7_mcp_dead_home");
+    let cwd = TempDir::new("acp_m7_mcp_dead_cwd");
+    let server = MockServer::start(vec![]).await;
+    let mut acp = AcpInteractive::spawn_mock(&home, &cwd, &server);
+    acp.send(&initialize_m7_req(1, json!({})));
+    assert_eq!(acp.next_line()["result"]["protocolVersion"], 1);
+    acp.send(&req(
+        2,
+        "session/new",
+        json!({
+            "cwd": cwd.path().to_string_lossy(),
+            "mcpServers": [{"name": "dead", "type": "http", "url": "http://127.0.0.1:1/mcp"}],
+        }),
+    ));
+    let resp = acp.next_line();
+    assert!(
+        resp.get("error").is_none(),
+        "unreachable MCP server must not fail session/new: {resp}"
+    );
+    assert!(resp["result"]["sessionId"].as_str().is_some(), "{resp}");
+    assert_eq!(acp.finish(), 0);
+}
+
+/// Minimal fake MCP server (stdio, JSON-RPC lines): answers `initialize`,
+/// `tools/list` (one `echo` tool) and `tools/call`. Mirrors the fixture in
+/// tests/mcp.rs, trimmed to what the rmcp client handshake needs (M7).
+fn fake_mcp_server_script() -> String {
+    r#"import sys, json
+
+def main():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        method = req.get("method")
+        rid = req.get("id")
+        if rid is None:
+            continue
+        if method == "initialize":
+            resp = {"jsonrpc": "2.0", "id": rid, "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "fake", "version": "1.0.0"}}}
+        elif method == "tools/list":
+            resp = {"jsonrpc": "2.0", "id": rid, "result": {"tools": [{
+                "name": "echo",
+                "description": "Echo the input",
+                "inputSchema": {"type": "object",
+                    "properties": {"message": {"type": "string"}},
+                    "required": ["message"]}}]}}
+        elif method == "tools/call":
+            params = req.get("params", {})
+            args = params.get("arguments", {})
+            message = args.get("message", "")
+            resp = {"jsonrpc": "2.0", "id": rid, "result": {
+                "content": [{"type": "text", "text": "ECHO: " + message}],
+                "isError": False}}
+        else:
+            resp = {"jsonrpc": "2.0", "id": rid, "error": {
+                "code": -32601, "message": "Unknown method: " + str(method)}}
+        print(json.dumps(resp), flush=True)
+
+main()
+"#
+    .to_string()
+}
+
+/// `python3` does not exist on a stock Windows install (only `python`).
+fn python_cmd() -> &'static str {
+    let ok = std::process::Command::new("python3")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|st| st.success())
+        .unwrap_or(false);
+    if ok { "python3" } else { "python" }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_session_mcp_server_stdio_tool_works() {
+    let home = TempDir::new("acp_m7_mcp_ok_home");
+    let cwd = TempDir::new("acp_m7_mcp_ok_cwd");
+    let script = cwd.write("mcp_fake_server.py", &fake_mcp_server_script());
+    let server = MockServer::start(vec![mcp_echo_tool_call_reply(), Reply::text("mcp done")]).await;
+    let mut acp = AcpInteractive::spawn_mock(&home, &cwd, &server);
+    acp.send(&initialize_m7_req(1, json!({})));
+    assert_eq!(acp.next_line()["result"]["protocolVersion"], 1);
+    acp.send(&req(
+        2,
+        "session/new",
+        json!({
+            "cwd": cwd.path().to_string_lossy(),
+            "mcpServers": [{"name": "fake", "type": "stdio", "command": python_cmd(), "args": [script.to_string_lossy()]}],
+        }),
+    ));
+    let resp = acp.next_line();
+    assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+    let session_id = resp["result"]["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
+    let (_requests, updates, response) =
+        drive_client_turn(&mut acp, 3, &session_id, "call mcp echo", |_method| None);
+    // The MCP tool result reached the turn.
+    let text = updates_text(&updates);
+    assert!(text.contains("ECHO: hello mcp"), "updates: {text}");
+    assert!(
+        response.get("error").is_none(),
+        "unexpected error: {response}"
+    );
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    assert_eq!(acp.finish(), 0);
+}
+
+#[test]
+fn without_verbatim_prefix_strips_windows_prefix() {
+    assert_eq!(
+        without_verbatim_prefix(r"\\?\C:\Users\zen\ghost.txt"),
+        r"C:\Users\zen\ghost.txt"
+    );
+    assert_eq!(
+        without_verbatim_prefix(r"\\?\UNC\server\share\file.txt"),
+        r"\\server\share\file.txt"
+    );
+    assert_eq!(
+        without_verbatim_prefix(r"C:\Users\zen\ghost.txt"),
+        r"C:\Users\zen\ghost.txt"
+    );
+    assert_eq!(without_verbatim_prefix("/tmp/ghost.txt"), "/tmp/ghost.txt");
+}

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -561,6 +561,14 @@ struct AcpServerState {
     /// both default false.
     client_notices: AtomicBool,
     client_compaction: AtomicBool,
+    /// Client-advertised filesystem capabilities (M7): `fs.readTextFile`
+    /// / `fs.writeTextFile` from `clientCapabilities.fs`. A false flag
+    /// means the agent MUST NOT call that `fs/*` method (ACP v1).
+    client_fs_read: AtomicBool,
+    client_fs_write: AtomicBool,
+    /// Client-advertised terminal support (M7):
+    /// `clientCapabilities.terminal` (plain boolean, default false).
+    client_terminal: AtomicBool,
 }
 
 impl AcpServerState {
@@ -573,6 +581,9 @@ impl AcpServerState {
             initialized: AtomicBool::new(false),
             client_notices: AtomicBool::new(false),
             client_compaction: AtomicBool::new(false),
+            client_fs_read: AtomicBool::new(false),
+            client_fs_write: AtomicBool::new(false),
+            client_terminal: AtomicBool::new(false),
         }
     }
 
@@ -699,6 +710,653 @@ fn route_client_response(state: &AcpServerState, msg: &Value) -> bool {
         None => {
             eprintln!("acp: response for unknown request id {key}, ignoring");
             false
+        }
+    }
+}
+
+/// M7 - client capability calls (ACP v1).
+///
+/// How long the agent waits for the client to answer a request it
+/// initiated (fs/*, terminal/*). Same 30 s default as the M4
+/// session/request_permission call: a client that never answers is
+/// treated as a failure and the caller falls back to the local tool.
+const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Why a client-capability call did not produce a usable result (M7).
+/// Every variant means "the client path is unavailable": fs/terminal
+/// wrappers fall back to the local tool. A client error is never
+/// silently treated as success.
+#[derive(Debug, PartialEq)]
+enum ClientCallError {
+    /// The client did not advertise this capability in `initialize`.
+    NotAdvertised(String),
+    /// The client answered with an error, timed out, or disconnected.
+    Failed(SendRequestError),
+    /// The client answered, but the result does not have the shape
+    /// the ACP v1 schema requires (missing/wrong-typed field).
+    BadResponse(String),
+}
+
+impl std::fmt::Display for ClientCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientCallError::NotAdvertised(method) => {
+                write!(f, "client does not advertise {method}")
+            }
+            ClientCallError::Failed(e) => write!(f, "{e}"),
+            ClientCallError::BadResponse(msg) => write!(f, "bad client response: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for ClientCallError {}
+
+impl From<SendRequestError> for ClientCallError {
+    fn from(e: SendRequestError) -> Self {
+        ClientCallError::Failed(e)
+    }
+}
+
+/// Terminal output from `terminal/output` (M7, ACP v1).
+#[derive(Debug, PartialEq)]
+struct TerminalOutput {
+    output: String,
+    truncated: bool,
+    exit_code: Option<i64>,
+    signal: Option<String>,
+}
+
+/// Exit status from `terminal/wait_for_exit` (M7, ACP v1).
+#[derive(Debug, PartialEq)]
+struct TerminalExit {
+    exit_code: Option<i64>,
+    signal: Option<String>,
+}
+
+impl AcpServerState {
+    /// Capability flags, as parsed by `apply_initialize` (M7).
+    fn client_fs_read(&self) -> bool {
+        self.client_fs_read.load(Ordering::SeqCst)
+    }
+    fn client_fs_write(&self) -> bool {
+        self.client_fs_write.load(Ordering::SeqCst)
+    }
+    fn client_terminal(&self) -> bool {
+        self.client_terminal.load(Ordering::SeqCst)
+    }
+    /// `fs/read_text_file` (M7): read `path` on the client. `line` /
+    /// `limit` are 1-based paging, as in the local Read tool. The path
+    /// must be absolute (ACP v1: paths are absolute per the machine
+    /// running the agent; callers resolve relative paths first).
+    async fn client_read_text_file(
+        &self,
+        session_id: &str,
+        path: &Path,
+        line: Option<u64>,
+        limit: Option<u64>,
+    ) -> Result<String, ClientCallError> {
+        if !self.client_fs_read() {
+            return Err(ClientCallError::NotAdvertised(
+                "fs/read_text_file".to_string(),
+            ));
+        }
+        let mut params = json!({
+            "sessionId": session_id,
+            "path": path.display().to_string(),
+        });
+        if let Some(line) = line {
+            params["line"] = json!(line);
+        }
+        if let Some(limit) = limit {
+            params["limit"] = json!(limit);
+        }
+        let result = self
+            .send_client_request("fs/read_text_file", params, CLIENT_REQUEST_TIMEOUT)
+            .await?;
+        result
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                ClientCallError::BadResponse(
+                    "fs/read_text_file result has no string content".to_string(),
+                )
+            })
+    }
+
+    /// `fs/write_text_file` (M7): write `content` to `path` on the
+    /// client. The result carries no data (ACP v1 schema); any result
+    /// value counts as success.
+    async fn client_write_text_file(
+        &self,
+        session_id: &str,
+        path: &Path,
+        content: &str,
+    ) -> Result<(), ClientCallError> {
+        if !self.client_fs_write() {
+            return Err(ClientCallError::NotAdvertised(
+                "fs/write_text_file".to_string(),
+            ));
+        }
+        self.send_client_request(
+            "fs/write_text_file",
+            json!({
+                "sessionId": session_id,
+                "path": path.display().to_string(),
+                "content": content,
+            }),
+            CLIENT_REQUEST_TIMEOUT,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `terminal/create` (M7): start `command` in a new terminal on
+    /// the client, in `cwd`. `command` is the command line to execute
+    /// (ACP v1 Terminals doc); the Bash wrapper passes the shell
+    /// command as `command` with no args. No env is forwarded: the
+    /// client runs with its own environment (the agent env may hold
+    /// secrets). Returns the terminal id.
+    async fn client_create_terminal(
+        &self,
+        session_id: &str,
+        command: &str,
+        cwd: &Path,
+    ) -> Result<String, ClientCallError> {
+        if !self.client_terminal() {
+            return Err(ClientCallError::NotAdvertised(
+                "terminal/create".to_string(),
+            ));
+        }
+        let result = self
+            .send_client_request(
+                "terminal/create",
+                json!({
+                    "sessionId": session_id,
+                    "command": command,
+                    "args": [],
+                    "cwd": cwd.display().to_string(),
+                }),
+                CLIENT_REQUEST_TIMEOUT,
+            )
+            .await?;
+        result
+            .get("terminalId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                ClientCallError::BadResponse(
+                    "terminal/create result has no string terminalId".to_string(),
+                )
+            })
+    }
+
+    /// `terminal/wait_for_exit` (M7): wait until the terminal command
+    /// exits, or `timeout` passes. A timeout surfaces as
+    /// `ClientCallError::Failed(Timeout)`; the caller kills the
+    /// terminal (ACP v1 "building a timeout" recipe).
+    async fn client_wait_for_terminal_exit(
+        &self,
+        session_id: &str,
+        terminal_id: &str,
+        timeout: Duration,
+    ) -> Result<TerminalExit, ClientCallError> {
+        if !self.client_terminal() {
+            return Err(ClientCallError::NotAdvertised(
+                "terminal/wait_for_exit".to_string(),
+            ));
+        }
+        let result = self
+            .send_client_request(
+                "terminal/wait_for_exit",
+                json!({"sessionId": session_id, "terminalId": terminal_id}),
+                timeout,
+            )
+            .await?;
+        Ok(TerminalExit {
+            exit_code: result.get("exitCode").and_then(Value::as_i64),
+            signal: result
+                .get("signal")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        })
+    }
+
+    /// `terminal/output` (M7): the terminal output so far, plus its
+    /// exit status when the command has finished.
+    async fn client_terminal_output(
+        &self,
+        session_id: &str,
+        terminal_id: &str,
+    ) -> Result<TerminalOutput, ClientCallError> {
+        if !self.client_terminal() {
+            return Err(ClientCallError::NotAdvertised(
+                "terminal/output".to_string(),
+            ));
+        }
+        let result = self
+            .send_client_request(
+                "terminal/output",
+                json!({"sessionId": session_id, "terminalId": terminal_id}),
+                CLIENT_REQUEST_TIMEOUT,
+            )
+            .await?;
+        let output = result
+            .get("output")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                ClientCallError::BadResponse(
+                    "terminal/output result has no string output".to_string(),
+                )
+            })?;
+        let exit = result.get("exitStatus");
+        Ok(TerminalOutput {
+            output,
+            truncated: result
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            exit_code: exit.and_then(|e| e.get("exitCode")).and_then(Value::as_i64),
+            signal: exit
+                .and_then(|e| e.get("signal"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        })
+    }
+
+    /// `terminal/kill` (M7): terminate the command without releasing
+    /// the terminal. Best-effort; callers ignore the result.
+    async fn client_kill_terminal(
+        &self,
+        session_id: &str,
+        terminal_id: &str,
+    ) -> Result<(), ClientCallError> {
+        if !self.client_terminal() {
+            return Err(ClientCallError::NotAdvertised("terminal/kill".to_string()));
+        }
+        self.send_client_request(
+            "terminal/kill",
+            json!({"sessionId": session_id, "terminalId": terminal_id}),
+            CLIENT_REQUEST_TIMEOUT,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `terminal/release` (M7): kill the command if still running and
+    /// release the terminal; the id is invalid after this call.
+    /// Best-effort; callers ignore the result.
+    async fn client_release_terminal(
+        &self,
+        session_id: &str,
+        terminal_id: &str,
+    ) -> Result<(), ClientCallError> {
+        if !self.client_terminal() {
+            return Err(ClientCallError::NotAdvertised(
+                "terminal/release".to_string(),
+            ));
+        }
+        self.send_client_request(
+            "terminal/release",
+            json!({"sessionId": session_id, "terminalId": terminal_id}),
+            CLIENT_REQUEST_TIMEOUT,
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+/// Content stamp for `ctx.read_files` (M7): must match
+/// `zen_tools::builtin::content_stamp` (DefaultHasher over the bytes),
+/// which is private there, so it is replicated here. Read/Write/Edit
+/// compare stamps to detect a file that changed since it was read.
+fn content_stamp(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
+/// Resolve a tool `file_path` argument the way the local tools do
+/// (M7): relative to the tool context cwd, then lenient canonicalize
+/// (existing prefixes resolved, missing tail kept). The result is
+/// absolute, as `fs/*` requires.
+fn resolve_client_path(cwd: &Path, input: &str) -> PathBuf {
+    zen_tools::canonicalize_lenient(&zen_tools::resolve_path(cwd, input))
+}
+
+/// Format file content the way the local Read tool does (M7):
+/// 1-based line numbers, 6-wide, tab-separated, lines longer than
+/// `READ_MAX_LINE_CHARS` cut with a marker. `first_line` is the
+/// absolute number of the first line in `content` (the client pages,
+/// so it is the requested `offset`, not 1).
+fn format_numbered_lines(content: &str, first_line: usize) -> String {
+    let mut out = String::new();
+    for (idx, line) in content.lines().enumerate() {
+        let shown = if line.chars().count() > zen_tools::builtin::READ_MAX_LINE_CHARS {
+            let cut: String = line
+                .chars()
+                .take(zen_tools::builtin::READ_MAX_LINE_CHARS)
+                .collect();
+            format!("{cut}... [line truncated]")
+        } else {
+            line.to_string()
+        };
+        out.push_str(&format!("{:>6}\t{}\n", first_line + idx, shown));
+    }
+    out
+}
+
+/// Local pre-checks for a client write (M7): mirror the guards the
+/// local Write tool applies before writing - directory, read-first,
+/// and changed-on-disk - against the local view of the file. Returns
+/// `Some(error)` when the write must not happen. A file that exists
+/// only on the client cannot be checked here; the client applies its
+/// own policy (ACP v1: the client is responsible for its checks).
+async fn client_write_precheck(
+    ctx: &zen_core::ToolContext,
+    path: &Path,
+) -> Option<zen_core::ToolOutput> {
+    if path.is_dir() {
+        return Some(zen_core::ToolOutput::err(format!(
+            "Error: {} is a directory",
+            path.display()
+        )));
+    }
+    if path.exists() {
+        let known = lock_or_recover(&ctx.read_files, "read_files").contains_key(path);
+        if !known {
+            return Some(zen_core::ToolOutput::err(format!(
+                "Error: {} already exists and has not been read in this session. Read it before overwriting.",
+                path.display()
+            )));
+        }
+        if let Ok(current) = tokio::fs::read(path).await {
+            let seen = lock_or_recover(&ctx.read_files, "read_files")
+                .get(path)
+                .copied();
+            if let Some(stamp) = seen
+                && stamp != content_stamp(&current)
+            {
+                return Some(zen_core::ToolOutput::err(format!(
+                    "Error: {} changed on disk since you last read it (another command, a formatter or a person modified it). Read it again before editing.",
+                    path.display()
+                )));
+            }
+        }
+    }
+    None
+}
+
+/// Read tool backed by the client `fs/read_text_file` (M7). Same
+/// name, description, and parameters as the local Read tool, so the
+/// model sees one Read tool. A client failure falls back to the local
+/// Read tool (same machine, same file in the common case); a client
+/// success is formatted exactly like a local read and marks the file
+/// read, so a later Write/Edit sees it as read.
+struct ClientReadTool {
+    state: Arc<AcpServerState>,
+    session_id: String,
+    inner: zen_tools::builtin::ReadTool,
+}
+
+impl ClientReadTool {
+    fn new(state: Arc<AcpServerState>, session_id: String) -> Self {
+        Self {
+            state,
+            session_id,
+            inner: zen_tools::builtin::ReadTool,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl zen_core::Tool for ClientReadTool {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+    fn parameters_schema(&self) -> Value {
+        self.inner.parameters_schema()
+    }
+    fn is_read_only(&self) -> bool {
+        self.inner.is_read_only()
+    }
+    async fn call(&self, args: Value, ctx: &zen_core::ToolContext) -> zen_core::ToolOutput {
+        let Some(fp) = args.get("file_path").and_then(Value::as_str) else {
+            return self.inner.call(args, ctx).await;
+        };
+        let offset = args
+            .get("offset")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .max(1) as usize;
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .unwrap_or(zen_tools::builtin::READ_DEFAULT_LIMIT);
+        let path = resolve_client_path(&ctx.cwd(), fp);
+        match self
+            .state
+            .client_read_text_file(
+                &self.session_id,
+                &path,
+                Some(offset as u64),
+                Some(limit as u64),
+            )
+            .await
+        {
+            Ok(content) => {
+                if content.contains("\0") {
+                    return zen_core::ToolOutput::err(format!(
+                        "Error: {} is a binary file - Read only handles UTF-8 text",
+                        path.display()
+                    ));
+                }
+                lock_or_recover(&ctx.read_files, "read_files")
+                    .insert(path.clone(), content_stamp(content.as_bytes()));
+                if content.is_empty() {
+                    return zen_core::ToolOutput::ok(format!(
+                        "(file {} has no content in range offset={} limit={})",
+                        path.display(),
+                        offset,
+                        limit
+                    ));
+                }
+                zen_core::ToolOutput::ok(format_numbered_lines(&content, offset))
+            }
+            Err(_) => self.inner.call(args, ctx).await,
+        }
+    }
+}
+
+/// Write tool backed by the client `fs/write_text_file` (M7). Same
+/// name, description, and parameters as the local Write tool. The
+/// local read-first / changed-on-disk checks and the syntax guard
+/// run before the client write, so a client write cannot bypass
+/// them. A client failure falls back to the local Write tool. The
+/// local checkpoints do not run for a client write: the file may not
+/// exist on this machine at all.
+struct ClientWriteTool {
+    state: Arc<AcpServerState>,
+    session_id: String,
+    inner: zen_tools::builtin::WriteTool,
+}
+
+impl ClientWriteTool {
+    fn new(state: Arc<AcpServerState>, session_id: String) -> Self {
+        Self {
+            state,
+            session_id,
+            inner: zen_tools::builtin::WriteTool,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl zen_core::Tool for ClientWriteTool {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+    fn parameters_schema(&self) -> Value {
+        self.inner.parameters_schema()
+    }
+    fn is_read_only(&self) -> bool {
+        self.inner.is_read_only()
+    }
+    async fn call(&self, args: Value, ctx: &zen_core::ToolContext) -> zen_core::ToolOutput {
+        let Some(fp) = args.get("file_path").and_then(Value::as_str) else {
+            return self.inner.call(args, ctx).await;
+        };
+        let content = args.get("content").and_then(Value::as_str).unwrap_or("");
+        let path = resolve_client_path(&ctx.cwd(), fp);
+        if let Some(err) = client_write_precheck(ctx, &path).await {
+            return err;
+        }
+        let old_text = tokio::fs::read(&path)
+            .await
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok());
+        if let Err(msg) =
+            zen_tools::syntax_guard::guard_write(&path, old_text.as_deref(), content).await
+        {
+            return zen_core::ToolOutput::err(msg);
+        }
+        match self
+            .state
+            .client_write_text_file(&self.session_id, &path, content)
+            .await
+        {
+            Ok(()) => {
+                lock_or_recover(&ctx.read_files, "read_files")
+                    .insert(path.clone(), content_stamp(content.as_bytes()));
+                zen_core::ToolOutput::ok(format!(
+                    "Wrote {} bytes to {}",
+                    content.len(),
+                    path.display()
+                ))
+            }
+            Err(_) => self.inner.call(args, ctx).await,
+        }
+    }
+}
+
+/// Bash tool backed by the client `terminal/*` methods (M7). Same
+/// name, description, and parameters as the local Bash tool. The
+/// command runs on the client: create, wait for exit, read output,
+/// release (ACP v1 "building a timeout" recipe). Background commands
+/// run locally: client terminals have no background-job model (no
+/// job id, no JobOutput/JobKill). Once `terminal/create` succeeds
+/// the command is running on the client, so the call never falls
+/// back to local after that point (that would run it twice); only a
+/// `terminal/create` failure falls back, because nothing ran yet.
+struct ClientBashTool {
+    state: Arc<AcpServerState>,
+    session_id: String,
+    inner: zen_tools::builtin::BashTool,
+}
+
+impl ClientBashTool {
+    fn new(state: Arc<AcpServerState>, session_id: String) -> Self {
+        Self {
+            state,
+            session_id,
+            inner: zen_tools::builtin::BashTool,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl zen_core::Tool for ClientBashTool {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+    fn parameters_schema(&self) -> Value {
+        self.inner.parameters_schema()
+    }
+    fn is_read_only(&self) -> bool {
+        self.inner.is_read_only()
+    }
+    async fn call(&self, args: Value, ctx: &zen_core::ToolContext) -> zen_core::ToolOutput {
+        let Some(cmd_str) = args.get("command").and_then(Value::as_str) else {
+            return self.inner.call(args, ctx).await;
+        };
+        let flag = |k: &str| args.get(k).and_then(Value::as_bool).unwrap_or(false);
+        if flag("background") || flag("run_in_background") {
+            return self.inner.call(args, ctx).await;
+        }
+        let timeout_ms = args
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .or(ctx.tool_timeout_ms.filter(|t| *t > 0))
+            .unwrap_or(120_000)
+            .clamp(1, 600_000);
+        let terminal_id = match self
+            .state
+            .client_create_terminal(&self.session_id, cmd_str, &ctx.cwd())
+            .await
+        {
+            Ok(id) => id,
+            Err(_) => return self.inner.call(args, ctx).await,
+        };
+        let timeout = Duration::from_millis(timeout_ms);
+        let waited = match self
+            .state
+            .client_wait_for_terminal_exit(&self.session_id, &terminal_id, timeout)
+            .await
+        {
+            Ok(w) => w,
+            Err(_) => {
+                let _ = self
+                    .state
+                    .client_kill_terminal(&self.session_id, &terminal_id)
+                    .await;
+                let _ = self
+                    .state
+                    .client_release_terminal(&self.session_id, &terminal_id)
+                    .await;
+                return zen_core::ToolOutput::err(format!(
+                    "Error: command timed out after {timeout_ms} ms and was killed"
+                ));
+            }
+        };
+        let output = self
+            .state
+            .client_terminal_output(&self.session_id, &terminal_id)
+            .await;
+        let _ = self
+            .state
+            .client_release_terminal(&self.session_id, &terminal_id)
+            .await;
+        let output = match output {
+            Ok(o) => o,
+            Err(e) => {
+                return zen_core::ToolOutput::err(format!(
+                    "Error: could not read terminal output: {e}"
+                ));
+            }
+        };
+        let body = output.output.trim_end_matches("\n").to_string();
+        let code = output.exit_code.or(waited.exit_code);
+        match code {
+            Some(0) => zen_core::ToolOutput::ok(body),
+            Some(code) => zen_core::ToolOutput::err(format!("Exit code {code}\n{body}")),
+            None => match output.signal.or(waited.signal) {
+                Some(signal) => {
+                    zen_core::ToolOutput::err(format!("Terminated by signal {signal}\n{body}"))
+                }
+                None => zen_core::ToolOutput::ok(body),
+            },
         }
     }
 }
@@ -849,6 +1507,7 @@ async fn dispatch_line(
         "authenticate" => Some(RpcResponse::ok(id, json!({}))),
         "session/new" => match reject_system_prompt(&req.params)
             .and_then(|()| validate_session_new_cwd(&req.params))
+            .and_then(|()| validate_mcp_servers(&req.params))
         {
             Err((code, msg)) => Some(RpcResponse::err(id, code, msg)),
             Ok(()) => match handle_session_new(cli, default_cwd, home, &req.params, state).await {
@@ -1115,6 +1774,28 @@ fn apply_initialize(state: &AcpServerState, id: Value, params: &Value) -> RpcRes
         state
             .client_compaction
             .store(advertised("compaction"), Ordering::SeqCst);
+        // Client filesystem / terminal capabilities (M7):
+        // `fs.readTextFile` / `fs.writeTextFile` and `terminal` are
+        // plain booleans.
+        let caps = params.get("clientCapabilities");
+        let fs_flag = |key: &str| {
+            caps.and_then(|c| c.get("fs"))
+                .and_then(|fs| fs.get(key))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        };
+        state
+            .client_fs_read
+            .store(fs_flag("readTextFile"), Ordering::SeqCst);
+        state
+            .client_fs_write
+            .store(fs_flag("writeTextFile"), Ordering::SeqCst);
+        state.client_terminal.store(
+            caps.and_then(|c| c.get("terminal"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            Ordering::SeqCst,
+        );
     }
     resp
 }
@@ -1147,9 +1828,9 @@ fn handle_initialize(id: Value, params: &Value) -> RpcResponse {
         json!({
             "protocolVersion": version,
             "agentCapabilities": {
-                // Only what M1-M5 actually implement is advertised; the
-                // rest (MCP servers, auth) arrives with M7. An omitted or
-                // false capability means unsupported.
+                // Only what M1-M7 actually implement is advertised; the
+                // rest (auth) is not implemented. An omitted or false
+                // capability means unsupported.
                 // Modes are NOT advertised here: ACP v1 puts them in the
                 // session/new response (M4), which lists exactly
                 // default/plan/acceptEdits/askAll and never bypassPermissions
@@ -1157,7 +1838,11 @@ fn handle_initialize(id: Value, params: &Value) -> RpcResponse {
                 // M5 advertises the persistence capability set of ACP v1.
                 "loadSession": true,
                 "promptCapabilities": { "image": false, "audio": false, "embeddedContext": false },
-                "mcpCapabilities": { "http": false, "sse": false },
+                // M7: per-session MCP servers (mcpServers in session/new)
+                // over stdio and HTTP, via the rmcp client (PR #206).
+                // SSE has no transport in the rmcp features we enable,
+                // so it stays false.
+                "mcpCapabilities": { "http": true, "sse": false },
                 "sessionCapabilities": {
                     "list": {},
                     "resume": {},
@@ -1203,8 +1888,12 @@ async fn handle_session_new(
         anyhow::bail!("ACP requires absolute paths; got: {}", cwd.display());
     }
 
+    // M7: per-session MCP servers are parsed here; the dispatcher
+    // already validated them (validate_mcp_servers), so a parse error
+    // here is unreachable for a dispatched request.
+    let mcp_servers = parse_mcp_servers(params).map_err(|(_code, msg)| anyhow::anyhow!("{msg}"))?;
     let session_id = uuid::Uuid::new_v4().hyphenated().to_string();
-    let session = build_acp_session(cli, &cwd, home, state, &session_id, &[]).await?;
+    let session = build_acp_session(cli, &cwd, home, state, &session_id, &[], mcp_servers).await?;
     Ok((session_id, session))
 }
 
@@ -1237,6 +1926,7 @@ async fn build_acp_session(
     state: &Arc<AcpServerState>,
     session_id: &str,
     seed: &[ChatMessage],
+    mcp_servers: BTreeMap<String, zen_mcp::McpServerConfig>,
 ) -> Result<AcpSession> {
     let cfg = settings::resolve_config_with_home(cli, cwd, home)?;
 
@@ -1249,7 +1939,49 @@ async fn build_acp_session(
         compaction: state.client_compaction.load(Ordering::SeqCst),
     });
 
-    let assembly = agent_run::assemble(cli, cwd, home, &cfg, session_id, None).await?;
+    let mut assembly = agent_run::assemble(cli, cwd, home, &cfg, session_id, None).await?;
+    // M7: per-session MCP servers from `session/new` (mcpServers):
+    // connect with the same rmcp client as config-file servers (PR
+    // #206) and register their tools. A server that fails to start
+    // is skipped with a stderr warning, like config-file servers;
+    // the session still starts.
+    if !mcp_servers.is_empty() {
+        let manager = zen_mcp::McpManager::start(mcp_servers, 30_000).await;
+        for skipped in manager.errors() {
+            eprintln!(
+                "warning: ACP MCP server {} skipped: {}",
+                skipped.server_name, skipped.reason
+            );
+        }
+        for (name, reason) in manager.failures() {
+            eprintln!("warning: ACP MCP server {name} failed: {reason}");
+        }
+        for tool in manager.tools() {
+            assembly.registry.register(tool);
+        }
+    }
+    // M7: client-backed tools replace the local equivalents when the
+    // client advertises the capability; otherwise the local tools
+    // stay. Registered before Agent::new, so the agent cloned
+    // registry carries them.
+    if state.client_fs_read() {
+        assembly.registry.register(Arc::new(ClientReadTool::new(
+            Arc::clone(state),
+            session_id.to_string(),
+        )));
+    }
+    if state.client_fs_write() {
+        assembly.registry.register(Arc::new(ClientWriteTool::new(
+            Arc::clone(state),
+            session_id.to_string(),
+        )));
+    }
+    if state.client_terminal() {
+        assembly.registry.register(Arc::new(ClientBashTool::new(
+            Arc::clone(state),
+            session_id.to_string(),
+        )));
+    }
     assembly.subagent_sink.set(sink.clone());
 
     let system_prompt = crate::build_system_prompt(cli, cwd, home)?;
@@ -1729,6 +2461,215 @@ fn handle_session_list(
 /// string (a number, null, ...) is rejected with -32602 (TCK run 1,
 /// cases 006 and 015). An absent `cwd` is fine: the caller falls back
 /// to the default working directory.
+/// Parse a `name`/`value` list from an MCP server entry (M7):
+/// `env` (stdio) or `headers` (http) in ACP v1 are arrays of
+/// `{name, value}` objects; `zen_mcp::McpServerConfig` keeps them as
+/// maps, so entries are collected into one.
+fn parse_mcp_name_value_list(
+    value: &Value,
+    field: &str,
+    index: usize,
+) -> Result<Vec<(String, String)>, (i64, String)> {
+    let Some(list) = value.as_array() else {
+        return Err((
+            ERR_INVALID_PARAMS,
+            format!("invalid params: mcpServers[{index}].{field} must be an array"),
+        ));
+    };
+    let mut out = Vec::new();
+    for (j, item) in list.iter().enumerate() {
+        let name = item.get("name").and_then(Value::as_str).ok_or_else(|| {
+            (
+                ERR_INVALID_PARAMS,
+                format!("invalid params: mcpServers[{index}].{field}[{j}].name must be a string"),
+            )
+        })?;
+        let val = item.get("value").and_then(Value::as_str).ok_or_else(|| {
+            (
+                ERR_INVALID_PARAMS,
+                format!("invalid params: mcpServers[{index}].{field}[{j}].value must be a string"),
+            )
+        })?;
+        out.push((name.to_string(), val.to_string()));
+    }
+    Ok(out)
+}
+
+/// Parse `mcpServers` from a `session/new` request (M7, ACP v1):
+/// a list of MCP server configs, each stdio (`command`, optional
+/// `args`/`env`) or http (`url`, optional `headers`), discriminated
+/// by the `type` field when present (`stdio` / `http`) and by
+/// `command` vs `url` otherwise. SSE is rejected: the agent
+/// advertises `mcpCapabilities.sse` false (no SSE transport in the
+/// rmcp features). A missing `args`/`env`/`headers` defaults to
+/// empty (the schema marks them required, but clients commonly omit
+/// empty lists; rejecting them would break working clients).
+/// Duplicate names, unknown types, and malformed entries are
+/// -32602 invalid params, like the other `session/new` validators.
+fn parse_mcp_servers(
+    params: &Value,
+) -> Result<BTreeMap<String, zen_mcp::McpServerConfig>, (i64, String)> {
+    let mut out = BTreeMap::new();
+    let Some(list) = params.get("mcpServers") else {
+        return Ok(out);
+    };
+    let Some(list) = list.as_array() else {
+        return Err((
+            ERR_INVALID_PARAMS,
+            "invalid params: mcpServers must be an array".to_string(),
+        ));
+    };
+    for (i, entry) in list.iter().enumerate() {
+        let entry = entry.as_object().ok_or_else(|| {
+            (
+                ERR_INVALID_PARAMS,
+                format!("invalid params: mcpServers[{i}] must be an object"),
+            )
+        })?;
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                (
+                    ERR_INVALID_PARAMS,
+                    format!("invalid params: mcpServers[{i}].name must be a non-empty string"),
+                )
+            })?;
+        if out.contains_key(name) {
+            return Err((
+                ERR_INVALID_PARAMS,
+                format!("invalid params: duplicate MCP server name {name:?}"),
+            ));
+        }
+        let ty = entry.get("type").and_then(Value::as_str);
+        if entry.contains_key("type") && ty.is_none() {
+            return Err((
+                ERR_INVALID_PARAMS,
+                format!("invalid params: mcpServers[{i}].type must be a string"),
+            ));
+        }
+        let has_command = entry.contains_key("command");
+        let has_url = entry.contains_key("url");
+        let kind = match (ty, has_command, has_url) {
+            (Some("stdio"), _, _) | (None, true, false) => "stdio",
+            (Some("http"), _, _) | (None, false, true) => "http",
+            (Some("sse"), _, _) => {
+                return Err((
+                    ERR_INVALID_PARAMS,
+                    "invalid params: MCP server type sse is not supported".to_string(),
+                ));
+            }
+            (Some(other), _, _) => {
+                return Err((
+                    ERR_INVALID_PARAMS,
+                    format!("invalid params: unknown MCP server type {other:?}"),
+                ));
+            }
+            (None, true, true) => {
+                return Err((
+                    ERR_INVALID_PARAMS,
+                    format!("invalid params: mcpServers[{i}] has both command and url; give one"),
+                ));
+            }
+            (None, false, false) => {
+                return Err((
+                    ERR_INVALID_PARAMS,
+                    format!("invalid params: mcpServers[{i}] needs command (stdio) or url (http)"),
+                ));
+            }
+        };
+        let cfg = if kind == "stdio" {
+            let command = entry
+                .get("command")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    (
+                        ERR_INVALID_PARAMS,
+                        format!(
+                            "invalid params: mcpServers[{i}].command must be a non-empty string"
+                        ),
+                    )
+                })?;
+            let args = match entry.get("args") {
+                None => Vec::new(),
+                Some(v) => {
+                    let Some(list) = v.as_array() else {
+                        return Err((
+                            ERR_INVALID_PARAMS,
+                            format!("invalid params: mcpServers[{i}].args must be an array"),
+                        ));
+                    };
+                    let mut args = Vec::new();
+                    for (j, a) in list.iter().enumerate() {
+                        args.push(
+                            a.as_str()
+                                .ok_or_else(|| {
+                                    (
+                                        ERR_INVALID_PARAMS,
+                                        format!(
+                                            "invalid params: mcpServers[{i}].args[{j}] must be a string"
+                                        ),
+                                    )
+                                })?
+                                .to_string(),
+                        );
+                    }
+                    args
+                }
+            };
+            let env = match entry.get("env") {
+                None => BTreeMap::new(),
+                Some(v) => parse_mcp_name_value_list(v, "env", i)?
+                    .into_iter()
+                    .collect(),
+            };
+            zen_mcp::McpServerConfig {
+                kind: Some("stdio".to_string()),
+                command: Some(command.to_string()),
+                args,
+                env,
+                url: None,
+                headers: BTreeMap::new(),
+            }
+        } else {
+            let url = entry
+                .get("url")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    (
+                        ERR_INVALID_PARAMS,
+                        format!("invalid params: mcpServers[{i}].url must be a non-empty string"),
+                    )
+                })?;
+            let headers = match entry.get("headers") {
+                None => BTreeMap::new(),
+                Some(v) => parse_mcp_name_value_list(v, "headers", i)?
+                    .into_iter()
+                    .collect(),
+            };
+            zen_mcp::McpServerConfig {
+                kind: Some("http".to_string()),
+                command: None,
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                url: Some(url.to_string()),
+                headers,
+            }
+        };
+        out.insert(name.to_string(), cfg);
+    }
+    Ok(out)
+}
+
+/// Validate `mcpServers` for the `session/new` dispatch chain (M7):
+/// same parse as `parse_mcp_servers`, result discarded.
+fn validate_mcp_servers(params: &Value) -> Result<(), (i64, String)> {
+    parse_mcp_servers(params).map(|_| ())
+}
+
 fn validate_session_new_cwd(params: &Value) -> Result<(), (i64, String)> {
     if params.get("cwd").is_some_and(|v| !v.is_string()) {
         return Err((
@@ -1874,9 +2815,17 @@ async fn restore_session(
             format!("failed to read session history: {e:#}"),
         )
     })?;
-    let session = build_acp_session(cli, &cwd, Some(home_path), state, &session_id, &history)
-        .await
-        .map_err(|e| (ERR_INTERNAL, format!("failed to restore session: {e:#}")))?;
+    let session = build_acp_session(
+        cli,
+        &cwd,
+        Some(home_path),
+        state,
+        &session_id,
+        &history,
+        BTreeMap::new(),
+    )
+    .await
+    .map_err(|e| (ERR_INTERNAL, format!("failed to restore session: {e:#}")))?;
     let session = Arc::new(session);
     {
         let mut sessions = lock_or_recover(&state.sessions, "acp sessions");
@@ -2477,7 +3426,7 @@ mod tests {
         assert_eq!(caps["promptCapabilities"]["image"], false);
         assert_eq!(caps["promptCapabilities"]["audio"], false);
         assert_eq!(caps["promptCapabilities"]["embeddedContext"], false);
-        assert_eq!(caps["mcpCapabilities"]["http"], false);
+        assert_eq!(caps["mcpCapabilities"]["http"], true);
         assert_eq!(caps["mcpCapabilities"]["sse"], false);
         assert_eq!(
             caps["sessionCapabilities"],
@@ -3772,6 +4721,853 @@ mod tests {
             &state,
             &json!({"jsonrpc": "2.0", "id": "zen-1", "result": {}}),
         ));
+    }
+
+    // ---- M7 client capability tests ----
+
+    /// Answer the next client request with the given method (M7):
+    /// wait for the request line, route `result` back to its waiter,
+    /// and return the request params the agent sent.
+    async fn answer_client_request(
+        state: &Arc<AcpServerState>,
+        buf: &Arc<Mutex<Vec<u8>>>,
+        method: &str,
+        result: Value,
+    ) -> Value {
+        let lines = wait_for_output(buf, Duration::from_secs(5), |ls| {
+            ls.iter()
+                .any(|l| l.get("method").and_then(Value::as_str) == Some(method))
+        })
+        .await;
+        let request = lines
+            .iter()
+            .find(|l| l.get("method").and_then(Value::as_str) == Some(method))
+            .expect("request must be written")
+            .clone();
+        let id = request["id"].clone();
+        assert!(route_client_response(
+            state,
+            &json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        ));
+        request["params"].clone()
+    }
+
+    /// Same as `answer_client_request`, but answer with a client
+    /// error (M7 fallback tests).
+    async fn answer_client_request_with_error(
+        state: &Arc<AcpServerState>,
+        buf: &Arc<Mutex<Vec<u8>>>,
+        method: &str,
+        code: i64,
+    ) -> Value {
+        let lines = wait_for_output(buf, Duration::from_secs(5), |ls| {
+            ls.iter()
+                .any(|l| l.get("method").and_then(Value::as_str) == Some(method))
+        })
+        .await;
+        let request = lines
+            .iter()
+            .find(|l| l.get("method").and_then(Value::as_str) == Some(method))
+            .expect("request must be written")
+            .clone();
+        let id = request["id"].clone();
+        assert!(route_client_response(
+            state,
+            &json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": "no such method"}}),
+        ));
+        request["params"].clone()
+    }
+
+    /// Test state with the given client capabilities advertised (M7):
+    /// sets the flags the way `apply_initialize` would.
+    fn m7_state(
+        fs_read: bool,
+        fs_write: bool,
+        terminal: bool,
+    ) -> (Arc<AcpServerState>, Arc<Mutex<Vec<u8>>>) {
+        let (state, buf) = test_state();
+        state.client_fs_read.store(fs_read, Ordering::SeqCst);
+        state.client_fs_write.store(fs_write, Ordering::SeqCst);
+        state.client_terminal.store(terminal, Ordering::SeqCst);
+        (state, buf)
+    }
+
+    #[test]
+    fn apply_initialize_records_client_fs_terminal_capabilities() {
+        let (state, _buf) = test_state();
+        let resp = apply_initialize(
+            &state,
+            json!(1),
+            &json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {
+                    "fs": {"readTextFile": true, "writeTextFile": false},
+                    "terminal": true,
+                    "session": {"notices": {}},
+                },
+            }),
+        );
+        assert!(resp.error.is_none());
+        assert!(state.client_fs_read());
+        assert!(!state.client_fs_write());
+        assert!(state.client_terminal());
+        assert!(state.client_notices.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn apply_initialize_without_client_capabilities_advertises_nothing() {
+        let (state, _buf) = test_state();
+        let resp = apply_initialize(&state, json!(1), &json!({"protocolVersion": 1}));
+        assert!(resp.error.is_none());
+        assert!(!state.client_fs_read());
+        assert!(!state.client_fs_write());
+        assert!(!state.client_terminal());
+    }
+
+    #[test]
+    fn parse_mcp_servers_accepts_stdio_and_http() {
+        let servers = parse_mcp_servers(&json!({
+            "mcpServers": [
+                {"name": "files", "type": "stdio", "command": "/usr/bin/mcp-files", "args": ["--root", "/tmp"], "env": [{"name": "KEY", "value": "V"}]},
+                {"name": "remote", "type": "http", "url": "https://example.invalid/mcp", "headers": [{"name": "Authorization", "value": "Bearer x"}]},
+                {"name": "inferred", "command": "/bin/echo"},
+            ],
+        }))
+        .expect("valid servers must parse");
+        assert_eq!(servers.len(), 3);
+        let stdio = &servers["files"];
+        assert_eq!(stdio.kind.as_deref(), Some("stdio"));
+        assert_eq!(stdio.command.as_deref(), Some("/usr/bin/mcp-files"));
+        assert_eq!(stdio.args, vec!["--root".to_string(), "/tmp".to_string()]);
+        assert_eq!(stdio.env.get("KEY").map(String::as_str), Some("V"));
+        assert_eq!(stdio.url, None);
+        let http = &servers["remote"];
+        assert_eq!(http.kind.as_deref(), Some("http"));
+        assert_eq!(http.url.as_deref(), Some("https://example.invalid/mcp"));
+        assert_eq!(
+            http.headers.get("Authorization").map(String::as_str),
+            Some("Bearer x")
+        );
+        assert_eq!(servers["inferred"].command.as_deref(), Some("/bin/echo"));
+        assert_eq!(servers["inferred"].args, Vec::<String>::new());
+    }
+
+    #[test]
+    fn parse_mcp_servers_rejects_malformed_entries() {
+        let bad: Vec<Value> = vec![
+            json!({"mcpServers": {}}),
+            json!({"mcpServers": [42]}),
+            json!({"mcpServers": [{"type": "stdio", "command": "x"}]}),
+            json!({"mcpServers": [{"name": "", "command": "x"}]}),
+            json!({"mcpServers": [{"name": "a", "command": "x"}, {"name": "a", "command": "y"}]}),
+            json!({"mcpServers": [{"name": "a", "type": "sse", "url": "https://x.invalid"}]}),
+            json!({"mcpServers": [{"name": "a", "type": "grpc", "command": "x"}]}),
+            json!({"mcpServers": [{"name": "a", "command": "x", "url": "https://x.invalid"}]}),
+            json!({"mcpServers": [{"name": "a"}]}),
+            json!({"mcpServers": [{"name": "a", "type": "stdio"}]}),
+            json!({"mcpServers": [{"name": "a", "type": "http"}]}),
+            json!({"mcpServers": [{"name": "a", "command": "x", "args": "nope"}]}),
+            json!({"mcpServers": [{"name": "a", "command": "x", "env": [{"name": "K"}]}]}),
+            json!({"mcpServers": [{"name": "a", "url": "https://x.invalid", "headers": [{"value": "v"}]}]}),
+        ];
+        for params in bad {
+            let err = parse_mcp_servers(&params).expect_err("malformed entry must fail");
+            assert_eq!(err.0, ERR_INVALID_PARAMS, "params: {params}");
+        }
+        assert!(
+            parse_mcp_servers(&json!({}))
+                .expect("absent is empty")
+                .is_empty()
+        );
+        assert!(
+            parse_mcp_servers(&json!({"mcpServers": []}))
+                .expect("empty is empty")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn client_read_text_file_roundtrip_via_fake_client() {
+        let (state, buf) = m7_state(true, false, false);
+        let path = std::env::temp_dir().join("m7-note.txt");
+        let asked = tokio::spawn({
+            let state = Arc::clone(&state);
+            let path = path.clone();
+            async move {
+                state
+                    .client_read_text_file("s1", &path, Some(2), Some(5))
+                    .await
+            }
+        });
+        let params = answer_client_request(
+            &state,
+            &buf,
+            "fs/read_text_file",
+            json!({"content": "line2\nline3\n"}),
+        )
+        .await;
+        assert_eq!(params["sessionId"], "s1");
+        assert_eq!(params["path"], path.display().to_string());
+        assert_eq!(params["line"], 2);
+        assert_eq!(params["limit"], 5);
+        assert_eq!(asked.await.unwrap().unwrap(), "line2\nline3\n");
+    }
+
+    #[tokio::test]
+    async fn client_write_text_file_roundtrip_via_fake_client() {
+        let (state, buf) = m7_state(false, true, false);
+        let path = std::env::temp_dir().join("m7-write.txt");
+        let asked = tokio::spawn({
+            let state = Arc::clone(&state);
+            let path = path.clone();
+            async move { state.client_write_text_file("s1", &path, "hello").await }
+        });
+        let params = answer_client_request(&state, &buf, "fs/write_text_file", json!({})).await;
+        assert_eq!(params["sessionId"], "s1");
+        assert_eq!(params["path"], path.display().to_string());
+        assert_eq!(params["content"], "hello");
+        assert!(asked.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn client_read_text_file_bad_response_is_error() {
+        let (state, buf) = m7_state(true, false, false);
+        let path = std::env::temp_dir().join("m7-x.txt");
+        let asked = tokio::spawn({
+            let state = Arc::clone(&state);
+            let path = path.clone();
+            async move { state.client_read_text_file("s1", &path, None, None).await }
+        });
+        answer_client_request(&state, &buf, "fs/read_text_file", json!({"nope": 1})).await;
+        assert!(matches!(
+            asked.await.unwrap().unwrap_err(),
+            ClientCallError::BadResponse(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn client_calls_fail_closed_when_not_advertised() {
+        let (state, buf) = test_state();
+        let path = std::env::temp_dir().join("m7-nope.txt");
+        assert_eq!(
+            state
+                .client_read_text_file("s1", &path, None, None)
+                .await
+                .unwrap_err(),
+            ClientCallError::NotAdvertised("fs/read_text_file".to_string())
+        );
+        assert_eq!(
+            state
+                .client_write_text_file("s1", &path, "x")
+                .await
+                .unwrap_err(),
+            ClientCallError::NotAdvertised("fs/write_text_file".to_string())
+        );
+        assert_eq!(
+            state
+                .client_create_terminal("s1", "echo hi", &path)
+                .await
+                .unwrap_err(),
+            ClientCallError::NotAdvertised("terminal/create".to_string())
+        );
+        assert!(read_output_lines(&buf).is_empty(), "nothing must be sent");
+    }
+
+    #[test]
+    fn client_call_error_display_names_each_cause() {
+        // The Display text is the only thing a caller sees for a failed
+        // client call (M7): assert every variant, so a mutant that empties
+        // the format string is caught.
+        assert_eq!(
+            ClientCallError::NotAdvertised("fs/read_text_file".to_string()).to_string(),
+            "client does not advertise fs/read_text_file"
+        );
+        assert_eq!(
+            ClientCallError::Failed(SendRequestError::Timeout).to_string(),
+            "client request timed out"
+        );
+        assert_eq!(
+            ClientCallError::BadResponse("missing content".to_string()).to_string(),
+            "bad client response: missing content"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_terminal_flow_roundtrip_via_fake_client() {
+        let (state, buf) = m7_state(false, false, true);
+        let cwd = std::env::temp_dir();
+        let terminal_id = tokio::spawn({
+            let state = Arc::clone(&state);
+            let cwd = cwd.clone();
+            async move { state.client_create_terminal("s1", "echo hi", &cwd).await }
+        });
+        let params = answer_client_request(
+            &state,
+            &buf,
+            "terminal/create",
+            json!({"terminalId": "t-1"}),
+        )
+        .await;
+        assert_eq!(params["sessionId"], "s1");
+        assert_eq!(params["command"], "echo hi");
+        assert_eq!(params["cwd"], cwd.display().to_string());
+        assert_eq!(terminal_id.await.unwrap().unwrap(), "t-1");
+
+        let waited = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                state
+                    .client_wait_for_terminal_exit("s1", "t-1", Duration::from_secs(5))
+                    .await
+            }
+        });
+        answer_client_request(
+            &state,
+            &buf,
+            "terminal/wait_for_exit",
+            json!({"exitCode": 0, "signal": null}),
+        )
+        .await;
+        assert_eq!(
+            waited.await.unwrap().unwrap(),
+            TerminalExit {
+                exit_code: Some(0),
+                signal: None
+            }
+        );
+
+        let output = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { state.client_terminal_output("s1", "t-1").await }
+        });
+        answer_client_request(
+            &state,
+            &buf,
+            "terminal/output",
+            json!({"output": "hi\n", "truncated": false, "exitStatus": {"exitCode": 0, "signal": null}}),
+        )
+        .await;
+        assert_eq!(
+            output.await.unwrap().unwrap(),
+            TerminalOutput {
+                output: "hi\n".to_string(),
+                truncated: false,
+                exit_code: Some(0),
+                signal: None
+            }
+        );
+
+        let released = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { state.client_release_terminal("s1", "t-1").await }
+        });
+        answer_client_request(&state, &buf, "terminal/release", json!({})).await;
+        assert!(released.await.unwrap().is_ok());
+    }
+
+    #[test]
+    fn format_numbered_lines_starts_at_offset_and_truncates_long_lines() {
+        assert_eq!(format_numbered_lines("b\nc", 5), "     5\tb\n     6\tc\n");
+        let long = "x".repeat(zen_tools::builtin::READ_MAX_LINE_CHARS + 10);
+        let out = format_numbered_lines(&long, 1);
+        assert!(out.starts_with("     1\t"));
+        assert!(out.contains("... [line truncated]"));
+        assert_eq!(format_numbered_lines("", 1), "");
+    }
+
+    /// Client tools mirror the local tools metadata (M7): name,
+    /// description, parameters and read-only flag all delegate to the
+    /// inner tool, so the model sees one Read tool. Pins the exact
+    /// values: a delegation returning an empty or placeholder value
+    /// would silently change the tool the model sees.
+    #[test]
+    fn client_read_tool_mirrors_local_read_tool_metadata() {
+        use zen_core::Tool;
+        let (state, _buf) = m7_state(true, false, false);
+        let tool = ClientReadTool::new(state, "s1".to_string());
+        let inner = zen_tools::builtin::ReadTool;
+        assert_eq!(tool.name(), "Read");
+        assert_eq!(tool.name(), inner.name());
+        assert_eq!(
+            tool.description(),
+            "Read a text file with 1-based line numbers (marks it read, enabling Write/Edit); page with offset/limit."
+        );
+        assert_eq!(tool.description(), inner.description());
+        assert_eq!(tool.parameters_schema(), inner.parameters_schema());
+        assert_eq!(tool.parameters_schema()["required"], json!(["file_path"]));
+        assert!(tool.is_read_only());
+        assert_eq!(tool.is_read_only(), inner.is_read_only());
+    }
+
+    #[test]
+    fn client_write_tool_mirrors_local_write_tool_metadata() {
+        use zen_core::Tool;
+        let (state, _buf) = m7_state(false, true, false);
+        let tool = ClientWriteTool::new(state, "s1".to_string());
+        let inner = zen_tools::builtin::WriteTool;
+        assert_eq!(tool.name(), "Write");
+        assert_eq!(tool.name(), inner.name());
+        assert_eq!(
+            tool.description(),
+            "Create or overwrite a file (existing files must have been read first); parent dirs are created."
+        );
+        assert_eq!(tool.description(), inner.description());
+        assert_eq!(tool.parameters_schema(), inner.parameters_schema());
+        assert_eq!(
+            tool.parameters_schema()["required"],
+            json!(["file_path", "content"])
+        );
+        assert!(!tool.is_read_only());
+        assert_eq!(tool.is_read_only(), inner.is_read_only());
+    }
+
+    #[test]
+    fn client_bash_tool_mirrors_local_bash_tool_metadata() {
+        use zen_core::Tool;
+        let (state, _buf) = m7_state(false, false, true);
+        let tool = ClientBashTool::new(state, "s1".to_string());
+        let inner = zen_tools::builtin::BashTool;
+        assert_eq!(tool.name(), "Bash");
+        assert_eq!(tool.name(), inner.name());
+        assert_eq!(
+            tool.description(),
+            "Run a shell command (persistent working directory); background:true runs it as a job (see JobOutput/JobKill)."
+        );
+        assert_eq!(tool.description(), inner.description());
+        assert_eq!(tool.parameters_schema(), inner.parameters_schema());
+        assert_eq!(tool.parameters_schema()["required"], json!(["command"]));
+        assert!(!tool.is_read_only());
+        assert_eq!(tool.is_read_only(), inner.is_read_only());
+    }
+
+    /// `format_numbered_lines` truncates only above the limit (M7):
+    /// a line of exactly `READ_MAX_LINE_CHARS` is shown whole, a line
+    /// one char longer is cut. Pins the `>` boundary.
+    #[test]
+    fn format_numbered_lines_truncates_only_above_max_line_chars() {
+        let max = zen_tools::builtin::READ_MAX_LINE_CHARS;
+        let exact = "x".repeat(max);
+        let out = format_numbered_lines(&exact, 1);
+        assert!(
+            !out.contains("... [line truncated]"),
+            "line at exactly MAX must not truncate: {out}"
+        );
+        assert!(out.contains(&exact));
+        let over = "x".repeat(max + 1);
+        let out = format_numbered_lines(&over, 1);
+        assert!(
+            out.contains("... [line truncated]"),
+            "line at MAX+1 must truncate: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_read_tool_uses_client_and_marks_read() {
+        use zen_core::Tool;
+        let (state, buf) = m7_state(true, false, false);
+        let dir = std::env::temp_dir().join("m7-read-tool");
+        let _ = std::fs::create_dir_all(&dir);
+        let tool = Arc::new(ClientReadTool::new(Arc::clone(&state), "s1".to_string()));
+        let ctx = zen_core::ToolContext::new(dir.clone(), "s1");
+        let asked = tokio::spawn({
+            let tool = Arc::clone(&tool);
+            let ctx = ctx.clone();
+            async move { tool.call(json!({"file_path": "note.txt"}), &ctx).await }
+        });
+        let params = answer_client_request(
+            &state,
+            &buf,
+            "fs/read_text_file",
+            json!({"content": "alpha\nbeta\n"}),
+        )
+        .await;
+        let expected = zen_tools::canonicalize_lenient(&dir.join("note.txt"));
+        assert_eq!(params["path"], expected.display().to_string());
+        let out = asked.await.unwrap();
+        assert!(!out.is_error);
+        assert_eq!(out.content, "     1\talpha\n     2\tbeta\n");
+        assert!(lock_or_recover(&ctx.read_files, "read_files").contains_key(&expected));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn client_read_tool_falls_back_to_local_on_client_error() {
+        use zen_core::Tool;
+        let (state, buf) = m7_state(true, false, false);
+        let dir = std::env::temp_dir().join("m7-read-fallback");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("note.txt"), "local one\nlocal two\n").unwrap();
+        let tool = Arc::new(ClientReadTool::new(Arc::clone(&state), "s1".to_string()));
+        let ctx = zen_core::ToolContext::new(dir.clone(), "s1");
+        let asked = tokio::spawn({
+            let tool = Arc::clone(&tool);
+            let ctx = ctx.clone();
+            async move { tool.call(json!({"file_path": "note.txt"}), &ctx).await }
+        });
+        answer_client_request_with_error(&state, &buf, "fs/read_text_file", -32601).await;
+        let out = asked.await.unwrap();
+        assert!(!out.is_error);
+        assert_eq!(out.content, "     1\tlocal one\n     2\tlocal two\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn client_write_tool_uses_client_and_skips_local_disk() {
+        use zen_core::Tool;
+        let (state, buf) = m7_state(false, true, false);
+        let dir = std::env::temp_dir().join("m7-write-tool");
+        // Start clean: a previous run (or a mutant falling back to
+        // the local Write) may have left new.txt behind, and the
+        // write precheck would then refuse the client write.
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let tool = Arc::new(ClientWriteTool::new(Arc::clone(&state), "s1".to_string()));
+        let ctx = zen_core::ToolContext::new(dir.clone(), "s1");
+        let asked = tokio::spawn({
+            let tool = Arc::clone(&tool);
+            let ctx = ctx.clone();
+            async move {
+                tool.call(json!({"file_path": "new.txt", "content": "hello"}), &ctx)
+                    .await
+            }
+        });
+        let params = answer_client_request(&state, &buf, "fs/write_text_file", json!({})).await;
+        let expected = zen_tools::canonicalize_lenient(&dir.join("new.txt"));
+        assert_eq!(params["path"], expected.display().to_string());
+        assert_eq!(params["content"], "hello");
+        let out = asked.await.unwrap();
+        assert!(!out.is_error);
+        assert!(out.content.contains("Wrote 5 bytes"));
+        assert!(
+            !dir.join("new.txt").exists(),
+            "client write must not touch local disk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn client_write_tool_falls_back_to_local_on_client_error() {
+        use zen_core::Tool;
+        let (state, buf) = m7_state(false, true, false);
+        let dir = std::env::temp_dir().join("m7-write-fallback");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("note.txt"), "old\n").unwrap();
+        let ctx = zen_core::ToolContext::new(dir.clone(), "s1");
+        // Mark the file read, so the local Write tool accepts it.
+        let path = zen_tools::canonicalize_lenient(&dir.join("note.txt"));
+        lock_or_recover(&ctx.read_files, "read_files")
+            .insert(path.clone(), content_stamp(b"old\n"));
+        let tool = Arc::new(ClientWriteTool::new(Arc::clone(&state), "s1".to_string()));
+        let asked = tokio::spawn({
+            let tool = Arc::clone(&tool);
+            let ctx = ctx.clone();
+            async move {
+                tool.call(json!({"file_path": "note.txt", "content": "new\n"}), &ctx)
+                    .await
+            }
+        });
+        answer_client_request_with_error(&state, &buf, "fs/write_text_file", -32603).await;
+        let out = asked.await.unwrap();
+        assert!(!out.is_error);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("note.txt")).unwrap(),
+            "new\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn client_write_tool_refuses_unread_existing_file() {
+        use zen_core::Tool;
+        let (state, buf) = m7_state(false, true, false);
+        let dir = std::env::temp_dir().join("m7-write-unread");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("note.txt"), "old\n").unwrap();
+        let tool = Arc::new(ClientWriteTool::new(Arc::clone(&state), "s1".to_string()));
+        let ctx = zen_core::ToolContext::new(dir.clone(), "s1");
+        let out = tool
+            .call(json!({"file_path": "note.txt", "content": "new\n"}), &ctx)
+            .await;
+        assert!(out.is_error);
+        assert!(out.content.contains("has not been read"));
+        assert!(
+            read_output_lines(&buf).is_empty(),
+            "refused write must not call the client"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("note.txt")).unwrap(),
+            "old\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn client_bash_tool_runs_on_client_terminal() {
+        use zen_core::Tool;
+        let (state, buf) = m7_state(false, false, true);
+        let dir = std::env::temp_dir().join("m7-bash-tool");
+        let _ = std::fs::create_dir_all(&dir);
+        let tool = Arc::new(ClientBashTool::new(Arc::clone(&state), "s1".to_string()));
+        let ctx = zen_core::ToolContext::new(dir.clone(), "s1");
+        let asked = tokio::spawn({
+            let tool = Arc::clone(&tool);
+            let ctx = ctx.clone();
+            async move { tool.call(json!({"command": "echo hi"}), &ctx).await }
+        });
+        let params = answer_client_request(
+            &state,
+            &buf,
+            "terminal/create",
+            json!({"terminalId": "t-1"}),
+        )
+        .await;
+        assert_eq!(params["command"], "echo hi");
+        assert_eq!(params["cwd"], dir.display().to_string());
+        answer_client_request(
+            &state,
+            &buf,
+            "terminal/wait_for_exit",
+            json!({"exitCode": 0, "signal": null}),
+        )
+        .await;
+        answer_client_request(
+            &state,
+            &buf,
+            "terminal/output",
+            json!({"output": "hi\n", "truncated": false, "exitStatus": {"exitCode": 0, "signal": null}}),
+        )
+        .await;
+        answer_client_request(&state, &buf, "terminal/release", json!({})).await;
+        let out = asked.await.unwrap();
+        assert!(!out.is_error);
+        assert_eq!(out.content, "hi");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn client_bash_tool_falls_back_to_local_when_create_fails() {
+        use zen_core::Tool;
+        let (state, buf) = m7_state(false, false, true);
+        let dir = std::env::temp_dir().join("m7-bash-fallback");
+        let _ = std::fs::create_dir_all(&dir);
+        let tool = Arc::new(ClientBashTool::new(Arc::clone(&state), "s1".to_string()));
+        let ctx = zen_core::ToolContext::new(dir.clone(), "s1");
+        let asked = tokio::spawn({
+            let tool = Arc::clone(&tool);
+            let ctx = ctx.clone();
+            async move {
+                tool.call(json!({"command": "echo fallback-ok"}), &ctx)
+                    .await
+            }
+        });
+        answer_client_request_with_error(&state, &buf, "terminal/create", -32601).await;
+        let out = asked.await.unwrap();
+        assert!(!out.is_error);
+        assert!(out.content.contains("fallback-ok"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn client_bash_tool_times_out_without_local_fallback() {
+        use zen_core::Tool;
+        let (state, buf) = m7_state(false, false, true);
+        let dir = std::env::temp_dir().join("m7-bash-timeout");
+        let _ = std::fs::create_dir_all(&dir);
+        let tool = Arc::new(ClientBashTool::new(Arc::clone(&state), "s1".to_string()));
+        let ctx = zen_core::ToolContext::new(dir.clone(), "s1");
+        let asked = tokio::spawn({
+            let tool = Arc::clone(&tool);
+            let ctx = ctx.clone();
+            async move {
+                tool.call(
+                    json!({"command": "echo must-not-run-locally", "timeout_ms": 1}),
+                    &ctx,
+                )
+                .await
+            }
+        });
+        // The client creates the terminal, then never answers the wait:
+        // the wrapper must time out, kill, and report - never run the
+        // command locally (that would print must-not-run-locally).
+        answer_client_request(
+            &state,
+            &buf,
+            "terminal/create",
+            json!({"terminalId": "t-9"}),
+        )
+        .await;
+        answer_client_request(&state, &buf, "terminal/kill", json!({})).await;
+        answer_client_request(&state, &buf, "terminal/release", json!({})).await;
+        let out = asked.await.unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("timed out"));
+        assert!(!out.content.contains("must-not-run-locally"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A background flag on either spelling runs locally (M7): the
+    /// client has no background-job model, so `background` OR
+    /// `run_in_background` must take the local path. Each flag alone
+    /// must trigger it: with `&&` instead of `||` a single flag would
+    /// wrongly go to the client and wait for a terminal answer.
+    #[tokio::test]
+    async fn client_bash_tool_run_in_background_flag_runs_locally() {
+        use zen_core::Tool;
+        let (state, _buf) = m7_state(false, false, true);
+        let dir = std::env::temp_dir().join("m7-bash-bg-alias");
+        let _ = std::fs::create_dir_all(&dir);
+        let tool = Arc::new(ClientBashTool::new(Arc::clone(&state), "s1".to_string()));
+        let ctx = zen_core::ToolContext::new(dir.clone(), "s1");
+        let asked = tokio::spawn({
+            let tool = Arc::clone(&tool);
+            let ctx = ctx.clone();
+            async move {
+                tool.call(
+                    json!({"command": "echo bg-local", "run_in_background": true}),
+                    &ctx,
+                )
+                .await
+            }
+        });
+        // The local path answers at once; the client path would wait
+        // for a terminal/create answer that never comes, so a 10s
+        // bound both keeps the test fast and fails it there.
+        let out = tokio::time::timeout(std::time::Duration::from_secs(10), asked)
+            .await
+            .expect("background flag must take the local path at once")
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(
+            out.content.contains("Started background job"),
+            "got: {}",
+            out.content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn client_bash_tool_background_flag_runs_locally() {
+        use zen_core::Tool;
+        let (state, _buf) = m7_state(false, false, true);
+        let dir = std::env::temp_dir().join("m7-bash-bg-flag");
+        let _ = std::fs::create_dir_all(&dir);
+        let tool = Arc::new(ClientBashTool::new(Arc::clone(&state), "s1".to_string()));
+        let ctx = zen_core::ToolContext::new(dir.clone(), "s1");
+        let asked = tokio::spawn({
+            let tool = Arc::clone(&tool);
+            let ctx = ctx.clone();
+            async move {
+                tool.call(
+                    json!({"command": "echo bg-local", "background": true}),
+                    &ctx,
+                )
+                .await
+            }
+        });
+        let out = tokio::time::timeout(std::time::Duration::from_secs(10), asked)
+            .await
+            .expect("background flag must take the local path at once")
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(
+            out.content.contains("Started background job"),
+            "got: {}",
+            out.content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A zero ctx timeout means "no timeout set" (M7): the `> 0`
+    /// filter must drop it so the 120s default applies. With `>=`
+    /// the zero would survive, clamp to 1ms, and the command would
+    /// be killed at once. The tool must show no kill request within
+    /// 300ms and then complete normally.
+    #[tokio::test]
+    async fn client_bash_tool_zero_ctx_timeout_uses_default() {
+        use zen_core::Tool;
+        let (state, buf) = m7_state(false, false, true);
+        let dir = std::env::temp_dir().join("m7-bash-zero-timeout");
+        let _ = std::fs::create_dir_all(&dir);
+        let tool = Arc::new(ClientBashTool::new(Arc::clone(&state), "s1".to_string()));
+        let mut ctx = zen_core::ToolContext::new(dir.clone(), "s1");
+        ctx.tool_timeout_ms = Some(0);
+        let asked = tokio::spawn({
+            let tool = Arc::clone(&tool);
+            let ctx = ctx.clone();
+            async move { tool.call(json!({"command": "echo hi"}), &ctx).await }
+        });
+        answer_client_request(
+            &state,
+            &buf,
+            "terminal/create",
+            json!({"terminalId": "t-1"}),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let lines = read_output_lines(&buf);
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.get("method").and_then(Value::as_str) == Some("terminal/kill")),
+            "zero ctx timeout must not kill the command early; requests: {lines:?}"
+        );
+        answer_client_request(
+            &state,
+            &buf,
+            "terminal/wait_for_exit",
+            json!({"exitCode": 0, "signal": null}),
+        )
+        .await;
+        answer_client_request(
+            &state,
+            &buf,
+            "terminal/output",
+            json!({"output": "hi\n", "truncated": false, "exitStatus": {"exitCode": 0, "signal": null}}),
+        )
+        .await;
+        answer_client_request(&state, &buf, "terminal/release", json!({})).await;
+        let out = asked.await.unwrap();
+        assert!(!out.is_error);
+        assert_eq!(out.content, "hi");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A positive ctx timeout applies when no `timeout_ms` arg is
+    /// given (M7): 50ms must time out the wait and report the exact
+    /// value. Pins the `> 0` filter from the other side: with `==`
+    /// or `<` the 50 would be dropped, the 120s default would apply,
+    /// and no kill request would ever arrive.
+    #[tokio::test]
+    async fn client_bash_tool_positive_ctx_timeout_times_out() {
+        use zen_core::Tool;
+        let (state, buf) = m7_state(false, false, true);
+        let dir = std::env::temp_dir().join("m7-bash-ctx-timeout");
+        let _ = std::fs::create_dir_all(&dir);
+        let tool = Arc::new(ClientBashTool::new(Arc::clone(&state), "s1".to_string()));
+        let mut ctx = zen_core::ToolContext::new(dir.clone(), "s1");
+        ctx.tool_timeout_ms = Some(50);
+        let asked = tokio::spawn({
+            let tool = Arc::clone(&tool);
+            let ctx = ctx.clone();
+            async move { tool.call(json!({"command": "echo hi"}), &ctx).await }
+        });
+        answer_client_request(
+            &state,
+            &buf,
+            "terminal/create",
+            json!({"terminalId": "t-1"}),
+        )
+        .await;
+        answer_client_request(&state, &buf, "terminal/kill", json!({})).await;
+        answer_client_request(&state, &buf, "terminal/release", json!({})).await;
+        let out = asked.await.unwrap();
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("timed out after 50 ms"),
+            "got: {}",
+            out.content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
