@@ -385,6 +385,7 @@ impl zen_core::EventSink for StreamJsonSink {
             AgentEvent::CompactBoundary {
                 trigger,
                 pre_tokens,
+                ..
             } => {
                 let uuid = uuid::Uuid::new_v4();
                 self.emit_line(serde_json::json!({
@@ -652,6 +653,7 @@ mod tests {
         sink.emit(AgentEvent::CompactBoundary {
             trigger: "auto".into(),
             pre_tokens: 90_000,
+            summary: "summary".into(),
         });
         let out = buf.text();
         let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();

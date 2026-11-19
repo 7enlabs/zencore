@@ -96,6 +96,15 @@ struct SessionUpdateParams {
     update: SessionUpdate,
 }
 
+/// Cumulative session cost attached to a `usage_update` (AgentEvent
+/// module, Phase 2 #9): ACP v1 `Cost { amount, currency }`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageCost {
+    amount: f64,
+    currency: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "sessionUpdate", rename_all = "snake_case")]
 enum SessionUpdate {
@@ -120,6 +129,35 @@ enum SessionUpdate {
     UsageUpdate {
         used: u64,
         size: u64,
+        /// Cumulative cost of the reported tokens (AgentEvent module,
+        /// Phase 2 #9): ACP v1 `Cost { amount, currency }`. Omitted
+        /// when the model has no known price, so a missing `cost`
+        /// means "unknown", never a false $0.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cost: Option<UsageCost>,
+    },
+    /// Live-only notice (AgentEvent module): fire-and-forget
+    /// information for the user, never session history. Sent only
+    /// when the client advertised `session.notices`; otherwise the
+    /// sink falls back to an agent message chunk (ACP v1, Session
+    /// Notices RFD).
+    #[serde(rename_all = "camelCase")]
+    Notice {
+        severity: &'static str,
+        title: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
+    /// Context compaction upsert (AgentEvent module): sent only when
+    /// the client advertised `session.compaction`. One `completed`
+    /// notification per compaction; the boundary event fires after
+    /// the compaction succeeded, so there is no `in_progress`.
+    #[serde(rename_all = "camelCase")]
+    CompactionUpdate {
+        compaction_id: String,
+        status: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<Vec<ContentBlock>>,
     },
 }
 
@@ -163,6 +201,13 @@ struct AcpSink {
     /// Tool calls announced but not yet finished (M3): a cancelled turn
     /// reports these as `cancelled` before answering the prompt.
     pending_tools: Arc<Mutex<HashSet<String>>>,
+
+    /// Client-advertised session capabilities, snapshotted when the
+    /// session was built (AgentEvent module, Phase 2 #9): `notices`
+    /// gates `notice` updates, `compaction` gates `compaction_update`.
+    /// Both false when the client did not advertise them.
+    notices: bool,
+    compaction: bool,
 }
 
 impl AcpSink {
@@ -230,18 +275,67 @@ impl EventSink for AcpSink {
                     content: Some(vec![ContentBlock::Text { text: content }]),
                 }));
             }
-            AgentEvent::SystemMessage { text, .. } => {
-                self.notify(SessionUpdate::AgentMessageChunk {
-                    content: ContentBlock::Text { text },
-                });
+            AgentEvent::SystemMessage { event, text } => {
+                if self.notices {
+                    let (severity, title) = notice_for_system_message(&event);
+                    self.notify(SessionUpdate::Notice {
+                        severity,
+                        title,
+                        description: if text.is_empty() { None } else { Some(text) },
+                    });
+                } else {
+                    // The client did not advertise notices: fall back
+                    // to an agent message chunk, as the spec allows.
+                    self.notify(SessionUpdate::AgentMessageChunk {
+                        content: ContentBlock::Text { text },
+                    });
+                }
+            }
+            AgentEvent::CompactBoundary { summary, .. } => {
+                if self.compaction {
+                    self.notify(SessionUpdate::CompactionUpdate {
+                        compaction_id: uuid::Uuid::new_v4().hyphenated().to_string(),
+                        status: "completed",
+                        summary: if summary.is_empty() {
+                            None
+                        } else {
+                            Some(vec![ContentBlock::Text { text: summary }])
+                        },
+                    });
+                }
+                // Without the capability the boundary stays silent, as before.
             }
 
-            AgentEvent::ApiRetry { .. }
-            | AgentEvent::PermissionDenied(_)
-            | AgentEvent::CompactBoundary { .. } => {}
+            AgentEvent::ApiRetry { .. } | AgentEvent::PermissionDenied(_) => {}
             _ => {}
         }
     }
+}
+
+/// Map an agent `SystemMessage` event to a notice `(severity, title)`
+/// (AgentEvent module, Phase 2 #9). The title must stand alone; the
+/// event text goes in the description.
+fn notice_for_system_message(event: &str) -> (&'static str, String) {
+    match event {
+        "budget" => ("warning", "Budget warning".to_string()),
+        "Truncation" => ("warning", "Reply truncated".to_string()),
+        "Verify" | "verify" => ("info", "Verification".to_string()),
+        "SubagentStart" => ("info", "Subagent started".to_string()),
+        "PostCompact" => ("info", "Context compacted".to_string()),
+        other => ("info", other.to_string()),
+    }
+}
+
+/// Cost of a turn's tokens in USD, if the model has a known price
+/// (AgentEvent module). Returns None for an unpriced model, so the
+/// caller omits `cost` instead of reporting a false $0.
+fn usage_cost(model: &str, input_tokens: u64, output_tokens: u64) -> Option<UsageCost> {
+    zen_agent::budget::estimate_cost_usd(model, input_tokens, output_tokens).map(|amount| {
+        UsageCost {
+            amount,
+            currency: "USD",
+        }
+    })
 }
 
 fn emit_assistant(sink: &AcpSink, message: &ChatMessage) {
@@ -461,6 +555,12 @@ struct AcpServerState {
     next_request_id: AtomicU64,
     /// Set once `initialize` succeeds (M1).
     initialized: AtomicBool,
+    /// Client-advertised session capabilities, set once `initialize`
+    /// succeeds (AgentEvent module, Phase 2 #9). `notices` gates
+    /// `notice` updates and `compaction` gates `compaction_update`;
+    /// both default false.
+    client_notices: AtomicBool,
+    client_compaction: AtomicBool,
 }
 
 impl AcpServerState {
@@ -471,6 +571,8 @@ impl AcpServerState {
             pending: Mutex::new(HashMap::new()),
             next_request_id: AtomicU64::new(1),
             initialized: AtomicBool::new(false),
+            client_notices: AtomicBool::new(false),
+            client_compaction: AtomicBool::new(false),
         }
     }
 
@@ -743,7 +845,7 @@ async fn dispatch_line(
     }
 
     let response = match req.method.as_str() {
-        "initialize" => Some(apply_initialize(&state.initialized, id, &req.params)),
+        "initialize" => Some(apply_initialize(state.as_ref(), id, &req.params)),
         "authenticate" => Some(RpcResponse::ok(id, json!({}))),
         "session/new" => match reject_system_prompt(&req.params)
             .and_then(|()| validate_session_new_cwd(&req.params))
@@ -990,13 +1092,29 @@ fn pre_init_decision(
 /// `initialize` after a successful one is rejected with -32600 (exactly
 /// one initialize per connection); `initialized` is set only when
 /// negotiation succeeds, so a failed attempt can be retried.
-fn apply_initialize(initialized: &AtomicBool, id: Value, params: &Value) -> RpcResponse {
-    if initialized.load(Ordering::SeqCst) {
+fn apply_initialize(state: &AcpServerState, id: Value, params: &Value) -> RpcResponse {
+    if state.initialized.load(Ordering::SeqCst) {
         return RpcResponse::err(id, ERR_INVALID_REQUEST, "already initialized");
     }
     let resp = handle_initialize(id, params);
     if resp.error.is_none() {
-        initialized.store(true, Ordering::SeqCst);
+        state.initialized.store(true, Ordering::SeqCst);
+        // Client-advertised session capabilities (AgentEvent module):
+        // a present, non-null object means advertised.
+        let session = params
+            .get("clientCapabilities")
+            .and_then(|caps| caps.get("session"));
+        let advertised = |key: &str| {
+            session
+                .and_then(|s| s.get(key))
+                .is_some_and(|v| !v.is_null())
+        };
+        state
+            .client_notices
+            .store(advertised("notices"), Ordering::SeqCst);
+        state
+            .client_compaction
+            .store(advertised("compaction"), Ordering::SeqCst);
     }
     resp
 }
@@ -1127,6 +1245,8 @@ async fn build_acp_session(
         session_id: session_id.to_string(),
         tools: Arc::new(Mutex::new(HashMap::new())),
         pending_tools: Arc::new(Mutex::new(HashSet::new())),
+        notices: state.client_notices.load(Ordering::SeqCst),
+        compaction: state.client_compaction.load(Ordering::SeqCst),
     });
 
     let assembly = agent_run::assemble(cli, cwd, home, &cfg, session_id, None).await?;
@@ -1319,6 +1439,11 @@ async fn run_prompt_turn(
             session.sink.notify(SessionUpdate::UsageUpdate {
                 used: result.usage.input_tokens + result.usage.output_tokens,
                 size,
+                cost: usage_cost(
+                    &result.model,
+                    result.usage.input_tokens,
+                    result.usage.output_tokens,
+                ),
             });
             if session.cancelled.load(Ordering::SeqCst) {
                 Ok("cancelled")
@@ -1346,11 +1471,16 @@ async fn run_prompt_turn(
             agent.set_messages(before);
             let used = (agent.usage.input_tokens + agent.usage.output_tokens)
                 - (usage_before.input_tokens + usage_before.output_tokens);
+            let cost = usage_cost(
+                &agent.config.model,
+                agent.usage.input_tokens - usage_before.input_tokens,
+                agent.usage.output_tokens - usage_before.output_tokens,
+            );
             drop(agent);
             session.sink.cancel_pending_tools();
             session
                 .sink
-                .notify(SessionUpdate::UsageUpdate { used, size });
+                .notify(SessionUpdate::UsageUpdate { used, size, cost });
             Ok("cancelled")
         }
     }
@@ -2399,30 +2529,196 @@ mod tests {
 
     #[test]
     fn apply_initialize_sets_flag_only_on_success() {
-        let initialized = AtomicBool::new(false);
-        let resp = apply_initialize(&initialized, json!(5), &json!({"protocolVersion": 1}));
+        let (state, _buf) = test_state();
+        let resp = apply_initialize(state.as_ref(), json!(5), &json!({"protocolVersion": 1}));
         assert!(serde_json::to_value(&resp).unwrap().get("error").is_none());
-        assert!(initialized.load(Ordering::SeqCst));
+        assert!(state.initialized.load(Ordering::SeqCst));
 
         // A repeat initialize is rejected and leaves the flag set.
-        let resp = apply_initialize(&initialized, json!(6), &json!({"protocolVersion": 1}));
+        let resp = apply_initialize(state.as_ref(), json!(6), &json!({"protocolVersion": 1}));
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["error"]["code"], -32600);
-        assert!(initialized.load(Ordering::SeqCst));
+        assert!(state.initialized.load(Ordering::SeqCst));
     }
 
     #[test]
     fn apply_initialize_failed_attempt_leaves_flag_clear() {
-        let initialized = AtomicBool::new(false);
-        let resp = apply_initialize(&initialized, json!(7), &json!({}));
+        let (state, _buf) = test_state();
+        let resp = apply_initialize(state.as_ref(), json!(7), &json!({}));
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["error"]["code"], -32602);
-        assert!(!initialized.load(Ordering::SeqCst));
+        assert!(!state.initialized.load(Ordering::SeqCst));
 
         // Retrying with a good request then succeeds.
-        let resp = apply_initialize(&initialized, json!(8), &json!({"protocolVersion": 1}));
+        let resp = apply_initialize(state.as_ref(), json!(8), &json!({"protocolVersion": 1}));
         assert!(serde_json::to_value(&resp).unwrap().get("error").is_none());
-        assert!(initialized.load(Ordering::SeqCst));
+        assert!(state.initialized.load(Ordering::SeqCst));
+    }
+
+    /// AgentEvent module: `initialize` records the client's advertised
+    /// session capabilities on the server state; absent capabilities
+    /// stay false.
+    #[test]
+    fn apply_initialize_records_client_session_capabilities() {
+        let (state, _buf) = test_state();
+        let resp = apply_initialize(
+            state.as_ref(),
+            json!(9),
+            &json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {
+                    "session": { "notices": {}, "compaction": {} }
+                }
+            }),
+        );
+        assert!(serde_json::to_value(&resp).unwrap().get("error").is_none());
+        assert!(state.client_notices.load(Ordering::SeqCst));
+        assert!(state.client_compaction.load(Ordering::SeqCst));
+
+        let (state2, _buf2) = test_state();
+        let resp = apply_initialize(state2.as_ref(), json!(10), &json!({"protocolVersion": 1}));
+        assert!(serde_json::to_value(&resp).unwrap().get("error").is_none());
+        assert!(!state2.client_notices.load(Ordering::SeqCst));
+        assert!(!state2.client_compaction.load(Ordering::SeqCst));
+    }
+
+    /// AgentEvent module: notice severity/title mapping for system
+    /// messages.
+    #[test]
+    fn notice_for_system_message_maps_known_events() {
+        assert_eq!(
+            notice_for_system_message("budget"),
+            ("warning", "Budget warning".to_string())
+        );
+        assert_eq!(
+            notice_for_system_message("Truncation"),
+            ("warning", "Reply truncated".to_string())
+        );
+        assert_eq!(
+            notice_for_system_message("Verify"),
+            ("info", "Verification".to_string())
+        );
+        assert_eq!(
+            notice_for_system_message("PostCompact"),
+            ("info", "Context compacted".to_string())
+        );
+        // An unknown hook event keeps its own name as the title.
+        assert_eq!(
+            notice_for_system_message("PreToolUse"),
+            ("info", "PreToolUse".to_string())
+        );
+    }
+
+    /// AgentEvent module: a system message becomes a `notice` update
+    /// when the client advertised notices, and stays an agent message
+    /// chunk otherwise.
+    #[test]
+    fn system_message_notice_gate() {
+        for advertised in [true, false] {
+            let (state, buf) = test_state();
+            let sink = Arc::new(AcpSink {
+                out: state.out.clone(),
+                session_id: "s1".into(),
+                tools: Arc::new(Mutex::new(HashMap::new())),
+                pending_tools: Arc::new(Mutex::new(HashSet::new())),
+                notices: advertised,
+                compaction: false,
+            });
+            sink.emit(AgentEvent::SystemMessage {
+                event: "budget".into(),
+                text: "spent $1 of $2".into(),
+            });
+            let lines = read_output_lines(&buf);
+            assert_eq!(lines.len(), 1);
+            let update = &lines[0]["params"]["update"];
+            if advertised {
+                assert_eq!(update["sessionUpdate"], "notice");
+                assert_eq!(update["severity"], "warning");
+                assert_eq!(update["title"], "Budget warning");
+                assert_eq!(update["description"], "spent $1 of $2");
+            } else {
+                assert_eq!(update["sessionUpdate"], "agent_message_chunk");
+            }
+        }
+    }
+
+    /// AgentEvent module: a compaction boundary becomes a
+    /// `compaction_update` (completed, with the summary) when the
+    /// client advertised compaction, and stays silent otherwise.
+    #[test]
+    fn compact_boundary_compaction_gate() {
+        for advertised in [true, false] {
+            let (state, buf) = test_state();
+            let sink = Arc::new(AcpSink {
+                out: state.out.clone(),
+                session_id: "s1".into(),
+                tools: Arc::new(Mutex::new(HashMap::new())),
+                pending_tools: Arc::new(Mutex::new(HashSet::new())),
+                notices: false,
+                compaction: advertised,
+            });
+            sink.emit(AgentEvent::CompactBoundary {
+                trigger: "auto".into(),
+                pre_tokens: 1000,
+                summary: "did the thing".into(),
+            });
+            let lines = read_output_lines(&buf);
+            if advertised {
+                assert_eq!(lines.len(), 1);
+                let update = &lines[0]["params"]["update"];
+                assert_eq!(update["sessionUpdate"], "compaction_update");
+                assert_eq!(update["status"], "completed");
+                assert!(!update["compactionId"].as_str().unwrap().is_empty());
+                assert_eq!(update["summary"][0]["type"], "text");
+                assert_eq!(update["summary"][0]["text"], "did the thing");
+            } else {
+                assert!(lines.is_empty());
+            }
+        }
+    }
+
+    /// AgentEvent module: usage cost is priced for a known model and
+    /// omitted for an unknown one.
+    #[test]
+    fn usage_cost_known_and_unknown_models() {
+        // The free default model costs $0, honestly reported.
+        let cost = usage_cost("deepseek-v4.1-flash", 10, 5).expect("priced");
+        assert_eq!(cost.amount, 0.0);
+        assert_eq!(cost.currency, "USD");
+        // gpt-4o: $2.50/$10 per 1M tokens.
+        let cost = usage_cost("gpt-4o", 1_000_000, 1_000_000).expect("priced");
+        assert_eq!(cost.amount, 12.5);
+        assert!(usage_cost("no-such-model-xyz", 10, 5).is_none());
+    }
+
+    /// AgentEvent module: a prompt turn on the free default model
+    /// reports a zero cost on its usage update.
+    #[tokio::test]
+    async fn prompt_turn_usage_update_carries_cost() {
+        let (state, buf) = test_state();
+        fake_session(&state, "s1", 0);
+        let run = drive_dispatcher(
+            Arc::clone(&state),
+            vec![
+                init_line(1),
+                json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": "s1", "prompt": [{"type": "text", "text": "hi"}]}})
+                    .to_string(),
+            ],
+        );
+        run.await.unwrap().unwrap();
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some()
+        })
+        .await;
+        let usage = lines
+            .iter()
+            .find(|l| {
+                l.get("method").and_then(Value::as_str) == Some("session/update")
+                    && l["params"]["update"]["sessionUpdate"].as_str() == Some("usage_update")
+            })
+            .expect("usage update must be emitted");
+        assert_eq!(usage["params"]["update"]["cost"]["amount"], 0.0);
+        assert_eq!(usage["params"]["update"]["cost"]["currency"], "USD");
     }
 
     #[test]
@@ -2571,6 +2867,8 @@ mod tests {
             session_id: "probe".into(),
             tools: Arc::new(Mutex::new(HashMap::new())),
             pending_tools: Arc::new(Mutex::new(HashSet::new())),
+            notices: false,
+            compaction: false,
         };
         let message = ChatMessage::assistant(
             None,
@@ -2609,6 +2907,8 @@ mod tests {
             session_id: "probe".into(),
             tools: Arc::new(Mutex::new(HashMap::new())),
             pending_tools: Arc::new(Mutex::new(HashSet::new())),
+            notices: false,
+            compaction: false,
         };
         emit_assistant(&sink, &message);
     }
@@ -3245,6 +3545,8 @@ mod tests {
             session_id: session_id.into(),
             tools: Arc::new(Mutex::new(HashMap::new())),
             pending_tools: Arc::new(Mutex::new(HashSet::new())),
+            notices: false,
+            compaction: false,
         });
         let mode = config.permission_mode;
         let model = config.model.clone();
@@ -3286,6 +3588,8 @@ mod tests {
             session_id: session_id.into(),
             tools: Arc::new(Mutex::new(HashMap::new())),
             pending_tools: Arc::new(Mutex::new(HashSet::new())),
+            notices: false,
+            compaction: false,
         });
         let config = zen_agent::AgentConfig::default();
         let mode = config.permission_mode;
@@ -3664,6 +3968,79 @@ mod tests {
             .collect();
         assert_eq!(usages.len(), 2, "{lines:?}");
         assert_eq!(usages[1]["params"]["update"]["used"], 15, "{lines:?}");
+        run.await.unwrap().unwrap();
+    }
+
+    /// AgentEvent module: a cancelled turn on a PRICED model reports
+    /// the cost of the usage DELTA, not the sum. The two `-` in the
+    /// cancel-path delta are load-bearing: with `+` the cost would be
+    /// computed from 30 in + 15 out tokens instead of 10 in + 5 out.
+    /// (The free default model cannot catch this: any token count
+    /// costs $0 there, which is why this test pins gpt-4o.)
+    #[tokio::test]
+    async fn cancelled_turn_usage_cost_uses_delta_on_priced_model() {
+        let (state, buf) = test_state();
+        let mut registry = zen_core::ToolRegistry::new();
+        registry.register(Arc::new(SlowTool { ms: 2000 }));
+        let config = zen_agent::AgentConfig {
+            model: "gpt-4o".into(),
+            ..zen_agent::AgentConfig::default()
+        };
+        fake_session_with_config(
+            &state,
+            "s1",
+            Arc::new(TwoPhaseLlm::default()),
+            registry,
+            config,
+        );
+        let (tx, run) = drive_dispatcher_live(Arc::clone(&state));
+        tx.send(init_line(1)).unwrap();
+        tx.send(prompt_line(2, "hi")).unwrap();
+        let _ = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 2).is_some()
+        })
+        .await;
+        tx.send(prompt_line(3, "hi again")).unwrap();
+        // Wait for the tool call to be announced, then cancel while
+        // the tool is still running.
+        let _ = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            ls.iter().any(is_update("tool_call"))
+        })
+        .await;
+        tx.send(
+            json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": "s1"}})
+                .to_string(),
+        )
+        .unwrap();
+        drop(tx);
+        let lines = wait_for_output(&buf, Duration::from_secs(5), |ls| {
+            find_response(ls, 3).is_some()
+        })
+        .await;
+        let prompt = find_response(&lines, 3).unwrap();
+        assert_eq!(prompt["result"]["stopReason"], "cancelled", "{lines:?}");
+        let usages: Vec<&Value> = lines
+            .iter()
+            .filter(|l| {
+                l.get("method").and_then(Value::as_str) == Some("session/update")
+                    && l["params"]["update"]["sessionUpdate"].as_str() == Some("usage_update")
+            })
+            .collect();
+        assert_eq!(usages.len(), 2, "{lines:?}");
+        // gpt-4o: $2.50/$10 per 1M tokens. Both turns cost the 10 in +
+        // 5 out delta: 10/1e6*2.5 + 5/1e6*10 = 0.000075.
+        let expected = 10.0 / 1_000_000.0 * 2.5 + 5.0 / 1_000_000.0 * 10.0;
+        for usage in usages {
+            assert_eq!(usage["params"]["update"]["used"], 15, "{lines:?}");
+            assert_eq!(
+                usage["params"]["update"]["cost"]["amount"]
+                    .as_f64()
+                    .unwrap(),
+                expected,
+                "{lines:?}"
+            );
+            assert_eq!(usage["params"]["update"]["cost"]["currency"], "USD");
+        }
         run.await.unwrap().unwrap();
     }
 
@@ -4230,6 +4607,8 @@ mod tests {
             session_id: "s1".into(),
             tools: Arc::new(Mutex::new(HashMap::new())),
             pending_tools: Arc::new(Mutex::new(HashSet::new())),
+            notices: false,
+            compaction: false,
         });
         let tool_call = |id: &str| {
             ChatMessage::assistant(
@@ -5426,6 +5805,8 @@ mod viec_a_tests {
             session_id: "probe".into(),
             tools: Arc::new(Mutex::new(HashMap::new())),
             pending_tools: Arc::new(Mutex::new(HashSet::new())),
+            notices: false,
+            compaction: false,
         };
         sink.emit(AgentEvent::TextDelta { text: "hi".into() });
         sink.emit(AgentEvent::ToolResult {
@@ -5452,7 +5833,8 @@ mod viec_a_tests {
             message: ChatMessage::assistant(None, None),
             parent_tool_use_id: None,
         });
-        // Retries and compaction boundaries are swallowed silently.
+        // Retries are swallowed silently; the compaction boundary is
+        // too while the probe sink has compaction off (see the gate test).
         sink.emit(AgentEvent::ApiRetry {
             attempt: 1,
             max_retries: 3,
@@ -5463,6 +5845,7 @@ mod viec_a_tests {
         sink.emit(AgentEvent::CompactBoundary {
             trigger: "t".into(),
             pre_tokens: 10,
+            summary: "s".into(),
         });
     }
 
