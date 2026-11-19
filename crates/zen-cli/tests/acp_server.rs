@@ -958,6 +958,17 @@ fn updates_text(updates: &[Value]) -> String {
         .join("\n")
 }
 
+/// Strip the Windows verbatim prefix (M7): on Windows
+/// `std::fs::canonicalize` returns a `\\?\`-prefixed path while the
+/// agent sends the `canonicalize_lenient` path with the prefix
+/// stripped, so both sides must be normalized before comparing.
+/// No-op on other platforms and on paths without the prefix.
+fn without_verbatim_prefix(path: &str) -> String {
+    zen_tools::builtin::strip_verbatim_prefix(std::path::Path::new(path))
+        .to_string_lossy()
+        .into_owned()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acp_client_fs_read_serves_file_not_present_locally() {
     let home = TempDir::new("acp_m7_read_home");
@@ -986,7 +997,10 @@ async fn acp_client_fs_read_serves_file_not_present_locally() {
         .join("ghost.txt")
         .to_string_lossy()
         .to_string();
-    assert_eq!(read["params"]["path"], expected);
+    assert_eq!(
+        without_verbatim_prefix(read["params"]["path"].as_str().unwrap()),
+        without_verbatim_prefix(&expected)
+    );
     // The client content reached the turn: the tool result is echoed in
     // the tool_call_update notification.
     let text = updates_text(&updates);
@@ -1029,7 +1043,10 @@ async fn acp_client_fs_write_does_not_touch_local_disk() {
         .join("test.txt")
         .to_string_lossy()
         .to_string();
-    assert_eq!(write["params"]["path"], expected);
+    assert_eq!(
+        without_verbatim_prefix(write["params"]["path"].as_str().unwrap()),
+        without_verbatim_prefix(&expected)
+    );
     assert_eq!(write["params"]["content"], "hello");
     assert!(
         response.get("error").is_none(),
@@ -1239,4 +1256,21 @@ async fn acp_session_mcp_server_stdio_tool_works() {
     );
     assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
     assert_eq!(acp.finish(), 0);
+}
+
+#[test]
+fn without_verbatim_prefix_strips_windows_prefix() {
+    assert_eq!(
+        without_verbatim_prefix(r"\\?\C:\Users\zen\ghost.txt"),
+        r"C:\Users\zen\ghost.txt"
+    );
+    assert_eq!(
+        without_verbatim_prefix(r"\\?\UNC\server\share\file.txt"),
+        r"\\server\share\file.txt"
+    );
+    assert_eq!(
+        without_verbatim_prefix(r"C:\Users\zen\ghost.txt"),
+        r"C:\Users\zen\ghost.txt"
+    );
+    assert_eq!(without_verbatim_prefix("/tmp/ghost.txt"), "/tmp/ghost.txt");
 }

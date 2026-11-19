@@ -5075,6 +5075,92 @@ mod tests {
         assert_eq!(format_numbered_lines("", 1), "");
     }
 
+    /// Client tools mirror the local tools metadata (M7): name,
+    /// description, parameters and read-only flag all delegate to the
+    /// inner tool, so the model sees one Read tool. Pins the exact
+    /// values: a delegation returning an empty or placeholder value
+    /// would silently change the tool the model sees.
+    #[test]
+    fn client_read_tool_mirrors_local_read_tool_metadata() {
+        use zen_core::Tool;
+        let (state, _buf) = m7_state(true, false, false);
+        let tool = ClientReadTool::new(state, "s1".to_string());
+        let inner = zen_tools::builtin::ReadTool;
+        assert_eq!(tool.name(), "Read");
+        assert_eq!(tool.name(), inner.name());
+        assert_eq!(
+            tool.description(),
+            "Read a text file with 1-based line numbers (marks it read, enabling Write/Edit); page with offset/limit."
+        );
+        assert_eq!(tool.description(), inner.description());
+        assert_eq!(tool.parameters_schema(), inner.parameters_schema());
+        assert_eq!(tool.parameters_schema()["required"], json!(["file_path"]));
+        assert!(tool.is_read_only());
+        assert_eq!(tool.is_read_only(), inner.is_read_only());
+    }
+
+    #[test]
+    fn client_write_tool_mirrors_local_write_tool_metadata() {
+        use zen_core::Tool;
+        let (state, _buf) = m7_state(false, true, false);
+        let tool = ClientWriteTool::new(state, "s1".to_string());
+        let inner = zen_tools::builtin::WriteTool;
+        assert_eq!(tool.name(), "Write");
+        assert_eq!(tool.name(), inner.name());
+        assert_eq!(
+            tool.description(),
+            "Create or overwrite a file (existing files must have been read first); parent dirs are created."
+        );
+        assert_eq!(tool.description(), inner.description());
+        assert_eq!(tool.parameters_schema(), inner.parameters_schema());
+        assert_eq!(
+            tool.parameters_schema()["required"],
+            json!(["file_path", "content"])
+        );
+        assert!(!tool.is_read_only());
+        assert_eq!(tool.is_read_only(), inner.is_read_only());
+    }
+
+    #[test]
+    fn client_bash_tool_mirrors_local_bash_tool_metadata() {
+        use zen_core::Tool;
+        let (state, _buf) = m7_state(false, false, true);
+        let tool = ClientBashTool::new(state, "s1".to_string());
+        let inner = zen_tools::builtin::BashTool;
+        assert_eq!(tool.name(), "Bash");
+        assert_eq!(tool.name(), inner.name());
+        assert_eq!(
+            tool.description(),
+            "Run a shell command (persistent working directory); background:true runs it as a job (see JobOutput/JobKill)."
+        );
+        assert_eq!(tool.description(), inner.description());
+        assert_eq!(tool.parameters_schema(), inner.parameters_schema());
+        assert_eq!(tool.parameters_schema()["required"], json!(["command"]));
+        assert!(!tool.is_read_only());
+        assert_eq!(tool.is_read_only(), inner.is_read_only());
+    }
+
+    /// `format_numbered_lines` truncates only above the limit (M7):
+    /// a line of exactly `READ_MAX_LINE_CHARS` is shown whole, a line
+    /// one char longer is cut. Pins the `>` boundary.
+    #[test]
+    fn format_numbered_lines_truncates_only_above_max_line_chars() {
+        let max = zen_tools::builtin::READ_MAX_LINE_CHARS;
+        let exact = "x".repeat(max);
+        let out = format_numbered_lines(&exact, 1);
+        assert!(
+            !out.contains("... [line truncated]"),
+            "line at exactly MAX must not truncate: {out}"
+        );
+        assert!(out.contains(&exact));
+        let over = "x".repeat(max + 1);
+        let out = format_numbered_lines(&over, 1);
+        assert!(
+            out.contains("... [line truncated]"),
+            "line at MAX+1 must truncate: {out}"
+        );
+    }
+
     #[tokio::test]
     async fn client_read_tool_uses_client_and_marks_read() {
         use zen_core::Tool;
@@ -5130,6 +5216,10 @@ mod tests {
         use zen_core::Tool;
         let (state, buf) = m7_state(false, true, false);
         let dir = std::env::temp_dir().join("m7-write-tool");
+        // Start clean: a previous run (or a mutant falling back to
+        // the local Write) may have left new.txt behind, and the
+        // write precheck would then refuse the client write.
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let tool = Arc::new(ClientWriteTool::new(Arc::clone(&state), "s1".to_string()));
         let ctx = zen_core::ToolContext::new(dir.clone(), "s1");
@@ -5312,6 +5402,171 @@ mod tests {
         assert!(out.is_error);
         assert!(out.content.contains("timed out"));
         assert!(!out.content.contains("must-not-run-locally"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A background flag on either spelling runs locally (M7): the
+    /// client has no background-job model, so `background` OR
+    /// `run_in_background` must take the local path. Each flag alone
+    /// must trigger it: with `&&` instead of `||` a single flag would
+    /// wrongly go to the client and wait for a terminal answer.
+    #[tokio::test]
+    async fn client_bash_tool_run_in_background_flag_runs_locally() {
+        use zen_core::Tool;
+        let (state, _buf) = m7_state(false, false, true);
+        let dir = std::env::temp_dir().join("m7-bash-bg-alias");
+        let _ = std::fs::create_dir_all(&dir);
+        let tool = Arc::new(ClientBashTool::new(Arc::clone(&state), "s1".to_string()));
+        let ctx = zen_core::ToolContext::new(dir.clone(), "s1");
+        let asked = tokio::spawn({
+            let tool = Arc::clone(&tool);
+            let ctx = ctx.clone();
+            async move {
+                tool.call(
+                    json!({"command": "echo bg-local", "run_in_background": true}),
+                    &ctx,
+                )
+                .await
+            }
+        });
+        // The local path answers at once; the client path would wait
+        // for a terminal/create answer that never comes, so a 10s
+        // bound both keeps the test fast and fails it there.
+        let out = tokio::time::timeout(std::time::Duration::from_secs(10), asked)
+            .await
+            .expect("background flag must take the local path at once")
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(
+            out.content.contains("Started background job"),
+            "got: {}",
+            out.content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn client_bash_tool_background_flag_runs_locally() {
+        use zen_core::Tool;
+        let (state, _buf) = m7_state(false, false, true);
+        let dir = std::env::temp_dir().join("m7-bash-bg-flag");
+        let _ = std::fs::create_dir_all(&dir);
+        let tool = Arc::new(ClientBashTool::new(Arc::clone(&state), "s1".to_string()));
+        let ctx = zen_core::ToolContext::new(dir.clone(), "s1");
+        let asked = tokio::spawn({
+            let tool = Arc::clone(&tool);
+            let ctx = ctx.clone();
+            async move {
+                tool.call(
+                    json!({"command": "echo bg-local", "background": true}),
+                    &ctx,
+                )
+                .await
+            }
+        });
+        let out = tokio::time::timeout(std::time::Duration::from_secs(10), asked)
+            .await
+            .expect("background flag must take the local path at once")
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(
+            out.content.contains("Started background job"),
+            "got: {}",
+            out.content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A zero ctx timeout means "no timeout set" (M7): the `> 0`
+    /// filter must drop it so the 120s default applies. With `>=`
+    /// the zero would survive, clamp to 1ms, and the command would
+    /// be killed at once. The tool must show no kill request within
+    /// 300ms and then complete normally.
+    #[tokio::test]
+    async fn client_bash_tool_zero_ctx_timeout_uses_default() {
+        use zen_core::Tool;
+        let (state, buf) = m7_state(false, false, true);
+        let dir = std::env::temp_dir().join("m7-bash-zero-timeout");
+        let _ = std::fs::create_dir_all(&dir);
+        let tool = Arc::new(ClientBashTool::new(Arc::clone(&state), "s1".to_string()));
+        let mut ctx = zen_core::ToolContext::new(dir.clone(), "s1");
+        ctx.tool_timeout_ms = Some(0);
+        let asked = tokio::spawn({
+            let tool = Arc::clone(&tool);
+            let ctx = ctx.clone();
+            async move { tool.call(json!({"command": "echo hi"}), &ctx).await }
+        });
+        answer_client_request(
+            &state,
+            &buf,
+            "terminal/create",
+            json!({"terminalId": "t-1"}),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let lines = read_output_lines(&buf);
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.get("method").and_then(Value::as_str) == Some("terminal/kill")),
+            "zero ctx timeout must not kill the command early; requests: {lines:?}"
+        );
+        answer_client_request(
+            &state,
+            &buf,
+            "terminal/wait_for_exit",
+            json!({"exitCode": 0, "signal": null}),
+        )
+        .await;
+        answer_client_request(
+            &state,
+            &buf,
+            "terminal/output",
+            json!({"output": "hi\n", "truncated": false, "exitStatus": {"exitCode": 0, "signal": null}}),
+        )
+        .await;
+        answer_client_request(&state, &buf, "terminal/release", json!({})).await;
+        let out = asked.await.unwrap();
+        assert!(!out.is_error);
+        assert_eq!(out.content, "hi");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A positive ctx timeout applies when no `timeout_ms` arg is
+    /// given (M7): 50ms must time out the wait and report the exact
+    /// value. Pins the `> 0` filter from the other side: with `==`
+    /// or `<` the 50 would be dropped, the 120s default would apply,
+    /// and no kill request would ever arrive.
+    #[tokio::test]
+    async fn client_bash_tool_positive_ctx_timeout_times_out() {
+        use zen_core::Tool;
+        let (state, buf) = m7_state(false, false, true);
+        let dir = std::env::temp_dir().join("m7-bash-ctx-timeout");
+        let _ = std::fs::create_dir_all(&dir);
+        let tool = Arc::new(ClientBashTool::new(Arc::clone(&state), "s1".to_string()));
+        let mut ctx = zen_core::ToolContext::new(dir.clone(), "s1");
+        ctx.tool_timeout_ms = Some(50);
+        let asked = tokio::spawn({
+            let tool = Arc::clone(&tool);
+            let ctx = ctx.clone();
+            async move { tool.call(json!({"command": "echo hi"}), &ctx).await }
+        });
+        answer_client_request(
+            &state,
+            &buf,
+            "terminal/create",
+            json!({"terminalId": "t-1"}),
+        )
+        .await;
+        answer_client_request(&state, &buf, "terminal/kill", json!({})).await;
+        answer_client_request(&state, &buf, "terminal/release", json!({})).await;
+        let out = asked.await.unwrap();
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("timed out after 50 ms"),
+            "got: {}",
+            out.content
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
