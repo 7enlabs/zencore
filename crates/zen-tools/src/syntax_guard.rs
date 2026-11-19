@@ -3,7 +3,10 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
-const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+// 30s: on a loaded Windows CI runner `node --check` can take over 10s;
+// timing out silently passes broken code (main run 44441607802), so give
+// the checker room before giving up.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Lang {
@@ -75,7 +78,13 @@ fn random_suffix() -> String {
 
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Per-call counter: SystemTime ticks coarsely on Windows (~15.6 ms), so
+    // two rapid calls could otherwise hash to the same suffix; the second
+    // create_new would then fail and the check would silently be skipped.
+    static CALLS: AtomicU64 = AtomicU64::new(0);
     let mut h = DefaultHasher::new();
+    CALLS.fetch_add(1, Ordering::Relaxed).hash(&mut h);
     std::process::id().hash(&mut h);
     std::time::SystemTime::now().hash(&mut h);
     std::thread::current().id().hash(&mut h);
@@ -215,6 +224,14 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn syntax_guard_temp_suffixes_are_unique_across_rapid_calls() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            assert!(seen.insert(random_suffix()));
+        }
     }
 
     #[tokio::test]
