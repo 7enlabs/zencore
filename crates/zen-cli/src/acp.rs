@@ -4973,6 +4973,25 @@ mod tests {
         assert!(read_output_lines(&buf).is_empty(), "nothing must be sent");
     }
 
+    #[test]
+    fn client_call_error_display_names_each_cause() {
+        // The Display text is the only thing a caller sees for a failed
+        // client call (M7): assert every variant, so a mutant that empties
+        // the format string is caught.
+        assert_eq!(
+            ClientCallError::NotAdvertised("fs/read_text_file".to_string()).to_string(),
+            "client does not advertise fs/read_text_file"
+        );
+        assert_eq!(
+            ClientCallError::Failed(SendRequestError::Timeout).to_string(),
+            "client request timed out"
+        );
+        assert_eq!(
+            ClientCallError::BadResponse("missing content".to_string()).to_string(),
+            "bad client response: missing content"
+        );
+    }
+
     #[tokio::test]
     async fn client_terminal_flow_roundtrip_via_fake_client() {
         let (state, buf) = m7_state(false, false, true);
