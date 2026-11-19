@@ -110,4 +110,52 @@ exclude_re = [
   # that emits an ApiRetry or PermissionDenied event and checks the
   # resulting session update.
   "acp\\.rs:309:13: delete match arm AgentEvent::ApiRetry.*PermissionDenied.* in <impl EventSink for AcpSink>::emit",
+  # PR #240 (M7 Phase 2 #9), acp.rs ClientReadTool::is_read_only (line 1126, col 9):
+  # replace the body with true.
+  # EQUIVALENT (waived by ZC Leader, 2026-11-19; verified by reading
+  # the code at acp.rs:1125-1127 and builtin.rs:305-326): the body is a
+  # one-line delegation `self.inner.is_read_only()` and inner is
+  # zen_tools::builtin::ReadTool, whose is_read_only returns the
+  # literal `true`. Replacing the body with `true` gives the same
+  # value on every call, so no observable behaviour changes and no
+  # test can kill this mutant. The opposite mutant (replace with
+  # false) IS killed by the new test in commit 5dbcf4b, which asserts
+  # tool.is_read_only() and equality with inner.is_read_only().
+  # EXPIRY: if ReadTool::is_read_only stops returning the literal
+  # true, or the client tool stops delegating to it, this mutant
+  # stops being equivalent: remove this exclusion and kill it with
+  # a test.
+  "acp\\.rs:1126:9: replace .*ClientReadTool.*is_read_only.* with true",
+  # PR #240 (M7 Phase 2 #9), acp.rs ClientWriteTool::is_read_only (line 1212, col 9):
+  # replace the body with false.
+  # EQUIVALENT (waived by ZC Leader, 2026-11-19; verified by reading
+  # the code at acp.rs:1211-1213 and builtin.rs:405-424): the body is a
+  # one-line delegation `self.inner.is_read_only()` and inner is
+  # zen_tools::builtin::WriteTool, whose is_read_only returns the
+  # literal `false`. Replacing the body with `false` gives the same
+  # value on every call, so no observable behaviour changes and no
+  # test can kill this mutant. The opposite mutant (replace with
+  # true) IS killed by the new test in commit 5dbcf4b, which asserts
+  # !tool.is_read_only() and equality with inner.is_read_only().
+  # EXPIRY: if WriteTool::is_read_only stops returning the literal
+  # false, or the client tool stops delegating to it, this mutant
+  # stops being equivalent: remove this exclusion and kill it with
+  # a test.
+  "acp\\.rs:1212:9: replace .*ClientWriteTool.*is_read_only.* with false",
+  # PR #240 (M7 Phase 2 #9), acp.rs ClientBashTool::is_read_only (line 1288, col 9):
+  # replace the body with false.
+  # EQUIVALENT (waived by ZC Leader, 2026-11-19; verified by reading
+  # the code at acp.rs:1287-1289 and builtin.rs:775-797): the body is a
+  # one-line delegation `self.inner.is_read_only()` and inner is
+  # zen_tools::builtin::BashTool, whose is_read_only returns the
+  # literal `false`. Replacing the body with `false` gives the same
+  # value on every call, so no observable behaviour changes and no
+  # test can kill this mutant. The opposite mutant (replace with
+  # true) IS killed by the new test in commit 5dbcf4b, which asserts
+  # !tool.is_read_only() and equality with inner.is_read_only().
+  # EXPIRY: if BashTool::is_read_only stops returning the literal
+  # false, or the client tool stops delegating to it, this mutant
+  # stops being equivalent: remove this exclusion and kill it with
+  # a test.
+  "acp\\.rs:1288:9: replace .*ClientBashTool.*is_read_only.* with false",
 ]
