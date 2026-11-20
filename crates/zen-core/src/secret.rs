@@ -2111,7 +2111,7 @@ mod tests {
                     task_id: None,
                     purpose: "short work".to_string(),
                     scope: format!("task:E-{i}"),
-                    until: rfc3339(Utc::now() + Duration::seconds(2)),
+                    until: rfc3339(Utc::now() + Duration::seconds(60)),
                     one_shot: false,
                     broker_action: None,
                 },
@@ -2129,8 +2129,11 @@ mod tests {
             issue_secret(&store, &req.request_id, OPERATOR_ISSUER, Utc::now()).unwrap();
             ids.push(req.request_id);
         }
-        std::thread::sleep(std::time::Duration::from_secs(3));
-        let later = Utc::now();
+        // Check against a computed future time instead of sleeping: the
+        // issue calls above complete well inside the 60s window, and every
+        // request is expired at `later` no matter how slow the runner is.
+        // A 2s window used to race issuance on a loaded Windows runner.
+        let later = Utc::now() + Duration::seconds(61);
         for id in &ids {
             let check = check_use(&store, id, "zd-developer", later).unwrap();
             assert!(!check.allowed, "{id}: {check:?}");

@@ -1438,17 +1438,20 @@ mod tests {
     async fn parallel_run_and_dedupe() {
         let tmp = TempDir::new();
         let log = tmp.path().join("log");
-        let dup = format!("sleep 1; echo x >> {}", shell_path(&log));
+        let dup = format!("sleep 2; echo x >> {}", shell_path(&log));
         let hooks = json!({"PreToolUse": [
-            {"matcher": "Bash", "hooks": [{"type": "command", "command": dup}, {"type": "command", "command": "sleep 1"}]},
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": dup}, {"type": "command", "command": "sleep 2"}]},
             {"matcher": "*", "hooks": [{"type": "command", "command": dup}]}
         ]});
         let r = runner(hooks, tmp.path());
         assert_eq!(r.matching_specs(HookEvent::PreToolUse, "Bash").len(), 2);
         let start = std::time::Instant::now();
         run_ev(&r, HookEvent::PreToolUse, "Bash", json!({})).await;
+        // Parallel takes ~2s, sequential ~4s; 3.5s sits between them with
+        // margin on both sides even on a loaded Windows runner, where
+        // 1s sleeps with a 1.9s bound used to flake.
         assert!(
-            start.elapsed() < Duration::from_millis(1900),
+            start.elapsed() < Duration::from_millis(3500),
             "hooks should run concurrently"
         );
         assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 1);
