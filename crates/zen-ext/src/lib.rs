@@ -14,8 +14,9 @@ pub use commands::{
 pub use hooks::{CommandHookSpec, CommandHooks, HOOK_OUTPUT_LIMIT, OnFailure, matches_target};
 pub use memory::{
     MANAGED_MEMORY_PATH, MAX_IMPORT_DEPTH, MemoryFile, append_memory_note,
-    detect_import_candidates, memories_report, memory_files, memory_files_with_managed,
-    memory_prompt,
+    detect_import_candidates, detect_import_candidates_with_root, memories_report,
+    memories_report_with_root, memory_files, memory_files_with_managed, memory_files_with_root,
+    memory_prompt, memory_prompt_with_root,
 };
 pub use settings::{
     LoadedSettings, load_settings, load_settings_trust, load_settings_with_managed, merge_json,
