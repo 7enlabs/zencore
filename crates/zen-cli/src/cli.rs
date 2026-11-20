@@ -1112,6 +1112,15 @@ mod tests {
     use clap::Parser;
 
     #[test]
+    fn invalid_sandbox_mode_error_names_value_and_source() {
+        // Kills the mutant that replaces the message with "xyzzy".
+        let msg = invalid_sandbox_mode_error("bogus", "--sandbox");
+        assert!(msg.contains("bogus"), "error names the bad value: {msg}");
+        assert!(msg.contains("--sandbox"), "error names the source: {msg}");
+        assert!(msg.contains("off"), "error lists valid modes: {msg}");
+    }
+
+    #[test]
     fn subcommand_help_includes_examples() {
         use clap::CommandFactory;
         let cmd = Cli::command();

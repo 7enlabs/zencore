@@ -1469,6 +1469,34 @@ pub fn resolve_shell(preferred: &str) -> ShellSpec {
 mod tests {
     use super::*;
     #[test]
+    fn sandbox_mode_as_str_and_parse_roundtrip() {
+        // Kills the as_str mutants ("" / "xyzzy") and the parse
+        // mutants (whole-body -> None, and each deleted match arm).
+        assert_eq!(SandboxMode::Off.as_str(), "off");
+        assert_eq!(SandboxMode::WorkspaceWrite.as_str(), "workspace-write");
+        assert_eq!(SandboxMode::ReadOnly.as_str(), "read-only");
+        assert_eq!(SandboxMode::parse("off"), Some(SandboxMode::Off));
+        assert_eq!(
+            SandboxMode::parse("workspace-write"),
+            Some(SandboxMode::WorkspaceWrite)
+        );
+        assert_eq!(
+            SandboxMode::parse("workspace_write"),
+            Some(SandboxMode::WorkspaceWrite)
+        );
+        assert_eq!(SandboxMode::parse("read-only"), Some(SandboxMode::ReadOnly));
+        assert_eq!(SandboxMode::parse("read_only"), Some(SandboxMode::ReadOnly));
+        assert_eq!(SandboxMode::parse("bogus"), None);
+        for mode in [
+            SandboxMode::Off,
+            SandboxMode::WorkspaceWrite,
+            SandboxMode::ReadOnly,
+        ] {
+            assert_eq!(SandboxMode::parse(mode.as_str()), Some(mode));
+        }
+    }
+
+    #[test]
     fn hook_events_all_33_roundtrip() {
         let all = HookEvent::all();
         assert_eq!(all.len(), 33);

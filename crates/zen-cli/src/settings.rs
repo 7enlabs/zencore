@@ -1047,6 +1047,30 @@ mod tests {
     }
 
     #[test]
+    fn merge_settings_applies_override_model_and_sandbox_mode() {
+        // Kills the mutant that replaces merge_settings with
+        // Default::default(): a non-default override must survive.
+        let base = Settings::default();
+        let over = Settings {
+            model: Some("override-model".to_string()),
+            permissions: PermissionSettings {
+                sandbox_mode: Some("read-only".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let merged = merge_settings(&base, &over);
+        assert_eq!(merged.model.as_deref(), Some("override-model"));
+        assert_eq!(
+            merged.permissions.sandbox_mode.as_deref(),
+            Some("read-only")
+        );
+        // And a default override leaves the base untouched.
+        let untouched = merge_settings(&base, &Settings::default());
+        assert_eq!(untouched, base);
+    }
+
+    #[test]
     fn config_precedence_env_over_default_when_no_cli() {
         let _env = env_lock();
         let cli = base_cli();

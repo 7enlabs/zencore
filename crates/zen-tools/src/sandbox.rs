@@ -86,7 +86,12 @@ pub enum SandboxOutcome {
 
 #[cfg(not(target_os = "linux"))]
 static WARN_NO_SANDBOX: AtomicBool = AtomicBool::new(false);
+/// Linux-only: only the Landlock path prints the bind-block warning
+/// and the enforced-mode log line, so these are dead on other
+/// platforms (Windows clippy errors on them without the gate).
+#[cfg(target_os = "linux")]
 static WARN_NO_BIND_BLOCK: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "linux")]
 static LOG_ENFORCED: AtomicBool = AtomicBool::new(false);
 
 /// Print a message at most once per process; returns true when this
@@ -288,6 +293,12 @@ mod imp {
     /// tests can probe the same syscall independently.
     pub(crate) const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
 
+    // aarch64: libc does not define SYS_kexec_file_load, but the
+    // kernel provides kexec_file_load as __NR_kexec_file_load 294
+    // (arch/arm64/include/uapi/asm/unistd.h).
+    #[cfg(target_arch = "aarch64")]
+    const SYS_KEXEC_FILE_LOAD_AARCH64: libc::c_long = 294;
+
     /// Flag value of `LANDLOCK_CREATE_RULESET_VERSION`: with this flag
     /// the syscall takes no ruleset and returns the kernel ABI version.
     pub(crate) const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
@@ -316,7 +327,10 @@ mod imp {
             "finit_module" => libc::SYS_finit_module,
             "delete_module" => libc::SYS_delete_module,
             "kexec_load" => libc::SYS_kexec_load,
+            #[cfg(target_arch = "x86_64")]
             "kexec_file_load" => libc::SYS_kexec_file_load,
+            #[cfg(target_arch = "aarch64")]
+            "kexec_file_load" => SYS_KEXEC_FILE_LOAD_AARCH64,
             "ptrace" => libc::SYS_ptrace,
             "perf_event_open" => libc::SYS_perf_event_open,
             "bpf" => libc::SYS_bpf,
