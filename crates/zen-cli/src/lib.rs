@@ -1309,7 +1309,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // floor-guard: test holds the shared env lock across the await so the key vars cannot change under run_with_home (C1)
     async fn run_with_home_init_or_maintenance_require_print() {
         // Pins the `(cli.init || cli.maintenance) && !cli.print` guard
         // in run_with_home, one row per side of each operator:
@@ -1325,16 +1324,14 @@ mod tests {
         // code. The temp home/cwd keep the run hermetic, and the key
         // env vars are cleared so a developer's shell cannot smuggle
         // a key into the fall-through path.
-        // Hold ENV_LOCK: this test clears process-wide key vars, so it
-        // must not race other tests that read them (core-perfect C1).
-        // The old values are restored at the end of the test.
-        let _env = crate::settings::env_lock();
-        let old_key = std::env::var("ZEN_API_KEY").ok();
-        let old_base = std::env::var("ZEN_BASE_URL").ok();
-        unsafe {
-            std::env::remove_var("ZEN_API_KEY");
-            std::env::remove_var("ZEN_BASE_URL");
-        }
+        // Hold ENV_LOCK while mutating env and asserting on the result,
+        // but release it across each await: no MutexGuard may be held
+        // over an await point (clippy::await_holding_lock). The guards
+        // stay alive across the await, so the key vars stay cleared
+        // while run_with_home runs, and restore the old values on drop
+        // even if a row panics.
+        let mut env_lock = Some(crate::settings::env_lock());
+        let _env_guards = crate::settings::EnvGuard::remove_many(&["ZEN_API_KEY", "ZEN_BASE_URL"]);
         // (init, maintenance, print, expect_validation)
         let cases = [
             (true, false, false, true),
@@ -1357,12 +1354,16 @@ mod tests {
                 args.push("-p");
             }
             let cli = Cli::parse_from(args);
+            // Release the lock before the await; re-acquire it before
+            // the assertions below.
+            drop(env_lock.take());
             let result = tokio::time::timeout(
                 Duration::from_secs(30),
                 run_with_home(cli, &dir, Some(&dir)),
             )
             .await
             .expect("run_with_home must not hang");
+            env_lock = Some(crate::settings::env_lock());
             if expect_validation {
                 assert_eq!(
                     result.unwrap(),
@@ -1377,14 +1378,6 @@ mod tests {
                 );
             }
             std::fs::remove_dir_all(&dir).ok();
-        }
-        match old_key {
-            Some(v) => unsafe { std::env::set_var("ZEN_API_KEY", v) },
-            None => unsafe { std::env::remove_var("ZEN_API_KEY") },
-        }
-        match old_base {
-            Some(v) => unsafe { std::env::set_var("ZEN_BASE_URL", v) },
-            None => unsafe { std::env::remove_var("ZEN_BASE_URL") },
         }
     }
 

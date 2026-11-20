@@ -494,7 +494,7 @@ mod tests {
         let _env = crate::settings::env_lock();
         let home = temp_home("noseat");
         seed_registry(&home);
-        unsafe { std::env::remove_var("ZEN_SEAT") };
+        let _env_guard = crate::settings::EnvGuard::remove("ZEN_SEAT");
         let args = SecretArgs {
             command: SecretSubcommand::Request {
                 name: "OPENROUTER_KEY".to_string(),

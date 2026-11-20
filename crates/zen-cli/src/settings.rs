@@ -24,6 +24,76 @@ pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// RAII guard restoring one env var's previous value on drop.
+///
+/// The manual `let old = var().ok(); ...; match old { ... }` restore
+/// pattern only restores when the test runs to the end: a panic
+/// mid-test (a failed assert, an `unwrap` on `Err`) leaves the var
+/// changed for every later test in the same process. A guard restores
+/// on drop, so it also runs during unwinding.
+///
+/// Callers must still hold [`env_lock`] for the whole mutation +
+/// assertion window: the guard restores the value, it does not
+/// serialize access. The guard itself holds no lock, so it is safe
+/// to keep across an `await` in async tests. Async tests release the
+/// lock across `.await` points and re-acquire it before asserting.
+#[cfg(test)]
+#[must_use = "a guard dropped immediately restores the var at once; bind it for the whole test"]
+pub(crate) struct EnvGuard {
+    key: &'static str,
+    old: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl EnvGuard {
+    /// Capture the current value of `key`, then set it to `value`.
+    pub(crate) fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let old = std::env::var_os(key);
+        // SAFETY: tests hold env_lock while mutating env (see the
+        // struct docs); the key is a fixed test var.
+        unsafe { std::env::set_var(key, value) };
+        Self { key, old }
+    }
+
+    /// Capture the current value of `key`, then remove it.
+    pub(crate) fn remove(key: &'static str) -> Self {
+        let old = std::env::var_os(key);
+        // SAFETY: same as `set` above.
+        unsafe { std::env::remove_var(key) };
+        Self { key, old }
+    }
+
+    /// Set several vars at once; the returned guards restore all of
+    /// them when dropped.
+    #[must_use]
+    pub(crate) fn set_many(vars: &[(&'static str, &str)]) -> Vec<Self> {
+        vars.iter().map(|(k, v)| Self::set(k, v)).collect()
+    }
+
+    /// Remove several vars at once; the returned guards restore all
+    /// of them when dropped.
+    #[must_use]
+    pub(crate) fn remove_many(keys: &[&'static str]) -> Vec<Self> {
+        keys.iter().map(|k| Self::remove(k)).collect()
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: same as `set` above; Drop runs on the test thread,
+        // which normally still holds env_lock. The async tests that
+        // release the lock across an await restore without it only
+        // when they panic mid-await.
+        unsafe {
+            match self.old.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
 /// Fail fast when the resolved route needs an API key and none is
 /// configured (core-perfect phase 1, A1). Without this the session
 /// opens normally and the first prompt dies with a raw `HTTP 401`.
@@ -915,18 +985,34 @@ mod tests {
     }
 
     #[test]
+    fn env_guard_restores_value_and_absence_on_panic() {
+        let _env = env_lock();
+        // Absent before: still absent after a panic inside the guard.
+        assert!(std::env::var("ZEN_GUARD_PROBE").is_err());
+        let _ = std::panic::catch_unwind(|| {
+            let _g = EnvGuard::set("ZEN_GUARD_PROBE", "probe");
+            assert_eq!(std::env::var("ZEN_GUARD_PROBE").unwrap(), "probe");
+            panic!("probe panic");
+        });
+        assert!(std::env::var("ZEN_GUARD_PROBE").is_err());
+        // Present before: the old value comes back after a panic.
+        let _ambient = EnvGuard::set("ZEN_GUARD_PROBE", "ambient");
+        let _ = std::panic::catch_unwind(|| {
+            let _g = EnvGuard::remove("ZEN_GUARD_PROBE");
+            assert!(std::env::var("ZEN_GUARD_PROBE").is_err());
+            panic!("probe panic");
+        });
+        assert_eq!(std::env::var("ZEN_GUARD_PROBE").unwrap(), "ambient");
+    }
+
+    #[test]
     fn config_precedence_model_cli_over_env_over_default() {
         let _env = env_lock();
         let mut cli = base_cli();
         cli.model = Some("cli-model".into());
 
-        let old = std::env::var("ZEN_MODEL").ok();
-        unsafe { std::env::set_var("ZEN_MODEL", "env-model") };
+        let _env_guard = EnvGuard::set("ZEN_MODEL", "env-model");
         let cfg = resolve_config(&cli, std::env::temp_dir().as_path()).unwrap();
-        unsafe { std::env::remove_var("ZEN_MODEL") };
-        if let Some(o) = old {
-            unsafe { std::env::set_var("ZEN_MODEL", o) };
-        }
         assert_eq!(cfg.model, "cli-model");
     }
 
@@ -934,13 +1020,8 @@ mod tests {
     fn config_precedence_env_over_default_when_no_cli() {
         let _env = env_lock();
         let cli = base_cli();
-        let old = std::env::var("ZEN_MODEL").ok();
-        unsafe { std::env::set_var("ZEN_MODEL", "env-model") };
+        let _env_guard = EnvGuard::set("ZEN_MODEL", "env-model");
         let cfg = resolve_config(&cli, std::env::temp_dir().as_path()).unwrap();
-        unsafe { std::env::remove_var("ZEN_MODEL") };
-        if let Some(o) = old {
-            unsafe { std::env::set_var("ZEN_MODEL", o) };
-        }
         assert_eq!(cfg.model, "env-model");
     }
 
@@ -948,10 +1029,7 @@ mod tests {
     fn config_default_model() {
         let _env = env_lock();
         let cli = base_cli();
-        let old_m = std::env::var("ZEN_MODEL").ok();
-        let old_b = std::env::var("ZEN_BASE_URL").ok();
-        unsafe { std::env::remove_var("ZEN_MODEL") };
-        unsafe { std::env::remove_var("ZEN_BASE_URL") };
+        let _env_guards = EnvGuard::remove_many(&["ZEN_MODEL", "ZEN_BASE_URL"]);
         // Isolate from the real user settings file as well as the ambient
         // env: defaults must hold with no user/project/local layer at all.
         let dir = std::env::temp_dir().join(format!("zen_cfg_def_{}", std::process::id()));
@@ -961,12 +1039,6 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::create_dir_all(&home).unwrap();
         let cfg = resolve_config_with_home(&cli, &dir, Some(&home)).unwrap();
-        if let Some(o) = old_m {
-            unsafe { std::env::set_var("ZEN_MODEL", o) };
-        }
-        if let Some(o) = old_b {
-            unsafe { std::env::set_var("ZEN_BASE_URL", o) };
-        }
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&home);
         assert_eq!(cfg.model, DEFAULT_MODEL);
@@ -984,14 +1056,8 @@ mod tests {
         // the route is the default ExperientialLabs gateway (A1).
         let _env = env_lock();
         let cli = base_cli();
-        let old_key = std::env::var("ZEN_API_KEY").ok();
-        let old_openai = std::env::var("OPENAI_API_KEY").ok();
-        let old_model = std::env::var("ZEN_MODEL").ok();
-        let old_base = std::env::var("ZEN_BASE_URL").ok();
-        unsafe { std::env::remove_var("ZEN_API_KEY") };
-        unsafe { std::env::remove_var("OPENAI_API_KEY") };
-        unsafe { std::env::remove_var("ZEN_MODEL") };
-        unsafe { std::env::remove_var("ZEN_BASE_URL") };
+        let _env_guards =
+            EnvGuard::remove_many(&["ZEN_API_KEY", "OPENAI_API_KEY", "ZEN_MODEL", "ZEN_BASE_URL"]);
         let dir = std::env::temp_dir().join(format!("zen_cfg_key_{}", std::process::id()));
         let home = std::env::temp_dir().join(format!("zen_cfg_key_home_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -1001,18 +1067,6 @@ mod tests {
         let cfg = resolve_config_with_home(&cli, &dir, Some(&home)).unwrap();
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&home);
-        if let Some(o) = old_key {
-            unsafe { std::env::set_var("ZEN_API_KEY", o) };
-        }
-        if let Some(o) = old_openai {
-            unsafe { std::env::set_var("OPENAI_API_KEY", o) };
-        }
-        if let Some(o) = old_model {
-            unsafe { std::env::set_var("ZEN_MODEL", o) };
-        }
-        if let Some(o) = old_base {
-            unsafe { std::env::set_var("ZEN_BASE_URL", o) };
-        }
         assert!(cfg.api_key().is_none(), "test setup leaked a key");
         cfg
     }
@@ -1062,16 +1116,11 @@ mod tests {
             resolve_base_url(&cli, Some("https://openrouter.ai/api/v1//")),
             crate::models::OPENROUTER_BASE_URL
         );
-        let old = std::env::var("ZEN_BASE_URL").ok();
-        unsafe { std::env::set_var("ZEN_BASE_URL", "https://openrouter.ai/api/v1/") };
+        let _env_guard = EnvGuard::set("ZEN_BASE_URL", "https://openrouter.ai/api/v1/");
         assert_eq!(
             resolve_base_url(&cli, None),
             crate::models::OPENROUTER_BASE_URL
         );
-        match old {
-            Some(o) => unsafe { std::env::set_var("ZEN_BASE_URL", o) },
-            None => unsafe { std::env::remove_var("ZEN_BASE_URL") },
-        }
         // Provider recognition tolerates the same sloppiness, so
         // callers holding an unnormalized URL still work.
         assert_eq!(
@@ -1091,10 +1140,7 @@ mod tests {
     #[test]
     fn model_id_is_trimmed_and_blank_means_unset() {
         let _env = env_lock();
-        let old = std::env::var("ZEN_MODEL").ok();
-        unsafe {
-            std::env::remove_var("ZEN_MODEL");
-        }
+        let _env_guard = EnvGuard::remove("ZEN_MODEL");
         let mut cli = base_cli();
         cli.model = Some("  padded-model  ".to_string());
         assert_eq!(resolve_model(&cli, None), "padded-model");
@@ -1115,27 +1161,17 @@ mod tests {
             std::env::remove_var("ZEN_MODEL");
         }
         assert_eq!(resolve_model(&cli, Some("  ")), DEFAULT_MODEL);
-        match old {
-            Some(o) => unsafe { std::env::set_var("ZEN_MODEL", o) },
-            None => unsafe { std::env::remove_var("ZEN_MODEL") },
-        }
     }
 
     #[test]
     fn btw_model_is_translated_or_replaced_across_providers() {
         let _env = env_lock();
-        let old_m = std::env::var("ZEN_MODEL").ok();
-        let old_b = std::env::var("ZEN_BASE_URL").ok();
+        let _env_guard_set = EnvGuard::set("ZEN_MODEL", "custom-main-model");
+        let _env_guard_removed = EnvGuard::remove("ZEN_BASE_URL");
         // Main model deliberately differs from every btw candidate below,
         // so a fallback to the main model is observable (the previous
         // version used the default model, which coincided with the
         // same-provider btw id and let the guard mutant survive).
-        unsafe {
-            std::env::set_var("ZEN_MODEL", "custom-main-model");
-        }
-        unsafe {
-            std::env::remove_var("ZEN_BASE_URL");
-        }
         let home = std::env::temp_dir().join(format!("zen_cfg_btw_home_{}", std::process::id()));
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(&home).unwrap();
@@ -1192,17 +1228,6 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&home);
-        match old_m {
-            Some(o) => unsafe { std::env::set_var("ZEN_MODEL", o) },
-            // The test sets ZEN_MODEL above; leave no trace when the
-            // caller had none, or later tests in this process inherit it.
-            None => unsafe { std::env::remove_var("ZEN_MODEL") },
-        }
-        if let Some(o) = old_b {
-            unsafe {
-                std::env::set_var("ZEN_BASE_URL", o);
-            }
-        }
     }
 
     #[test]
@@ -1246,21 +1271,12 @@ mod tests {
         // Env overrides beat files, so a ZEN_MODEL/ZEN_BASE_URL left in the
         // ambient environment would mask the project file. Resolve against
         // an empty user home so the real user settings file cannot leak in.
-        let old_m = std::env::var("ZEN_MODEL").ok();
-        let old_b = std::env::var("ZEN_BASE_URL").ok();
-        unsafe { std::env::remove_var("ZEN_MODEL") };
-        unsafe { std::env::remove_var("ZEN_BASE_URL") };
+        let _env_guards = EnvGuard::remove_many(&["ZEN_MODEL", "ZEN_BASE_URL"]);
         let home = std::env::temp_dir().join(format!("zen_cfg_test_home_{}", std::process::id()));
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(&home).unwrap();
         let cli = Cli::parse_from(["zen", "--setting-sources", "project", "--trust-folder"]);
         let cfg = resolve_config_with_home(&cli, &dir, Some(&home)).unwrap();
-        if let Some(o) = old_m {
-            unsafe { std::env::set_var("ZEN_MODEL", o) };
-        }
-        if let Some(o) = old_b {
-            unsafe { std::env::set_var("ZEN_BASE_URL", o) };
-        }
         let _ = fs::remove_dir_all(&home);
         assert_eq!(cfg.model, "from-file");
         assert_eq!(cfg.base_url, "https://file.example.com/v1");
@@ -1321,10 +1337,7 @@ mod tests {
     #[test]
     fn config_rejects_malformed_model_with_exit_4() {
         let _env = env_lock();
-        let old_m = std::env::var("ZEN_MODEL").ok();
-        let old_b = std::env::var("ZEN_BASE_URL").ok();
-        unsafe { std::env::remove_var("ZEN_MODEL") };
-        unsafe { std::env::remove_var("ZEN_BASE_URL") };
+        let _env_guards = EnvGuard::remove_many(&["ZEN_MODEL", "ZEN_BASE_URL"]);
         let dir = std::env::temp_dir().join(format!("zen_cfg_badmodel_{}", std::process::id()));
         let home =
             std::env::temp_dir().join(format!("zen_cfg_badmodel_home_{}", std::process::id()));
@@ -1356,21 +1369,12 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&home);
-        if let Some(o) = old_m {
-            unsafe { std::env::set_var("ZEN_MODEL", o) };
-        }
-        if let Some(o) = old_b {
-            unsafe { std::env::set_var("ZEN_BASE_URL", o) };
-        }
     }
 
     #[test]
     fn config_accepts_wellformed_unknown_model() {
         let _env = env_lock();
-        let old_m = std::env::var("ZEN_MODEL").ok();
-        let old_b = std::env::var("ZEN_BASE_URL").ok();
-        unsafe { std::env::remove_var("ZEN_MODEL") };
-        unsafe { std::env::remove_var("ZEN_BASE_URL") };
+        let _env_guards = EnvGuard::remove_many(&["ZEN_MODEL", "ZEN_BASE_URL"]);
         let dir = std::env::temp_dir().join(format!("zen_cfg_okmodel_{}", std::process::id()));
         let home =
             std::env::temp_dir().join(format!("zen_cfg_okmodel_home_{}", std::process::id()));
@@ -1386,12 +1390,6 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&home);
-        if let Some(o) = old_m {
-            unsafe { std::env::set_var("ZEN_MODEL", o) };
-        }
-        if let Some(o) = old_b {
-            unsafe { std::env::set_var("ZEN_BASE_URL", o) };
-        }
     }
 
     #[test]
@@ -1401,8 +1399,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join(".zen")).unwrap();
         fs::write(dir.join(".zen/settings.json"), r#"{"model":"from-file"}"#).unwrap();
-        let old = std::env::var("ZEN_MODEL").ok();
-        unsafe { std::env::set_var("ZEN_MODEL", "env-model") };
+        let _env_guard = EnvGuard::set("ZEN_MODEL", "env-model");
         let cli = Cli::parse_from(["zen", "--setting-sources", "project"]);
         let from_env = resolve_config(&cli, &dir).unwrap().model;
         let cli = Cli::parse_from([
@@ -1416,9 +1413,6 @@ mod tests {
         unsafe { std::env::remove_var("ZEN_MODEL") };
         let cli = Cli::parse_from(["zen", "--setting-sources", "project"]);
         let from_file = resolve_config(&cli, &dir).unwrap().model;
-        if let Some(o) = old {
-            unsafe { std::env::set_var("ZEN_MODEL", o) };
-        }
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(from_env, "env-model");
         assert_eq!(from_flag, "flag-model");
@@ -1604,8 +1598,7 @@ mod tests {
             r#"{"model":"pm","hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]},"permissions":{"allow":["Bash"]}}"#,
         )
         .unwrap();
-        let old = std::env::var(zen_ext::TRUST_ENV).ok();
-        unsafe { std::env::remove_var(zen_ext::TRUST_ENV) };
+        let _env_guard = EnvGuard::remove(zen_ext::TRUST_ENV);
 
         let cfg = resolve_config_with_home(&base_cli(), &proj, Some(&home)).unwrap();
         assert!(!cfg.folder_trusted);
@@ -1634,9 +1627,6 @@ mod tests {
             cfg.folder_trusted && cfg.hooks.get("Stop").is_some() && cfg.trust_skipped.is_empty()
         );
 
-        if let Some(o) = old {
-            unsafe { std::env::set_var(zen_ext::TRUST_ENV, o) };
-        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1780,10 +1770,7 @@ mod tests {
     #[test]
     fn provider_routing_default_model_untouched_without_key() {
         let _env = env_lock();
-        let old = std::env::var("GOOGLE_API_KEY").ok();
-        unsafe { std::env::remove_var("GOOGLE_API_KEY") };
-        let old_m = std::env::var("ZEN_MODEL").ok();
-        unsafe { std::env::remove_var("ZEN_MODEL") };
+        let _env_guards = EnvGuard::remove_many(&["GOOGLE_API_KEY", "ZEN_MODEL"]);
         let cli = base_cli();
         let cfg = resolve_config(&cli, std::env::temp_dir().as_path()).unwrap();
         assert_eq!(cfg.model, DEFAULT_MODEL);
@@ -1793,36 +1780,23 @@ mod tests {
                 .iter()
                 .all(|w| !w.contains("provider 'google'"))
         );
-        if let Some(o) = old {
-            unsafe { std::env::set_var("GOOGLE_API_KEY", o) };
-        }
-        if let Some(o) = old_m {
-            unsafe { std::env::set_var("ZEN_MODEL", o) };
-        }
     }
 
     #[test]
     fn provider_routing_direct_when_key_set() {
         let _env = env_lock();
-        let old = std::env::var("ZAI_API_KEY").ok();
-        unsafe { std::env::set_var("ZAI_API_KEY", "test-key-zai") };
+        let _env_guard = EnvGuard::set("ZAI_API_KEY", "test-key-zai");
         let cli = Cli::parse_from(["zen", "--model", "zai/glm-5.2"]);
         let cfg = resolve_config(&cli, std::env::temp_dir().as_path()).unwrap();
         assert_eq!(cfg.model, "glm-5.2", "prefix stripped on the wire");
         assert_eq!(cfg.base_url, "https://api.z.ai/api/paas/v4");
         assert_eq!(cfg.api_key.as_deref(), Some("test-key-zai"));
-        if let Some(o) = old {
-            unsafe { std::env::set_var("ZAI_API_KEY", o) };
-        } else {
-            unsafe { std::env::remove_var("ZAI_API_KEY") };
-        }
     }
 
     #[test]
     fn provider_routing_warns_without_key() {
         let _env = env_lock();
-        let old = std::env::var("MOONSHOT_API_KEY").ok();
-        unsafe { std::env::remove_var("MOONSHOT_API_KEY") };
+        let _env_guard = EnvGuard::remove("MOONSHOT_API_KEY");
         let cli = Cli::parse_from(["zen", "--model", "moonshot/kimi-k2.7"]);
         let cfg = resolve_config(&cli, std::env::temp_dir().as_path()).unwrap();
         assert_eq!(
@@ -1835,16 +1809,12 @@ mod tests {
             "expected key warning, got: {:?}",
             cfg.warnings
         );
-        if let Some(o) = old {
-            unsafe { std::env::set_var("MOONSHOT_API_KEY", o) };
-        }
     }
 
     #[test]
     fn provider_routing_explicit_base_url_wins() {
         let _env = env_lock();
-        let old = std::env::var("DEEPSEEK_API_KEY").ok();
-        unsafe { std::env::set_var("DEEPSEEK_API_KEY", "test-key-ds") };
+        let _env_guard = EnvGuard::set("DEEPSEEK_API_KEY", "test-key-ds");
         let cli = Cli::parse_from([
             "zen",
             "--model",
@@ -1856,11 +1826,6 @@ mod tests {
         assert_eq!(cfg.model, "deepseek-v4-flash");
         assert_eq!(cfg.base_url, "https://proxy.example.com/v1");
         assert_eq!(cfg.api_key.as_deref(), Some("test-key-ds"));
-        if let Some(o) = old {
-            unsafe { std::env::set_var("DEEPSEEK_API_KEY", o) };
-        } else {
-            unsafe { std::env::remove_var("DEEPSEEK_API_KEY") };
-        }
     }
 
     #[test]
@@ -1870,14 +1835,11 @@ mod tests {
         // provider, so ModelSpec::parse used to strip it and route_direct
         // sent it to DeepSeek's paid API. Catalog ids must win.
         let _env = env_lock();
-        let old_ds = std::env::var("DEEPSEEK_API_KEY").ok();
-        let old_or = std::env::var("OPENROUTER_API_KEY").ok();
-        let old_m = std::env::var("ZEN_MODEL").ok();
-        let old_u = std::env::var("ZEN_BASE_URL").ok();
-        unsafe { std::env::set_var("DEEPSEEK_API_KEY", "test-key-ds") };
-        unsafe { std::env::set_var("OPENROUTER_API_KEY", "test-key-or") };
-        unsafe { std::env::remove_var("ZEN_MODEL") };
-        unsafe { std::env::remove_var("ZEN_BASE_URL") };
+        let _env_guards_set = EnvGuard::set_many(&[
+            ("DEEPSEEK_API_KEY", "test-key-ds"),
+            ("OPENROUTER_API_KEY", "test-key-or"),
+        ]);
+        let _env_guards_removed = EnvGuard::remove_many(&["ZEN_MODEL", "ZEN_BASE_URL"]);
         let cli = Cli::parse_from(["zen", "--model", "deepseek/deepseek-r1:free"]);
         let mut cfg = resolve_config(&cli, std::env::temp_dir().as_path()).unwrap();
         // resolve_config alone must keep the full catalog id on the
@@ -1894,22 +1856,6 @@ mod tests {
         assert_eq!(cfg.base_url, crate::models::OPENROUTER_BASE_URL);
         assert_eq!(cfg.model, "deepseek/deepseek-r1:free");
         assert_eq!(cfg.api_key.as_deref(), Some("test-key-or"));
-        if let Some(o) = old_ds {
-            unsafe { std::env::set_var("DEEPSEEK_API_KEY", o) };
-        } else {
-            unsafe { std::env::remove_var("DEEPSEEK_API_KEY") };
-        }
-        if let Some(o) = old_or {
-            unsafe { std::env::set_var("OPENROUTER_API_KEY", o) };
-        } else {
-            unsafe { std::env::remove_var("OPENROUTER_API_KEY") };
-        }
-        if let Some(o) = old_m {
-            unsafe { std::env::set_var("ZEN_MODEL", o) };
-        }
-        if let Some(o) = old_u {
-            unsafe { std::env::set_var("ZEN_BASE_URL", o) };
-        }
     }
 
     #[test]
@@ -1936,8 +1882,7 @@ mod tests {
     #[test]
     fn route_catalog_model_filters_fallbacks_by_the_routed_provider() {
         let _env = env_lock();
-        let old = std::env::var("OPENROUTER_API_KEY").ok();
-        unsafe { std::env::set_var("OPENROUTER_API_KEY", "or-key") };
+        let _env_guard = EnvGuard::set("OPENROUTER_API_KEY", "or-key");
         let mut cfg = resolve_config(&base_cli(), std::env::temp_dir().as_path()).unwrap();
         cfg.model = "deepseek/deepseek-r1:free".to_string();
         cfg.base_url = DEFAULT_BASE_URL.to_string();
@@ -1950,17 +1895,12 @@ mod tests {
         // Filtering uses the FINAL base URL: once the primary routes
         // to OpenRouter, the Experiential entry is the foreign one.
         assert_eq!(cfg.fallback_models, ["qwen/qwen3-coder:free"]);
-        match old {
-            Some(v) => unsafe { std::env::set_var("OPENROUTER_API_KEY", v) },
-            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
-        }
     }
 
     #[test]
     fn route_to_catalog_entry_routes_cross_provider_pin() {
         let _env = env_lock();
-        let old = std::env::var("OPENROUTER_API_KEY").ok();
-        unsafe { std::env::set_var("OPENROUTER_API_KEY", "or-key") };
+        let _env_guard = EnvGuard::set("OPENROUTER_API_KEY", "or-key");
         let mut cfg = resolve_config(&base_cli(), std::env::temp_dir().as_path()).unwrap();
         cfg.model = DEFAULT_MODEL.to_string();
         cfg.base_url = DEFAULT_BASE_URL.to_string();
@@ -1970,10 +1910,6 @@ mod tests {
         assert_eq!(cfg.base_url, crate::models::OPENROUTER_BASE_URL);
         assert_eq!(cfg.api_key.as_deref(), Some("or-key"));
         assert_eq!(cfg.model, "qwen/qwen3-coder:free");
-        match old {
-            Some(v) => unsafe { std::env::set_var("OPENROUTER_API_KEY", v) },
-            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
-        }
     }
 
     #[test]
@@ -1983,43 +1919,21 @@ mod tests {
         // the OpenRouter key hint instead of silently sending the id to
         // DeepSeek's paid API.
         let _env = env_lock();
-        let old_ds = std::env::var("DEEPSEEK_API_KEY").ok();
-        let old_or = std::env::var("OPENROUTER_API_KEY").ok();
-        let old_m = std::env::var("ZEN_MODEL").ok();
-        let old_u = std::env::var("ZEN_BASE_URL").ok();
-        unsafe { std::env::set_var("DEEPSEEK_API_KEY", "test-key-ds") };
-        unsafe { std::env::remove_var("OPENROUTER_API_KEY") };
-        unsafe { std::env::remove_var("ZEN_MODEL") };
-        unsafe { std::env::remove_var("ZEN_BASE_URL") };
+        let _env_guard_set = EnvGuard::set("DEEPSEEK_API_KEY", "test-key-ds");
+        let _env_guards_removed =
+            EnvGuard::remove_many(&["OPENROUTER_API_KEY", "ZEN_MODEL", "ZEN_BASE_URL"]);
         let cli = Cli::parse_from(["zen", "--model", "deepseek/deepseek-r1:free"]);
         let mut cfg = resolve_config(&cli, std::env::temp_dir().as_path()).unwrap();
         assert_eq!(cfg.model, "deepseek/deepseek-r1:free");
         assert_eq!(cfg.base_url, DEFAULT_BASE_URL);
         let err = route_catalog_model(&mut cfg).unwrap_err();
         assert!(err.to_string().contains("OPENROUTER_API_KEY"), "{err}");
-        if let Some(o) = old_ds {
-            unsafe { std::env::set_var("DEEPSEEK_API_KEY", o) };
-        } else {
-            unsafe { std::env::remove_var("DEEPSEEK_API_KEY") };
-        }
-        if let Some(o) = old_or {
-            unsafe { std::env::set_var("OPENROUTER_API_KEY", o) };
-        } else {
-            unsafe { std::env::remove_var("OPENROUTER_API_KEY") };
-        }
-        if let Some(o) = old_m {
-            unsafe { std::env::set_var("ZEN_MODEL", o) };
-        }
-        if let Some(o) = old_u {
-            unsafe { std::env::set_var("ZEN_BASE_URL", o) };
-        }
     }
 
     #[test]
     fn route_to_catalog_entry_pin_wins_over_explicit_base_url() {
         let _env = env_lock();
-        let old = std::env::var("OPENROUTER_API_KEY").ok();
-        unsafe { std::env::set_var("OPENROUTER_API_KEY", "or-key") };
+        let _env_guard = EnvGuard::set("OPENROUTER_API_KEY", "or-key");
         let mut cfg = resolve_config(&base_cli(), std::env::temp_dir().as_path()).unwrap();
         cfg.model = DEFAULT_MODEL.to_string();
         cfg.base_url = "http://127.0.0.1:9".to_string();
@@ -2028,17 +1942,12 @@ mod tests {
         route_to_catalog_entry(&mut cfg, entry, &None).unwrap();
         assert_eq!(cfg.base_url, crate::models::OPENROUTER_BASE_URL);
         assert_eq!(cfg.api_key.as_deref(), Some("or-key"));
-        match old {
-            Some(v) => unsafe { std::env::set_var("OPENROUTER_API_KEY", v) },
-            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
-        }
     }
 
     #[test]
     fn route_to_catalog_entry_missing_key_errors_without_mutating() {
         let _env = env_lock();
-        let old = std::env::var("OPENROUTER_API_KEY").ok();
-        unsafe { std::env::remove_var("OPENROUTER_API_KEY") };
+        let _env_guard = EnvGuard::remove("OPENROUTER_API_KEY");
         let mut cfg = resolve_config(&base_cli(), std::env::temp_dir().as_path()).unwrap();
         cfg.model = DEFAULT_MODEL.to_string();
         cfg.base_url = DEFAULT_BASE_URL.to_string();
@@ -2048,10 +1957,6 @@ mod tests {
         let err = route_to_catalog_entry(&mut cfg, entry, &None).unwrap_err();
         assert!(err.to_string().contains("OPENROUTER_API_KEY"), "{err}");
         assert_eq!((cfg.model, cfg.base_url, cfg.api_key), before);
-        match old {
-            Some(v) => unsafe { std::env::set_var("OPENROUTER_API_KEY", v) },
-            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
-        }
     }
 
     #[test]
@@ -2068,16 +1973,19 @@ mod tests {
         assert_eq!(cfg.model, "deepseek-v4.1-flash");
     }
 
-    fn clear_ollama_env() {
-        for v in ["ZEN_MODEL", "ZEN_BASE_URL", "ZEN_PROVIDER", "OLLAMA_HOST"] {
-            unsafe { std::env::remove_var(v) };
-        }
+    /// Remove the ollama-related env vars, returning guards that
+    /// restore their previous values when dropped. Callers must bind
+    /// the return value for the whole test: dropping it early would
+    /// restore the vars while the test still assumes them unset.
+    #[must_use]
+    fn clear_ollama_env() -> Vec<EnvGuard> {
+        EnvGuard::remove_many(&["ZEN_MODEL", "ZEN_BASE_URL", "ZEN_PROVIDER", "OLLAMA_HOST"])
     }
 
     #[test]
     fn ollama_model_prefix_routes_to_local() {
         let _env = env_lock();
-        clear_ollama_env();
+        let _ollama_env = clear_ollama_env();
         let mut cli = base_cli();
         cli.model = Some("ollama/qwen3-coder:30b".into());
         let cfg = resolve_config(&cli, std::env::temp_dir().as_path()).unwrap();
@@ -2090,7 +1998,7 @@ mod tests {
     #[test]
     fn ollama_provider_flag_routes_without_prefix() {
         let _env = env_lock();
-        clear_ollama_env();
+        let _ollama_env = clear_ollama_env();
         let mut cli = base_cli();
         cli.provider = Some("ollama".into());
         cli.model = Some("llama3.1".into());
@@ -2103,7 +2011,7 @@ mod tests {
     #[test]
     fn model_auto_defaults_on_and_pin_turns_it_off() {
         let _env = env_lock();
-        clear_ollama_env();
+        let _ollama_env = clear_ollama_env();
         // No model chosen anywhere: auto is on by default.
         let cli = base_cli();
         let cfg = resolve_config(&cli, std::env::temp_dir().as_path()).unwrap();
@@ -2130,7 +2038,7 @@ mod tests {
     #[test]
     fn ollama_provider_env_routes() {
         let _env = env_lock();
-        clear_ollama_env();
+        let _ollama_env = clear_ollama_env();
         unsafe { std::env::set_var("ZEN_PROVIDER", "ollama") };
         let mut cli = base_cli();
         cli.model = Some("ollama/mistral:7b".into());
@@ -2143,7 +2051,7 @@ mod tests {
     #[test]
     fn ollama_host_env_overrides_default() {
         let _env = env_lock();
-        clear_ollama_env();
+        let _ollama_env = clear_ollama_env();
         unsafe { std::env::set_var("OLLAMA_HOST", "192.168.1.5:11434") };
         let mut cli = base_cli();
         cli.model = Some("ollama/qwen3-coder:30b".into());
@@ -2156,7 +2064,7 @@ mod tests {
     #[test]
     fn ollama_explicit_base_url_wins_over_default() {
         let _env = env_lock();
-        clear_ollama_env();
+        let _ollama_env = clear_ollama_env();
         let mut cli = base_cli();
         cli.model = Some("ollama/qwen3-coder:30b".into());
         cli.base_url = Some("http://gateway.internal:11434/v1".into());
@@ -2169,7 +2077,7 @@ mod tests {
     #[test]
     fn ollama_empty_model_name_rejected() {
         let _env = env_lock();
-        clear_ollama_env();
+        let _ollama_env = clear_ollama_env();
         let mut cli = base_cli();
         cli.model = Some("ollama/".into());
         let err = resolve_config(&cli, std::env::temp_dir().as_path()).unwrap_err();
@@ -2179,7 +2087,7 @@ mod tests {
     #[test]
     fn unknown_provider_rejected() {
         let _env = env_lock();
-        clear_ollama_env();
+        let _ollama_env = clear_ollama_env();
         let mut cli = base_cli();
         cli.provider = Some("wat".into());
         let err = resolve_config(&cli, std::env::temp_dir().as_path()).unwrap_err();
@@ -2192,7 +2100,7 @@ mod tests {
     #[test]
     fn non_ollama_model_untouched() {
         let _env = env_lock();
-        clear_ollama_env();
+        let _ollama_env = clear_ollama_env();
         let mut cli = base_cli();
         cli.model = Some("gpt-4o".into());
         let cfg = resolve_config(&cli, std::env::temp_dir().as_path()).unwrap();

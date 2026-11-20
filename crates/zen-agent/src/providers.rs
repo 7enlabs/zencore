@@ -607,19 +607,62 @@ mod tests {
         assert_eq!(s.api_key(None), None);
     }
 
+    /// RAII guard restoring one env var's previous value on drop
+    /// (panic-safe): the manual restore after `f()` in
+    /// `with_account_id_env` never ran when the closure panicked.
+    /// Same shape as the EnvGuard in zen-cli's settings module,
+    /// duplicated here because that guard is `pub(crate)` to zen-cli.
+    #[must_use = "a guard dropped immediately restores the var at once; bind it for the whole scope"]
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        /// Capture the current value of `key`, then set it to `value`.
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let old = std::env::var_os(key);
+            // SAFETY: callers hold the module lock while mutating env.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, old }
+        }
+
+        /// Capture the current value of `key`, then remove it.
+        fn remove(key: &'static str) -> Self {
+            let old = std::env::var_os(key);
+            // SAFETY: same as `set` above.
+            unsafe { std::env::remove_var(key) };
+            Self { key, old }
+        }
+
+        /// Set `key` to `value`, or remove it when `value` is `None`.
+        fn set_or_remove(key: &'static str, value: Option<&str>) -> Self {
+            match value {
+                Some(v) => Self::set(key, v),
+                None => Self::remove(key),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: same as `set` above.
+            unsafe {
+                match self.old.take() {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
     fn with_account_id_env(value: Option<&str>, f: impl FnOnce()) {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let saved = std::env::var("CLOUDFLARE_ACCOUNT_ID").ok();
-        match value {
-            Some(v) => unsafe { std::env::set_var("CLOUDFLARE_ACCOUNT_ID", v) },
-            None => unsafe { std::env::remove_var("CLOUDFLARE_ACCOUNT_ID") },
-        }
+        // The guard restores the previous value even if `f` panics;
+        // it drops before the lock guard (reverse declaration order).
+        let _env = EnvGuard::set_or_remove("CLOUDFLARE_ACCOUNT_ID", value);
         f();
-        match saved {
-            Some(v) => unsafe { std::env::set_var("CLOUDFLARE_ACCOUNT_ID", v) },
-            None => unsafe { std::env::remove_var("CLOUDFLARE_ACCOUNT_ID") },
-        }
     }
 
     #[test]

@@ -675,6 +675,9 @@ mod tests {
         // Hold the shared env lock: this test flips the same var the
         // budget tests read (core-perfect C1).
         let _env = crate::settings::env_lock();
+        // Guard first: the mid-test flips below must not leak the
+        // ambient value, even if an assert panics halfway.
+        let _env_guard = crate::settings::EnvGuard::remove("ZEN_MAX_BUDGET_USD");
         assert_eq!(resolve_budget_usd(Some(2.0)), Some(2.0));
 
         unsafe { std::env::set_var("ZEN_MAX_BUDGET_USD", "3.25") };
@@ -683,6 +686,5 @@ mod tests {
         assert_eq!(resolve_budget_usd(None), None);
         unsafe { std::env::set_var("ZEN_MAX_BUDGET_USD", "not-a-number") };
         assert_eq!(resolve_budget_usd(None), None);
-        unsafe { std::env::remove_var("ZEN_MAX_BUDGET_USD") };
     }
 }

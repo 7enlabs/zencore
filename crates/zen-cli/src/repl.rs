@@ -3434,8 +3434,7 @@ mod model_picker_tests {
     #[test]
     fn apply_picked_model_switches_model_and_turns_auto_off() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let old = std::env::var("OPENROUTER_API_KEY").ok();
-        unsafe { std::env::set_var("OPENROUTER_API_KEY", "test-openrouter-key") };
+        let _env_guard = EnvGuard::set("OPENROUTER_API_KEY", "test-openrouter-key");
         let backend = std::sync::Arc::new(RecordingBackend {
             models: std::sync::Mutex::new(vec![]),
         });
@@ -3488,10 +3487,6 @@ mod model_picker_tests {
         assert_eq!(cfg.model, "cohere/north-mini-code:free");
         assert!(!repl.auto_model, "pinning a model must turn auto off");
         std::fs::remove_dir_all(&dir).ok();
-        match old {
-            Some(v) => unsafe { std::env::set_var("OPENROUTER_API_KEY", v) },
-            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
-        }
     }
 
     #[test]
@@ -3645,7 +3640,7 @@ mod model_picker_tests {
     // local one used to serialize only this module, so a budget test
     // flipping ZEN_MAX_BUDGET_USD could still race config resolution
     // here (core-perfect C1).
-    use crate::settings::ENV_LOCK;
+    use crate::settings::{ENV_LOCK, EnvGuard};
 
     fn test_cfg() -> crate::settings::ResolvedConfig {
         use clap::Parser;
@@ -3655,14 +3650,8 @@ mod model_picker_tests {
         // config, and a later route (which resets the key to the home
         // key, None here) would look like a key change and rebuild the
         // client (core-perfect C1: box runs with ZEN_API_KEY set).
-        let old_model = std::env::var("ZEN_MODEL").ok();
-        let old_base = std::env::var("ZEN_BASE_URL").ok();
-        let old_key = std::env::var("ZEN_API_KEY").ok();
-        let old_openai_key = std::env::var("OPENAI_API_KEY").ok();
-        unsafe { std::env::remove_var("ZEN_MODEL") };
-        unsafe { std::env::remove_var("ZEN_BASE_URL") };
-        unsafe { std::env::remove_var("ZEN_API_KEY") };
-        unsafe { std::env::remove_var("OPENAI_API_KEY") };
+        let _env_guards =
+            EnvGuard::remove_many(&["ZEN_MODEL", "ZEN_BASE_URL", "ZEN_API_KEY", "OPENAI_API_KEY"]);
         let cli = crate::cli::Cli::parse_from(["zen"]);
         let dir = std::env::temp_dir().join(format!("zen_model400_cfg_{}", uuid::Uuid::new_v4()));
         let home = std::env::temp_dir().join(format!("zen_model400_home_{}", uuid::Uuid::new_v4()));
@@ -3671,22 +3660,6 @@ mod model_picker_tests {
         let cfg = crate::settings::resolve_config_with_home(&cli, &dir, Some(&home)).unwrap();
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&home).ok();
-        match old_model {
-            Some(v) => unsafe { std::env::set_var("ZEN_MODEL", v) },
-            None => unsafe { std::env::remove_var("ZEN_MODEL") },
-        }
-        match old_base {
-            Some(v) => unsafe { std::env::set_var("ZEN_BASE_URL", v) },
-            None => unsafe { std::env::remove_var("ZEN_BASE_URL") },
-        }
-        match old_key {
-            Some(v) => unsafe { std::env::set_var("ZEN_API_KEY", v) },
-            None => unsafe { std::env::remove_var("ZEN_API_KEY") },
-        }
-        match old_openai_key {
-            Some(v) => unsafe { std::env::set_var("OPENAI_API_KEY", v) },
-            None => unsafe { std::env::remove_var("OPENAI_API_KEY") },
-        }
         cfg
     }
 
@@ -3756,8 +3729,7 @@ mod model_picker_tests {
     #[test]
     fn switch_to_openrouter_model_changes_provider() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let old = std::env::var("OPENROUTER_API_KEY").ok();
-        unsafe { std::env::set_var("OPENROUTER_API_KEY", "test-openrouter-key") };
+        let _env_guard = EnvGuard::set("OPENROUTER_API_KEY", "test-openrouter-key");
         let backend = std::sync::Arc::new(RecordingBackend {
             models: std::sync::Mutex::new(vec![]),
         });
@@ -3780,18 +3752,12 @@ mod model_picker_tests {
         assert_eq!(cfg.api_key.as_deref(), Some("test-openrouter-key"));
         // Provider changed: the live backend must have been rebuilt.
         assert!(!std::sync::Arc::ptr_eq(&old_llm, &agent.llm));
-
-        match old {
-            Some(v) => unsafe { std::env::set_var("OPENROUTER_API_KEY", v) },
-            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
-        }
     }
 
     #[test]
     fn switch_rebuilds_backend_when_only_base_url_changes() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let old = std::env::var("OPENROUTER_API_KEY").ok();
-        unsafe { std::env::set_var("OPENROUTER_API_KEY", "shared-key") };
+        let _env_guard = EnvGuard::set("OPENROUTER_API_KEY", "shared-key");
         let backend = std::sync::Arc::new(RecordingBackend {
             models: std::sync::Mutex::new(vec![]),
         });
@@ -3816,11 +3782,6 @@ mod model_picker_tests {
         // The live backend was built for the old base URL, so it
         // must be rebuilt even though the key is identical.
         assert!(!std::sync::Arc::ptr_eq(&old_llm, &agent.llm));
-
-        match old {
-            Some(v) => unsafe { std::env::set_var("OPENROUTER_API_KEY", v) },
-            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
-        }
     }
 
     #[test]
@@ -3856,8 +3817,7 @@ mod model_picker_tests {
     #[test]
     fn switch_to_openrouter_model_without_key_is_refused() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let old = std::env::var("OPENROUTER_API_KEY").ok();
-        unsafe { std::env::remove_var("OPENROUTER_API_KEY") };
+        let _env_guard = EnvGuard::remove("OPENROUTER_API_KEY");
         let backend = std::sync::Arc::new(RecordingBackend {
             models: std::sync::Mutex::new(vec![]),
         });
@@ -3879,11 +3839,6 @@ mod model_picker_tests {
         assert_eq!(agent.config.model, "google/gemini-4-argon:free");
         assert_eq!(cfg.base_url, crate::settings::DEFAULT_BASE_URL);
         assert!(std::sync::Arc::ptr_eq(&old_llm, &agent.llm));
-
-        match old {
-            Some(v) => unsafe { std::env::set_var("OPENROUTER_API_KEY", v) },
-            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
-        }
     }
 
     #[tokio::test]
@@ -3895,8 +3850,7 @@ mod model_picker_tests {
         // the foreign id (HTTP 400, PR #71 class).
         use clap::Parser;
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let old = std::env::var("OPENROUTER_API_KEY").ok();
-        unsafe { std::env::remove_var("OPENROUTER_API_KEY") };
+        let _env_guard = EnvGuard::remove("OPENROUTER_API_KEY");
         let dir = std::env::temp_dir().join(format!("zen_slash_pin_{}", uuid::Uuid::new_v4()));
         let cmd_dir = dir.join(".zen").join("commands");
         std::fs::create_dir_all(&cmd_dir).unwrap();
@@ -3960,10 +3914,6 @@ mod model_picker_tests {
 
         // Re-acquire the lock for the env restore.
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        match old {
-            Some(v) => unsafe { std::env::set_var("OPENROUTER_API_KEY", v) },
-            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
-        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4003,8 +3953,7 @@ mod model_picker_tests {
         // F1: experiential -> openrouter -> experiential must restore
         // the startup key, not leak the OpenRouter key.
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let old = std::env::var("OPENROUTER_API_KEY").ok();
-        unsafe { std::env::set_var("OPENROUTER_API_KEY", "or-key") };
+        let _env_guard = EnvGuard::set("OPENROUTER_API_KEY", "or-key");
         let backend = std::sync::Arc::new(RecordingBackend {
             models: std::sync::Mutex::new(vec![]),
         });
@@ -4038,11 +3987,6 @@ mod model_picker_tests {
         assert_eq!(cfg.base_url, crate::settings::DEFAULT_BASE_URL);
         assert_eq!(agent.config.model, "deepseek-v4.1-flash");
         assert_eq!(cfg.model, "deepseek-v4.1-flash");
-
-        match old {
-            Some(v) => unsafe { std::env::set_var("OPENROUTER_API_KEY", v) },
-            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
-        }
     }
 
     #[test]
@@ -4114,10 +4058,7 @@ mod model_picker_tests {
         let home =
             std::env::temp_dir().join(format!("zen_model_persist_home_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&home).unwrap();
-        let old_model = std::env::var("ZEN_MODEL").ok();
-        let old_base = std::env::var("ZEN_BASE_URL").ok();
-        unsafe { std::env::remove_var("ZEN_MODEL") };
-        unsafe { std::env::remove_var("ZEN_BASE_URL") };
+        let _env_guards = EnvGuard::remove_many(&["ZEN_MODEL", "ZEN_BASE_URL"]);
         // Pin: the saved id is what the next run starts on.
         let path = save_model_choice(
             &dir,
@@ -4143,14 +4084,6 @@ mod model_picker_tests {
         assert!(cfg.model_auto);
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&home).ok();
-        match old_model {
-            Some(v) => unsafe { std::env::set_var("ZEN_MODEL", v) },
-            None => unsafe { std::env::remove_var("ZEN_MODEL") },
-        }
-        match old_base {
-            Some(v) => unsafe { std::env::set_var("ZEN_BASE_URL", v) },
-            None => unsafe { std::env::remove_var("ZEN_BASE_URL") },
-        }
     }
 
     #[test]
@@ -4161,12 +4094,8 @@ mod model_picker_tests {
         // provider. A restart must land on the same provider.
         use clap::Parser;
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let old_key = std::env::var("OPENROUTER_API_KEY").ok();
-        unsafe { std::env::set_var("OPENROUTER_API_KEY", "or-key") };
-        let old_model = std::env::var("ZEN_MODEL").ok();
-        let old_base = std::env::var("ZEN_BASE_URL").ok();
-        unsafe { std::env::remove_var("ZEN_MODEL") };
-        unsafe { std::env::remove_var("ZEN_BASE_URL") };
+        let _env_guard_set = EnvGuard::set("OPENROUTER_API_KEY", "or-key");
+        let _env_guards_removed = EnvGuard::remove_many(&["ZEN_MODEL", "ZEN_BASE_URL"]);
         let dir = std::env::temp_dir().join(format!("zen_model_baseurl_{}", uuid::Uuid::new_v4()));
         let home =
             std::env::temp_dir().join(format!("zen_model_baseurl_home_{}", uuid::Uuid::new_v4()));
@@ -4200,27 +4129,12 @@ mod model_picker_tests {
         assert_eq!(cfg3.base_url, "https://openrouter.ai/api/v1");
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&home).ok();
-        match old_key {
-            Some(v) => unsafe { std::env::set_var("OPENROUTER_API_KEY", v) },
-            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
-        }
-        match old_model {
-            Some(v) => unsafe { std::env::set_var("ZEN_MODEL", v) },
-            None => unsafe { std::env::remove_var("ZEN_MODEL") },
-        }
-        match old_base {
-            Some(v) => unsafe { std::env::set_var("ZEN_BASE_URL", v) },
-            None => unsafe { std::env::remove_var("ZEN_BASE_URL") },
-        }
     }
 
     #[test]
     fn env_shadow_note_names_the_shadowing_vars() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let old_model = std::env::var("ZEN_MODEL").ok();
-        let old_base = std::env::var("ZEN_BASE_URL").ok();
-        unsafe { std::env::remove_var("ZEN_MODEL") };
-        unsafe { std::env::remove_var("ZEN_BASE_URL") };
+        let _env_guards = EnvGuard::remove_many(&["ZEN_MODEL", "ZEN_BASE_URL"]);
         assert!(env_shadow_note().is_none());
         unsafe { std::env::set_var("ZEN_MODEL", "env-pinned") };
         let note = env_shadow_note().expect("ZEN_MODEL shadows the saved model");
@@ -4232,14 +4146,6 @@ mod model_picker_tests {
             note.contains("ZEN_MODEL") && note.contains("ZEN_BASE_URL"),
             "{note}"
         );
-        match old_model {
-            Some(v) => unsafe { std::env::set_var("ZEN_MODEL", v) },
-            None => unsafe { std::env::remove_var("ZEN_MODEL") },
-        }
-        match old_base {
-            Some(v) => unsafe { std::env::set_var("ZEN_BASE_URL", v) },
-            None => unsafe { std::env::remove_var("ZEN_BASE_URL") },
-        }
     }
 
     #[test]
@@ -4247,10 +4153,7 @@ mod model_picker_tests {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("zen_report_switch_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let old_model = std::env::var("ZEN_MODEL").ok();
-        let old_base = std::env::var("ZEN_BASE_URL").ok();
-        unsafe { std::env::remove_var("ZEN_MODEL") };
-        unsafe { std::env::remove_var("ZEN_BASE_URL") };
+        let _env_guards = EnvGuard::remove_many(&["ZEN_MODEL", "ZEN_BASE_URL"]);
         report_model_switch(
             &dir,
             false,
@@ -4266,14 +4169,6 @@ mod model_picker_tests {
             "saved model id missing"
         );
         std::fs::remove_dir_all(&dir).ok();
-        match old_model {
-            Some(v) => unsafe { std::env::set_var("ZEN_MODEL", v) },
-            None => unsafe { std::env::remove_var("ZEN_MODEL") },
-        }
-        match old_base {
-            Some(v) => unsafe { std::env::set_var("ZEN_BASE_URL", v) },
-            None => unsafe { std::env::remove_var("ZEN_BASE_URL") },
-        }
     }
 
     #[test]
@@ -4327,33 +4222,23 @@ mod model_picker_tests {
     #[test]
     fn route_moves_openrouter_model_to_its_provider() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let old = std::env::var("OPENROUTER_API_KEY").ok();
-        unsafe { std::env::set_var("OPENROUTER_API_KEY", "or-key") };
+        let _env_guard = EnvGuard::set("OPENROUTER_API_KEY", "or-key");
         let mut cfg = test_cfg();
         cfg.model = "qwen/qwen3-coder:free".to_string();
         let routed = crate::settings::route_catalog_model(&mut cfg).unwrap();
         assert!(routed);
         assert_eq!(cfg.base_url, "https://openrouter.ai/api/v1");
         assert_eq!(cfg.api_key.as_deref(), Some("or-key"));
-        match old {
-            Some(v) => unsafe { std::env::set_var("OPENROUTER_API_KEY", v) },
-            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
-        }
     }
 
     #[test]
     fn route_refuses_openrouter_model_without_key() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let old = std::env::var("OPENROUTER_API_KEY").ok();
-        unsafe { std::env::remove_var("OPENROUTER_API_KEY") };
+        let _env_guard = EnvGuard::remove("OPENROUTER_API_KEY");
         let mut cfg = test_cfg();
         cfg.model = "qwen/qwen3-coder:free".to_string();
         let err = crate::settings::route_catalog_model(&mut cfg).unwrap_err();
         assert!(err.to_string().contains("OPENROUTER_API_KEY"), "{err}");
-        match old {
-            Some(v) => unsafe { std::env::set_var("OPENROUTER_API_KEY", v) },
-            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
-        }
     }
 
     #[test]
@@ -4389,18 +4274,13 @@ mod model_picker_tests {
         assert!(routed);
         assert_eq!(cfg.model, "deepseek-v4.1-flash");
         // On the OpenRouter base, auto is that provider's default.
-        let old = std::env::var("OPENROUTER_API_KEY").ok();
-        unsafe { std::env::set_var("OPENROUTER_API_KEY", "or-key") };
+        let _env_guard = EnvGuard::set("OPENROUTER_API_KEY", "or-key");
         let mut cfg = test_cfg();
         cfg.model = "auto".to_string();
         cfg.base_url = crate::models::OPENROUTER_BASE_URL.to_string();
         let routed = crate::settings::route_catalog_model(&mut cfg).unwrap();
         assert!(routed);
         assert_eq!(cfg.model, "qwen/qwen3-coder:free");
-        match old {
-            Some(v) => unsafe { std::env::set_var("OPENROUTER_API_KEY", v) },
-            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
-        }
         // Casing must not change the meaning (PR #73 review
         // follow-up): `Auto` and `AUTO` resolve the same way.
         for spelling in ["Auto", "AUTO"] {
@@ -4590,7 +4470,7 @@ mod welcome_box_tests {
 #[cfg(test)]
 mod pr208_mutant_tests {
     use super::*;
-    use crate::settings::ENV_LOCK;
+    use crate::settings::{ENV_LOCK, EnvGuard};
     use clap::Parser;
 
     fn temp_dir(prefix: &str) -> std::path::PathBuf {
@@ -4604,36 +4484,14 @@ mod pr208_mutant_tests {
         // Caller holds ENV_LOCK; isolate from ambient model/base-url/key
         // env so the resolved config is the plain default one (same
         // contract as the test_cfg helper above).
-        let old_model = std::env::var("ZEN_MODEL").ok();
-        let old_base = std::env::var("ZEN_BASE_URL").ok();
-        let old_key = std::env::var("ZEN_API_KEY").ok();
-        let old_openai_key = std::env::var("OPENAI_API_KEY").ok();
-        unsafe { std::env::remove_var("ZEN_MODEL") };
-        unsafe { std::env::remove_var("ZEN_BASE_URL") };
-        unsafe { std::env::remove_var("ZEN_API_KEY") };
-        unsafe { std::env::remove_var("OPENAI_API_KEY") };
+        let _env_guards =
+            EnvGuard::remove_many(&["ZEN_MODEL", "ZEN_BASE_URL", "ZEN_API_KEY", "OPENAI_API_KEY"]);
         let cli = crate::cli::Cli::parse_from(["zen"]);
         let dir = temp_dir("zen_pr208_cfg");
         let home = temp_dir("zen_pr208_home");
         let cfg = crate::settings::resolve_config_with_home(&cli, &dir, Some(&home)).unwrap();
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&home).ok();
-        match old_model {
-            Some(v) => unsafe { std::env::set_var("ZEN_MODEL", v) },
-            None => unsafe { std::env::remove_var("ZEN_MODEL") },
-        }
-        match old_base {
-            Some(v) => unsafe { std::env::set_var("ZEN_BASE_URL", v) },
-            None => unsafe { std::env::remove_var("ZEN_BASE_URL") },
-        }
-        match old_key {
-            Some(v) => unsafe { std::env::set_var("ZEN_API_KEY", v) },
-            None => unsafe { std::env::remove_var("ZEN_API_KEY") },
-        }
-        match old_openai_key {
-            Some(v) => unsafe { std::env::set_var("OPENAI_API_KEY", v) },
-            None => unsafe { std::env::remove_var("OPENAI_API_KEY") },
-        }
         cfg
     }
 
