@@ -1218,11 +1218,8 @@ pub(crate) async fn run_agent_with_result(args: AgentRunArgs<'_>) -> Result<(i32
     // prompt run_plan_flow builds from this result); the transcript
     // keeps the raw model text.
     let mut result = result;
-    if agent.config.permission_mode == PermissionMode::Plan
-        && zen_agent::plan::looks_like_plan_exit(&result.result)
-    {
-        result.result = crate::planmode::strip_plan_exit_markers(&result.result);
-    }
+    result.result =
+        crate::planmode::deliver_plan_text(agent.config.permission_mode, &result.result);
 
     print_result(&result, &cli.effective_output_format(), &buf, false);
 
