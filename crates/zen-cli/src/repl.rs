@@ -4601,6 +4601,9 @@ mod pr208_mutant_tests {
 
     fn test_cfg() -> crate::settings::ResolvedConfig {
         use clap::Parser;
+        // Caller holds ENV_LOCK; isolate from ambient model/base-url/key
+        // env so the resolved config is the plain default one (same
+        // contract as the test_cfg helper above).
         let old_model = std::env::var("ZEN_MODEL").ok();
         let old_base = std::env::var("ZEN_BASE_URL").ok();
         let old_key = std::env::var("ZEN_API_KEY").ok();
