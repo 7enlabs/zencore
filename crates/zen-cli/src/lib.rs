@@ -1309,7 +1309,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // test holds the shared env lock across the await so the key vars cannot change under run_with_home (C1)
+    #[allow(clippy::await_holding_lock)] // floor-guard: test holds the shared env lock across the await so the key vars cannot change under run_with_home (C1)
     async fn run_with_home_init_or_maintenance_require_print() {
         // Pins the `(cli.init || cli.maintenance) && !cli.print` guard
         // in run_with_home, one row per side of each operator:
