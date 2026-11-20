@@ -78,9 +78,18 @@ Checked against `main` at 647fcc0.
 3. Binary release v0.1.0 exists (published 2026-11-10) and the Windows installer verifies
    the downloaded binary by SHA-256 (the default hash is pinned in `install.ps1`). There is
    still no SHA256SUMS file per artifact and no code signature to verify.
-4. No OS-level sandbox for the Bash tool. Verified: `crates/zen-tools` and `crates/zen-agent` contain no
-   bubblewrap, bwrap, unshare, namespace, seatbelt, pledge, landlock or seccomp. Bash runs with the user's
-   privileges, gated only by the permission layer. Known limit; follow-up is a separate work item, owner to be named by Leader.
+4. OS-level sandbox for the Bash tool and background jobs (Phase 2 #12). Bash and background jobs spawn through one
+   enforcement point (`crates/zen-tools/src/sandbox.rs`): on Linux the child is restricted by Landlock (default mode
+   `workspace-write`: writes only in the working directory, additional directories, the scratch directory and /tmp;
+   reads in system directories plus the user's git config files and the Rust toolchain paths) and a seccomp denylist
+   (20 syscalls on x86_64 denied with EPERM, namespace creation blocked). The real Landlock ABI is logged once per
+   process. `bypassPermissions` does not skip the sandbox. On a kernel without Landlock the command is refused, not
+   run unsandboxed. On macOS and Windows there is no OS-level enforcement: the CLI prints a warning and runs without
+   a sandbox. Known limits, stated here by design (Zen decisions, Phase 2 #12): (a) hooks run WITHOUT a sandbox in
+   this round; (b) the in-process file tools (Read/Write/Edit) run inside the agent process and are outside the
+   child-process sandbox, so the permission layer (#8) stays the main control for them; (c) `clone3` namespace
+   creation cannot be filtered by seccomp (its flags live in a struct the filter cannot inspect), so only plain
+   `clone`/`unshare` with namespace bits set are blocked.
 5. Session files and exports on disk (verified against `main` 647fcc0):
    - Session files are written with `OpenOptions` and no `set_permissions` (`crates/zen-cli/src/session.rs:227`,
      `:362`), so mode follows umask, typically 0644, not 0600.

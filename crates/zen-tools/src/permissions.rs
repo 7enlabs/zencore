@@ -1030,6 +1030,7 @@ mod permission_tests {
             deny: deny.iter().map(|s| s.to_string()).collect(),
             default_mode: None,
             additional_directories: vec![],
+            sandbox_mode: None,
         };
         RulePermissions::new(mode, &settings, vec![], vec![], local)
     }

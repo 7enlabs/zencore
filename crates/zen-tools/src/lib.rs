@@ -5,6 +5,7 @@ pub mod edit_match;
 pub mod gitignore;
 pub mod jobs;
 pub mod permissions;
+pub mod sandbox;
 pub mod syntax_guard;
 pub mod tool_docs;
 

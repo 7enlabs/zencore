@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record past releases, issue numbers, or file names.
 
 ### Added
+- OS-level sandbox for the Bash tool and background jobs (Phase 2 #12): on Linux, Landlock (default mode
+  `workspace-write`) plus a seccomp denylist, configured with `--sandbox off|workspace-write|read-only` or
+  `permissions.sandboxMode`; `bypassPermissions` does not skip the sandbox. On macOS/Windows the CLI warns and
+  runs without enforcement. Hooks run without a sandbox in this round, and the in-process file tools stay
+  outside the child-process sandbox (see `SECURITY_MODEL.md`).
 - `delegate` tool: multi-seat coordination in one session (single / parallel /
   chain modes, handoff envelope JSON with 50 KB cap and parent-computed
   sha256, per-subagent timeout, max 4 concurrent, nesting max 2 levels),

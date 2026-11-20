@@ -16,3 +16,11 @@ dirs.workspace = true
 globset.workspace = true
 walkdir.workspace = true
 reqwest.workspace = true
+
+# Phase 2 #12: Linux-only sandbox enforcement (Landlock + seccomp).
+# Both crates are Linux-only, so they live behind a target gate and the
+# sandbox module compiles a warn-and-run stub on other platforms.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+seccompiler = "0.5"
+libc.workspace = true

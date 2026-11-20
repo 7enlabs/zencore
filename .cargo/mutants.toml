@@ -158,4 +158,64 @@ exclude_re = [
   # stops being equivalent: remove this exclusion and kill it with
   # a test.
   "acp\\.rs:1288:9: replace <impl zen_core::Tool for ClientBashTool>::is_read_only -> bool with false",
+  # Phase 2 #12, sandbox.rs detect_landlock_abi (line 307, col 16):
+  # replace < with == and replace < with <= in
+  # `if ret < 0 { 0 } else { ret as i32 }`.
+  # EQUIVALENT (waived by ZC Leader, Telegram tin 18631, 2026-11-20;
+  # verified by independent code review of the #12 bundle): the
+  # `<=` mutant is exactly equivalent: ret == 0 gives 0 under both
+  # branches, and ret < 0 and ret > 0 agree as well. The `==`
+  # mutant differs only when the raw syscall returns a negative
+  # value (original 0, mutant the negative value itself), and the
+  # only production caller (apply_to_command, sandbox.rs:480)
+  # refuses whenever abi <= 0, so both values take the identical
+  # error path and no observable behaviour changes. The test
+  # detect_landlock_abi_matches_raw_syscall would distinguish the
+  # `==` mutant only on a kernel without Landlock; CI runs on
+  # Landlock kernels, so no test in the suite can kill it.
+  # EXPIRY: if detect_landlock_abi is rewritten, or apply_to_command
+  # stops refusing on abi <= 0, these mutants stop being equivalent:
+  # remove these exclusions and kill them with tests.
+  "sandbox\\.rs:307:16: replace < with == in imp::detect_landlock_abi",
+  "sandbox\\.rs:307:16: replace < with <= in imp::detect_landlock_abi",
+  # Phase 2 #12, sandbox.rs build_landlock_ruleset (line 429, col 51):
+  # replace | with ^ in
+  # `AccessFs::from_read(abi) | AccessFs::from_write(abi)`.
+  # EQUIVALENT (waived by ZC Leader, Telegram tin 18631, 2026-11-20;
+  # verified by independent code review of the #12 bundle): the
+  # landlock crate documents from_read and from_write as exclusive,
+  # and the test read_and_write_access_sets_are_disjoint pins that
+  # the two sets share no bit for every ABI 0-9, so `|` and `^`
+  # coincide on them and no test can kill this mutant.
+  # EXPIRY: if from_read and from_write ever share a bit, or the
+  # ruleset stops combining the two sets, this mutant stops being
+  # equivalent: remove this exclusion and kill it with a test where
+  # the two sets overlap.
+  "sandbox\\.rs:429:51: replace \\| with \\^ in imp::build_landlock_ruleset",
+  # Phase 2 #12, sandbox.rs build_landlock_ruleset (line 468, col 49):
+  # replace | with ^ in
+  # `AccessFs::ReadFile | AccessFs::WriteFile`.
+  # EQUIVALENT (waived by ZC Leader, Telegram tin 18631, 2026-11-20;
+  # verified by independent code review of the #12 bundle):
+  # ReadFile and WriteFile are distinct single bits, pinned by the
+  # test device_access_flags_share_no_bits, so `|` and `^` coincide
+  # on them and no test can kill this mutant.
+  # EXPIRY: if ReadFile and WriteFile ever share a bit, this mutant
+  # stops being equivalent: remove this exclusion and kill it with
+  # a test.
+  "sandbox\\.rs:468:49: replace \\| with \\^ in imp::build_landlock_ruleset",
+  # Phase 2 #12, sandbox.rs apply_to_command, non-Linux stub
+  # (line 545, col 9): replace the body with Ok(Default::default()).
+  # EQUIVALENT (waived by ZC Leader, Telegram tin 18631, 2026-11-20;
+  # verified by independent code review of the #12 bundle): the
+  # whole imp module is #[cfg(not(target_os = "linux"))], so on
+  # Linux this code is never compiled and the mutant cannot change
+  # anything the Linux build observes; on the platforms where the
+  # module is live, SandboxOutcome has no Default impl, so the
+  # replacement expression cannot compile there either. No test on
+  # any platform can kill this mutant.
+  # EXPIRY: if the stub is compiled on Linux, or SandboxOutcome
+  # gains a Default impl, this mutant stops being equivalent:
+  # remove this exclusion and kill it with a test.
+  "sandbox\\.rs:545:9: replace imp::apply_to_command -> Result<SandboxOutcome, String> with Ok\\(Default::default\\(\\)\\)",
 ]
