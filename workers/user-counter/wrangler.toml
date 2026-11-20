@@ -9,6 +9,6 @@ routes = [{ pattern = "count.runzen.dev", custom_domain = true }]
 
 [[d1_databases]]
 binding = "DB"
-database_name = "zencode-user-counter"
-# Fill in at deploy time: wrangler d1 create zencode-user-counter
+database_name = "zen-user-counter"
+# Fill in at deploy time: wrangler d1 create zen-user-counter
 database_id = "08e16417-cf96-41d8-926f-b577d9bbf67d"

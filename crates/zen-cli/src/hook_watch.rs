@@ -1,7 +1,7 @@
 //! Polling watchers that drive the `ConfigChange` and `FileChanged`
 //! hook events in the REPL.
 //!
-//! ZenCode has no filesystem-watcher dependency, so the REPL polls file
+//! Zen has no filesystem-watcher dependency, so the REPL polls file
 //! mtimes once per prompt iteration. A change is reported once and the
 //! snapshot refreshes, so a hook that rewrites the file it watches does
 //! not loop forever (the same guard the reference documents for

@@ -284,7 +284,7 @@ All 33 events (the full set from the reference agent's hooks reference):
 | `TaskCreated` / `TaskCompleted` | a TodoWrite creates / completes a task | - |
 | `Stop` | the agent finished a turn | - |
 | `StopFailure` | a model call failed (rate limit, auth, server error, …) | error type |
-| `TeammateIdle` | (no trigger: ZenCode has no agent-team concept) | - |
+| `TeammateIdle` | (no trigger: Zen has no agent-team concept) | - |
 | `InstructionsLoaded` | a memory file (ZEN.md / AGENTS.md / rules) loads at session start | load reason (`"session_start"`) |
 | `ConfigChange` | a settings / hooks / skills file changed on disk (REPL polling) | change source (`"user_settings"`, `"project_settings"`, `"local_settings"`, `"skills"`) |
 | `CwdChanged` | the working directory changed during a turn | - |
@@ -293,17 +293,17 @@ All 33 events (the full set from the reference agent's hooks reference):
 | `WorktreeCreate` / `WorktreeRemove` | `/worktree` create / remove (REPL) | - |
 | `PreCompact` / `PostCompact` | before / after compaction | `"manual"` / `"auto"` |
 | `PreModelSwitch` / `PostModelSwitch` | before / after a model switch (REPL); Post also fires for automatic changes | model id |
-| `Elicitation` / `ElicitationResult` | (no trigger: ZenCode has no MCP elicitation) | - |
+| `Elicitation` / `ElicitationResult` | (no trigger: Zen has no MCP elicitation) | - |
 | `SessionEnd` | session ends | reason (`"clear"` / `"resume"` / `"logout"` / `"prompt_input_exit"` / `"other"`) |
 
 Notes and deviations from the reference:
 
 - `TeammateIdle`, `Elicitation`, `ElicitationResult` are defined and
-  runnable through the generic runner, but nothing in ZenCode triggers
+  runnable through the generic runner, but nothing in Zen triggers
   them yet.
 - `PermissionDenied` fires on every recorded denial; the reference
   restricts it to auto-mode classifier denials.
-- `ConfigChange` fires for audit/logging only: ZenCode loads settings
+- `ConfigChange` fires for audit/logging only: Zen loads settings
   once at startup and never hot-reloads, so a block is a no-op.
 - `FileChanged` is driven by mtime polling in the REPL loop (not during
   turns, not in `-p` mode). `*` as a matcher segment means "match all,
@@ -536,7 +536,7 @@ tighten, never loosen.
 | `MessageDisplay` | an assistant message is about to be shown | `turn_id`, `index`, `final`, `delta` |
 | `SubagentStart` / `SubagentStop` | a sub-agent starts / stops; matcher target is the agent type | agent fields |
 | `TaskCreated` / `TaskCompleted` | a TodoWrite creates / completes a task; exit 2 vetoes the whole TodoWrite | `task_id`, `task_subject`, `task_description` |
-| `TeammateIdle` | no trigger yet (ZenCode has no agent-team concept) | - |
+| `TeammateIdle` | no trigger yet (Zen has no agent-team concept) | - |
 | `InstructionsLoaded` | a memory file loads at session start; matcher target is the load reason | `file_path`, `memory_type`, `load_reason` |
 | `ConfigChange` | a settings / hooks / skills file changed on disk (REPL polling); matcher target is the change source | `source`, `file_path` |
 | `CwdChanged` | the working directory changed during a turn | `old_cwd`, `new_cwd` |
@@ -544,7 +544,7 @@ tighten, never loosen.
 | `FileChanged` | a watched file changed (REPL polling); matcher target is the filename | `file_path`, `event` (`change` \| `add` \| `unlink`) |
 | `WorktreeCreate` / `WorktreeRemove` | `/worktree` create / remove (REPL) | `worktree_path` (create), `worktree_path` (remove) |
 | `PreModelSwitch` / `PostModelSwitch` | before / after a model switch (REPL); Post also fires for automatic changes | `from_model`, `to_model`, `requested_model`, `source`, `context_tokens` |
-| `Elicitation` / `ElicitationResult` | no trigger yet (ZenCode has no MCP elicitation) | - |
+| `Elicitation` / `ElicitationResult` | no trigger yet (Zen has no MCP elicitation) | - |
 | `PermissionRequest` / `PermissionDenied` | a permission prompt is about to be decided / was denied | `tool_name`, `tool_input`, `tool_use_id` (+ `reason` for `PermissionDenied`) |
 | `Notification` | the CLI wants the user's attention | `message` |
 
