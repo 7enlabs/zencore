@@ -760,6 +760,41 @@ pub(crate) async fn run_agent_with_result(args: AgentRunArgs<'_>) -> Result<(i32
         return Ok((1, result));
     }
 
+    // --json-schema (issue #252): load the schema before any model call,
+    // so a bad path or invalid schema fails fast (exit 4, VALIDATION)
+    // instead of spending a full model call first. Only in JSON output
+    // mode: in other modes the flag is ignored with a warning, as before.
+    let schema: Option<serde_json::Value> = match &cli.json_schema {
+        Some(path) if cli.effective_output_format() == OutputFormat::Json => {
+            match crate::output::load_json_schema(path) {
+                Ok(schema) => Some(schema),
+                Err(msg) => {
+                    let text = format!("--json-schema {}: {}", path.display(), msg);
+                    let mut result = local_result(
+                        session_id,
+                        &cfg.model,
+                        Default::default(),
+                        text.clone(),
+                        true,
+                        0,
+                    );
+                    result.schema_error = Some(msg.clone());
+                    let buf = Buffered::new();
+                    print_result(&result, &cli.effective_output_format(), &buf, false);
+                    if !cli.quiet {
+                        print!("{}", buf.text());
+                    }
+                    // Stdout (the machine-readable result) goes first,
+                    // then the human-facing line on stderr, naming the
+                    // flag and the path (issue #252).
+                    eprintln!("JSON schema validation failed: {}", text);
+                    return Ok((crate::exit_code::VALIDATION, result));
+                }
+            }
+        }
+        _ => None,
+    };
+
     let (prompt, slash_cmd) = match &builtin {
         Some((name, args)) if name == "review" => (commands::review_prompt(args), None),
         Some((name, _)) if name == "init" => {
@@ -1126,6 +1161,7 @@ pub(crate) async fn run_agent_with_result(args: AgentRunArgs<'_>) -> Result<(i32
                     usage: agent.usage.clone(),
                     model: cfg.model.clone(),
                     permission_denials: vec![],
+                    schema_error: None,
                 };
                 // Both SIGINT and SIGTERM emit the closing `result` event
                 // before exiting (issue #168): the bridge reads the last
@@ -1220,6 +1256,25 @@ pub(crate) async fn run_agent_with_result(args: AgentRunArgs<'_>) -> Result<(i32
     let mut result = result;
     result.result =
         crate::planmode::deliver_plan_text(agent.config.permission_mode, &result.result);
+    // --json-schema (issue #252): validate BEFORE printing, and fold the
+    // outcome into the result record, so the stdout JSON agrees with the
+    // exit code instead of reporting is_error:false on a rejected run.
+    // `schema` is Some exactly when the flag is set and the output
+    // format is JSON (the early load above enforces that); otherwise the
+    // flag is ignored with a warning, as before. The validation runs on
+    // the delivered text, after the plan-mode strip above.
+    let mut schema_failed = false;
+    if let Some(schema) = &schema {
+        if let Err(msg) = crate::output::validate_json_schema_value(&result.result, schema) {
+            eprintln!("JSON schema validation failed: {}", msg);
+            result.is_error = true;
+            result.subtype = "schema_validation_failed".into();
+            result.schema_error = Some(msg);
+            schema_failed = true;
+        }
+    } else if cli.json_schema.is_some() {
+        eprintln!("warning: --json-schema requires --output-format json");
+    }
 
     print_result(&result, &cli.effective_output_format(), &buf, false);
 
@@ -1234,13 +1289,8 @@ pub(crate) async fn run_agent_with_result(args: AgentRunArgs<'_>) -> Result<(i32
         println!();
     }
 
-    if let Some(schema_path) = &cli.json_schema {
-        if cli.effective_output_format() != OutputFormat::Json {
-            eprintln!("warning: --json-schema requires --output-format json");
-        } else if let Err(msg) = crate::output::validate_json_schema(&result.result, schema_path) {
-            eprintln!("JSON schema validation failed: {}", msg);
-            return Ok((2, result));
-        }
+    if schema_failed {
+        return Ok((2, result));
     }
 
     // The agent reports provider failures as a result event, not as
@@ -1377,6 +1427,7 @@ fn local_result(
         usage,
         model: model.into(),
         permission_denials: vec![],
+        schema_error: None,
     }
 }
 
@@ -1667,6 +1718,7 @@ pub fn denied_result(session_id: &str, model: &str, denials: Vec<PermissionDenia
         usage: Default::default(),
         model: model.into(),
         permission_denials: denials,
+        schema_error: None,
     }
 }
 
@@ -1999,6 +2051,7 @@ mod verify_tests {
             usage: Default::default(),
             model: "m".into(),
             permission_denials: vec![],
+            schema_error: None,
         };
         let r = verify_failed_result(&base, &fail(3), "make check", 2, "s1");
         assert!(r.is_error);

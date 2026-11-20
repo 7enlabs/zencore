@@ -483,6 +483,7 @@ impl Agent {
             usage: self.usage.clone(),
             model: self.config.model.clone(),
             permission_denials: self.denials.clone(),
+            schema_error: None,
         }
     }
 
