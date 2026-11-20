@@ -401,6 +401,50 @@ impl PermissionMode {
     }
 }
 
+/// OS-level sandbox mode for child processes spawned by the Bash tool and
+/// background jobs (Phase 2 #12). This is a second layer, orthogonal to the
+/// permission layer: permissions decide whether a tool runs at all, the
+/// sandbox decides what the child process may do at the kernel level.
+/// Enforcement exists only on Linux (Landlock + seccomp); other platforms
+/// warn and run without a sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxMode {
+    Off,
+    WorkspaceWrite,
+    ReadOnly,
+}
+
+impl SandboxMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::WorkspaceWrite => "workspace-write",
+            Self::ReadOnly => "read-only",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "off" => Self::Off,
+            "workspace-write" | "workspace_write" => Self::WorkspaceWrite,
+            "read-only" | "read_only" => Self::ReadOnly,
+            _ => return None,
+        })
+    }
+
+    /// Platform default (Zen decision 1, Phase 2 #12): Linux defaults to
+    /// `workspace-write` when Landlock is available; every other platform
+    /// defaults to `off` because there is no enforcement there.
+    pub fn default_for_platform() -> Self {
+        if cfg!(target_os = "linux") {
+            Self::WorkspaceWrite
+        } else {
+            Self::Off
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
     Text,
@@ -433,6 +477,12 @@ pub struct ToolContext {
     pub cwd: Arc<Mutex<PathBuf>>,
 
     pub extra_dirs: Vec<PathBuf>,
+
+    /// OS-level sandbox mode applied to child processes spawned by the
+    /// Bash tool and background jobs (Phase 2 #12). Defaults to `Off` for
+    /// contexts built directly; the real agent path sets the resolved mode
+    /// from CLI flag / settings / platform default.
+    pub sandbox_mode: SandboxMode,
 
     pub env: HashMap<String, String>,
 
@@ -573,6 +623,7 @@ impl ToolContext {
         Self {
             cwd: Arc::new(Mutex::new(cwd)),
             extra_dirs: vec![],
+            sandbox_mode: SandboxMode::Off,
             env: HashMap::new(),
             api_key_env: None,
             allow_private_network: false,
@@ -1150,6 +1201,10 @@ pub struct PermissionSettings {
     pub default_mode: Option<String>,
     #[serde(default)]
     pub additional_directories: Vec<String>,
+    /// Sandbox mode for child processes, JSON key `sandboxMode`
+    /// (Phase 2 #12). `None` means "use the platform default".
+    #[serde(default)]
+    pub sandbox_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1413,6 +1468,34 @@ pub fn resolve_shell(preferred: &str) -> ShellSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sandbox_mode_as_str_and_parse_roundtrip() {
+        // Kills the as_str mutants ("" / "xyzzy") and the parse
+        // mutants (whole-body -> None, and each deleted match arm).
+        assert_eq!(SandboxMode::Off.as_str(), "off");
+        assert_eq!(SandboxMode::WorkspaceWrite.as_str(), "workspace-write");
+        assert_eq!(SandboxMode::ReadOnly.as_str(), "read-only");
+        assert_eq!(SandboxMode::parse("off"), Some(SandboxMode::Off));
+        assert_eq!(
+            SandboxMode::parse("workspace-write"),
+            Some(SandboxMode::WorkspaceWrite)
+        );
+        assert_eq!(
+            SandboxMode::parse("workspace_write"),
+            Some(SandboxMode::WorkspaceWrite)
+        );
+        assert_eq!(SandboxMode::parse("read-only"), Some(SandboxMode::ReadOnly));
+        assert_eq!(SandboxMode::parse("read_only"), Some(SandboxMode::ReadOnly));
+        assert_eq!(SandboxMode::parse("bogus"), None);
+        for mode in [
+            SandboxMode::Off,
+            SandboxMode::WorkspaceWrite,
+            SandboxMode::ReadOnly,
+        ] {
+            assert_eq!(SandboxMode::parse(mode.as_str()), Some(mode));
+        }
+    }
+
     #[test]
     fn hook_events_all_33_roundtrip() {
         let all = HookEvent::all();

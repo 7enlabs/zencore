@@ -32,6 +32,7 @@ zen [OPTIONS] [PROMPT]
 | `--base-url <url>` / env `ZEN_BASE_URL` | OpenAI-compatible endpoint. |
 | env `ZEN_API_KEY` (or `OPENAI_API_KEY`) | Bearer token; optional (some gateways inject auth). Never logged. |
 | `--permission-mode default\|acceptEdits\|plan\|bypassPermissions\|dontAsk` (kebab-case `accept-edits`, `bypass-permissions`, `dont-ask` also accepted; `auto`/`manual` rejected) | See §5. |
+| `--sandbox off\|workspace-write\|read-only` (kebab-case also accepted; `workspace_write` and `read_only` also accepted; default `workspace-write` on Linux, `off` elsewhere) | OS-level sandbox for Bash and background jobs (Landlock + seccomp on Linux; warning and no enforcement on macOS/Windows). Config key `permissions.sandboxMode`. `bypassPermissions` does not skip the sandbox. |
 | `--allowedTools <rules...>` / `--disallowedTools <rules...>` | Comma/space separated permission rules. |
 | `--tools <list>` | Restrict built-in tool set (`""` = none, `default` = all, `Read,Bash` = only those, `-Bash,-Write` / `+Name` = default set minus/plus; plain names and +/- deltas cannot be mixed). |
 | `--system-prompt <text>` / `--append-system-prompt <text>` | Replace / append to the built-in system prompt. |

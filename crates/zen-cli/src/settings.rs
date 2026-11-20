@@ -1,6 +1,6 @@
-use crate::cli::{Cli, PermissionMode, invalid_permission_mode_error};
+use crate::cli::{Cli, PermissionMode, invalid_permission_mode_error, invalid_sandbox_mode_error};
 use anyhow::Result;
-use zen_core::{PermissionSettings, Settings};
+use zen_core::{PermissionSettings, SandboxMode, Settings};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.experientiallabs.ai/api/v1";
 pub const DEFAULT_MODEL: &str = "deepseek-v4.1-flash";
@@ -144,6 +144,8 @@ pub struct ResolvedConfig {
     pub fallback_models: Vec<String>,
     pub permissions: PermissionSettings,
     pub permission_mode: PermissionMode,
+    /// Resolved OS-level sandbox mode for child processes (Phase 2 #12).
+    pub sandbox_mode: SandboxMode,
     pub hooks: serde_json::Value,
     pub env: std::collections::HashMap<String, String>,
     pub auto_compact: Option<serde_json::Value>,
@@ -355,6 +357,9 @@ pub fn merge_settings(base: &Settings, over: &Settings) -> Settings {
     dedup_append(&mut out.permissions.deny, &over.permissions.deny);
     if over.permissions.default_mode.is_some() {
         out.permissions.default_mode = over.permissions.default_mode.clone();
+    }
+    if over.permissions.sandbox_mode.is_some() {
+        out.permissions.sandbox_mode = over.permissions.sandbox_mode.clone();
     }
     dedup_append(
         &mut out.permissions.additional_directories,
@@ -644,6 +649,27 @@ fn resolve_permission_mode(
     Ok(PermissionMode::Default)
 }
 
+/// Resolve the sandbox mode for child processes (Phase 2 #12), mirroring
+/// `resolve_permission_mode`: the `--sandbox` flag wins, then
+/// `permissions.sandboxMode` from settings, then the platform default
+/// (Linux `workspace-write`, anything else `off`). A bad settings value
+/// fails loudly instead of silently falling back, so typos surface.
+fn resolve_sandbox_mode(cli: &Cli, sandbox_mode: Option<&str>) -> Result<SandboxMode> {
+    if let Some(m) = &cli.sandbox {
+        return Ok(*m);
+    }
+    if let Some(m) = sandbox_mode {
+        let Some(parsed) = SandboxMode::parse(m) else {
+            anyhow::bail!(invalid_sandbox_mode_error(
+                m,
+                "settings (permissions.sandboxMode)"
+            ));
+        };
+        return Ok(parsed);
+    }
+    Ok(SandboxMode::default_for_platform())
+}
+
 fn sources_filter(raw: &Option<String>) -> Option<Vec<String>> {
     raw.as_ref().map(|s| {
         s.split(',')
@@ -880,6 +906,8 @@ pub fn resolve_config_with_home(
         loaded.bypass_forbidden,
     )?;
 
+    let sandbox_mode = resolve_sandbox_mode(cli, merged.permissions.sandbox_mode.as_deref())?;
+
     let max_turns = cli
         .max_turns
         .or(merged.max_turns)
@@ -917,8 +945,10 @@ pub fn resolve_config_with_home(
             deny: cli_deny,
             default_mode: Some(permission_mode.as_str().to_string()),
             additional_directories: merged.permissions.additional_directories.clone(),
+            sandbox_mode: Some(sandbox_mode.as_str().to_string()),
         },
         permission_mode,
+        sandbox_mode,
 
         hooks: if merged.extra.get("disableAllHooks") == Some(&serde_json::Value::Bool(true)) {
             serde_json::json!({})
@@ -1014,6 +1044,30 @@ mod tests {
         let _env_guard = EnvGuard::set("ZEN_MODEL", "env-model");
         let cfg = resolve_config(&cli, std::env::temp_dir().as_path()).unwrap();
         assert_eq!(cfg.model, "cli-model");
+    }
+
+    #[test]
+    fn merge_settings_applies_override_model_and_sandbox_mode() {
+        // Kills the mutant that replaces merge_settings with
+        // Default::default(): a non-default override must survive.
+        let base = Settings::default();
+        let over = Settings {
+            model: Some("override-model".to_string()),
+            permissions: PermissionSettings {
+                sandbox_mode: Some("read-only".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let merged = merge_settings(&base, &over);
+        assert_eq!(merged.model.as_deref(), Some("override-model"));
+        assert_eq!(
+            merged.permissions.sandbox_mode.as_deref(),
+            Some("read-only")
+        );
+        // And a default override leaves the base untouched.
+        let untouched = merge_settings(&base, &Settings::default());
+        assert_eq!(untouched, base);
     }
 
     #[test]

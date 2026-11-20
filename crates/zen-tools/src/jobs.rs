@@ -63,6 +63,7 @@ pub fn start_job(
     env: &HashMap<String, String>,
     scratch: &Path,
     api_key_env: Option<&str>,
+    sandbox: &crate::sandbox::SandboxConfig,
 ) -> Result<Started, String> {
     let id = next_id();
     let dir = scratch.join("jobs");
@@ -89,6 +90,8 @@ pub fn start_job(
     }
     #[cfg(unix)]
     cmd.process_group(0);
+    // Phase 2 #12: same single enforcement point as the Bash tool.
+    crate::sandbox::apply_to_command(&mut cmd, sandbox).map_err(|e| format!("sandbox: {e}"))?;
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to start {}: {}", shell.program, e))?;

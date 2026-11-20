@@ -1,5 +1,6 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
+use zen_core::SandboxMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
@@ -78,6 +79,19 @@ pub fn invalid_permission_mode_error(value: &str, source: &str) -> String {
 
 fn parse_permission_mode_flag(s: &str) -> Result<PermissionMode, String> {
     PermissionMode::parse(s).ok_or_else(|| invalid_permission_mode_error(s, "--permission-mode"))
+}
+
+/// Error text for a sandbox-mode spelling that is not a supported mode.
+/// `source` names where the value came from, e.g. "--sandbox" or
+/// "settings (permissions.sandboxMode)".
+pub fn invalid_sandbox_mode_error(value: &str, source: &str) -> String {
+    format!(
+        "invalid sandbox mode '{value}' in {source} (expected one of: off, workspace-write, workspace_write, read-only, read_only)"
+    )
+}
+
+fn parse_sandbox_mode_flag(s: &str) -> Result<SandboxMode, String> {
+    SandboxMode::parse(s).ok_or_else(|| invalid_sandbox_mode_error(s, "--sandbox"))
 }
 
 impl std::fmt::Display for PermissionMode {
@@ -252,6 +266,13 @@ pub struct Cli {
     /// 'manual' are not modes and are rejected; use 'default'.
     #[arg(long = "permission-mode", value_parser = parse_permission_mode_flag)]
     pub permission_mode: Option<PermissionMode>,
+
+    /// OS-level sandbox mode for child processes spawned by the Bash tool
+    /// and background jobs (Phase 2 #12): off, workspace-write, read-only.
+    /// Linux defaults to workspace-write (Landlock + seccomp); other
+    /// platforms warn and run without a sandbox.
+    #[arg(long = "sandbox", value_parser = parse_sandbox_mode_flag)]
+    pub sandbox: Option<SandboxMode>,
 
     /// Only allow these tools (space-separated names)
     #[arg(long = "allowedTools", visible_alias = "allowed-tools", num_args = 1..)]
@@ -1089,6 +1110,15 @@ pub struct ReviewArgs {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn invalid_sandbox_mode_error_names_value_and_source() {
+        // Kills the mutant that replaces the message with "xyzzy".
+        let msg = invalid_sandbox_mode_error("bogus", "--sandbox");
+        assert!(msg.contains("bogus"), "error names the bad value: {msg}");
+        assert!(msg.contains("--sandbox"), "error names the source: {msg}");
+        assert!(msg.contains("off"), "error lists valid modes: {msg}");
+    }
 
     #[test]
     fn subcommand_help_includes_examples() {

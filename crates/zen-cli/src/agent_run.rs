@@ -659,6 +659,9 @@ fn tool_context(cwd: &Path, cfg: &ResolvedConfig, cli: &Cli, session_id: &str) -
         extra.push(std::path::PathBuf::from(d));
     }
     ctx.extra_dirs = extra;
+    // Phase 2 #12: the resolved sandbox mode travels with the tool
+    // context so the Bash tool and background jobs can enforce it.
+    ctx.sandbox_mode = cfg.sandbox_mode;
     ctx
 }
 

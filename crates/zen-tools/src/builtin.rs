@@ -818,6 +818,7 @@ impl Tool for BashTool {
                 &ctx.env,
                 &ctx.scratch_dir(),
                 ctx.api_key_env.as_deref(),
+                &crate::sandbox::SandboxConfig::from_tool_context(ctx),
             ) {
                 Ok(j) => ToolOutput::ok(format!(
                     "Started background job {} (pid {}). Output is logged to {}. Read new output with \
@@ -854,6 +855,16 @@ impl Tool for BashTool {
 
         for name in zen_core::api_key_env_names(ctx.api_key_env.as_deref()) {
             command.env_remove(name);
+        }
+
+        // Phase 2 #12: the OS-level sandbox is the single enforcement
+        // point for child processes. A failure to apply it refuses the
+        // spawn instead of running unsandboxed.
+        if let Err(e) = crate::sandbox::apply_to_command(
+            &mut command,
+            &crate::sandbox::SandboxConfig::from_tool_context(ctx),
+        ) {
+            return ToolOutput::err(format!("Error: sandbox: {e}"));
         }
 
         let child = match command.spawn() {

@@ -383,6 +383,7 @@ async fn run_subcommand(cli: &Cli, cwd: &Path, home: Option<&Path>, sub: &Comman
                         }
                     );
                     println!("  permission_mode: {}", cfg.permission_mode);
+                    println!("  sandbox_mode: {}", cfg.sandbox_mode.as_str());
                     println!("  folder_trusted: {}", cfg.folder_trusted);
                     for s in &cfg.trust_skipped {
                         println!("    skipped: {}", s);
