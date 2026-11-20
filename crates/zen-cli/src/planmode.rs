@@ -26,7 +26,19 @@ pub fn strip_plan_exit_markers(text: &str) -> String {
     lines.join("\n").trim_end().to_string()
 }
 
-/// Rebuild the system prompt from the untouched base on every mode change,
+/// Deliver plan-mode text: strip the trailing exit marker when the run
+/// is in plan mode and the text carries it. In any other mode the text
+/// is returned unchanged — the marker is only meaningful in plan mode,
+/// so a model that writes it as prose outside plan mode keeps it.
+/// The transcript keeps the raw model text; only delivery goes through
+/// here.
+pub fn deliver_plan_text(mode: PermissionMode, text: &str) -> String {
+    if mode == PermissionMode::Plan && zen_agent::plan::looks_like_plan_exit(text) {
+        strip_plan_exit_markers(text)
+    } else {
+        text.to_string()
+    }
+}
 /// instead of appending or stripping a banner: toggling plan mode twice
 /// must never stack the plan banner, and leaving plan mode must restore the
 /// exact base prompt.
@@ -82,6 +94,26 @@ mod tests {
         );
         assert_eq!(strip_plan_exit_markers("no markers"), "no markers");
         assert_eq!(strip_plan_exit_markers(""), "");
+    }
+
+    #[test]
+    fn deliver_strips_marker_only_in_plan_mode() {
+        assert_eq!(
+            deliver_plan_text(PermissionMode::Plan, "1. do X\nExitPlanMode"),
+            "1. do X"
+        );
+        assert_eq!(
+            deliver_plan_text(PermissionMode::Default, "1. do X\nExitPlanMode"),
+            "1. do X\nExitPlanMode"
+        );
+        assert_eq!(
+            deliver_plan_text(PermissionMode::Plan, "1. do X"),
+            "1. do X"
+        );
+        assert_eq!(
+            deliver_plan_text(PermissionMode::Plan, "ExitPlanMode\n1. do X"),
+            "ExitPlanMode\n1. do X"
+        );
     }
 
     #[test]

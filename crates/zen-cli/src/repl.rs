@@ -1011,6 +1011,13 @@ async fn handle_line(
         }
     }
     let finished = result.is_some();
+    // Issue #248: the exit marker is an instruction, not plan content.
+    // The stripped plan is already stored for approval above; print
+    // the same stripped text instead of leaking the marker.
+    let mut result = result;
+    if let Some(r) = result.as_mut() {
+        r.result = crate::planmode::deliver_plan_text(agent.config.permission_mode, &r.result);
+    }
     print_turn(result);
 
     if finished {
