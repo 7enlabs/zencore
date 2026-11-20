@@ -572,6 +572,7 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::process::Stdio;
 
     #[test]
