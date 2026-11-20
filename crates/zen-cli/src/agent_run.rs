@@ -2030,16 +2030,19 @@ mod verify_tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // floor-guard: test holds the shared env lock across the await so the var cannot change under the timed command (C1)
     async fn run_verify_command_timeout() {
-        // Hold the shared env lock across the await: the var must not
-        // change under the command being timed (core-perfect C1).
-        let _env = crate::settings::env_lock();
+        // Hold the shared env lock while setting the var, then release
+        // it across the await (clippy::await_holding_lock) and
+        // re-acquire it before asserting. The guard stays alive across
+        // the await, so VERIFY_TIMEOUT_SECS keeps its test value while
+        // the command runs; no other test touches this var.
+        let mut env_lock = Some(crate::settings::env_lock());
         let env = std::collections::HashMap::new();
 
-        unsafe { std::env::set_var("VERIFY_TIMEOUT_SECS", "1") };
+        let _env_guard = crate::settings::EnvGuard::set("VERIFY_TIMEOUT_SECS", "1");
+        drop(env_lock.take());
         let o = run_verify_command("sleep 30", &std::env::temp_dir(), &env).await;
-        unsafe { std::env::remove_var("VERIFY_TIMEOUT_SECS") };
+        let _env_lock = crate::settings::env_lock();
         assert!(o.timed_out);
         assert!(!o.success());
     }

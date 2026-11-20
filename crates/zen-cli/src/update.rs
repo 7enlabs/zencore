@@ -355,15 +355,10 @@ mod tests {
     #[test]
     fn repo_url_defaults_and_env_override() {
         let _env = crate::settings::env_lock();
-        let old = std::env::var("ZENCORE_REPO").ok();
-        unsafe { std::env::remove_var("ZENCORE_REPO") };
+        let _env_guard = crate::settings::EnvGuard::remove("ZENCORE_REPO");
         assert_eq!(repo_url(), DEFAULT_REPO);
         unsafe { std::env::set_var("ZENCORE_REPO", "https://example.com/custom.git") };
         assert_eq!(repo_url(), "https://example.com/custom.git");
-        match old {
-            Some(v) => unsafe { std::env::set_var("ZENCORE_REPO", v) },
-            None => unsafe { std::env::remove_var("ZENCORE_REPO") },
-        }
     }
 
     #[test]
@@ -381,8 +376,7 @@ mod tests {
         // No ZENCORE_SRC_DIR override and no checkout under home:
         // --check reports nothing to do and exits 0.
         let _env = crate::settings::env_lock();
-        let old = std::env::var("ZENCORE_SRC_DIR").ok();
-        unsafe { std::env::remove_var("ZENCORE_SRC_DIR") };
+        let _env_guard = crate::settings::EnvGuard::remove("ZENCORE_SRC_DIR");
         let home =
             std::env::temp_dir().join(format!("zen_update_nocheckout_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
@@ -390,10 +384,6 @@ mod tests {
         let code = run_update(true, Some(&home), true, false, false).unwrap();
         assert_eq!(code, 0);
         let _ = std::fs::remove_dir_all(&home);
-        match old {
-            Some(v) => unsafe { std::env::set_var("ZENCORE_SRC_DIR", v) },
-            None => unsafe { std::env::remove_var("ZENCORE_SRC_DIR") },
-        }
     }
 
     #[test]
@@ -401,8 +391,7 @@ mod tests {
         // A checkout with an untracked file must refuse to update
         // (and never reach the network) - an error, not Ok(0).
         let _env = crate::settings::env_lock();
-        let old = std::env::var("ZENCORE_SRC_DIR").ok();
-        unsafe { std::env::remove_var("ZENCORE_SRC_DIR") };
+        let _env_guard = crate::settings::EnvGuard::remove("ZENCORE_SRC_DIR");
         let home = std::env::temp_dir().join(format!("zen_update_dirty_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let src = home.join(".local").join("share").join("zencore");
@@ -421,10 +410,6 @@ mod tests {
             "unexpected error: {err}"
         );
         let _ = std::fs::remove_dir_all(&home);
-        match old {
-            Some(v) => unsafe { std::env::set_var("ZENCORE_SRC_DIR", v) },
-            None => unsafe { std::env::remove_var("ZENCORE_SRC_DIR") },
-        }
     }
 
     #[test]

@@ -73,24 +73,19 @@ mod tests {
     // local one used to serialize only this module, so a deep_research
     // test flipping ZEN_MAX_BUDGET_USD could still race these tests
     // (core-perfect C1).
-    use crate::settings::env_lock;
-
-    fn unset_env() {
-        unsafe { std::env::remove_var("ZEN_MAX_BUDGET_USD") };
-        unsafe { std::env::remove_var("ZEN_BUDGET_WARN_AT") };
-    }
+    use crate::settings::{EnvGuard, env_lock};
 
     #[test]
     fn no_cap_anywhere_is_none() {
         let _g = env_lock();
-        unset_env();
+        let _env_guards = EnvGuard::remove_many(&["ZEN_MAX_BUDGET_USD", "ZEN_BUDGET_WARN_AT"]);
         assert_eq!(resolve_budget(None, None, None, None), None);
     }
 
     #[test]
     fn flag_beats_env_beats_config() {
         let _g = env_lock();
-        unset_env();
+        let _env_guards = EnvGuard::remove_many(&["ZEN_MAX_BUDGET_USD", "ZEN_BUDGET_WARN_AT"]);
         unsafe { std::env::set_var("ZEN_MAX_BUDGET_USD", "3.0") };
 
         let p = resolve_budget(None, None, Some(5.0), None).unwrap();
@@ -98,13 +93,12 @@ mod tests {
 
         let p = resolve_budget(Some(7.0), None, Some(5.0), None).unwrap();
         assert_eq!(p.max_budget_usd, 7.0);
-        unset_env();
     }
 
     #[test]
     fn warn_threshold_precedence_and_default() {
         let _g = env_lock();
-        unset_env();
+        let _env_guards = EnvGuard::remove_many(&["ZEN_MAX_BUDGET_USD", "ZEN_BUDGET_WARN_AT"]);
         let p = resolve_budget(Some(5.0), None, None, None).unwrap();
         assert_eq!(p.warn_at, 0.8);
         let p = resolve_budget(Some(5.0), Some(0.5), None, Some(0.9)).unwrap();
@@ -112,25 +106,23 @@ mod tests {
         unsafe { std::env::set_var("ZEN_BUDGET_WARN_AT", "0.6") };
         let p = resolve_budget(Some(5.0), None, None, Some(0.9)).unwrap();
         assert_eq!(p.warn_at, 0.6);
-        unset_env();
     }
 
     #[test]
     fn invalid_values_are_ignored() {
         let _g = env_lock();
-        unset_env();
+        let _env_guards = EnvGuard::remove_many(&["ZEN_MAX_BUDGET_USD", "ZEN_BUDGET_WARN_AT"]);
         assert_eq!(resolve_budget(Some(0.0), None, None, None), None);
         assert_eq!(resolve_budget(Some(-2.0), None, None, None), None);
         assert_eq!(resolve_budget(Some(f64::INFINITY), None, None, None), None);
         unsafe { std::env::set_var("ZEN_MAX_BUDGET_USD", "not-a-number") };
         assert_eq!(resolve_budget(None, None, None, None), None);
-        unset_env();
     }
 
     #[test]
     fn warn_at_out_of_range_normalized() {
         let _g = env_lock();
-        unset_env();
+        let _env_guards = EnvGuard::remove_many(&["ZEN_MAX_BUDGET_USD", "ZEN_BUDGET_WARN_AT"]);
         let p = resolve_budget(Some(5.0), Some(5.0), None, None).unwrap();
         assert_eq!(p.warn_at, 0.8);
     }

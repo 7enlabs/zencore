@@ -19,6 +19,37 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 static PATH_LOCK: Mutex<()> = Mutex::new(());
 
+/// RAII guard restoring one env var's previous value on drop
+/// (panic-safe). Same shape as the EnvGuard in zen-cli's settings
+/// module, duplicated here because that guard is `pub(crate)` to zen-cli.
+#[must_use = "a guard dropped immediately restores the var at once; bind it for the whole test"]
+struct EnvGuard {
+    key: &'static str,
+    old: Option<std::ffi::OsString>,
+}
+
+impl EnvGuard {
+    /// Capture the current value of `key`, then set it to `value`.
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let old = std::env::var_os(key);
+        // SAFETY: callers hold PATH_LOCK while mutating env.
+        unsafe { std::env::set_var(key, value) };
+        Self { key, old }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: same as `set` above.
+        unsafe {
+            match self.old.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
 fn unique_tmpdir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "zen-lsp-test-{}-{}-{}",
@@ -715,8 +746,7 @@ async fn unknown_extension_is_a_clear_error() {
 async fn missing_binary_names_the_install_command() {
     let _guard = PATH_LOCK.lock().unwrap();
     let tmp = unique_tmpdir("empty-path");
-    let old_path = std::env::var_os("PATH");
-    unsafe { std::env::set_var("PATH", &tmp) };
+    let _env_guard = EnvGuard::set("PATH", &tmp);
 
     let mgr = LspManager::new();
     let cases = [
@@ -737,10 +767,9 @@ async fn missing_binary_names_the_install_command() {
         }
     }
 
-    match old_path {
-        Some(v) => unsafe { std::env::set_var("PATH", v) },
-        None => unsafe { std::env::remove_var("PATH") },
-    }
+    // Restore PATH before releasing the lock, as before: another
+    // test must never observe the fixture PATH.
+    drop(_env_guard);
     drop(_guard);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
