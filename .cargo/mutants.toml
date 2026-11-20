@@ -158,7 +158,7 @@ exclude_re = [
   # stops being equivalent: remove this exclusion and kill it with
   # a test.
   "acp\\.rs:1288:9: replace <impl zen_core::Tool for ClientBashTool>::is_read_only -> bool with false",
-  # Phase 2 #12, sandbox.rs detect_landlock_abi (line 307, col 16):
+  # Phase 2 #12, sandbox.rs detect_landlock_abi (line 318, col 16):
   # replace < with == and replace < with <= in
   # `if ret < 0 { 0 } else { ret as i32 }`.
   # EQUIVALENT (waived by ZC Leader, Telegram tin 18631, 2026-11-20;
@@ -176,9 +176,12 @@ exclude_re = [
   # EXPIRY: if detect_landlock_abi is rewritten, or apply_to_command
   # stops refusing on abi <= 0, these mutants stop being equivalent:
   # remove these exclusions and kill them with tests.
-  "sandbox\\.rs:307:16: replace < with == in imp::detect_landlock_abi",
-  "sandbox\\.rs:307:16: replace < with <= in imp::detect_landlock_abi",
-  # Phase 2 #12, sandbox.rs build_landlock_ruleset (line 429, col 51):
+  # NOTE (2026-11-21, follow-up commit 3a80e9a): the code moved from
+  # line 307 to line 318, so the exclusion line numbers were updated
+  # to match; the equivalence argument is unchanged.
+  "sandbox\\.rs:318:16: replace < with == in imp::detect_landlock_abi",
+  "sandbox\\.rs:318:16: replace < with <= in imp::detect_landlock_abi",
+  # Phase 2 #12, sandbox.rs build_landlock_ruleset (line 443, col 51):
   # replace | with ^ in
   # `AccessFs::from_read(abi) | AccessFs::from_write(abi)`.
   # EQUIVALENT (waived by ZC Leader, Telegram tin 18631, 2026-11-20;
@@ -191,8 +194,10 @@ exclude_re = [
   # ruleset stops combining the two sets, this mutant stops being
   # equivalent: remove this exclusion and kill it with a test where
   # the two sets overlap.
-  "sandbox\\.rs:429:51: replace \\| with \\^ in imp::build_landlock_ruleset",
-  # Phase 2 #12, sandbox.rs build_landlock_ruleset (line 468, col 49):
+  # NOTE (2026-11-21): the code moved from line 429 to line 443
+  # (follow-up commit 3a80e9a), exclusion updated to match.
+  "sandbox\\.rs:443:51: replace \\| with \\^ in imp::build_landlock_ruleset",
+  # Phase 2 #12, sandbox.rs build_landlock_ruleset (line 482, col 49):
   # replace | with ^ in
   # `AccessFs::ReadFile | AccessFs::WriteFile`.
   # EQUIVALENT (waived by ZC Leader, Telegram tin 18631, 2026-11-20;
@@ -203,9 +208,25 @@ exclude_re = [
   # EXPIRY: if ReadFile and WriteFile ever share a bit, this mutant
   # stops being equivalent: remove this exclusion and kill it with
   # a test.
-  "sandbox\\.rs:468:49: replace \\| with \\^ in imp::build_landlock_ruleset",
+  # NOTE (2026-11-21): the code moved from line 468 to line 482
+  # (follow-up commit 3a80e9a), exclusion updated to match.
+  "sandbox\\.rs:482:49: replace \\| with \\^ in imp::build_landlock_ruleset",
+  # Phase 2 #12, sandbox.rs syscall_number (line 332, col 13):
+  # delete match arm "kexec_file_load" in imp::syscall_number.
+  # EQUIVALENT on the x86_64 mutants platform (waived by ZC Leader,
+  # 2026-11-21; verified by reading the match): the arm at 332 is
+  # #[cfg(target_arch = "aarch64")] and is compiled out on x86_64,
+  # so deleting it changes nothing the x86_64 mutants run observes.
+  # On aarch64 the arm is live and the aarch64-musl build guards it:
+  # deleting it there makes build_seccomp_filter fail at runtime
+  # ("no syscall number for denied syscall kexec_file_load").
+  # EXPIRY: if the mutants job runs on aarch64, or the aarch64 arm
+  # is removed, this mutant stops being equivalent: remove this
+  # exclusion and kill it with a test that calls build_seccomp_filter
+  # on aarch64.
+  "sandbox\\.rs:332:13: delete match arm \\\"kexec_file_load\\\" in imp::syscall_number",
   # Phase 2 #12, sandbox.rs apply_to_command, non-Linux stub
-  # (line 545, col 9): replace the body with Ok(Default::default()).
+  # (line 559, col 9): replace the body with Ok(Default::default()).
   # EQUIVALENT (waived by ZC Leader, Telegram tin 18631, 2026-11-20;
   # verified by independent code review of the #12 bundle): the
   # whole imp module is #[cfg(not(target_os = "linux"))], so on
@@ -217,5 +238,7 @@ exclude_re = [
   # EXPIRY: if the stub is compiled on Linux, or SandboxOutcome
   # gains a Default impl, this mutant stops being equivalent:
   # remove this exclusion and kill it with a test.
-  "sandbox\\.rs:545:9: replace imp::apply_to_command -> Result<SandboxOutcome, String> with Ok\\(Default::default\\(\\)\\)",
+  # NOTE (2026-11-21): the code moved from line 545 to line 559
+  # (follow-up commit 3a80e9a), exclusion updated to match.
+  "sandbox\\.rs:559:9: replace imp::apply_to_command -> Result<SandboxOutcome, String> with Ok\\(Default::default\\(\\)\\)",
 ]

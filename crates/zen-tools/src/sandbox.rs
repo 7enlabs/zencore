@@ -745,6 +745,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn read_and_write_access_sets_are_disjoint() {
         // The landlock crate documents from_read and from_write as
         // exclusive. Pin it: disjoint sets mean `|` and `^` coincide
@@ -760,6 +761,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn device_access_flags_share_no_bits() {
         // ReadFile and WriteFile are distinct single bits, so `|` and
         // `^` coincide on them.
