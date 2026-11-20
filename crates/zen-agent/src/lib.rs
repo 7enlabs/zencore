@@ -26,6 +26,7 @@ pub use client::{
     AnthropicClient, HttpTimeouts, OpenAiClient, is_anthropic_url, make_backend, make_backend_with,
     request_id_from_error,
 };
+pub use env_context::sha256_hex;
 pub use providers::{ApiStandard, ModelSpec, ProviderInfo};
 pub use rategate::{DEFAULT_DAILY_LIMIT, RateGate, RateGateSettings};
 pub use safety::{ErrorClass, classify_error, user_agent};

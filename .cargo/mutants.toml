@@ -125,7 +125,7 @@ exclude_re = [
   # true, or the client tool stops delegating to it, this mutant
   # stops being equivalent: remove this exclusion and kill it with
   # a test.
-  "acp\\.rs:1126:9: replace .*ClientReadTool.*is_read_only.* with true",
+  "acp\\.rs:1126:9: replace <impl zen_core::Tool for ClientReadTool>::is_read_only -> bool with true",
   # PR #240 (M7 Phase 2 #9), acp.rs ClientWriteTool::is_read_only (line 1212, col 9):
   # replace the body with false.
   # EQUIVALENT (waived by ZC Leader, 2026-11-19; verified by reading
@@ -141,7 +141,7 @@ exclude_re = [
   # false, or the client tool stops delegating to it, this mutant
   # stops being equivalent: remove this exclusion and kill it with
   # a test.
-  "acp\\.rs:1212:9: replace .*ClientWriteTool.*is_read_only.* with false",
+  "acp\\.rs:1212:9: replace <impl zen_core::Tool for ClientWriteTool>::is_read_only -> bool with false",
   # PR #240 (M7 Phase 2 #9), acp.rs ClientBashTool::is_read_only (line 1288, col 9):
   # replace the body with false.
   # EQUIVALENT (waived by ZC Leader, 2026-11-19; verified by reading
@@ -157,5 +157,5 @@ exclude_re = [
   # false, or the client tool stops delegating to it, this mutant
   # stops being equivalent: remove this exclusion and kill it with
   # a test.
-  "acp\\.rs:1288:9: replace .*ClientBashTool.*is_read_only.* with false",
+  "acp\\.rs:1288:9: replace <impl zen_core::Tool for ClientBashTool>::is_read_only -> bool with false",
 ]
