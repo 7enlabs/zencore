@@ -373,6 +373,79 @@ pub async fn assemble(
     })
 }
 
+/// A `SubAgentRunner` that can never run anything. It exists only so the
+/// `Task`/`delegate` tool instances can be built for documentation:
+/// `tool_help` reads their definitions but never calls them.
+struct DocsRunner;
+
+#[async_trait::async_trait]
+impl zen_core::SubAgentRunner for DocsRunner {
+    async fn run_subagent(
+        &self,
+        _def: &zen_core::AgentDefinition,
+        _prompt: &str,
+        _parent_tool_use_id: &str,
+    ) -> anyhow::Result<String> {
+        anyhow::bail!("DocsRunner cannot run sub-agents; it only documents the Task/delegate tools")
+    }
+}
+
+/// The full tool set a headless agent run can expose, built without any
+/// I/O: no MCP startup, no skill discovery, no agent loading, no
+/// permission filtering. `tool_help` documents from this set, so the help
+/// text can never drift from the agent's real tool list (issue #251):
+/// the 10 builtins, the 2 job tools, Skill, Task, delegate and the 4 LSP
+/// tools.
+///
+/// The instances are documentation-only: `Task`/`delegate` carry a
+/// runner that can never run (see `DocsRunner`), `Skill` carries no
+/// discovered skills, and the LSP tools share a manager that starts no
+/// servers. Their definitions (name, description, parameters) are the
+/// same as the live ones, except the Task/delegate schema lists no
+/// sub-agents (the agent lists the loaded ones there).
+pub fn documentable_tools() -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    for t in zen_tools::builtin_tools() {
+        registry.register(t);
+    }
+    for t in zen_tools::job_tools() {
+        registry.register(t);
+    }
+    registry.register(Arc::new(zen_ext::SkillTool::new(vec![])));
+    let docs_runner: Arc<dyn zen_core::SubAgentRunner> = Arc::new(DocsRunner);
+    registry.register(Arc::new(zen_mcp::TaskTool::new(
+        vec![],
+        docs_runner.clone(),
+    )));
+    registry.register(Arc::new(zen_mcp::DelegateTool::new(vec![], docs_runner)));
+    let lsp_manager = Arc::new(zen_mcp::LspManager::new());
+    let lsp_tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(zen_mcp::GotoDefinitionTool::new(lsp_manager.clone())),
+        Arc::new(zen_mcp::HoverTool::new(lsp_manager.clone())),
+        Arc::new(zen_mcp::FindReferencesTool::new(lsp_manager.clone())),
+        Arc::new(zen_mcp::DiagnosticsTool::new(lsp_manager.clone())),
+    ];
+    for tool in lsp_tools {
+        registry.register(tool);
+    }
+    registry
+}
+
+/// Why a tool needs live runtime state to do anything, if it does.
+/// `tool_help` prints this so a documented tool is never mistaken for
+/// one that works standalone.
+pub fn tool_runtime_note(name: &str) -> Option<&'static str> {
+    match name {
+        "Task" | "delegate" => Some(
+            "Requires configured sub-agents and a live sub-agent executor at runtime; this page documents the tool's interface only.",
+        ),
+        "goto_definition" | "hover" | "find_references" | "diagnostics" => Some(
+            "Requires an active LSP provider at runtime; this page documents the tool's interface only.",
+        ),
+        _ => None,
+    }
+}
+
 fn lsp_tool_allowed(spec: Option<&str>, name: &str) -> bool {
     let list = match spec {
         None | Some("default") => return true,
@@ -2450,6 +2523,53 @@ mod lsp_provider_tests {
             .unwrap();
         let _ = std::fs::remove_dir_all(&base);
         assembly
+    }
+
+    /// Issue #251: the help registry must be the agent's real tool set,
+    /// not a hand-kept subset. Assemble a headless run with agents
+    /// configured (so Task/delegate register) and no --bare (so Skill
+    /// registers), then compare the assembled names with the
+    /// documentation registry and resolve every one through tool_help.
+    #[tokio::test]
+    async fn documentable_tools_match_assembled_registry() {
+        let base = std::env::temp_dir().join(format!(
+            "zen-f1-doc-tools-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the epoch")
+                .as_nanos()
+        ));
+        let cwd = base.join("cwd");
+        let home = base.join("home");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let agents_json =
+            r#"{"scout": {"description": "Scout", "prompt": "Scout.", "tools": ["Read"]}}"#;
+        use clap::Parser;
+        let cli =
+            crate::cli::Cli::try_parse_from(["zen", "-p", "--agents", agents_json, "hi"]).unwrap();
+        let cfg = crate::settings::resolve_config_with_home(&cli, &cwd, Some(&home)).unwrap();
+        let assembly = assemble(&cli, &cwd, Some(&home), &cfg, "f1-test", None)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+        let mut assembled = assembly.registry.names();
+        assembled.sort();
+        let mut documented = documentable_tools().names();
+        documented.sort();
+        assert_eq!(
+            assembled, documented,
+            "assembled vs documented tools must match"
+        );
+        assert_eq!(assembled.len(), 19, "assembled tools: {assembled:?}");
+        for name in &assembled {
+            let help = crate::commands::tool_help(name);
+            assert!(
+                !help.starts_with("Unknown tool"),
+                "tool_help({name}) should resolve, got: {help}"
+            );
+        }
     }
 }
 
