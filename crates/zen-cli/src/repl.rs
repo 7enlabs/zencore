@@ -1011,6 +1011,16 @@ async fn handle_line(
         }
     }
     let finished = result.is_some();
+    // Issue #248: the exit marker is an instruction, not plan content.
+    // The stripped plan is already stored for approval above; print
+    // the same stripped text instead of leaking the marker.
+    let mut result = result;
+    if agent.config.permission_mode == zen_core::PermissionMode::Plan
+        && let Some(r) = result.as_mut()
+        && zen_agent::plan::looks_like_plan_exit(&r.result)
+    {
+        r.result = crate::planmode::strip_plan_exit_markers(&r.result);
+    }
     print_turn(result);
 
     if finished {

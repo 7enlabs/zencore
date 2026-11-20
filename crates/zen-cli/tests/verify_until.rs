@@ -199,6 +199,33 @@ async fn plan_mode_plans_first_then_executes_with_yes() {
     assert_eq!(last_result(&stdout)["result"], "executed");
 }
 
+/// Issue #248: `-p --permission-mode plan` printed the trailing
+/// `ExitPlanMode` marker instead of stripping it. The marker is the
+/// internal signal to leave plan mode, not plan content.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_mode_headless_strips_exit_marker() {
+    let home = TempDir::new("plan_strip_home");
+    let cwd = TempDir::new("plan_strip_cwd");
+    let server = MockServer::start(vec![Reply::text(
+        "1. Create foo.txt\n2. Done\nExitPlanMode",
+    )])
+    .await;
+    let (stdout, stderr, code) = tokio::time::timeout(TEST_TIMEOUT, async {
+        ZenRun::new("plan_strip", &home, &cwd)
+            .args(base_args())
+            .args(["--permission-mode", "plan"])
+            .mock("mock-model", &server)
+            .arg("make foo")
+            .run_output()
+    })
+    .await
+    .expect("timed out");
+    assert_eq!(code, 0, "stderr: {}", stderr);
+    let result = last_result(&stdout)["result"].as_str().unwrap().to_string();
+    assert_eq!(result, "1. Create foo.txt\n2. Done");
+    assert!(!result.contains("ExitPlanMode"), "{result}");
+}
+
 /// The plan turn must NOT run `--until` verification: run_plan_flow
 /// clears `until` on the plan-phase Cli, so a failing verify command
 /// only gates the execution turn. If the plan turn verified, the

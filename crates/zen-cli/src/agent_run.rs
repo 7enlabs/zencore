@@ -1212,6 +1212,18 @@ pub(crate) async fn run_agent_with_result(args: AgentRunArgs<'_>) -> Result<(i32
 
     run_session_end(&assembly.hooks, session_id, cwd, cfg, "other").await;
 
+    // Issue #248: in plan mode the trailing ExitPlanMode marker is the
+    // internal signal to leave plan mode, not plan content. Strip it
+    // from the delivered result (all output formats, and the approved-plan
+    // prompt run_plan_flow builds from this result); the transcript
+    // keeps the raw model text.
+    let mut result = result;
+    if agent.config.permission_mode == PermissionMode::Plan
+        && zen_agent::plan::looks_like_plan_exit(&result.result)
+    {
+        result.result = crate::planmode::strip_plan_exit_markers(&result.result);
+    }
+
     print_result(&result, &cli.effective_output_format(), &buf, false);
 
     if !cli.quiet {
