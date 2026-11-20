@@ -35,8 +35,8 @@ that owns the runzen.dev zone):
 
 ```sh
 cd workers/user-counter
-npx wrangler d1 create zencode-user-counter   # put the id in wrangler.toml
-npx wrangler d1 execute zencode-user-counter --file schema.sql
+npx wrangler d1 create zen-user-counter   # put the id in wrangler.toml
+npx wrangler d1 execute zen-user-counter --file schema.sql
 npx wrangler deploy                            # workers.dev URL first
 ```
 

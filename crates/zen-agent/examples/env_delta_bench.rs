@@ -44,7 +44,7 @@ fn scenario_turn(turn: u64) -> EnvSnapshot {
         }
     }
     EnvSnapshot {
-        cwd: "/data/workspace/zencode-zcdev".to_string(),
+        cwd: "/data/workspace/zen-zcdev".to_string(),
         env: BTreeMap::from([
             (
                 "PATH".to_string(),

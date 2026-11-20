@@ -79,7 +79,7 @@
       "version": "1.0.0"
     },
     {
-      "author": "zencode-community",
+      "author": "zen-community",
       "description": "EXAMPLE ENTRY - conventional-commit message generator from staged diffs",
       "name": "commit-msg",
       "permissions": {
@@ -94,7 +94,7 @@
       },
       "source": {
         "kind": "git",
-        "url": "https://github.com/zencode-community/skill-commit-msg"
+        "url": "https://github.com/zen-community/skill-commit-msg"
       },
       "tags": [
         "git",
@@ -105,7 +105,7 @@
       "version": "0.3.0"
     },
     {
-      "author": "zencode-community",
+      "author": "zen-community",
       "description": "EXAMPLE ENTRY - plain-language explanations of unfamiliar code",
       "name": "explain-code",
       "permissions": {
@@ -121,7 +121,7 @@
       },
       "source": {
         "kind": "git",
-        "url": "https://github.com/zencode-community/skill-explain-code"
+        "url": "https://github.com/zen-community/skill-explain-code"
       },
       "tags": [
         "learning",
@@ -132,7 +132,7 @@
       "version": "0.2.1"
     },
     {
-      "author": "zencode-community",
+      "author": "zen-community",
       "description": "EXAMPLE ENTRY - generate API reference docs from source annotations",
       "name": "api-docs",
       "permissions": {
@@ -149,7 +149,7 @@
       },
       "source": {
         "kind": "git",
-        "url": "https://github.com/zencode-community/skill-api-docs"
+        "url": "https://github.com/zen-community/skill-api-docs"
       },
       "tags": [
         "documentation",

@@ -541,7 +541,7 @@ async fn poll_hook_watchers(
 ) {
     use zen_core::HookEvent;
     for (path, source) in config_watcher.poll() {
-        // A blocked change is not applied. ZenCode loads settings once
+        // A blocked change is not applied. Zen loads settings once
         // at startup and never hot-reloads, so there is nothing to
         // withhold; the event fires for audit/logging either way.
         let _ = agent

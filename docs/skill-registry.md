@@ -62,7 +62,7 @@ future open HTTP registry safe to browse.
       "name": "commit-msg",
       "description": "Conventional-commit message generator from staged diffs",
       "version": "0.3.0",
-      "author": "zencode-community",
+      "author": "zen-community",
       "tier": "community",
       "tags": ["git", "commits", "workflow"],
       "permissions": {
@@ -72,7 +72,7 @@ future open HTTP registry safe to browse.
         "exec": true,
         "file_scope": "project"
       },
-      "source": { "kind": "git", "url": "https://github.com/zencode-community/skill-commit-msg" }
+      "source": { "kind": "git", "url": "https://github.com/zen-community/skill-commit-msg" }
     }
   ]
 }

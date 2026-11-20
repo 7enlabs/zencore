@@ -58,7 +58,7 @@ each in the entry's `review_notes`:
 1. Publish your skill at a public git URL with `SKILL.md` and `zen-plugin.json`.
 2. Run the self-assessment: `zen skill test <name>` must pass, and you must be
    able to answer all four criteria above for your own skill.
-3. Open a **Curation request** issue on `atzenn/zencode` with:
+3. Open a **Curation request** issue on `7enlabs/zencore` with:
    - skill name, repo URL, version submitted
    - self-assessment against the four criteria (one paragraph each)
    - any permission broader than `read`/`grep`/`glob`, with justification

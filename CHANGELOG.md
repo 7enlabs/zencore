@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+- Brand: the former name is now Zen (the CLI is Zen CLI, the site is
+  runzen.dev). Historical entries below keep the former name where they
+  record past releases, issue numbers, or file names.
+
 ### Added
 - `delegate` tool: multi-seat coordination in one session (single / parallel /
   chain modes, handoff envelope JSON with 50 KB cap and parent-computed
