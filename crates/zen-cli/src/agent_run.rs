@@ -2571,6 +2571,22 @@ mod lsp_provider_tests {
             );
         }
     }
+
+    /// `DocsRunner` exists only to build Task/delegate definitions for
+    /// documentation; it must never run a sub-agent. Pin the refusal so
+    /// a mutant replacing the body with `Ok(...)` is caught.
+    #[tokio::test]
+    async fn docs_runner_never_runs() {
+        let runner = DocsRunner;
+        let def = zen_core::AgentDefinition::default();
+        let err = zen_core::SubAgentRunner::run_subagent(&runner, &def, "hi", "parent-1")
+            .await
+            .expect_err("DocsRunner must refuse to run sub-agents");
+        assert!(
+            err.to_string().contains("DocsRunner cannot run"),
+            "unexpected error: {err}"
+        );
+    }
 }
 
 #[cfg(test)]
