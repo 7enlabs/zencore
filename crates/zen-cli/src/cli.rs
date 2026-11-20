@@ -274,12 +274,12 @@ pub struct Cli {
     #[arg(long = "sandbox", value_parser = parse_sandbox_mode_flag)]
     pub sandbox: Option<SandboxMode>,
 
-    /// Only allow these tools (space-separated names)
-    #[arg(long = "allowedTools", visible_alias = "allowed-tools", num_args = 1..)]
+    /// Only allow these tools (comma-separated names; repeat the flag for more)
+    #[arg(long = "allowedTools", visible_alias = "allowed-tools")]
     pub allowed_tools: Vec<String>,
 
-    /// Never allow these tools (space-separated names)
-    #[arg(long = "disallowedTools", visible_alias = "disallowed-tools", num_args = 1..)]
+    /// Never allow these tools (comma-separated names; repeat the flag for more)
+    #[arg(long = "disallowedTools", visible_alias = "disallowed-tools")]
     pub disallowed_tools: Vec<String>,
 
     /// Tool set for the run (bundle name or list)
@@ -294,12 +294,15 @@ pub struct Cli {
     #[arg(long = "append-system-prompt")]
     pub append_system_prompt: Option<String>,
 
-    /// Add a working directory the agent may access
-    #[arg(long = "add-dir", num_args = 1..)]
+    /// Add a working directory the agent may access (repeat the flag for
+    /// more). One value per occurrence: a greedy multi-value flag would
+    /// swallow the trailing positional prompt (issue #247).
+    #[arg(long = "add-dir")]
     pub add_dir: Vec<PathBuf>,
 
-    /// Load MCP servers from this config file or JSON
-    #[arg(long = "mcp-config", num_args = 1..)]
+    /// Load MCP servers from this config file or JSON (repeat the flag
+    /// for more). One value per occurrence, same reason as --add-dir.
+    #[arg(long = "mcp-config")]
     pub mcp_config: Vec<String>,
 
     /// Only use MCP servers given via --mcp-config
@@ -2096,8 +2099,19 @@ mod tests {
 
     #[test]
     fn parse_add_dir() {
-        let cli = parse(&["--add-dir", "/a", "/b"]);
+        let cli = parse(&["--add-dir", "/a", "--add-dir", "/b"]);
         assert_eq!(cli.add_dir.len(), 2);
+    }
+
+    #[test]
+    fn parse_add_dir_does_not_swallow_prompt() {
+        // Issue #247: with num_args = 1.. the flag ate the prompt.
+        let cli = parse(&["-p", "--add-dir", "/tmp", "hello"]);
+        assert_eq!(cli.add_dir, vec![PathBuf::from("/tmp")]);
+        assert_eq!(cli.prompt, vec!["hello".to_string()]);
+        let cli = parse(&["-p", "--mcp-config", "{}", "hello"]);
+        assert_eq!(cli.mcp_config, vec!["{}".to_string()]);
+        assert_eq!(cli.prompt, vec!["hello".to_string()]);
     }
 
     #[test]
@@ -2105,12 +2119,21 @@ mod tests {
         let cli = parse(&[
             "--allowedTools",
             "Read",
+            "--allowedTools",
             "Bash(git status)",
             "--disallowedTools",
             "Write",
         ]);
         assert_eq!(cli.allowed_tools, vec!["Read", "Bash(git status)"]);
         assert_eq!(cli.disallowed_tools, vec!["Write"]);
+    }
+
+    #[test]
+    fn parse_allowed_tools_does_not_swallow_prompt() {
+        // Same greedy-flag class as issue #247.
+        let cli = parse(&["-p", "--allowedTools", "Read", "hello"]);
+        assert_eq!(cli.allowed_tools, vec!["Read".to_string()]);
+        assert_eq!(cli.prompt, vec!["hello".to_string()]);
     }
 
     #[test]
