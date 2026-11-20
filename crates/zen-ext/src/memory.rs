@@ -1069,4 +1069,42 @@ mod tests {
         assert_eq!(bounded.len(), 1, "candidates: {:?}", bounded);
         assert!(bounded[0].ends_with("CLAUDE.md"));
     }
+
+    // The unbounded memory_prompt / memories_report wrappers are the
+    // production entry points (system prompt, /memory report). They must
+    // stay covered: the assertions only require the fixture content to
+    // be present, so a stray AGENTS.md above TMPDIR (issue #253) can add
+    // sections without breaking them, while a mutant returning "" or
+    // "xyzzy" fails.
+    #[test]
+    fn memory_prompt_unbounded_returns_fixture_content() {
+        let tmp = TempDir::new();
+        let proj = tmp.path().join("proj");
+        let sub = proj.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(proj.join("ZEN.md"), "inside-root").unwrap();
+        let nohome = tmp.path().join("nohome");
+
+        let prompt = memory_prompt(&sub, Some(&nohome));
+        assert!(
+            prompt.contains("inside-root"),
+            "unbounded prompt should contain the fixture memory: {prompt}"
+        );
+    }
+
+    #[test]
+    fn memories_report_unbounded_lists_fixture() {
+        let tmp = TempDir::new();
+        let proj = tmp.path().join("proj");
+        let sub = proj.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(proj.join("ZEN.md"), "inside-root").unwrap();
+        let nohome = tmp.path().join("nohome");
+
+        let report = memories_report(&sub, Some(&nohome));
+        assert!(
+            report.contains("ZEN.md"),
+            "unbounded report should list the fixture memory: {report}"
+        );
+    }
 }
