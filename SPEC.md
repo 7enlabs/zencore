@@ -33,11 +33,11 @@ zen [OPTIONS] [PROMPT]
 | env `ZEN_API_KEY` (or `OPENAI_API_KEY`) | Bearer token; optional (some gateways inject auth). Never logged. |
 | `--permission-mode default\|acceptEdits\|plan\|bypassPermissions\|dontAsk` (kebab-case `accept-edits`, `bypass-permissions`, `dont-ask` also accepted; `auto`/`manual` rejected) | See §5. |
 | `--sandbox off\|workspace-write\|read-only` (kebab-case also accepted; `workspace_write` and `read_only` also accepted; default `workspace-write` on Linux, `off` elsewhere) | OS-level sandbox for Bash and background jobs (Landlock + seccomp on Linux; warning and no enforcement on macOS/Windows). Config key `permissions.sandboxMode`. `bypassPermissions` does not skip the sandbox. |
-| `--allowedTools <rules...>` / `--disallowedTools <rules...>` | Comma/space separated permission rules. |
+| `--allowedTools <rules>` / `--disallowedTools <rules>` (repeatable) | Comma-separated permission rules. |
 | `--tools <list>` | Restrict built-in tool set (`""` = none, `default` = all, `Read,Bash` = only those, `-Bash,-Write` / `+Name` = default set minus/plus; plain names and +/- deltas cannot be mixed). |
 | `--system-prompt <text>` / `--append-system-prompt <text>` | Replace / append to the built-in system prompt. |
-| `--add-dir <dirs...>` | Extra directories file tools may access. |
-| `--mcp-config <file-or-json...>`, `--strict-mcp-config` | Load MCP servers; strict = only those. |
+| `--add-dir <dir>` (repeatable) | Extra directories file tools may access. One value per occurrence: a greedy multi-value flag swallowed the trailing prompt (issue #247). |
+| `--mcp-config <file-or-json>` (repeatable), `--strict-mcp-config` | Load MCP servers; strict = only those. One value per occurrence, same reason. |
 | `--settings <file-or-json>` | Session-only settings layer (§12). |
 | `--setting-sources user,project,local` | Which file layers to load. |
 | `--agents <json-or-file>` | Define sub-agents inline. |
