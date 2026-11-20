@@ -1309,6 +1309,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test holds the shared env lock across the await so the key vars cannot change under run_with_home (C1)
     async fn run_with_home_init_or_maintenance_require_print() {
         // Pins the `(cli.init || cli.maintenance) && !cli.print` guard
         // in run_with_home, one row per side of each operator:
@@ -1324,6 +1325,12 @@ mod tests {
         // code. The temp home/cwd keep the run hermetic, and the key
         // env vars are cleared so a developer's shell cannot smuggle
         // a key into the fall-through path.
+        // Hold ENV_LOCK: this test clears process-wide key vars, so it
+        // must not race other tests that read them (core-perfect C1).
+        // The old values are restored at the end of the test.
+        let _env = crate::settings::env_lock();
+        let old_key = std::env::var("ZEN_API_KEY").ok();
+        let old_base = std::env::var("ZEN_BASE_URL").ok();
         unsafe {
             std::env::remove_var("ZEN_API_KEY");
             std::env::remove_var("ZEN_BASE_URL");
@@ -1370,6 +1377,14 @@ mod tests {
                 );
             }
             std::fs::remove_dir_all(&dir).ok();
+        }
+        match old_key {
+            Some(v) => unsafe { std::env::set_var("ZEN_API_KEY", v) },
+            None => unsafe { std::env::remove_var("ZEN_API_KEY") },
+        }
+        match old_base {
+            Some(v) => unsafe { std::env::set_var("ZEN_BASE_URL", v) },
+            None => unsafe { std::env::remove_var("ZEN_BASE_URL") },
         }
     }
 

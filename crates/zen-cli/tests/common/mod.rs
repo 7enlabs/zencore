@@ -317,6 +317,24 @@ pub fn request_tool_names(raw: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Standard scrub for spawning the real `zen` binary in tests.
+///
+/// Every test that runs the binary as a subprocess must go through this
+/// helper (or `ZenRun::command`, which calls it): it pins a hermetic
+/// baseline so a developer's shell cannot smuggle a key, model, base URL
+/// or settings path into the child - ZEN_API_KEY=dummy, ZEN_MODEL /
+/// ZEN_BASE_URL / OPENAI_API_KEY / ZEN_SETTINGS removed, ZEN_TRUST_FOLDER=1.
+/// HOME/USERPROFILE stay per-site: each test owns its temp home.
+pub fn scrub_zen_env(mut cmd: std::process::Command) -> std::process::Command {
+    cmd.env("ZEN_API_KEY", "dummy")
+        .env_remove("ZEN_MODEL")
+        .env_remove("ZEN_BASE_URL")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("ZEN_SETTINGS")
+        .env("ZEN_TRUST_FOLDER", "1");
+    cmd
+}
+
 pub struct ZenRun {
     args: Vec<String>,
     cwd: PathBuf,
@@ -378,16 +396,10 @@ impl ZenRun {
     }
 
     fn command(&self) -> Command {
-        let mut cmd = Command::new(zen_bin());
+        let mut cmd = scrub_zen_env(Command::new(zen_bin()));
         cmd.current_dir(&self.cwd)
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
-            .env("ZEN_API_KEY", "dummy")
-            .env_remove("ZEN_MODEL")
-            .env_remove("ZEN_BASE_URL")
-            .env_remove("OPENAI_API_KEY")
-            .env_remove("ZEN_SETTINGS")
-            .env("ZEN_TRUST_FOLDER", "1")
             .stdin(if self.stdin.is_some() {
                 Stdio::piped()
             } else {

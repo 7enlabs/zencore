@@ -56,10 +56,10 @@ exclude_re = [
   # equivalent: remove these exclusions and kill them with tests.
   "env_context\\.rs:359:31: replace \\^ with \\| in sha256_hex",
   "env_context\\.rs:359:41: replace \\^ with \\| in sha256_hex",
-  # PR #226 (M3 Phase 2 #9), acp.rs run_prompt_turn (line 1058, col 21):
+  # PR #226 (M3 Phase 2 #9), acp.rs run_prompt_turn (line 2184, col 21):
   # delete match arm "success" in run_prompt_turn.
   # EQUIVALENT (waived by ZC Leader, 2026-11-17; verified by reading
-  # the match at acp.rs:1056-1065): the "success" arm returns
+  # the match at acp.rs:2183-2191): the "success" arm returns
   # "end_turn", and the catch-all arm `_ => "end_turn"` also returns
   # "end_turn". Deleting the "success" arm makes "success" fall
   # through to the catch-all, which returns the same value, so no
@@ -68,8 +68,8 @@ exclude_re = [
   # "success" arm stops returning "end_turn", this mutant stops being
   # equivalent: remove this exclusion and kill it with a test where
   # the turn ends with subtype "success".
-  "acp\\.rs:1058:21: delete match arm \"success\" in run_prompt_turn",
-  # PR #227, lib.rs PermissionChecker::set_mode (line 694, col 9):
+  "acp\\.rs:2184:21: delete match arm \"success\" in run_prompt_turn",
+  # PR #227, lib.rs PermissionChecker::set_mode (line 720, col 9):
   # replace the default set_mode body with ().
   # EQUIVALENT (waived by ZC Leader, 2026-11-17; verified by
   # independent code review): the default body is `let _ = mode;`,
@@ -82,7 +82,8 @@ exclude_re = [
   # stores the mode), this mutant stops being equivalent: remove
   # this exclusion and kill it with a test that calls the default
   # set_mode and checks the stored mode.
-  # PR #228, acp.rs collect_listed_sessions (line 1500, col 41):
+  "lib\\.rs:720:9: replace PermissionChecker::set_mode with \\(\\)",
+  # PR #228, acp.rs collect_listed_sessions (line 2379, col 41):
   # replace `activity > t` with `activity >= t`.
   # EQUIVALENT (waived by ZC Leader, 2026-11-18; verified by
   # independent code review): when activity == t, the original
@@ -94,8 +95,7 @@ exclude_re = [
   # (e.g. it stores something other than activity itself), this
   # mutant stops being equivalent: remove this exclusion and kill
   # it with a test where two sessions share the same activity time.
-  "acp\\.rs:1500:41: replace > with >= in collect_listed_sessions",
-  "lib\\.rs:694:9: replace PermissionChecker::set_mode with \\(\\)",
+  "acp\\.rs:2379:41: replace > with >= in collect_listed_sessions",
   # Phase 2 #9 AgentEvent module, acp.rs AcpSink::emit (line 309, col 13):
   # delete match arm AgentEvent::ApiRetry{..} | AgentEvent::PermissionDenied(_).
   # EQUIVALENT (waived by ZC Leader, 2026-11-19; verified by reading
@@ -125,7 +125,7 @@ exclude_re = [
   # true, or the client tool stops delegating to it, this mutant
   # stops being equivalent: remove this exclusion and kill it with
   # a test.
-  "acp\\.rs:1126:9: replace .*ClientReadTool.*is_read_only.* with true",
+  "acp\\.rs:1126:9: replace <impl zen_core::Tool for ClientReadTool>::is_read_only -> bool with true",
   # PR #240 (M7 Phase 2 #9), acp.rs ClientWriteTool::is_read_only (line 1212, col 9):
   # replace the body with false.
   # EQUIVALENT (waived by ZC Leader, 2026-11-19; verified by reading
@@ -141,7 +141,7 @@ exclude_re = [
   # false, or the client tool stops delegating to it, this mutant
   # stops being equivalent: remove this exclusion and kill it with
   # a test.
-  "acp\\.rs:1212:9: replace .*ClientWriteTool.*is_read_only.* with false",
+  "acp\\.rs:1212:9: replace <impl zen_core::Tool for ClientWriteTool>::is_read_only -> bool with false",
   # PR #240 (M7 Phase 2 #9), acp.rs ClientBashTool::is_read_only (line 1288, col 9):
   # replace the body with false.
   # EQUIVALENT (waived by ZC Leader, 2026-11-19; verified by reading
@@ -157,5 +157,5 @@ exclude_re = [
   # false, or the client tool stops delegating to it, this mutant
   # stops being equivalent: remove this exclusion and kill it with
   # a test.
-  "acp\\.rs:1288:9: replace .*ClientBashTool.*is_read_only.* with false",
+  "acp\\.rs:1288:9: replace <impl zen_core::Tool for ClientBashTool>::is_read_only -> bool with false",
 ]

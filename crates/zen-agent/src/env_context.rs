@@ -300,8 +300,8 @@ pub fn render_delta(delta: &EnvDelta) -> String {
     }
 }
 
-/// Minimal SHA-256 (FIPS 180-4), dependency-free - same approach as
-/// `zen_cli::skills::sha256_hex`. Test-vector verified below.
+/// Minimal SHA-256 (FIPS 180-4), dependency-free - single shared
+/// implementation, also used by `zen_cli::skills`. Test-vector verified below.
 pub fn sha256_hex(data: &[u8]) -> String {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,

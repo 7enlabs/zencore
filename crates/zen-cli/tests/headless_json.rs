@@ -1,3 +1,6 @@
+mod common;
+
+use common::scrub_zen_env;
 use std::process::Command;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -80,14 +83,10 @@ async fn headless_json_against_mock_server() {
         std::fs::create_dir_all(&cwd).unwrap();
 
         let bin = zen_bin();
-        let out = Command::new(&bin)
+        let out = scrub_zen_env(Command::new(&bin))
             .current_dir(&cwd)
             .env("HOME", &home)
             .env("USERPROFILE", &home)
-            .env_remove("ZEN_API_KEY")
-            .env_remove("OPENAI_API_KEY")
-            .env_remove("ZEN_MODEL")
-            .env_remove("ZEN_BASE_URL")
             .args([
                 "-p",
                 "--output-format",
@@ -166,14 +165,10 @@ async fn headless_stream_json_against_mock_server() {
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&cwd).unwrap();
 
-        let out = Command::new(zen_bin())
+        let out = scrub_zen_env(Command::new(zen_bin()))
             .current_dir(&cwd)
             .env("HOME", &home)
             .env("USERPROFILE", &home)
-            .env_remove("ZEN_API_KEY")
-            .env_remove("OPENAI_API_KEY")
-            .env_remove("ZEN_MODEL")
-            .env_remove("ZEN_BASE_URL")
             .args([
                 "-p", "--output-format", "stream-json", "--bare", "--setting-sources", "",
                 "--model", "mock-model", "--base-url", &format!("http://{}/v1", addr),
@@ -237,14 +232,10 @@ async fn headless_text_mode_prints_result_only() {
         let _ = std::fs::remove_dir_all(&cwd);
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&cwd).unwrap();
-        let out = Command::new(zen_bin())
+        let out = scrub_zen_env(Command::new(zen_bin()))
             .current_dir(&cwd)
             .env("HOME", &home)
             .env("USERPROFILE", &home)
-            .env_remove("ZEN_API_KEY")
-            .env_remove("OPENAI_API_KEY")
-            .env_remove("ZEN_MODEL")
-            .env_remove("ZEN_BASE_URL")
             .args([
                 "-p", "--bare", "--setting-sources", "",
                 "--model", "mock-model", "--base-url", &format!("http://{}/v1", addr),
@@ -284,14 +275,10 @@ async fn resume_replays_prior_messages() {
             });
             write_json(&mut sock, &r.to_string()).await;
         });
-        let o1 = Command::new(zen_bin())
+        let o1 = scrub_zen_env(Command::new(zen_bin()))
             .current_dir(&cwd)
             .env("HOME", &home)
             .env("USERPROFILE", &home)
-            .env_remove("ZEN_API_KEY")
-            .env_remove("OPENAI_API_KEY")
-            .env_remove("ZEN_MODEL")
-            .env_remove("ZEN_BASE_URL")
             .args([
                 "-p", "--bare", "--setting-sources", "", "--session-id", "00000000-0000-4000-8000-000000000002",
                 "--model", "m", "--base-url", &format!("http://{}/v1", a1), "remember alpha",
@@ -315,14 +302,10 @@ async fn resume_replays_prior_messages() {
             write_json(&mut sock, &r.to_string()).await;
             text
         });
-        let o2 = Command::new(zen_bin())
+        let o2 = scrub_zen_env(Command::new(zen_bin()))
             .current_dir(&cwd)
             .env("HOME", &home)
             .env("USERPROFILE", &home)
-            .env_remove("ZEN_API_KEY")
-            .env_remove("OPENAI_API_KEY")
-            .env_remove("ZEN_MODEL")
-            .env_remove("ZEN_BASE_URL")
             .args([
                 "-p", "--bare", "--setting-sources", "", "--resume", "00000000-0000-4000-8000-000000000002",
                 "--model", "m", "--base-url", &format!("http://{}/v1", a2), "what did I say?",
@@ -387,14 +370,10 @@ async fn tool_call_round_trip_and_allowed_tools_filter() {
             text2
         });
 
-        let out = Command::new(zen_bin())
+        let out = scrub_zen_env(Command::new(zen_bin()))
             .current_dir(&cwd)
             .env("HOME", &home)
             .env("USERPROFILE", &home)
-            .env_remove("ZEN_API_KEY")
-            .env_remove("OPENAI_API_KEY")
-            .env_remove("ZEN_MODEL")
-            .env_remove("ZEN_BASE_URL")
             .args([
                 "-p", "--output-format", "stream-json", "--bare", "--setting-sources", "",
                 "--permission-mode", "bypassPermissions",

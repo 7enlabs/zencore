@@ -65,7 +65,27 @@ fn normalise(stdout: &str, subs: &[(String, &str)]) -> String {
 }
 
 async fn check(name: &str, replies: Vec<Reply>, extra_args: &[&str], setup: impl FnOnce(&TempDir)) {
-    check_with_prompt(name, replies, extra_args, setup, "hello").await;
+    check_with_prompt(name, replies, extra_args, setup, "hello", &[]).await;
+}
+
+/// Like `check`, but seeds the child's retry jitter so retry fixtures are
+/// deterministic. The seed goes to the child via its own env (not the
+/// test process env) so parallel fixtures cannot leak it into each other.
+async fn check_seeded(
+    name: &str,
+    replies: Vec<Reply>,
+    extra_args: &[&str],
+    setup: impl FnOnce(&TempDir),
+) {
+    check_with_prompt(
+        name,
+        replies,
+        extra_args,
+        setup,
+        "hello",
+        &[("ZEN_JITTER_SEED", "42")],
+    )
+    .await;
 }
 
 async fn check_with_prompt(
@@ -74,6 +94,7 @@ async fn check_with_prompt(
     extra_args: &[&str],
     setup: impl FnOnce(&TempDir),
     prompt: &str,
+    extra_env: &[(&str, &str)],
 ) {
     let home = TempDir::new(&format!("sj_{name}_home"));
     let cwd = TempDir::new(&format!("sj_{name}_cwd"));
@@ -81,7 +102,7 @@ async fn check_with_prompt(
     let server = MockServer::start(replies).await;
     let addr = server.addr().to_string();
     let (stdout, stderr, _code) = tokio::time::timeout(TEST_TIMEOUT, async {
-        ZenRun::new(name, &home, &cwd)
+        let mut run = ZenRun::new(name, &home, &cwd)
             .args([
                 "-p",
                 "--output-format",
@@ -91,8 +112,11 @@ async fn check_with_prompt(
             ])
             .args(extra_args.iter().copied())
             .mock("mock-model", &server)
-            .arg(prompt)
-            .run_output()
+            .arg(prompt);
+        for (k, v) in extra_env {
+            run = run.env(k, Some(v));
+        }
+        run.run_output()
     })
     .await
     .expect("timed out");
@@ -198,8 +222,7 @@ async fn fixture_subagent() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fixture_api_retry() {
-    unsafe { std::env::set_var("ZEN_JITTER_SEED", "42") };
-    check(
+    check_seeded(
         "api_retry",
         vec![
             Reply::status(500, "upstream overloaded"),
@@ -242,6 +265,7 @@ async fn fixture_compact_boundary() {
         &args,
         |_| {},
         "hello, please greet me warmly and at length",
+        &[],
     )
     .await;
 }
@@ -323,8 +347,7 @@ async fn fixture_content_filter() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fixture_mid_response_retry() {
-    unsafe { std::env::set_var("ZEN_JITTER_SEED", "42") };
-    check(
+    check_seeded(
         "mid_response_retry",
         vec![
             mid_response_error(429, "rate_limit_exceeded", "Rate limit exceeded"),
@@ -338,8 +361,7 @@ async fn fixture_mid_response_retry() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fixture_mid_response_error() {
-    unsafe { std::env::set_var("ZEN_JITTER_SEED", "42") };
-    check(
+    check_seeded(
         "mid_response_error",
         vec![mid_response_error(
             502,
