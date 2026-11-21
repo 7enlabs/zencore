@@ -919,6 +919,18 @@ impl Tool for BashTool {
                 let body = spill_output(&combined, BASH_MAX_CHARS, ctx);
                 if status.success() {
                     ToolOutput::ok(body)
+                } else if code == 126 {
+                    // 126 is the shell's "command cannot execute": inside
+                    // the sandbox that means Landlock denied the real
+                    // binary's path (issue #254). Name the location so
+                    // the failure is diagnosable instead of bare.
+                    let path_var = std::env::var("PATH").unwrap_or_default();
+                    ToolOutput::err(format!(
+                        "Exit code {}\n{}\n{}",
+                        code,
+                        body,
+                        crate::sandbox::exit_126_hint(cmd_str, &path_var)
+                    ))
                 } else {
                     ToolOutput::err(format!("Exit code {}\n{}", code, body))
                 }
