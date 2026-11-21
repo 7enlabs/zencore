@@ -980,6 +980,7 @@ pub fn resolve_config_with_home(
             default_mode: Some(permission_mode.as_str().to_string()),
             additional_directories: merged.permissions.additional_directories.clone(),
             sandbox_mode: Some(sandbox_mode.as_str().to_string()),
+            classifier: merged.permissions.classifier.clone(),
         },
         permission_mode,
         sandbox_mode,
