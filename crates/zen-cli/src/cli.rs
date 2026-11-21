@@ -481,6 +481,21 @@ pub enum Commands {
 
     /// Check for and install zen updates
     Update(UpdateArgs),
+
+    /// Open the live session dashboard (TUI)
+    Flightdeck(FlightdeckArgs),
+}
+
+/// Arguments for `zen flightdeck`.
+#[derive(Args, Debug, Clone)]
+pub struct FlightdeckArgs {
+    /// Run the scripted 3-subagent demo instead of a live session.
+    #[arg(long)]
+    pub demo: bool,
+
+    /// Auto-exit the demo after N seconds (0 = run until q is pressed).
+    #[arg(long, default_value_t = 0)]
+    pub demo_seconds: u64,
 }
 
 #[derive(Args, Debug, Clone)]

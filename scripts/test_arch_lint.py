@@ -24,8 +24,9 @@ def _tree(root: Path, deps: dict[str, list[str]] | None = None) -> None:
         "zen-agent": ["zen-core"],
         "zen-tools": ["zen-core"],
         "zen-ext": ["zen-core"],
+        "zen-flightdeck": ["zen-core"],
         "zen-mcp": ["zen-core", "zen-tools"],
-        "zen-cli": ["zen-core", "zen-agent", "zen-tools", "zen-ext", "zen-mcp"],
+        "zen-cli": ["zen-core", "zen-agent", "zen-tools", "zen-ext", "zen-mcp", "zen-flightdeck"],
     }
     for name, ds in deps.items():
         _crate(root, name, ds)
@@ -56,7 +57,8 @@ class Layers(unittest.TestCase):
 
     def test_layer_zen_cli_may_depend_on_all(self):
         _crate(self.root, "zen-cli",
-               ["zen-core", "zen-agent", "zen-tools", "zen-ext", "zen-mcp"])
+               ["zen-core", "zen-agent", "zen-tools", "zen-ext", "zen-mcp",
+                "zen-flightdeck"])
         self.assertEqual(al.check_layers(self.root), [])
 
     def test_layer_nothing_may_depend_on_zen_cli(self):
