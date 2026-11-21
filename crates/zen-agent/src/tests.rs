@@ -3008,3 +3008,129 @@ async fn async_prompter_is_consulted_for_asked_tool_call() {
         requests[1].messages
     );
 }
+
+// ---------------------------------------------------------------------
+// Flightdeck Phase 2: gate events (PermissionClassified / Resolved)
+// ---------------------------------------------------------------------
+
+struct FixedPrompter(PromptAnswer);
+
+impl Prompter for FixedPrompter {
+    fn ask_permission(&self, _tool_name: &str, _input: &Value) -> PromptAnswer {
+        self.0.clone()
+    }
+}
+
+fn gate_events(sink: &CollectSink) -> Vec<String> {
+    sink.events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::PermissionClassified {
+                bucket,
+                reason_code,
+                tool_use_id,
+                ..
+            } => Some(format!("classified:{tool_use_id}:{bucket:?}:{reason_code}")),
+            AgentEvent::PermissionResolved { outcome, .. } => Some(format!("resolved:{outcome:?}")),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn gate_events_for_approved_ask() {
+    let llm = MockLlm::new(vec![
+        resp_tool("Write", r#"{"file_path": "a.txt"}"#, "c1"),
+        resp("done"),
+    ]);
+    let reg = registry_with(vec![fake("Write", false, "written")]);
+    let perms = FakePerms::new(PermissionDecision::Ask);
+    let (mut agent, sink, _h) = build_agent(llm.clone(), reg, perms, base_cfg());
+    agent.prompter = Some(Arc::new(FixedPrompter(PromptAnswer::Yes)));
+    agent.run_turn("go").await;
+    assert_eq!(
+        gate_events(&sink),
+        vec![
+            "classified:c1:Classifier:ask".to_string(),
+            "resolved:ApprovedOnce".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn gate_events_for_denied_by_user_and_always() {
+    // No from the user: classified Classifier, resolved DeniedByUser,
+    // and the tool never runs (no ToolResult content "written").
+    let llm = MockLlm::new(vec![
+        resp_tool("Write", r#"{"file_path": "a.txt"}"#, "c1"),
+        resp("done"),
+    ]);
+    let reg = registry_with(vec![fake("Write", false, "written")]);
+    let perms = FakePerms::new(PermissionDecision::Ask);
+    let (mut agent, sink, _h) = build_agent(llm.clone(), reg, perms.clone(), base_cfg());
+    agent.prompter = Some(Arc::new(FixedPrompter(PromptAnswer::No)));
+    agent.run_turn("go").await;
+    assert_eq!(
+        gate_events(&sink),
+        vec![
+            "classified:c1:Classifier:ask".to_string(),
+            "resolved:DeniedByUser".to_string(),
+        ]
+    );
+
+    // Always: the rule is recorded on the checker.
+    let llm = MockLlm::new(vec![
+        resp_tool("Write", r#"{"file_path": "a.txt"}"#, "c1"),
+        resp("done"),
+    ]);
+    let reg = registry_with(vec![fake("Write", false, "written")]);
+    let (mut agent, sink, _h) = build_agent(llm.clone(), reg, perms.clone(), base_cfg());
+    agent.prompter = Some(Arc::new(FixedPrompter(PromptAnswer::Always(
+        "Write(a.txt)".to_string(),
+    ))));
+    agent.run_turn("go").await;
+    assert_eq!(
+        gate_events(&sink),
+        vec![
+            "classified:c1:Classifier:ask".to_string(),
+            "resolved:ApprovedAlways(\"Write(a.txt)\")".to_string(),
+        ]
+    );
+    assert_eq!(perms.always.lock().unwrap().clone(), vec!["Write(a.txt)"]);
+}
+
+#[tokio::test]
+async fn gate_events_for_hard_deny_and_headless_ask() {
+    // Checker deny: one Classified(Denied), no Resolved.
+    let llm = MockLlm::new(vec![
+        resp_tool("Write", r#"{"file_path": "a.txt"}"#, "c1"),
+        resp("done"),
+    ]);
+    let reg = registry_with(vec![fake("Write", false, "written")]);
+    let perms = FakePerms::new(PermissionDecision::Deny("no".into()));
+    let (mut agent, sink, _h) = build_agent(llm.clone(), reg, perms, base_cfg());
+    agent.run_turn("go").await;
+    assert_eq!(
+        gate_events(&sink),
+        vec!["classified:c1:Denied:deny".to_string()]
+    );
+
+    // Ask with no prompter at all: Resolved(DeniedNoPrompter).
+    let llm = MockLlm::new(vec![
+        resp_tool("Write", r#"{"file_path": "a.txt"}"#, "c1"),
+        resp("done"),
+    ]);
+    let reg = registry_with(vec![fake("Write", false, "written")]);
+    let perms = FakePerms::new(PermissionDecision::Ask);
+    let (mut agent, sink, _h) = build_agent(llm.clone(), reg, perms, base_cfg());
+    agent.run_turn("go").await;
+    assert_eq!(
+        gate_events(&sink),
+        vec![
+            "classified:c1:Classifier:ask".to_string(),
+            "resolved:DeniedNoPrompter".to_string(),
+        ]
+    );
+}

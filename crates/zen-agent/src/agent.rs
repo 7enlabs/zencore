@@ -1500,19 +1500,24 @@ impl Agent {
             return Slot::Done(tool_use_id, content, true);
         }
 
-        let checked = self
+        let (checked, gate_info) = self
             .permissions
-            .check(&tool_name, &args, read_only, &self.ctx);
+            .gate_decision(&tool_name, &args, read_only, &self.ctx);
         let ask_rule = matches!(checked, PermissionDecision::Ask)
             && self
                 .permissions
                 .ask_rule_matches(&tool_name, &args, &self.ctx);
+        let mut gate_reason_code = gate_info.reason_code.clone();
         let mut decision = combine_permission(
-            checked,
+            checked.clone(),
             pre.permission_override.clone(),
             ask_rule,
             self.config.permission_mode,
         );
+        if std::mem::discriminant(&decision) != std::mem::discriminant(&checked) {
+            // A PreToolUse hook changed the checker's verdict.
+            gate_reason_code = "hook".to_string();
+        }
         // `PermissionRequest`: a permission prompt is about to be shown.
         // A hook may decide the request itself (allow/deny/ask) or block
         // it (exit 2 / decision block) instead of asking the user.
@@ -1531,13 +1536,30 @@ impl Agent {
                 .await;
             self.emit_system_message(HookEvent::PermissionRequest, &req);
             if req.blocked {
+                gate_reason_code = "hook".to_string();
                 decision = PermissionDecision::Deny(req.feedback.unwrap_or_else(|| {
                     format!("Permission request for '{tool_name}' blocked by hook")
                 }));
             } else if let Some(po) = req.permission_override {
+                gate_reason_code = "hook".to_string();
                 decision = po;
             }
         }
+        // Flightdeck Phase 2: exactly one gate event per tool call,
+        // carrying the final bucket after hooks have had their say.
+        let gate_bucket = match &decision {
+            PermissionDecision::Allow => GateBucket::Allowed,
+            PermissionDecision::Deny(_) => GateBucket::Denied,
+            PermissionDecision::Ask => GateBucket::Classifier,
+        };
+        self.sink.emit(AgentEvent::PermissionClassified {
+            tool_use_id: tool_use_id.clone(),
+            tool_name: tool_name.clone(),
+            bucket: gate_bucket,
+            reason_code: gate_reason_code,
+            summary: summarize_tool_call(&tool_name, &args),
+            parent_tool_use_id: self.parent_tool_use_id.clone(),
+        });
         let mut allowed = true;
         let mut deny_reason = String::new();
         match decision {
@@ -1568,12 +1590,27 @@ impl Agent {
                 };
                 match answer {
                     Some(answer) => {
+                        let outcome = match &answer {
+                            PromptAnswer::Yes => GateOutcome::ApprovedOnce,
+                            PromptAnswer::Always(rules) => {
+                                GateOutcome::ApprovedAlways(rules.clone())
+                            }
+                            PromptAnswer::No => GateOutcome::DeniedByUser,
+                        };
                         if let Some(reason) = self.apply_prompt_answer(answer, &tool_name) {
                             allowed = false;
                             deny_reason = reason;
                         }
+                        self.sink.emit(AgentEvent::PermissionResolved {
+                            tool_use_id: tool_use_id.clone(),
+                            outcome,
+                        });
                     }
                     None => {
+                        self.sink.emit(AgentEvent::PermissionResolved {
+                            tool_use_id: tool_use_id.clone(),
+                            outcome: GateOutcome::DeniedNoPrompter,
+                        });
                         allowed = false;
                         deny_reason = format!(
                             "Permission required for '{tool_name}' in non-interactive mode"
