@@ -338,16 +338,44 @@ mod tests {
                 }
             }
         });
-        // Let the viewer enter raw mode, then press q. The pty holds
-        // the key until the viewer reads it, so the timing is not a race.
-        // Keep stdin open until the child exits: closing it early could
-        // let `script` exit before the viewer has drawn.
-        std::thread::sleep(Duration::from_millis(500));
-        {
-            let mut s = stdin.lock().expect("stdin lock");
-            s.write_all(b"q").expect("write q to pty");
-            s.flush().expect("flush q");
+        // Press q again and again until the child exits: a key that
+        // arrives while the viewer polls must be read, not skipped.
+        // This kills the delete-! mutant on event::poll: with the `!`
+        // gone, a ready key makes the loop spin on continue instead
+        // of reading it, so the viewer never exits. Keep stdin open
+        // until the child exits: closing it early could let `script`
+        // exit before the viewer has drawn.
+        let stop_sending = Arc::new(AtomicBool::new(false));
+        let sender_stop = Arc::clone(&stop_sending);
+        let sender_stdin = Arc::clone(&stdin);
+        let sender = std::thread::spawn(move || {
+            while !sender_stop.load(Ordering::SeqCst) {
+                if let Ok(mut s) = sender_stdin.lock() {
+                    let _ = s.write_all(b"q");
+                    let _ = s.flush();
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        // Stop the q-sender when the test ends, even on panic: without
+        // this a failing test would leave the sender thread writing
+        // forever and the test binary would never exit.
+        struct StopSender {
+            stop: Arc<AtomicBool>,
+            handle: Option<std::thread::JoinHandle<()>>,
         }
+        impl Drop for StopSender {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::SeqCst);
+                if let Some(handle) = self.handle.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
+        let _sender_guard = StopSender {
+            stop: stop_sending,
+            handle: Some(sender),
+        };
         let deadline = Instant::now() + Duration::from_secs(15);
         let status = loop {
             match child.try_wait() {

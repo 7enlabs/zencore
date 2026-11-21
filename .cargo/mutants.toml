@@ -279,4 +279,34 @@ exclude_re = [
   # being equivalent: remove this exclusion and kill it with a test
   # that applies a TextDelta event and checks the state.
   "state\\.rs:465:13: delete match arm AgentEvent::TextDelta\\{\\.\\.\\} in FlightdeckState::apply",
+  # PR #262, state.rs FlightdeckState::push_log (line 515, col 27):
+  # replace > with >= in the cap check.
+  # EQUIVALENT (waived by ZC Leader, Telegram tin 19373, 2026-11-21;
+  # verified by reading state.rs:512-518): the two operators differ
+  # only when len == MAX_LOG_LINES exactly (500); then excess is
+  # 500 - 500 = 0 and drain(..0) removes nothing, which is exactly
+  # what skipping the drain does. No observable behaviour changes
+  # and no test can kill this mutant.
+  # EXPIRY: if the drain is changed so the boundary case can remove
+  # lines (for example the drain range stops starting at 0), this
+  # mutant stops being equivalent: remove this exclusion and kill it
+  # with a test that pushes exactly MAX_LOG_LINES lines and checks
+  # the log is unchanged.
+  "state\\.rs:515:27: replace > with >= in FlightdeckState::push_log",
+  # PR #262, state.rs FlightdeckState::push_log (line 516, col 41):
+  # replace - with / in the excess computation.
+  # EQUIVALENT (waived by ZC Leader, Telegram tin 19373, 2026-11-21;
+  # verified by reading state.rs:512-518 and grepping the workspace:
+  # the only push/drain of log anywhere is here in push_log, so the
+  # log holds at most MAX_LOG_LINES after every call and at most
+  # MAX_LOG_LINES + 1 right after the push; inside the len >
+  # MAX_LOG_LINES branch len is therefore exactly 501, so len - 500
+  # = 1 and len / 500 = 1 (integer division): the same excess, the
+  # same drain. No observable behaviour changes and no test can
+  # kill this mutant.
+  # EXPIRY: if log can grow anywhere other than push_log, or
+  # push_log stops draining to MAX_LOG_LINES after every push, this
+  # mutant stops being equivalent: remove this exclusion and kill it
+  # with a test that overfills the log and checks the oldest lines.
+  "state\\.rs:516:41: replace - with / in FlightdeckState::push_log",
 ]

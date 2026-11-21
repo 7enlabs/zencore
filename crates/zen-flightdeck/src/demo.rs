@@ -243,4 +243,141 @@ mod tests {
         assert!(done.load(Ordering::SeqCst));
         assert!(start.elapsed() >= Duration::from_secs(1));
     }
+
+    /// Helper run only under a pty by `demo_draws_and_exits`: it runs
+    /// the real demo with a 1s auto-exit. In a normal suite run the
+    /// marker is absent (and stdin is piped), so this returns at once
+    /// instead of blocking on the viewer.
+    #[test]
+    fn demo_pty_helper() {
+        if std::env::var_os("FLIGHTDECK_PTY_DEMO").is_none() {
+            return;
+        }
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            return;
+        }
+        run_demo(1).expect("demo failed under pty");
+    }
+
+    /// The demo draws a frame and exits on its own once the scripted
+    /// scenario finishes: this kills the `run_demo -> Ok(())` mutant,
+    /// which would exit at once with no frame drawn. The viewer needs
+    /// a real terminal, so the helper above runs under `script` and a
+    /// reader thread answers the DSR cursor-position query, exactly
+    /// like the viewer pty test in app.rs.
+    #[test]
+    fn demo_draws_and_exits() {
+        use std::io::{Read, Write};
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let exe = std::env::current_exe().expect("current test exe");
+        let mut child = Command::new("script")
+            .arg("-qec")
+            .arg(format!(
+                "stty rows 24 cols 100; exec {} demo_pty_helper --nocapture",
+                exe.display()
+            ))
+            .arg("/dev/null")
+            .env("FLIGHTDECK_PTY_DEMO", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn `script` (util-linux) for the pty demo test");
+        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("pty stdin")));
+        let mut stdout = child.stdout.take().expect("pty stdout");
+        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let reader_out = Arc::clone(&output);
+        let reader_stdin = Arc::clone(&stdin);
+        let reader = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut answered = 0usize;
+            loop {
+                match stdout.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        // The DSR query is ESC [ 6 n; answer ESC [ 1 ; 1 R.
+                        let queries = {
+                            let mut out = reader_out.lock().expect("output lock");
+                            out.extend_from_slice(&buf[..n]);
+                            out.windows(4).filter(|w| *w == [27u8, 91, 54, 110]).count()
+                        };
+                        while answered < queries {
+                            answered += 1;
+                            if let Ok(mut s) = reader_stdin.lock() {
+                                let _ = s.write_all(&[27u8, 91, 49, 59, 49, 82]);
+                                let _ = s.flush();
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        // The demo runs the scripted scenario, then exits 1s after it
+        // finishes: no key press needed. Keep stdin open until the
+        // child exits: closing it early could let `script` exit before
+        // the viewer has drawn.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {
+                    if Instant::now() > deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("demo did not exit on its own within 20s");
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => panic!("try_wait: {e}"),
+            }
+        };
+        let _ = reader.join();
+        drop(stdin);
+        assert!(status.success(), "pty demo failed, status {status}");
+        let guard = output.lock().expect("output lock");
+        let raw = String::from_utf8_lossy(&guard);
+        // The frame writes text in pieces with cursor moves between
+        // them, so assert on the text with the escape sequences
+        // stripped out (same helper as the viewer pty test in app.rs).
+        let text = strip_ansi(&guard);
+        assert!(text.contains("AGENTS LIVE"), "no frame drawn: {text}");
+        assert!(text.contains("SESSION"), "no log block drawn: {text}");
+        assert!(text.contains("LOG"), "no log block drawn: {text}");
+        assert!(
+            raw.contains(&format!("{}[?1049l", char::from(27))),
+            "terminal not restored (no LeaveAlternateScreen): {raw}"
+        );
+    }
+
+    /// Strip ANSI escape sequences (CSI, ending at a letter, and
+    /// two-byte escapes) so frame text can be asserted on without the
+    /// cursor moves ratatui writes between the pieces. Copy of the
+    /// helper in app.rs tests: the two test modules cannot share it.
+    fn strip_ansi(bytes: &[u8]) -> String {
+        let text = String::from_utf8_lossy(bytes);
+        let mut out = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        let esc = char::from(27);
+        let bracket = char::from(91);
+        while let Some(c) = chars.next() {
+            if c != esc {
+                out.push(c);
+                continue;
+            }
+            if chars.peek() == Some(&bracket) {
+                chars.next();
+                for c2 in chars.by_ref() {
+                    if c2.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                chars.next();
+            }
+        }
+        out
+    }
 }
