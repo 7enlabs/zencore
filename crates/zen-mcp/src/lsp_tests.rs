@@ -741,12 +741,16 @@ async fn unknown_extension_is_a_clear_error() {
 }
 
 #[tokio::test]
-#[allow(clippy::await_holding_lock)]
-
 async fn missing_binary_names_the_install_command() {
-    let _guard = PATH_LOCK.lock().unwrap();
+    // Hold PATH_LOCK while setting the fixture PATH, then release it
+    // across the awaits (clippy::await_holding_lock) and re-acquire it
+    // before restoring PATH. The EnvGuard stays alive across the awaits,
+    // so PATH keeps the fixture value; this is the only test in this
+    // binary that mutates PATH, so no other test can change it under us.
+    let mut path_lock = Some(PATH_LOCK.lock().unwrap());
     let tmp = unique_tmpdir("empty-path");
     let _env_guard = EnvGuard::set("PATH", &tmp);
+    drop(path_lock.take());
 
     let mgr = LspManager::new();
     let cases = [
@@ -767,10 +771,10 @@ async fn missing_binary_names_the_install_command() {
         }
     }
 
-    // Restore PATH before releasing the lock, as before: another
+    // Re-acquire the lock before restoring PATH, as before: another
     // test must never observe the fixture PATH.
+    let _path_lock = PATH_LOCK.lock().unwrap();
     drop(_env_guard);
-    drop(_guard);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
