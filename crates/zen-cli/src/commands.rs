@@ -354,12 +354,11 @@ pub fn context_report(
 }
 
 pub fn tool_help(name: &str) -> String {
-    let mut registry = zen_core::ToolRegistry::new();
-    for t in zen_tools::builtin_tools() {
-        registry.register(t);
-    }
-    registry.register(std::sync::Arc::new(zen_tools::JobOutputTool));
-    registry.register(std::sync::Arc::new(zen_tools::JobKillTool));
+    // The registry is the agent's own full tool set (see
+    // `agent_run::documentable_tools`), so every tool the agent can run
+    // is documented here, including the ones that need runtime state
+    // (Skill, Task, delegate, LSP) and are never built by this path.
+    let registry = crate::agent_run::documentable_tools();
     let found = registry.get(name).or_else(|| {
         let lower = name.to_ascii_lowercase();
         registry
@@ -377,14 +376,18 @@ pub fn tool_help(name: &str) -> String {
                 .unwrap_or("unclassified");
             let docs = zen_tools::tool_long_docs(tool.name())
                 .unwrap_or("No extended documentation available.");
-            format!(
+            let mut out = format!(
                 "{} (phase: {}, ~{} schema tokens)\n\n{}\n\n---\n\n{}",
                 tool.name(),
                 phase,
                 tokens,
                 tool.description(),
                 docs
-            )
+            );
+            if let Some(note) = crate::agent_run::tool_runtime_note(tool.name()) {
+                out.push_str(&format!("\n\nNote: {}", note));
+            }
+            out
         }
         None => format!(
             "Unknown tool '{}'. Available tools: {}",
@@ -1031,6 +1034,44 @@ mod tests {
                 "missing description for {c}"
             );
         }
+    }
+
+    #[test]
+    fn tool_help_covers_every_documentable_tool() {
+        // Issue #251: `zen tool-help` only knew the 12 tools it built
+        // itself and rejected Skill, Task, delegate and the 4 LSP tools
+        // with "Unknown tool". It now documents from the agent's own
+        // full tool set, so every name there must resolve.
+        let names = crate::agent_run::documentable_tools().names();
+        assert_eq!(names.len(), 19, "documentable tools: {names:?}");
+        for name in &names {
+            let help = tool_help(name);
+            assert!(
+                !help.starts_with("Unknown tool"),
+                "tool_help({name}) should resolve, got: {help}"
+            );
+            assert!(
+                help.starts_with(&format!("{} (phase:", name)),
+                "tool_help({name}) should start with its header, got: {help}"
+            );
+        }
+        // The runtime-state tools carry the note; the plain ones do not.
+        assert!(
+            tool_help("Task").contains("Requires configured sub-agents"),
+            "Task help must carry its runtime note"
+        );
+        assert!(
+            tool_help("delegate").contains("Requires configured sub-agents"),
+            "delegate help must carry its runtime note"
+        );
+        assert!(
+            tool_help("goto_definition").contains("active LSP provider"),
+            "LSP help must carry its runtime note"
+        );
+        assert!(
+            !tool_help("Read").contains("Note:"),
+            "Read needs no runtime note"
+        );
     }
 
     fn sample_messages() -> Vec<zen_core::ChatMessage> {
