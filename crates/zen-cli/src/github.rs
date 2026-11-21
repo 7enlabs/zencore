@@ -190,25 +190,19 @@ pub fn parse_issue_comments(json: &str) -> Result<Vec<PrComment>> {
 }
 
 fn resolve_pr(cwd: &Path, pr_arg: Option<&str>) -> Result<(String, u64)> {
-    let nwo = gh_json(
-        cwd,
-        &[
-            "repo",
-            "view",
-            "--json",
-            "nameWithOwner",
-            "--jq",
-            ".nameWithOwner",
-        ],
-    )
-    .map_err(|e| {
+    let nwo = gh_json(cwd, &["repo", "view", "--json", "nameWithOwner"]).map_err(|e| {
         if e.to_string().contains("not authenticated") {
             e
         } else {
             anyhow!("could not determine the GitHub repo (is this a GitHub checkout?)")
         }
     })?;
-    let nwo = nwo.as_str().unwrap_or("").trim().to_string();
+    let nwo = nwo
+        .get("nameWithOwner")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if nwo.is_empty() {
         return Err(anyhow!("could not determine the GitHub repo"));
     }
@@ -951,10 +945,10 @@ args="$*"
 case "$FAKE_GH_MODE" in
   auth-fail) echo "gh: not authenticated, run gh auth login" >&2; exit 1 ;;
   bad-json) printf 'not json\n'; exit 0 ;;
-  empty-nwo) printf '""\n'; exit 0 ;;
+  empty-nwo) printf '{"nameWithOwner":""}\n'; exit 0 ;;
 esac
 case "$args" in
-  *'repo view'*) printf '"7enlabs/zencore"\n'; exit 0 ;;
+  *'repo view'*) printf '{"nameWithOwner":"7enlabs/zencore"}\n'; exit 0 ;;
   *'pr view'*)
     if [ "$FAKE_GH_MODE" = "no-pr" ]; then echo "no PR for branch" >&2; exit 1; fi
     printf '42\n'; exit 0 ;;
@@ -1066,19 +1060,8 @@ esac
     fn gh_json_and_available_via_fake_gh() {
         let _env = crate::settings::env_lock();
         let (base, _restore) = setup_fake_gh("gh_json", "ok");
-        let v = gh_json(
-            &base,
-            &[
-                "repo",
-                "view",
-                "--json",
-                "nameWithOwner",
-                "--jq",
-                ".nameWithOwner",
-            ],
-        )
-        .unwrap();
-        assert_eq!(v.as_str(), Some("7enlabs/zencore"));
+        let v = gh_json(&base, &["repo", "view", "--json", "nameWithOwner"]).unwrap();
+        assert_eq!(v["nameWithOwner"].as_str(), Some("7enlabs/zencore"));
         assert!(gh_available(&base));
         let _ = std::fs::remove_dir_all(&base);
 
