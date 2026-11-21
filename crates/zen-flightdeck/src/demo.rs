@@ -46,13 +46,20 @@ pub fn run_demo(auto_exit_secs: u64) -> io::Result<()> {
     let feeder_state = state.clone();
     thread::spawn(move || {
         run_scenario(&sink, &feeder_state);
-        if auto_exit_secs > 0 {
-            thread::sleep(Duration::from_secs(auto_exit_secs));
-            feeder_done.store(true, Ordering::SeqCst);
-        }
+        signal_done_after(auto_exit_secs, &feeder_done);
     });
     run_viewer(state, Some(done))
 }
+/// Signal the viewer to exit once the scripted scenario is done,
+/// when an auto-exit delay is set. Split out so the `> 0` boundary is
+/// unit-testable without the terminal viewer.
+fn signal_done_after(auto_exit_secs: u64, done: &AtomicBool) {
+    if auto_exit_secs > 0 {
+        thread::sleep(Duration::from_secs(auto_exit_secs));
+        done.store(true, Ordering::SeqCst);
+    }
+}
+
 fn sleep_ms(ms: u64) {
     thread::sleep(Duration::from_millis(ms));
 }
@@ -216,5 +223,24 @@ mod tests {
             "{:?}",
             s.agent_rows()
         );
+    }
+
+    #[test]
+    fn auto_exit_zero_never_signals_done() {
+        // Kills the `>` -> `>=` mutant (0 >= 0 would signal at once).
+        let done = AtomicBool::new(false);
+        signal_done_after(0, &done);
+        assert!(!done.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn auto_exit_one_second_signals_done() {
+        // Kills the `>` -> `==` and `>` -> `<` mutants (1 == 0 and
+        // 1 < 0 are both false, so neither would signal).
+        let done = AtomicBool::new(false);
+        let start = std::time::Instant::now();
+        signal_done_after(1, &done);
+        assert!(done.load(Ordering::SeqCst));
+        assert!(start.elapsed() >= Duration::from_secs(1));
     }
 }

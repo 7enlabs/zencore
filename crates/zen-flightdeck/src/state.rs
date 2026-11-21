@@ -998,4 +998,13 @@ mod tests {
             assert!(log[i].contains(&format!("({want})")), "{}", log[i]);
         }
     }
+
+    #[test]
+    fn fmt_duration_boundary_is_minutes() {
+        // The 60s boundary kills the `<` -> `<=` mutant: at exactly 60s
+        // the display must switch from seconds to minutes.
+        assert_eq!(fmt_duration(Duration::from_secs(59)), "59s");
+        assert_eq!(fmt_duration(Duration::from_secs(60)), "1m 00s");
+        assert_eq!(fmt_duration(Duration::from_secs(125)), "2m 05s");
+    }
 }

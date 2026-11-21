@@ -121,6 +121,13 @@ impl KeyHandler {
     }
 }
 
+/// Whether this key event is a press: releases and repeats never
+/// act, so holding `q` cannot exit the viewer twice over. Split out
+/// so the press/release boundary is unit-testable without a tty.
+fn is_press(key: event::KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press
+}
+
 /// Run the viewer over shared state until `q` (or Ctrl-C) is pressed.
 /// When `exit_when` is set, the viewer also exits once that flag is
 /// set (used by the scripted demo for unattended runs).
@@ -148,7 +155,7 @@ pub fn run_viewer(
         let Event::Key(key) = event::read()? else {
             continue;
         };
-        if key.kind != KeyEventKind::Press {
+        if !is_press(key) {
             continue;
         }
         if keys.handle(&state, key) {
@@ -232,5 +239,174 @@ mod tests {
         assert!(!h.handle(&s, key(KeyCode::Char('/'))));
         assert!(!h.handle(&s, key(KeyCode::Char('q'))));
         assert_eq!(lock_state(&s).filter, "yq");
+    }
+
+    fn key_with_kind(code: KeyCode, kind: KeyEventKind) -> KeyEvent {
+        KeyEvent { kind, ..key(code) }
+    }
+
+    #[test]
+    fn only_key_presses_act() {
+        assert!(is_press(key_with_kind(
+            KeyCode::Char('q'),
+            KeyEventKind::Press
+        )));
+        assert!(!is_press(key_with_kind(
+            KeyCode::Char('q'),
+            KeyEventKind::Release
+        )));
+        assert!(!is_press(key_with_kind(
+            KeyCode::Char('q'),
+            KeyEventKind::Repeat
+        )));
+    }
+
+    /// Helper run only under a pty by `viewer_draws_and_restores_terminal`:
+    /// it opens the real viewer and waits for `q`. The parent test sets
+    /// FLIGHTDECK_PTY_HELPER=1 and runs this under `script`, so stdin is
+    /// a terminal there. In a normal suite run the marker is absent (and
+    /// stdin is piped), so this returns at once instead of blocking on a
+    /// key that will never come.
+    #[test]
+    fn viewer_pty_helper() {
+        if std::env::var_os("FLIGHTDECK_PTY_HELPER").is_none() {
+            return;
+        }
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            return;
+        }
+        let s = state();
+        let done = Arc::new(AtomicBool::new(false));
+        run_viewer(s, Some(done)).expect("viewer failed under pty");
+    }
+
+    /// The viewer draws a frame and restores the terminal on exit, run
+    /// under a pty (`script`) so raw mode works. The drawn frame kills
+    /// the run_viewer -> Ok(()) mutant; the LeaveAlternateScreen bytes
+    /// kill the TerminalGuard Drop-deletion mutant. A reader thread
+    /// answers the cursor-position (DSR) queries the viewer's
+    /// Terminal::clear() sends: `script` is not a terminal emulator and
+    /// never replies, so without the answer clear() times out after 2s.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn viewer_draws_and_restores_terminal() {
+        use std::io::{Read, Write};
+        use std::process::{Command, Stdio};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        let exe = std::env::current_exe().expect("current test exe");
+        let mut child = Command::new("script")
+            .arg("-qec")
+            .arg(format!(
+                "stty rows 24 cols 100; exec {} viewer_pty_helper --nocapture",
+                exe.display()
+            ))
+            .arg("/dev/null")
+            .env("FLIGHTDECK_PTY_HELPER", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn `script` (util-linux) for the pty viewer test");
+        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("pty stdin")));
+        let mut stdout = child.stdout.take().expect("pty stdout");
+        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let reader_out = Arc::clone(&output);
+        let reader_stdin = Arc::clone(&stdin);
+        let reader = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut answered = 0usize;
+            loop {
+                match stdout.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let queries = {
+                            let mut out = reader_out.lock().expect("output lock");
+                            out.extend_from_slice(&buf[..n]);
+                            out.windows(4).filter(|w| *w == b"\x1b[6n").count()
+                        };
+                        while answered < queries {
+                            answered += 1;
+                            if let Ok(mut s) = reader_stdin.lock() {
+                                let _ = s.write_all(b"\x1b[1;1R");
+                                let _ = s.flush();
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        // Let the viewer enter raw mode, then press q. The pty holds
+        // the key until the viewer reads it, so the timing is not a race.
+        // Keep stdin open until the child exits: closing it early could
+        // let `script` exit before the viewer has drawn.
+        std::thread::sleep(Duration::from_millis(500));
+        {
+            let mut s = stdin.lock().expect("stdin lock");
+            s.write_all(b"q").expect("write q to pty");
+            s.flush().expect("flush q");
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {
+                    if Instant::now() > deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("viewer did not exit on q within 15s");
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => panic!("try_wait: {e}"),
+            }
+        };
+        let _ = reader.join();
+        drop(stdin);
+        assert!(status.success(), "pty viewer failed, status {status}");
+        let guard = output.lock().expect("output lock");
+        let raw = String::from_utf8_lossy(&guard);
+        // The frame writes text in pieces with cursor moves between
+        // them ("SESSION" ... "LOG"), so assert on the text with the
+        // escape sequences stripped out.
+        let text = strip_ansi(&guard);
+        assert!(text.contains("AGENTS LIVE"), "no frame drawn: {text}");
+        assert!(text.contains("SESSION"), "no log block drawn: {text}");
+        assert!(text.contains("LOG"), "no log block drawn: {text}");
+        assert!(
+            raw.contains("\u{1b}[?1049l"),
+            "terminal not restored (no LeaveAlternateScreen): {raw}"
+        );
+    }
+    /// Strip ANSI escape sequences (CSI, ending at a letter, and two-byte
+    /// escapes) so frame text can be asserted on without the cursor moves
+    /// ratatui writes between the pieces.
+    fn strip_ansi(bytes: &[u8]) -> String {
+        let text = String::from_utf8_lossy(bytes);
+        let mut out = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '\x1b' {
+                out.push(c);
+                continue;
+            }
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    for c2 in chars.by_ref() {
+                        if c2.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+        }
+        out
     }
 }

@@ -267,4 +267,16 @@ exclude_re = [
   # NOTE (2026-11-21, PR #259): the cargo PATH resolution fix moved
   # the code from line 559 to line 689; exclusion updated to match.
   "sandbox\\.rs:689:9: replace imp::apply_to_command -> Result<SandboxOutcome, String> with Ok\\(Default::default\\(\\)\\)",
+  # PR #262, state.rs FlightdeckState::apply (line 465, col 13):
+  # delete match arm AgentEvent::TextDelta{..}.
+  # EQUIVALENT (verified by reading state.rs:464-470): the arm body
+  # is empty, and the catch-all arm `_ => {}` directly below it is
+  # also empty, so deleting the TextDelta arm makes TextDelta fall
+  # through to the catch-all, which does exactly the same nothing.
+  # No observable behaviour changes and no test can kill this mutant.
+  # EXPIRY: if the TextDelta arm gains a body, or the catch-all arm
+  # gains a body that treats TextDelta differently, this mutant stops
+  # being equivalent: remove this exclusion and kill it with a test
+  # that applies a TextDelta event and checks the state.
+  "state\\.rs:465:13: delete match arm AgentEvent::TextDelta\\{\\.\\.\\} in FlightdeckState::apply",
 ]
