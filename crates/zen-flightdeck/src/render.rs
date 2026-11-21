@@ -266,6 +266,19 @@ mod tests {
     }
 
     #[test]
+    fn log_block_starts_right_after_the_table() {
+        // Layout geometry with 2 agent rows at 100x24: header takes
+        // lines 0-3, the table 5 lines (4-8), so the log block's
+        // title sits on line 9. The table-height mutant (`rows + 3`
+        // -> `rows * 3`, 6 lines) pushes it to line 10.
+        let s = populated_state();
+        let out = render_to_string(&s, 100, 24);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 24, "{out}");
+        assert!(lines[9].contains("SESSION LOG"), "{out}");
+    }
+
+    #[test]
     fn single_agent_row_is_not_clipped() {
         let s = FlightdeckState::new(
             "sess-empty",
