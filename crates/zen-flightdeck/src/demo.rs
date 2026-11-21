@@ -48,7 +48,7 @@ pub fn run_demo(auto_exit_secs: u64) -> io::Result<()> {
         run_scenario(&sink, &feeder_state);
         signal_done_after(auto_exit_secs, &feeder_done);
     });
-    run_viewer(state, Some(done))
+    run_viewer(state, None, Some(done))
 }
 /// Signal the viewer to exit once the scripted scenario is done,
 /// when an auto-exit delay is set. Split out so the `> 0` boundary is
@@ -182,6 +182,40 @@ fn run_scenario(sink: &Arc<FlightdeckSink>, state: &Arc<Mutex<FlightdeckState>>)
     ));
     sleep_ms(400);
 
+    // Phase 2: the GATE pane in action — one call allowed at once,
+    // one waiting for approval (approved after a pause), one blocked
+    // outright by the classifier.
+    emit(AgentEvent::PermissionClassified {
+        tool_use_id: "demo-gate-1".to_string(),
+        tool_name: "Bash".to_string(),
+        bucket: zen_core::GateBucket::Allowed,
+        reason_code: "safe.bash-readonly".to_string(),
+        summary: "ls crates".to_string(),
+        parent_tool_use_id: None,
+    });
+    emit(AgentEvent::PermissionClassified {
+        tool_use_id: "demo-gate-2".to_string(),
+        tool_name: "Bash".to_string(),
+        bucket: zen_core::GateBucket::Classifier,
+        reason_code: "warn.git-destructive".to_string(),
+        summary: "git reset --hard HEAD~1".to_string(),
+        parent_tool_use_id: None,
+    });
+    sleep_ms(900);
+    emit(AgentEvent::PermissionResolved {
+        tool_use_id: "demo-gate-2".to_string(),
+        outcome: zen_core::GateOutcome::ApprovedOnce,
+    });
+    emit(AgentEvent::PermissionClassified {
+        tool_use_id: "demo-gate-3".to_string(),
+        tool_name: "Bash".to_string(),
+        bucket: zen_core::GateBucket::Denied,
+        reason_code: "danger.rm-recursive-root".to_string(),
+        summary: "rm -rf /".to_string(),
+        parent_tool_use_id: None,
+    });
+    sleep_ms(400);
+
     // The main agent merges the three results.
     emit(assistant("Đã gộp 3 kết quả thành bản cuối.", None));
     note_demo_turn(state);
@@ -210,6 +244,18 @@ mod tests {
         let s = state.lock().unwrap();
         assert_eq!(s.agents.len(), 4);
         assert!(s.agents[1..].iter().all(|r| r.status == AgentStatus::Done));
+        // The gate sequence ran: one of each bucket, approval resolved.
+        assert_eq!((s.gate_allow, s.gate_ask, s.gate_deny), (1, 1, 1));
+        assert_eq!(s.gate_rows.len(), 3);
+        assert!(s.pending_gate.is_none());
+        assert!(
+            s.gate_rows[1]
+                .resolution
+                .as_deref()
+                .is_some_and(|r| r.contains("duyệt 1 lần")),
+            "{:?}",
+            s.gate_rows[1]
+        );
         // 5 assistant messages: split + 3 completions + merge.
         assert_eq!(s.requests, 5);
         // The demo model is free: exact cost $0.00, never "giá chưa rõ".

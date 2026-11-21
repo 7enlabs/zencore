@@ -21,6 +21,8 @@ use zen_core::{AgentEvent, PermissionMode, UsageStats, estimate_tokens};
 /// Cap on retained session-log lines: the dashboard is a live view, not
 /// an archive; the oldest lines drop once the buffer is full.
 const MAX_LOG_LINES: usize = 500;
+/// Cap on retained GATE rows (Phase 2), same reasoning as the log.
+const MAX_GATE_ROWS: usize = 200;
 /// First-line truncation for assistant text in the log.
 const MAX_TEXT_CHARS: usize = 120;
 /// Truncation for a delegate result in the agents table.
@@ -126,7 +128,52 @@ pub struct LogLine {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Agents,
+    Gate,
     Log,
+}
+
+/// One row of the GATE pane (Phase 2): a tool call, the bucket it
+/// landed in, and why. `resolution` is filled in when a call that
+/// waited for approval is decided.
+#[derive(Debug, Clone)]
+pub struct GateRow {
+    pub time: String,
+    pub tool_use_id: String,
+    pub tool_name: String,
+    pub summary: String,
+    pub bucket: zen_core::GateBucket,
+    pub reason_code: String,
+    pub resolution: Option<String>,
+}
+
+impl GateRow {
+    /// The row as one display line.
+    pub fn line(&self) -> String {
+        let bucket = match self.bucket {
+            zen_core::GateBucket::Allowed => "ALLOWED",
+            zen_core::GateBucket::Classifier => "CLASSIFIER",
+            zen_core::GateBucket::Denied => "DENIED",
+        };
+        let mut out = format!(
+            "{} {} {} {} {}",
+            self.time, self.tool_name, self.summary, bucket, self.reason_code
+        );
+        if let Some(r) = &self.resolution {
+            out.push_str(&format!(" → {r}"));
+        }
+        out
+    }
+}
+
+/// A call waiting for a per-command approval right now (Phase 2).
+/// Set from the `PermissionClassified` event, cleared by the
+/// matching `PermissionResolved`.
+#[derive(Debug, Clone)]
+pub struct PendingGate {
+    pub tool_use_id: String,
+    pub tool_name: String,
+    pub summary: String,
+    pub reason_code: String,
 }
 
 /// The whole dashboard state: header numbers, the agents table, and the
@@ -162,6 +209,15 @@ pub struct FlightdeckState {
     pub focus: Focus,
     /// Log filter text (`/` to edit); empty means no filtering.
     pub filter: String,
+    /// GATE pane rows (Phase 2), oldest first, capped.
+    pub gate_rows: Vec<GateRow>,
+    /// Gate counters for the header: calls allowed at once, calls
+    /// that waited for approval, calls blocked.
+    pub gate_allow: u64,
+    pub gate_ask: u64,
+    pub gate_deny: u64,
+    /// The call currently waiting for a per-command approval.
+    pub pending_gate: Option<PendingGate>,
     /// Last tool name seen per tool call id (from `ToolProgress`).
     tool_names: HashMap<String, String>,
     /// Last heartbeat elapsed per tool call id (from `ToolProgress`).
@@ -197,6 +253,11 @@ impl FlightdeckState {
             log: Vec::new(),
             focus: Focus::Agents,
             filter: String::new(),
+            gate_rows: Vec::new(),
+            gate_allow: 0,
+            gate_ask: 0,
+            gate_deny: 0,
+            pending_gate: None,
             tool_names: HashMap::new(),
             tool_elapsed_ms: HashMap::new(),
             subagent_tools: HashMap::new(),
@@ -237,7 +298,7 @@ impl FlightdeckState {
             None => "-".to_string(),
         };
         format!(
-            "ZEN - phiên {} | ctx {} ({}/{}) | {} | req {} | model {}\nmode: {} (autocompact: {})",
+            "ZEN - phiên {} | ctx {} ({}/{}) | {} | req {} | model {}\nmode: {} (autocompact: {}) | gate: allow {} · ask {} · deny {}",
             short_id(&self.session_id),
             pct,
             fmt_u64(self.used_tokens_display()),
@@ -247,7 +308,21 @@ impl FlightdeckState {
             self.model,
             self.permission_mode,
             self.autocompact,
+            self.gate_allow,
+            self.gate_ask,
+            self.gate_deny,
         )
+    }
+
+    /// GATE pane lines, oldest first, with the active filter applied
+    /// (same filter as the log: tool name, reason code, summary).
+    pub fn visible_gate_rows(&self) -> Vec<String> {
+        let needle = self.filter.to_lowercase();
+        self.gate_rows
+            .iter()
+            .map(|r| r.line())
+            .filter(|l| needle.is_empty() || l.to_lowercase().contains(&needle))
+            .collect()
     }
 
     /// Table rows as `[name, status, current tool, elapsed, result]`.
@@ -446,6 +521,77 @@ impl FlightdeckState {
                 self.push_log(format!(
                     "đã cắt {pruned} tin, tiết kiệm {tokens_saved} token"
                 ));
+            }
+            AgentEvent::PermissionClassified {
+                tool_use_id,
+                tool_name,
+                bucket,
+                reason_code,
+                summary,
+                ..
+            } => {
+                match bucket {
+                    zen_core::GateBucket::Allowed => self.gate_allow += 1,
+                    zen_core::GateBucket::Classifier => self.gate_ask += 1,
+                    zen_core::GateBucket::Denied => self.gate_deny += 1,
+                }
+                // M2 applies to the gate too: the summary comes from
+                // tool input, so no control character reaches the
+                // terminal through a gate row or the pending block.
+                let tool_name = strip_control(tool_name);
+                let summary = strip_control(summary);
+                let time = chrono::Local::now().format("%H:%M:%S").to_string();
+                self.gate_rows.push(GateRow {
+                    time,
+                    tool_use_id: tool_use_id.clone(),
+                    tool_name: tool_name.clone(),
+                    summary: summary.clone(),
+                    bucket: *bucket,
+                    reason_code: reason_code.clone(),
+                    resolution: None,
+                });
+                if self.gate_rows.len() > MAX_GATE_ROWS {
+                    let excess = self.gate_rows.len() - MAX_GATE_ROWS;
+                    self.gate_rows.drain(..excess);
+                }
+                if *bucket == zen_core::GateBucket::Classifier {
+                    self.pending_gate = Some(PendingGate {
+                        tool_use_id: tool_use_id.clone(),
+                        tool_name,
+                        summary,
+                        reason_code: reason_code.clone(),
+                    });
+                }
+            }
+            AgentEvent::PermissionResolved {
+                tool_use_id,
+                outcome,
+            } => {
+                let text = match outcome {
+                    zen_core::GateOutcome::ApprovedOnce => "duyệt 1 lần".to_string(),
+                    zen_core::GateOutcome::ApprovedAlways(rule) => {
+                        format!("luôn cho phép: {}", strip_control(rule))
+                    }
+                    zen_core::GateOutcome::DeniedByUser => "người dùng từ chối".to_string(),
+                    zen_core::GateOutcome::DeniedNoPrompter => {
+                        "từ chối: không có nơi duyệt".to_string()
+                    }
+                };
+                if let Some(row) = self
+                    .gate_rows
+                    .iter_mut()
+                    .rev()
+                    .find(|r| r.tool_use_id == *tool_use_id && r.resolution.is_none())
+                {
+                    row.resolution = Some(text);
+                }
+                if self
+                    .pending_gate
+                    .as_ref()
+                    .is_some_and(|p| p.tool_use_id == *tool_use_id)
+                {
+                    self.pending_gate = None;
+                }
             }
             AgentEvent::PermissionDenied(denial) => {
                 self.push_log(format!(
@@ -1110,6 +1256,26 @@ mod tests {
         );
         assert!(line.contains("RED"), "{line}");
         assert!(line.contains("done"), "{line}");
+    }
+
+    #[test]
+    fn gate_rows_strip_control_chars() {
+        // M2 covers the gate too: the summary comes from tool input.
+        let mut s = state();
+        s.apply(&AgentEvent::PermissionClassified {
+            tool_use_id: "g1".to_string(),
+            tool_name: "Bash".to_string(),
+            bucket: zen_core::GateBucket::Classifier,
+            reason_code: "warn.git-destructive".to_string(),
+            summary: "git reset \u{1b}[31m--hard\u{7}".to_string(),
+            parent_tool_use_id: None,
+        });
+        let row = &s.gate_rows[0];
+        assert!(!row.summary.chars().any(|c| c.is_control()), "{row:?}");
+        assert!(row.summary.contains("--hard"), "{row:?}");
+        let pending = s.pending_gate.as_ref().expect("pending set");
+        assert!(!pending.summary.chars().any(|c| c.is_control()));
+        assert_eq!(s.gate_ask, 1);
     }
 
     #[test]

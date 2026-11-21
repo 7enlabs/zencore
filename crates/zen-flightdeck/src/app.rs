@@ -21,6 +21,7 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 
+use crate::gate::{GateAnswer, GateBridge};
 use crate::render::draw;
 use crate::state::{FlightdeckState, Focus};
 
@@ -67,6 +68,9 @@ struct KeyHandler {
     /// Filter in force before the current edit, so `Esc` can restore
     /// it (the draft previews live in the state while editing).
     saved_filter: String,
+    /// Approval bridge (Phase 2): set when the viewer can answer a
+    /// pending per-command approval with `y` / `a` / `n`.
+    gate: Option<Arc<GateBridge>>,
 }
 
 impl KeyHandler {
@@ -99,13 +103,35 @@ impl KeyHandler {
             }
             return false;
         }
+        // Phase 2: while a command waits for approval, `y` / `a` /
+        // `n` answer it and mean nothing else.
+        if let Some(bridge) = &self.gate
+            && lock_state(state).pending_gate.is_some()
+        {
+            match key.code {
+                KeyCode::Char('y') => {
+                    bridge.answer(GateAnswer::Once);
+                    return false;
+                }
+                KeyCode::Char('a') => {
+                    bridge.answer(GateAnswer::Always);
+                    return false;
+                }
+                KeyCode::Char('n') => {
+                    bridge.answer(GateAnswer::Deny);
+                    return false;
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Char('q') => true,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
             KeyCode::Tab => {
                 let mut s = lock_state(state);
                 s.focus = match s.focus {
-                    Focus::Agents => Focus::Log,
+                    Focus::Agents => Focus::Gate,
+                    Focus::Gate => Focus::Log,
                     Focus::Log => Focus::Agents,
                 };
                 false
@@ -130,15 +156,39 @@ fn is_press(key: event::KeyEvent) -> bool {
 
 /// Run the viewer over shared state until `q` (or Ctrl-C) is pressed.
 /// When `exit_when` is set, the viewer also exits once that flag is
-/// set (used by the scripted demo for unattended runs).
+/// set (used by the scripted demo for unattended runs). While the
+/// viewer is open it owns per-command approvals through `gate`
+/// (Phase 2); closing the viewer denies any command still waiting
+/// (D5).
 pub fn run_viewer(
     state: Arc<Mutex<FlightdeckState>>,
+    gate: Option<Arc<GateBridge>>,
     exit_when: Option<Arc<AtomicBool>>,
 ) -> io::Result<()> {
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.clear()?;
-    let mut keys = KeyHandler::default();
+    if let Some(bridge) = &gate {
+        bridge.set_viewer_open(true);
+    }
+    let mut keys = KeyHandler {
+        gate: gate.clone(),
+        ..Default::default()
+    };
+    let result = viewer_loop(&mut terminal, &state, &mut keys, &exit_when);
+    if let Some(bridge) = &gate {
+        bridge.set_viewer_open(false);
+        bridge.deny_pending();
+    }
+    result
+}
+
+fn viewer_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    state: &Arc<Mutex<FlightdeckState>>,
+    keys: &mut KeyHandler,
+    exit_when: &Option<Arc<AtomicBool>>,
+) -> io::Result<()> {
     loop {
         if let Some(done) = &exit_when
             && done.load(Ordering::SeqCst)
@@ -146,7 +196,7 @@ pub fn run_viewer(
             break;
         }
         {
-            let snapshot = lock_state(&state).clone();
+            let snapshot = lock_state(state).clone();
             terminal.draw(|frame| draw(frame, &snapshot))?;
         }
         if !event::poll(Duration::from_millis(100))? {
@@ -158,7 +208,7 @@ pub fn run_viewer(
         if !is_press(key) {
             continue;
         }
-        if keys.handle(&state, key) {
+        if keys.handle(state, key) {
             break;
         }
     }
@@ -210,9 +260,35 @@ mod tests {
         let mut h = KeyHandler::default();
         assert_eq!(lock_state(&s).focus, Focus::Agents);
         assert!(!h.handle(&s, key(KeyCode::Tab)));
+        assert_eq!(lock_state(&s).focus, Focus::Gate);
+        assert!(!h.handle(&s, key(KeyCode::Tab)));
         assert_eq!(lock_state(&s).focus, Focus::Log);
         assert!(!h.handle(&s, key(KeyCode::Tab)));
         assert_eq!(lock_state(&s).focus, Focus::Agents);
+    }
+
+    #[test]
+    fn gate_keys_answer_a_pending_approval() {
+        use crate::state::PendingGate;
+        let s = state();
+        lock_state(&s).pending_gate = Some(PendingGate {
+            tool_use_id: "c1".to_string(),
+            tool_name: "Bash".to_string(),
+            summary: "git reset --hard".to_string(),
+            reason_code: "warn.git-destructive".to_string(),
+        });
+        let bridge = Arc::new(GateBridge::new());
+        let mut h = KeyHandler {
+            gate: Some(bridge.clone()),
+            ..Default::default()
+        };
+        // 'n' answers Deny through the bridge (nobody waits here, so
+        // the bridge reports false, but the key is consumed as an
+        // answer, not as anything else).
+        assert!(!h.handle(&s, key(KeyCode::Char('n'))));
+        // With no pending approval, 'y' falls through and does nothing.
+        lock_state(&s).pending_gate = None;
+        assert!(!h.handle(&s, key(KeyCode::Char('y'))));
     }
 
     #[test]
@@ -278,7 +354,7 @@ mod tests {
         }
         let s = state();
         let done = Arc::new(AtomicBool::new(false));
-        run_viewer(s, Some(done)).expect("viewer failed under pty");
+        run_viewer(s, None, Some(done)).expect("viewer failed under pty");
     }
 
     /// The viewer draws a frame and restores the terminal on exit, run
