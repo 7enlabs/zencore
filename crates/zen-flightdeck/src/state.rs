@@ -816,4 +816,186 @@ mod tests {
         assert_eq!(fmt_u64(53_760), "53.760");
         assert_eq!(fmt_u64(1_234_567), "1.234.567");
     }
+
+    #[test]
+    fn cost_text_formats_small_and_large_amounts() {
+        let mut s = state();
+        s.cost_usd = Some(0.004);
+        assert_eq!(s.cost_text(), "$0.0040");
+        s.cost_usd = Some(0.01);
+        assert_eq!(s.cost_text(), "$0.01");
+        s.cost_usd = Some(0.0);
+        assert_eq!(s.cost_text(), "$0.00");
+        s.cost_usd = Some(2.5);
+        assert_eq!(s.cost_text(), "$2.50");
+        s.cost_usd = None;
+        assert_eq!(s.cost_text(), "giá chưa rõ");
+    }
+
+    #[test]
+    fn any_event_marks_main_running() {
+        let mut s = state();
+        assert_eq!(s.agents[0].status, AgentStatus::Waiting);
+        s.apply(&assistant_event("hello"));
+        assert_eq!(s.agents[0].status, AgentStatus::Running);
+        // A second event keeps it running (the == is not inverted).
+        s.apply(&assistant_event("again"));
+        assert_eq!(s.agents[0].status, AgentStatus::Running);
+    }
+
+    #[test]
+    fn assistant_with_empty_tool_calls_logs_no_text() {
+        let mut s = state();
+        s.apply(&AgentEvent::Assistant {
+            message: ChatMessage::assistant(None, Some(vec![])),
+            parent_tool_use_id: None,
+        });
+        assert!(
+            s.visible_log()[0].contains("(không có nội dung text)"),
+            "{}",
+            s.visible_log()[0]
+        );
+    }
+
+    #[test]
+    fn child_tool_result_clears_matching_current_tool() {
+        let mut s = state();
+        s.apply(&AgentEvent::ToolProgress {
+            tool_use_id: "dlg-1".to_string(),
+            tool_name: "delegate".to_string(),
+            elapsed_ms: 100,
+        });
+        s.apply(&AgentEvent::Assistant {
+            message: ChatMessage::assistant(
+                None,
+                Some(vec![ToolCall {
+                    id: "t-1".to_string(),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "Read".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+            ),
+            parent_tool_use_id: Some("dlg-1".to_string()),
+        });
+        s.apply(&AgentEvent::ToolProgress {
+            tool_use_id: "t-1".to_string(),
+            tool_name: "Read".to_string(),
+            elapsed_ms: 200,
+        });
+        assert_eq!(s.agents[1].current_tool.as_deref(), Some("Read"));
+        s.apply(&AgentEvent::ToolResult {
+            tool_use_id: "t-1".to_string(),
+            content: "ok".to_string(),
+            is_error: false,
+            parent_tool_use_id: Some("dlg-1".to_string()),
+            parallel: false,
+        });
+        assert_eq!(s.agents[1].current_tool, None);
+    }
+
+    #[test]
+    fn permission_denied_is_logged() {
+        let mut s = state();
+        s.apply(&AgentEvent::PermissionDenied(zen_core::PermissionDenial {
+            tool_name: "Read".to_string(),
+            tool_use_id: "t-9".to_string(),
+            tool_input: serde_json::Value::Null,
+        }));
+        assert!(
+            s.visible_log()
+                .iter()
+                .any(|l| l.contains("quyền bị từ chối: Read (t-9)")),
+            "{:?}",
+            s.visible_log()
+        );
+    }
+
+    #[test]
+    fn second_subagent_start_does_not_rename_a_named_row() {
+        let mut s = state();
+        s.apply(&AgentEvent::ToolProgress {
+            tool_use_id: "dlg-7".to_string(),
+            tool_name: "delegate".to_string(),
+            elapsed_ms: 50,
+        });
+        s.apply(&AgentEvent::SystemMessage {
+            event: "SubagentStart".to_string(),
+            text: "sub-agent 'scout': skill 'x' not found".to_string(),
+        });
+        assert_eq!(s.agents[1].name, "scout");
+        // No unnamed row left: the second start must not rename the
+        // already-named row (the && in the finder is not ||).
+        s.apply(&AgentEvent::SystemMessage {
+            event: "SubagentStart".to_string(),
+            text: "sub-agent 'other': skill 'y' not found".to_string(),
+        });
+        assert_eq!(s.agents[1].name, "scout");
+    }
+
+    #[test]
+    fn log_is_capped_at_500_lines() {
+        let mut s = state();
+        for i in 0..505 {
+            s.apply(&assistant_event(&format!("message {i}")));
+        }
+        assert_eq!(s.log.len(), 500);
+        // The oldest lines are the ones dropped.
+        assert!(s.log[0].text.contains("message 5"));
+        for i in 0..505 {
+            s.apply(&assistant_event(&format!("more {i}")));
+        }
+        assert_eq!(s.log.len(), 500);
+    }
+
+    #[test]
+    fn first_line_truncates_only_past_the_limit() {
+        let mut s = state();
+        let exact = "x".repeat(MAX_TEXT_CHARS);
+        s.apply(&assistant_event(&exact));
+        assert!(!s.visible_log()[0].contains('…'), "{}", s.visible_log()[0]);
+        let over = "y".repeat(MAX_TEXT_CHARS + 1);
+        s.apply(&assistant_event(&over));
+        assert!(s.visible_log()[1].contains('…'), "{}", s.visible_log()[1]);
+    }
+
+    #[test]
+    fn header_shows_short_session_id() {
+        let s = state(); // session "sess-0123456789abcdef"
+        assert!(
+            s.header_line().contains("sess-0123456"),
+            "{}",
+            s.header_line()
+        );
+        assert!(
+            !s.header_line().contains("sess-0123456789abcdef"),
+            "{}",
+            s.header_line()
+        );
+    }
+
+    #[test]
+    fn tool_result_log_shows_heartbeat_elapsed() {
+        let mut s = state();
+        for (i, (ms, want)) in [(999, "999ms"), (1000, "1.0s"), (1200, "1.2s")]
+            .into_iter()
+            .enumerate()
+        {
+            s.apply(&AgentEvent::ToolProgress {
+                tool_use_id: "t-x".to_string(),
+                tool_name: "Read".to_string(),
+                elapsed_ms: ms,
+            });
+            s.apply(&AgentEvent::ToolResult {
+                tool_use_id: "t-x".to_string(),
+                content: "ok".to_string(),
+                is_error: false,
+                parent_tool_use_id: None,
+                parallel: false,
+            });
+            let log = s.visible_log();
+            assert!(log[i].contains(&format!("({want})")), "{}", log[i]);
+        }
+    }
 }

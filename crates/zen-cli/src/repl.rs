@@ -1011,7 +1011,12 @@ async fn handle_line(
     let result = run_turn_interruptible(agent, &prompt, repl.interrupts.as_deref_mut()).await;
     persist(repl.writer, &before, agent);
     record_turn_cost(home, repl.session_id.as_str(), cfg, agent, &usage_before);
-    refresh_flightdeck_after_turn(home, repl.session_id.as_str(), agent, &repl.flightdeck);
+    refresh_flightdeck_after_turn(
+        home,
+        repl.session_id.as_str(),
+        &agent.usage,
+        &repl.flightdeck,
+    );
 
     if agent.config.permission_mode == zen_core::PermissionMode::Plan
         && let Some(r) = &result
@@ -2296,7 +2301,12 @@ async fn handle_slash(
             let result =
                 run_turn_interruptible(agent, &prompt, repl.interrupts.as_deref_mut()).await;
             record_turn_cost(home, repl.session_id.as_str(), cfg, agent, &usage_before);
-            refresh_flightdeck_after_turn(home, repl.session_id.as_str(), agent, &repl.flightdeck);
+            refresh_flightdeck_after_turn(
+                home,
+                repl.session_id.as_str(),
+                &agent.usage,
+                &repl.flightdeck,
+            );
             print_turn(result);
         }
         "/map" => match crate::repomap::repo_map(cwd, cli.map_tokens) {
@@ -2671,7 +2681,7 @@ async fn handle_slash(
                 refresh_flightdeck_after_turn(
                     home,
                     repl.session_id.as_str(),
-                    agent,
+                    &agent.usage,
                     &repl.flightdeck,
                 );
                 let pinned = agent.config.model.clone();
@@ -3000,7 +3010,7 @@ fn flightdeck_autocompact_label(config: &zen_agent::AgentConfig) -> String {
 fn refresh_flightdeck_after_turn(
     home: Option<&Path>,
     session_id: &str,
-    agent: &zen_agent::Agent,
+    usage: &zen_core::UsageStats,
     flightdeck: &std::sync::Arc<std::sync::Mutex<zen_flightdeck::FlightdeckState>>,
 ) {
     let cost_usd = home
@@ -3017,7 +3027,56 @@ fn refresh_flightdeck_after_turn(
     flightdeck
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .note_turn_result(&agent.usage, cost_usd);
+        .note_turn_result(usage, cost_usd);
+}
+
+#[cfg(test)]
+mod flightdeck_label_tests {
+    use super::*;
+
+    /// The autocompact label is the only place the resolved threshold
+    /// becomes display text: without this test, a mutant replacing
+    /// the whole function with an empty or garbage string, or
+    /// flipping the 80% guard, goes uncaught.
+    #[test]
+    fn autocompact_label_off_auto_and_number() {
+        let mut cfg = zen_agent::AgentConfig {
+            context_window: 128_000,
+            auto_compact_threshold: None,
+            ..Default::default()
+        };
+        assert_eq!(flightdeck_autocompact_label(&cfg), "off");
+        cfg.auto_compact_threshold = Some(128_000 * 80 / 100);
+        assert_eq!(flightdeck_autocompact_label(&cfg), "auto");
+        cfg.auto_compact_threshold = Some(50_000);
+        assert_eq!(flightdeck_autocompact_label(&cfg), "50000");
+    }
+
+    /// The refresh must copy the agent's cumulative usage into the
+    /// dashboard's exact numbers. Without this test, a mutant
+    /// replacing the whole function with a no-op goes uncaught.
+    #[test]
+    fn refresh_after_turn_sets_exact_tokens() {
+        let state =
+            std::sync::Arc::new(std::sync::Mutex::new(zen_flightdeck::FlightdeckState::new(
+                "test-session",
+                "mock-model",
+                128_000,
+                zen_core::PermissionMode::Default,
+                "auto",
+            )));
+        let usage = zen_core::UsageStats {
+            input_tokens: 1234,
+            output_tokens: 56,
+            cache_read_input_tokens: 0,
+        };
+        refresh_flightdeck_after_turn(None, "test-session", &usage, &state);
+        let s = state.lock().unwrap();
+        assert_eq!(s.used_tokens_exact, Some(1234));
+        // No home directory: no ledger, so the cost stays unknown
+        // rather than a made-up $0.
+        assert_eq!(s.cost_usd, None);
+    }
 }
 
 #[cfg(test)]

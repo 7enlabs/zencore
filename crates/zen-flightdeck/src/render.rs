@@ -251,4 +251,40 @@ mod tests {
         assert!(out.contains("mode: plan (autocompact: off)"), "{out}");
         assert!(out.contains("req 0"), "{out}");
     }
+
+    #[test]
+    fn compact_threshold_is_exact_at_the_boundary() {
+        let s = populated_state();
+        // Exactly 80x24 renders the full layout.
+        let out = render_to_string(&s, 80, 24);
+        assert!(out.contains("AGENTS LIVE"), "{out}");
+        // One column short, or one row short: compact, no table.
+        let out = render_to_string(&s, 79, 30);
+        assert!(!out.contains("AGENTS LIVE"), "{out}");
+        let out = render_to_string(&s, 100, 23);
+        assert!(!out.contains("AGENTS LIVE"), "{out}");
+    }
+
+    #[test]
+    fn single_agent_row_is_not_clipped() {
+        let s = FlightdeckState::new(
+            "sess-empty",
+            "deepseek-v4.1-flash",
+            128_000,
+            PermissionMode::Plan,
+            "off",
+        );
+        let out = render_to_string(&s, 100, 30);
+        assert!(out.contains("main"), "{out}");
+    }
+
+    #[test]
+    fn focused_pane_has_the_double_border() {
+        let s = populated_state();
+        let out = render_to_string(&s, 100, 30);
+        // Default focus is the agents table: its title line carries
+        // the double border corner, the log block stays plain.
+        assert!(out.contains("╔ AGENTS LIVE"), "{out}");
+        assert!(!out.contains("╔ SESSION LOG"), "{out}");
+    }
 }

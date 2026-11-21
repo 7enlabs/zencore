@@ -56,6 +56,71 @@ fn lock_state(state: &Mutex<FlightdeckState>) -> std::sync::MutexGuard<'_, Fligh
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Keyboard state for the viewer loop, kept separate from the
+/// terminal so the key handling is unit-testable without a tty:
+/// every key the viewer understands is decided here, and the loop
+/// only owns the terminal and the poll timeout.
+#[derive(Default)]
+struct KeyHandler {
+    filter_editing: bool,
+    filter_draft: String,
+    /// Filter in force before the current edit, so `Esc` can restore
+    /// it (the draft previews live in the state while editing).
+    saved_filter: String,
+}
+
+impl KeyHandler {
+    /// Handle one key press. Returns true when the viewer should exit.
+    fn handle(&mut self, state: &Arc<Mutex<FlightdeckState>>, key: event::KeyEvent) -> bool {
+        if self.filter_editing {
+            match key.code {
+                KeyCode::Esc => {
+                    // Cancel: discard the draft, restore the old filter.
+                    self.filter_editing = false;
+                    self.filter_draft.clear();
+                    lock_state(state).filter = std::mem::take(&mut self.saved_filter);
+                }
+                KeyCode::Enter => {
+                    let draft = std::mem::take(&mut self.filter_draft);
+                    lock_state(state).filter = draft;
+                    self.filter_editing = false;
+                }
+                KeyCode::Backspace => {
+                    self.filter_draft.pop();
+                }
+                KeyCode::Char(c) => {
+                    self.filter_draft.push(c);
+                }
+                _ => {}
+            }
+            // Live preview of the draft in the footer while editing.
+            if self.filter_editing {
+                lock_state(state).filter = self.filter_draft.clone();
+            }
+            return false;
+        }
+        match key.code {
+            KeyCode::Char('q') => true,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
+            KeyCode::Tab => {
+                let mut s = lock_state(state);
+                s.focus = match s.focus {
+                    Focus::Agents => Focus::Log,
+                    Focus::Log => Focus::Agents,
+                };
+                false
+            }
+            KeyCode::Char('/') => {
+                self.filter_editing = true;
+                self.saved_filter = lock_state(state).filter.clone();
+                self.filter_draft = self.saved_filter.clone();
+                false
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Run the viewer over shared state until `q` (or Ctrl-C) is pressed.
 /// When `exit_when` is set, the viewer also exits once that flag is
 /// set (used by the scripted demo for unattended runs).
@@ -66,11 +131,7 @@ pub fn run_viewer(
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.clear()?;
-    let mut filter_editing = false;
-    let mut filter_draft = String::new();
-    // Filter in force before the current edit, so `Esc` can restore it
-    // (the draft previews live in the state while editing).
-    let mut saved_filter = String::new();
+    let mut keys = KeyHandler::default();
     loop {
         if let Some(done) = &exit_when
             && done.load(Ordering::SeqCst)
@@ -90,50 +151,86 @@ pub fn run_viewer(
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        if filter_editing {
-            match key.code {
-                KeyCode::Esc => {
-                    // Cancel: discard the draft, restore the old filter.
-                    filter_editing = false;
-                    filter_draft.clear();
-                    lock_state(&state).filter = std::mem::take(&mut saved_filter);
-                }
-                KeyCode::Enter => {
-                    let draft = std::mem::take(&mut filter_draft);
-                    lock_state(&state).filter = draft;
-                    filter_editing = false;
-                }
-                KeyCode::Backspace => {
-                    filter_draft.pop();
-                }
-                KeyCode::Char(c) => {
-                    filter_draft.push(c);
-                }
-                _ => {}
-            }
-            // Live preview of the draft in the footer while editing.
-            if filter_editing {
-                lock_state(&state).filter = filter_draft.clone();
-            }
-            continue;
-        }
-        match key.code {
-            KeyCode::Char('q') => break,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-            KeyCode::Tab => {
-                let mut s = lock_state(&state);
-                s.focus = match s.focus {
-                    Focus::Agents => Focus::Log,
-                    Focus::Log => Focus::Agents,
-                };
-            }
-            KeyCode::Char('/') => {
-                filter_editing = true;
-                saved_filter = lock_state(&state).filter.clone();
-                filter_draft = saved_filter.clone();
-            }
-            _ => {}
+        if keys.handle(&state, key) {
+            break;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use zen_core::PermissionMode;
+
+    fn state() -> Arc<Mutex<FlightdeckState>> {
+        Arc::new(Mutex::new(FlightdeckState::new(
+            "sess-1",
+            "deepseek-v4.1-flash",
+            128_000,
+            PermissionMode::Default,
+            "auto",
+        )))
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn key_mod(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn q_and_ctrl_c_exit() {
+        let s = state();
+        assert!(KeyHandler::default().handle(&s, key(KeyCode::Char('q'))));
+        assert!(
+            KeyHandler::default().handle(&s, key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        );
+    }
+
+    #[test]
+    fn plain_c_does_not_exit() {
+        let s = state();
+        assert!(!KeyHandler::default().handle(&s, key(KeyCode::Char('c'))));
+    }
+
+    #[test]
+    fn tab_switches_focus_back_and_forth() {
+        let s = state();
+        let mut h = KeyHandler::default();
+        assert_eq!(lock_state(&s).focus, Focus::Agents);
+        assert!(!h.handle(&s, key(KeyCode::Tab)));
+        assert_eq!(lock_state(&s).focus, Focus::Log);
+        assert!(!h.handle(&s, key(KeyCode::Tab)));
+        assert_eq!(lock_state(&s).focus, Focus::Agents);
+    }
+
+    #[test]
+    fn filter_editing_flow() {
+        let s = state();
+        let mut h = KeyHandler::default();
+        // Open the filter editor and type: the draft previews live.
+        assert!(!h.handle(&s, key(KeyCode::Char('/'))));
+        assert!(!h.handle(&s, key(KeyCode::Char('x'))));
+        assert_eq!(lock_state(&s).filter, "x");
+        assert!(!h.handle(&s, key(KeyCode::Backspace)));
+        assert_eq!(lock_state(&s).filter, "");
+        assert!(!h.handle(&s, key(KeyCode::Char('y'))));
+        // Enter commits the draft.
+        assert!(!h.handle(&s, key(KeyCode::Enter)));
+        assert_eq!(lock_state(&s).filter, "y");
+        // Esc while editing cancels and restores the previous filter.
+        assert!(!h.handle(&s, key(KeyCode::Char('/'))));
+        assert!(!h.handle(&s, key(KeyCode::Char('z'))));
+        assert_eq!(lock_state(&s).filter, "yz");
+        assert!(!h.handle(&s, key(KeyCode::Esc)));
+        assert_eq!(lock_state(&s).filter, "y");
+        // q while editing the filter types 'q'; it does not exit.
+        assert!(!h.handle(&s, key(KeyCode::Char('/'))));
+        assert!(!h.handle(&s, key(KeyCode::Char('q'))));
+        assert_eq!(lock_state(&s).filter, "yq");
+    }
 }

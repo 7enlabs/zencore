@@ -53,7 +53,6 @@ pub fn run_demo(auto_exit_secs: u64) -> io::Result<()> {
     });
     run_viewer(state, Some(done))
 }
-
 fn sleep_ms(ms: u64) {
     thread::sleep(Duration::from_millis(ms));
 }
@@ -179,4 +178,43 @@ fn run_scenario(sink: &Arc<FlightdeckSink>, state: &Arc<Mutex<FlightdeckState>>)
     // The main agent merges the three results.
     emit(assistant("Đã gộp 3 kết quả thành bản cuối.", None));
     note_demo_turn(state);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::AgentStatus;
+
+    /// The scripted demo, without the viewer: three rows complete,
+    /// the header carries exact numbers, and the sleeps actually
+    /// stagger the work. This pins run_scenario, sleep_ms and
+    /// note_demo_turn in one test.
+    #[test]
+    fn scenario_completes_three_subagents() {
+        let state = Arc::new(Mutex::new(FlightdeckState::new(
+            "demo-test",
+            "deepseek-v4.1-flash",
+            DEFAULT_CONTEXT_WINDOW,
+            PermissionMode::Default,
+            "auto",
+        )));
+        let sink = FlightdeckSink::new(state.clone());
+        run_scenario(&sink, &state);
+        let s = state.lock().unwrap();
+        assert_eq!(s.agents.len(), 4);
+        assert!(s.agents[1..].iter().all(|r| r.status == AgentStatus::Done));
+        // 5 assistant messages: split + 3 completions + merge.
+        assert_eq!(s.requests, 5);
+        // The demo model is free: exact cost $0.00, never "giá chưa rõ".
+        assert_eq!(s.cost_usd, Some(0.0));
+        assert!(s.used_tokens_exact.is_some());
+        // The sleeps stagger the work: each row ran over 100ms.
+        assert!(
+            s.agents[1..]
+                .iter()
+                .all(|r| r.elapsed() >= Duration::from_millis(100)),
+            "{:?}",
+            s.agent_rows()
+        );
+    }
 }
