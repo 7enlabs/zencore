@@ -824,10 +824,17 @@ mod tests {
                 .created_by_session,
             "sess-1"
         );
+        // Windows: `git worktree list --porcelain` prints the path in
+        // git's own form (forward slashes, resolved case), which does
+        // not compare equal to the temp_dir-built path as raw `Path`s
+        // (Windows job log run 44928292749: count 0 vs 1, while
+        // `is_registered_worktree` on the same list passed). Compare
+        // canonicalized paths, like `is_registered_worktree` does.
+        let want = canonical_or_raw(&wt);
         assert_eq!(
             list_worktrees(&dir)
                 .iter()
-                .filter(|(p, _, _)| Path::new(p) == wt)
+                .filter(|(p, _, _)| canonical_or_raw(Path::new(p)) == want)
                 .count(),
             1
         );
