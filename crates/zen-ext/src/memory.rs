@@ -12,13 +12,27 @@ pub struct MemoryFile {
 }
 
 pub fn memory_files(cwd: &Path, home: Option<&Path>) -> Vec<(PathBuf, String)> {
-    memory_files_with_managed(cwd, home, Some(Path::new(MANAGED_MEMORY_PATH)))
+    memory_files_with_managed(cwd, home, Some(Path::new(MANAGED_MEMORY_PATH)), None)
+}
+
+/// Load memory files, stopping the ancestor walk at `root` (inclusive).
+/// The unbounded `memory_files` keeps walking all the way to `/`, which
+/// is the production behaviour. Tests pass the fixture root so a real
+/// `AGENTS.md` sitting above the temp dir (e.g. in an ancestor of
+/// `TMPDIR`) cannot leak in.
+pub fn memory_files_with_root(
+    cwd: &Path,
+    home: Option<&Path>,
+    root: &Path,
+) -> Vec<(PathBuf, String)> {
+    memory_files_with_managed(cwd, home, Some(Path::new(MANAGED_MEMORY_PATH)), Some(root))
 }
 
 pub fn memory_files_with_managed(
     cwd: &Path,
     home: Option<&Path>,
     managed: Option<&Path>,
+    root: Option<&Path>,
 ) -> Vec<(PathBuf, String)> {
     let home_dir = home.map(Path::to_path_buf).or_else(dirs::home_dir);
     let mut loader = Loader {
@@ -43,7 +57,7 @@ pub fn memory_files_with_managed(
     }
 
     let cwd_abs = abs_path(cwd);
-    let dirs = ancestors_root_first(&cwd_abs);
+    let dirs = ancestors_root_first(&cwd_abs, root);
     for dir in &dirs {
         let zen_files = [
             dir.join("ZEN.md"),
@@ -362,9 +376,18 @@ fn normalize(p: &Path) -> PathBuf {
     out
 }
 
-fn ancestors_root_first(dir: &Path) -> Vec<PathBuf> {
+fn ancestors_root_first(dir: &Path, root: Option<&Path>) -> Vec<PathBuf> {
     let mut chain: Vec<PathBuf> = dir.ancestors().map(|p| p.to_path_buf()).collect();
     chain.reverse();
+    // The chain is root-first ("/" first). Drop every ancestor above the
+    // bound, keeping the bound itself. A root that is not an ancestor of
+    // `dir` leaves the chain untouched (walk to "/").
+    if let Some(root) = root {
+        let root = abs_path(root);
+        if let Some(pos) = chain.iter().position(|p| *p == root) {
+            chain.drain(..pos);
+        }
+    }
     chain
 }
 
@@ -391,7 +414,15 @@ fn render_memory_section(path: &Path, content: &str) -> String {
 }
 
 pub fn memory_prompt(cwd: &Path, home: Option<&Path>) -> String {
-    let files = memory_files(cwd, home);
+    memory_prompt_with_root_impl(cwd, home, None)
+}
+
+pub fn memory_prompt_with_root(cwd: &Path, home: Option<&Path>, root: &Path) -> String {
+    memory_prompt_with_root_impl(cwd, home, Some(root))
+}
+
+fn memory_prompt_with_root_impl(cwd: &Path, home: Option<&Path>, root: Option<&Path>) -> String {
+    let files = memory_files_with_managed(cwd, home, Some(Path::new(MANAGED_MEMORY_PATH)), root);
     if files.is_empty() {
         return String::new();
     }
@@ -430,7 +461,15 @@ fn display_path(path: &Path, home: Option<&Path>) -> String {
 }
 
 pub fn memories_report(cwd: &Path, home: Option<&Path>) -> String {
-    let files = memory_files(cwd, home);
+    memories_report_with_root_impl(cwd, home, None)
+}
+
+pub fn memories_report_with_root(cwd: &Path, home: Option<&Path>, root: &Path) -> String {
+    memories_report_with_root_impl(cwd, home, Some(root))
+}
+
+fn memories_report_with_root_impl(cwd: &Path, home: Option<&Path>, root: Option<&Path>) -> String {
+    let files = memory_files_with_managed(cwd, home, Some(Path::new(MANAGED_MEMORY_PATH)), root);
     let mut sections: Vec<(PathBuf, String)> = Vec::new();
     for (path, content) in &files {
         if content.trim().is_empty() {
@@ -457,9 +496,17 @@ pub fn memories_report(cwd: &Path, home: Option<&Path>) -> String {
 }
 
 pub fn detect_import_candidates(cwd: &Path) -> Vec<PathBuf> {
+    detect_import_candidates_with_root_impl(cwd, None)
+}
+
+pub fn detect_import_candidates_with_root(cwd: &Path, root: &Path) -> Vec<PathBuf> {
+    detect_import_candidates_with_root_impl(cwd, Some(root))
+}
+
+fn detect_import_candidates_with_root_impl(cwd: &Path, root: Option<&Path>) -> Vec<PathBuf> {
     let cwd_abs = abs_path(cwd);
     let mut out = Vec::new();
-    for dir in ancestors_root_first(&cwd_abs) {
+    for dir in ancestors_root_first(&cwd_abs, root) {
         let claude = dir.join("CLAUDE.md");
         if claude.is_file() {
             out.push(normalize(&claude));
@@ -500,7 +547,7 @@ mod tests {
         fs::write(proj.join(".zen/ZEN.md"), "project dotzen memory").unwrap();
         fs::write(sub.join("ZEN.md"), "sub memory").unwrap();
 
-        let files = memory_files(&sub, Some(&home));
+        let files = memory_files_with_root(&sub, Some(&home), tmp.path());
         let names: Vec<String> = files
             .iter()
             .map(|(p, _)| p.file_name().unwrap().to_string_lossy().to_string())
@@ -524,7 +571,7 @@ mod tests {
         fs::write(proj.join("ZEN.md"), "shared").unwrap();
         fs::write(proj.join("ZEN.local.md"), "personal").unwrap();
 
-        let files = memory_files(&proj, None);
+        let files = memory_files_with_root(&proj, None, tmp.path());
         assert_eq!(files.last().unwrap().1.trim(), "personal");
     }
 
@@ -536,7 +583,7 @@ mod tests {
         fs::write(proj.join("ZEN.md"), "top\n@docs/extra.md\nbottom\n").unwrap();
         fs::write(proj.join("docs/extra.md"), "imported content").unwrap();
 
-        let files = memory_files(&proj, None);
+        let files = memory_files_with_root(&proj, None, tmp.path());
         let top = files.iter().find(|(p, _)| p.ends_with("ZEN.md")).unwrap();
         assert!(top.1.contains("top"));
         assert!(top.1.contains("imported content"));
@@ -551,7 +598,7 @@ mod tests {
         fs::create_dir_all(&proj).unwrap();
         fs::write(proj.join("ZEN.md"), "before\n@does/not/exist.md\nafter\n").unwrap();
 
-        let files = memory_files(&proj, None);
+        let files = memory_files_with_root(&proj, None, tmp.path());
         let top = &files[0].1;
         assert!(top.contains("before"));
         assert!(top.contains("after"));
@@ -565,7 +612,7 @@ mod tests {
         fs::write(proj.join("ZEN.md"), "root\n@b.md\n").unwrap();
         fs::write(proj.join("b.md"), "b\n@ZEN.md\n").unwrap();
 
-        let files = memory_files(&proj, None);
+        let files = memory_files_with_root(&proj, None, tmp.path());
 
         let joined = files
             .iter()
@@ -588,7 +635,7 @@ mod tests {
         fs::write(proj.join("l5.md"), "l5\n@l6.md\n").unwrap();
         fs::write(proj.join("l6.md"), "l6-deepest").unwrap();
 
-        let files = memory_files(&proj, None);
+        let files = memory_files_with_root(&proj, None, tmp.path());
         let joined = files
             .iter()
             .map(|(_, c)| c.clone())
@@ -607,7 +654,7 @@ mod tests {
         fs::create_dir_all(&proj).unwrap();
         fs::write(proj.join("ZEN.md"), "hello memory").unwrap();
 
-        let prompt = memory_prompt(&proj, None);
+        let prompt = memory_prompt_with_root(&proj, None, tmp.path());
         assert!(prompt.contains("# Memory:"));
         assert!(prompt.contains("ZEN.md"));
         assert!(prompt.contains("hello memory"));
@@ -619,7 +666,7 @@ mod tests {
         let proj = tmp.path().join("proj");
         fs::create_dir_all(&proj).unwrap();
 
-        let prompt = memory_prompt(&proj, Some(&tmp.path().join("nohome")));
+        let prompt = memory_prompt_with_root(&proj, Some(&tmp.path().join("nohome")), tmp.path());
         assert_eq!(prompt, "");
     }
 
@@ -646,8 +693,8 @@ mod tests {
         assert!(content.contains("- second"));
     }
 
-    fn mem(proj: &Path, home: &Path) -> Vec<(PathBuf, String)> {
-        memory_files_with_managed(proj, Some(home), None)
+    fn mem(proj: &Path, home: &Path, root: &Path) -> Vec<(PathBuf, String)> {
+        memory_files_with_managed(proj, Some(home), None, Some(root))
     }
 
     #[test]
@@ -667,7 +714,10 @@ mod tests {
 
         fs::write(sub.join("ZEN.md"), "sub-zen").unwrap();
         fs::write(sub.join("AGENTS.md"), "sub-agents").unwrap();
-        let got: Vec<String> = mem(&sub, &home).into_iter().map(|(_, c)| c).collect();
+        let got: Vec<String> = mem(&sub, &home, tmp.path())
+            .into_iter()
+            .map(|(_, c)| c)
+            .collect();
         assert_eq!(
             got,
             vec!["user-agents", "proj-agents", "proj-dot-agents", "sub-zen"]
@@ -686,7 +736,10 @@ mod tests {
 
         fs::write(proj.join("ZEN.local.md"), "proj-local").unwrap();
         fs::write(proj.join("AGENTS.md"), "proj-agents").unwrap();
-        let got: Vec<String> = mem(&proj, &home).into_iter().map(|(_, c)| c).collect();
+        let got: Vec<String> = mem(&proj, &home, tmp.path())
+            .into_iter()
+            .map(|(_, c)| c)
+            .collect();
         assert_eq!(got, vec!["user-zen", "proj-local"]);
     }
 
@@ -720,7 +773,7 @@ mod tests {
         )
         .unwrap();
 
-        let files = memory_files_with_managed(&sub, Some(&home), Some(&managed));
+        let files = memory_files_with_managed(&sub, Some(&home), Some(&managed), Some(tmp.path()));
         let contents: Vec<&str> = files.iter().map(|(_, c)| c.trim()).collect();
         assert_eq!(
             contents,
@@ -747,7 +800,7 @@ mod tests {
         fs::create_dir_all(&proj).unwrap();
         fs::write(home.join(".zen/ZEN.md"), "user").unwrap();
         fs::write(home.join(".zen/rules/r.md"), "rule").unwrap();
-        let files = mem(&proj, &home);
+        let files = mem(&proj, &home, tmp.path());
         let contents: Vec<&str> = files.iter().map(|(_, c)| c.trim()).collect();
         assert_eq!(contents, vec!["user", "rule"]);
     }
@@ -771,7 +824,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let files = mem(&proj, &home);
+        let files = mem(&proj, &home, tmp.path());
         let top = &files
             .iter()
             .find(|(p, _)| p.ends_with("proj/ZEN.md"))
@@ -791,7 +844,7 @@ mod tests {
             "See @README.md for an overview. Mail me@example.com\n",
         )
         .unwrap();
-        let files = mem(&proj, &tmp.path().join("nohome"));
+        let files = mem(&proj, &tmp.path().join("nohome"), tmp.path());
         assert_eq!(
             files[0].1,
             "See @README.md for an overview. Mail me@example.com\nreadme body\n"
@@ -809,7 +862,7 @@ mod tests {
             "Use `@x.md` literally\n```\n@x.md\n```\n~~~~\n@x.md\n~~~~\nend\n",
         )
         .unwrap();
-        let files = mem(&proj, &tmp.path().join("nohome"));
+        let files = mem(&proj, &tmp.path().join("nohome"), tmp.path());
         assert!(!files[0].1.contains("SHOULD-NOT-APPEAR"));
         assert!(files[0].1.contains("```\n@x.md\n```"));
         assert!(files[0].1.ends_with("end\n"));
@@ -824,7 +877,7 @@ mod tests {
         fs::write(proj.join("ZEN.md"), "@d/a.md\n").unwrap();
         fs::write(proj.join("d/a.md"), "A\n@b.md\n").unwrap();
         fs::write(proj.join("d/b.md"), "B\n").unwrap();
-        let files = mem(&proj, &tmp.path().join("nohome"));
+        let files = mem(&proj, &tmp.path().join("nohome"), tmp.path());
         assert_eq!(files[0].1, "A\nB\n");
     }
 
@@ -834,7 +887,7 @@ mod tests {
         let proj = tmp.path().join("proj");
         fs::create_dir_all(&proj).unwrap();
         fs::write(proj.join("ZEN.md"), "@missing.md\nping @team\n").unwrap();
-        let files = mem(&proj, &tmp.path().join("nohome"));
+        let files = mem(&proj, &tmp.path().join("nohome"), tmp.path());
         assert_eq!(files[0].1, "@missing.md\nping @team\n");
     }
 
@@ -849,7 +902,7 @@ mod tests {
             "a\n<!-- one line -->\n<!-- multi\n@secret.md\nline --> tail\nkeep <!-- inline --> text\n```html\n<!-- in code -->\n```\nz\n",
         )
         .unwrap();
-        let files = mem(&proj, &tmp.path().join("nohome"));
+        let files = mem(&proj, &tmp.path().join("nohome"), tmp.path());
         assert_eq!(
             files[0].1,
             "a\n tail\nkeep <!-- inline --> text\n```html\n<!-- in code -->\n```\nz\n"
@@ -863,7 +916,7 @@ mod tests {
         fs::create_dir_all(&proj).unwrap();
         fs::write(proj.join("inc.md"), "<!-- hidden -->\nvisible\n").unwrap();
         fs::write(proj.join("ZEN.md"), "@inc.md\n").unwrap();
-        let files = mem(&proj, &tmp.path().join("nohome"));
+        let files = mem(&proj, &tmp.path().join("nohome"), tmp.path());
         assert_eq!(files[0].1, "visible\n");
     }
 
@@ -877,7 +930,7 @@ mod tests {
         fs::write(home.join(".zen/ZEN.md"), "user rules here").unwrap();
         fs::write(proj.join("ZEN.md"), "project rules here").unwrap();
 
-        let report = memories_report(&proj, Some(&home));
+        let report = memories_report_with_root(&proj, Some(&home), tmp.path());
         let lines: Vec<&str> = report.lines().collect();
 
         assert_eq!(lines.len(), 3, "report:\n{}", report);
@@ -919,7 +972,7 @@ mod tests {
         let tmp = TempDir::new();
         let proj = tmp.path().join("proj");
         fs::create_dir_all(&proj).unwrap();
-        let report = memories_report(&proj, Some(&tmp.path().join("nohome")));
+        let report = memories_report_with_root(&proj, Some(&tmp.path().join("nohome")), tmp.path());
         assert_eq!(report, "(no memory files loaded)");
     }
 
@@ -932,7 +985,7 @@ mod tests {
         fs::write(proj.join("CLAUDE.md"), "claude rules").unwrap();
         fs::write(sub.join("AGENTS.md"), "agents rules").unwrap();
 
-        let cands = detect_import_candidates(&sub);
+        let cands = detect_import_candidates_with_root(&sub, tmp.path());
         assert_eq!(cands.len(), 2, "candidates: {:?}", cands);
 
         assert!(
@@ -956,7 +1009,7 @@ mod tests {
         fs::write(proj.join("AGENTS.md"), "agents rules").unwrap();
         fs::write(proj.join("CLAUDE.md"), "claude rules").unwrap();
 
-        let cands = detect_import_candidates(&proj);
+        let cands = detect_import_candidates_with_root(&proj, tmp.path());
 
         assert_eq!(cands.len(), 1, "candidates: {:?}", cands);
         assert!(cands[0].ends_with("CLAUDE.md"));
@@ -967,6 +1020,91 @@ mod tests {
         let tmp = TempDir::new();
         let proj = tmp.path().join("proj");
         fs::create_dir_all(&proj).unwrap();
-        assert!(detect_import_candidates(&proj).is_empty());
+        assert!(detect_import_candidates_with_root(&proj, tmp.path()).is_empty());
+    }
+
+    // #253: an AGENTS.md sitting above the fixture root (e.g. in an
+    // ancestor of TMPDIR) must not leak into the bounded load, while the
+    // unbounded load keeps the production behaviour of walking to "/".
+    #[test]
+    fn memory_files_with_root_stops_at_root() {
+        let tmp = TempDir::new();
+        let proj = tmp.path().join("proj");
+        let sub = proj.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(tmp.path().join("AGENTS.md"), "outside-root").unwrap();
+        fs::write(proj.join("ZEN.md"), "inside-root").unwrap();
+        let nohome = tmp.path().join("nohome");
+
+        let unbounded = memory_files(&sub, Some(&nohome));
+        assert!(
+            unbounded.iter().any(|(_, c)| c.contains("outside-root")),
+            "unbounded load should still pick up the parent AGENTS.md: {:?}",
+            unbounded.iter().map(|(p, _)| p).collect::<Vec<_>>()
+        );
+
+        let bounded = memory_files_with_root(&sub, Some(&nohome), &proj);
+        assert!(
+            !bounded.iter().any(|(_, c)| c.contains("outside-root")),
+            "bounded load leaked the parent AGENTS.md"
+        );
+        assert!(bounded.iter().any(|(_, c)| c.contains("inside-root")));
+    }
+
+    #[test]
+    fn detect_import_candidates_with_root_stops_at_root() {
+        let tmp = TempDir::new();
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(tmp.path().join("AGENTS.md"), "outside-root").unwrap();
+        fs::write(proj.join("CLAUDE.md"), "claude rules").unwrap();
+
+        let unbounded = detect_import_candidates(&proj);
+        assert!(
+            unbounded.iter().any(|p| p.ends_with("AGENTS.md")),
+            "unbounded candidates should still include the parent AGENTS.md"
+        );
+
+        let bounded = detect_import_candidates_with_root(&proj, &proj);
+        assert_eq!(bounded.len(), 1, "candidates: {:?}", bounded);
+        assert!(bounded[0].ends_with("CLAUDE.md"));
+    }
+
+    // The unbounded memory_prompt / memories_report wrappers are the
+    // production entry points (system prompt, /memory report). They must
+    // stay covered: the assertions only require the fixture content to
+    // be present, so a stray AGENTS.md above TMPDIR (issue #253) can add
+    // sections without breaking them, while a mutant returning "" or
+    // "xyzzy" fails.
+    #[test]
+    fn memory_prompt_unbounded_returns_fixture_content() {
+        let tmp = TempDir::new();
+        let proj = tmp.path().join("proj");
+        let sub = proj.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(proj.join("ZEN.md"), "inside-root").unwrap();
+        let nohome = tmp.path().join("nohome");
+
+        let prompt = memory_prompt(&sub, Some(&nohome));
+        assert!(
+            prompt.contains("inside-root"),
+            "unbounded prompt should contain the fixture memory: {prompt}"
+        );
+    }
+
+    #[test]
+    fn memories_report_unbounded_lists_fixture() {
+        let tmp = TempDir::new();
+        let proj = tmp.path().join("proj");
+        let sub = proj.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(proj.join("ZEN.md"), "inside-root").unwrap();
+        let nohome = tmp.path().join("nohome");
+
+        let report = memories_report(&sub, Some(&nohome));
+        assert!(
+            report.contains("ZEN.md"),
+            "unbounded report should list the fixture memory: {report}"
+        );
     }
 }
