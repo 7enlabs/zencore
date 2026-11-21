@@ -460,11 +460,19 @@ pub fn print_result(
     }
 }
 
-pub fn validate_json_schema(text: &str, schema_path: &std::path::Path) -> Result<(), String> {
+/// Read and parse a JSON Schema file. Separated from validation so the
+/// headless run can load the schema once, before any model call, and
+/// fail fast (exit 4) on a bad path instead of spending tokens first.
+pub fn load_json_schema(schema_path: &std::path::Path) -> Result<serde_json::Value, String> {
     let schema_text =
         std::fs::read_to_string(schema_path).map_err(|e| format!("cannot read schema: {}", e))?;
-    let schema: serde_json::Value =
-        serde_json::from_str(&schema_text).map_err(|e| format!("invalid schema JSON: {}", e))?;
+    serde_json::from_str(&schema_text).map_err(|e| format!("invalid schema JSON: {}", e))
+}
+
+/// Validate output text against an already-loaded schema. The check is
+/// deliberately strict: the output must be bare JSON (a markdown-fenced
+/// block is not valid JSON and fails).
+pub fn validate_json_schema_value(text: &str, schema: &serde_json::Value) -> Result<(), String> {
     let value: serde_json::Value = serde_json::from_str(text.trim())
         .map_err(|e| format!("output is not valid JSON: {}", e))?;
 
@@ -694,6 +702,7 @@ mod tests {
             },
             model: "m".into(),
             permission_denials: vec![],
+            schema_error: None,
         };
         print_result(&result, &crate::cli::OutputFormat::Json, &buf, false);
         let text_out = buf.text();
@@ -920,6 +929,7 @@ mod tests {
             usage: zen_core::UsageStats::default(),
             model: "m".into(),
             permission_denials: vec![],
+            schema_error: None,
         };
         let r = result_json(&result);
         assert_eq!(r["v"], json!(STREAM_JSON_VERSION));
@@ -977,6 +987,105 @@ mod tests {
         assert_eq!(
             lock_or_recover(&sink.prompt_input, "prompt input").as_deref(),
             Some("hello")
+        );
+    }
+
+    // Issue #252: the schema loader and validator, split so the headless
+    // run can load once before any model call.
+    fn schema_value() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {"answer": {"type": "number"}},
+            "required": ["answer"],
+            "additionalProperties": false
+        })
+    }
+
+    fn write_schema_file(name: &str, contents: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("zen-schema-test-{}-{}", std::process::id(), name));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("schema.json");
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn load_json_schema_missing_path_errors() {
+        let missing = std::env::temp_dir().join(format!(
+            "zen-schema-test-{}-missing/schema.json",
+            std::process::id()
+        ));
+        let err = load_json_schema(&missing).unwrap_err();
+        assert!(err.contains("cannot read schema"), "{err}");
+    }
+
+    #[test]
+    fn load_json_schema_invalid_json_errors() {
+        let path = write_schema_file("bad", "not json");
+        let err = load_json_schema(&path).unwrap_err();
+        assert!(err.contains("invalid schema JSON"), "{err}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn validate_json_schema_value_accepts_matching_output() {
+        assert!(validate_json_schema_value(r#"{"answer": 42}"#, &schema_value()).is_ok());
+    }
+
+    #[test]
+    fn validate_json_schema_value_rejects_plain_text() {
+        let err = validate_json_schema_value("Hello!", &schema_value()).unwrap_err();
+        assert!(err.contains("not valid JSON"), "{err}");
+    }
+
+    #[test]
+    fn validate_json_schema_value_rejects_wrong_top_level_type() {
+        let err = validate_json_schema_value("[1, 2]", &schema_value()).unwrap_err();
+        assert!(err.contains("expected type 'object'"), "{err}");
+    }
+
+    #[test]
+    fn validate_json_schema_value_rejects_missing_required_field() {
+        let err = validate_json_schema_value(r#"{"other": 1}"#, &schema_value()).unwrap_err();
+        assert!(err.contains("missing required field 'answer'"), "{err}");
+    }
+
+    #[test]
+    fn validate_json_schema_value_rejects_fenced_json() {
+        // A markdown-fenced block is not bare JSON: the validator stays
+        // strict here (issue #252 notes the lenient-looking run 3).
+        let err = validate_json_schema_value("```json\n{\"answer\": 42}\n```", &schema_value())
+            .unwrap_err();
+        assert!(err.contains("not valid JSON"), "{err}");
+    }
+
+    #[test]
+    fn result_json_schema_error_field_is_additive() {
+        let mut result = RunResult {
+            record_type: "result".into(),
+            subtype: "success".into(),
+            is_error: false,
+            duration_ms: 1,
+            duration_api_ms: 1,
+            num_turns: 1,
+            result: "done".into(),
+            session_id: "s".into(),
+            total_cost_usd: 0.0,
+            usage: zen_core::UsageStats::default(),
+            model: "m".into(),
+            permission_denials: vec![],
+            schema_error: None,
+        };
+        let r = result_json(&result);
+        assert!(r.get("schema_error").is_none(), "{}", r);
+        result.is_error = true;
+        result.subtype = "schema_validation_failed".into();
+        result.schema_error = Some("output is not valid JSON: expected value".into());
+        let r = result_json(&result);
+        assert_eq!(
+            r["schema_error"],
+            json!("output is not valid JSON: expected value")
         );
     }
 }

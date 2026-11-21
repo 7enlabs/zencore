@@ -1133,6 +1133,12 @@ pub struct RunResult {
     pub usage: UsageStats,
     pub model: String,
     pub permission_denials: Vec<PermissionDenial>,
+    /// Set when `--json-schema` validation rejects the final output (or
+    /// the schema file itself cannot be loaded): the validator message.
+    /// Absent from the JSON when `None`, so existing consumers see no
+    /// change on runs without schema validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]

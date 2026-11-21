@@ -266,3 +266,144 @@ async fn plan_turn_does_not_run_until_verification() {
     assert!(result.contains("executed"), "{result}");
     assert!(result.contains("Verify failed"), "{result}");
 }
+
+const SCHEMA_ANSWER_NUMBER: &str = r#"{"type":"object","properties":{"answer":{"type":"number"}},"required":["answer"],"additionalProperties":false}"#;
+
+// Issue #252: a schema validation failure must be visible in the stdout
+// JSON, not only in the exit code. Before the fix the result record said
+// is_error:false / subtype:success while the process exited 2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn json_schema_failure_marks_result_error() {
+    let home = TempDir::new("schema_home");
+    let cwd = TempDir::new("schema_cwd");
+    let schema = cwd.write("schema.json", SCHEMA_ANSWER_NUMBER);
+    let server = MockServer::start(vec![Reply::text("Hello!")]).await;
+    let (stdout, stderr, code) = tokio::time::timeout(TEST_TIMEOUT, async {
+        ZenRun::new("schema_fail", &home, &cwd)
+            .args(base_args())
+            .arg("--json-schema")
+            .arg(schema.to_string_lossy())
+            .mock("mock-model", &server)
+            .arg("Say hello in plain text, no JSON.")
+            .run_output()
+    })
+    .await
+    .expect("timed out");
+    assert_eq!(code, 2, "stderr: {}", stderr);
+    assert!(
+        stderr.contains("JSON schema validation failed"),
+        "stderr: {}",
+        stderr
+    );
+    let result = last_result(&stdout);
+    assert_eq!(result["is_error"], true, "stdout: {}", stdout);
+    assert_eq!(
+        result["subtype"], "schema_validation_failed",
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(result["result"], "Hello!");
+    let schema_error = result["schema_error"].as_str().unwrap_or_default();
+    assert!(
+        schema_error.contains("not valid JSON"),
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(server.finish().await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn json_schema_valid_output_passes() {
+    let home = TempDir::new("schema_home");
+    let cwd = TempDir::new("schema_cwd");
+    let schema = cwd.write("schema.json", SCHEMA_ANSWER_NUMBER);
+    let server = MockServer::start(vec![Reply::text(r#"{"answer": 42}"#)]).await;
+    let (stdout, stderr, code) = tokio::time::timeout(TEST_TIMEOUT, async {
+        ZenRun::new("schema_pass", &home, &cwd)
+            .args(base_args())
+            .arg("--json-schema")
+            .arg(schema.to_string_lossy())
+            .mock("mock-model", &server)
+            .arg("Answer 42 as JSON.")
+            .run_output()
+    })
+    .await
+    .expect("timed out");
+    assert_eq!(code, 0, "stderr: {}", stderr);
+    let result = last_result(&stdout);
+    assert_eq!(result["is_error"], false, "stdout: {}", stdout);
+    assert!(result.get("schema_error").is_none(), "stdout: {}", stdout);
+    assert_eq!(server.finish().await.len(), 1);
+}
+
+// Issue #252 (smaller finding): a bad schema path must fail before any
+// model call, with exit 4 (VALIDATION) and a message naming the flag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn json_schema_bad_path_fails_fast_before_model_call() {
+    let home = TempDir::new("schema_home");
+    let cwd = TempDir::new("schema_cwd");
+    let missing = cwd.path().join("missing-schema.json");
+    let server = MockServer::start(vec![Reply::text("Hello!")]).await;
+    let (stdout, stderr, code) = tokio::time::timeout(TEST_TIMEOUT, async {
+        ZenRun::new("schema_badpath", &home, &cwd)
+            .args(base_args())
+            .arg("--json-schema")
+            .arg(missing.to_string_lossy())
+            .mock("mock-model", &server)
+            .arg("Say hello.")
+            .run_output()
+    })
+    .await
+    .expect("timed out");
+    assert_eq!(code, 4, "stderr: {}", stderr);
+    assert!(stderr.contains("--json-schema"), "stderr: {}", stderr);
+    assert!(stderr.contains("missing-schema.json"), "stderr: {}", stderr);
+    let result = last_result(&stdout);
+    assert_eq!(result["is_error"], true, "stdout: {}", stdout);
+    assert!(
+        result["schema_error"].as_str().is_some(),
+        "stdout: {}",
+        stdout
+    );
+    assert_eq!(
+        server.finish().await.len(),
+        0,
+        "no model call should happen"
+    );
+}
+
+// In text output mode --json-schema stays a warned no-op: a bad path
+// must not fail the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn json_schema_ignored_in_text_mode() {
+    let home = TempDir::new("schema_home");
+    let cwd = TempDir::new("schema_cwd");
+    let missing = cwd.path().join("missing-schema.json");
+    let server = MockServer::start(vec![Reply::text("hi")]).await;
+    let (stdout, stderr, code) = tokio::time::timeout(TEST_TIMEOUT, async {
+        ZenRun::new("schema_text", &home, &cwd)
+            .args([
+                "-p",
+                "--output-format",
+                "text",
+                "--bare",
+                "--setting-sources",
+                "",
+            ])
+            .arg("--json-schema")
+            .arg(missing.to_string_lossy())
+            .mock("mock-model", &server)
+            .arg("Say hi.")
+            .run_output()
+    })
+    .await
+    .expect("timed out");
+    assert_eq!(code, 0, "stderr: {}", stderr);
+    assert!(
+        stderr.contains("warning: --json-schema requires --output-format json"),
+        "stderr: {}",
+        stderr
+    );
+    assert!(stdout.contains("hi"), "stdout: {}", stdout);
+    assert_eq!(server.finish().await.len(), 1);
+}
