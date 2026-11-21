@@ -410,7 +410,10 @@ mod tests {
     }
     /// Strip ANSI escape sequences (CSI, ending at a letter, and two-byte
     /// escapes) so frame text can be asserted on without the cursor moves
-    /// ratatui writes between the pieces.
+    /// ratatui writes between the pieces. Linux-only: the sole caller is
+    /// the Linux-gated pty test below, so on Windows this would be dead
+    /// code (windows-check clippy error on commit a4fe2ce).
+    #[cfg(target_os = "linux")]
     fn strip_ansi(bytes: &[u8]) -> String {
         let text = String::from_utf8_lossy(bytes);
         let mut out = String::with_capacity(text.len());
