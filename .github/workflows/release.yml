@@ -8,13 +8,16 @@ name: Release
 # (same OS / target / zig / test rows) so a target CI builds is a target
 # the release ships. Tests run in CI's `build` job on the same tag push
 # and again here for the native targets (test: true rows).
+# Known limits: `cargo install cargo-zigbuild` pulls from crates.io with
+# no checksum verification (`cargo install` has no checksum option);
+# `--locked` only pins the dependency tree, not the downloaded crate.
+# The aarch64-unknown-linux-musl leg only builds: there is no aarch64
+# runner to smoke-test it, so a broken aarch64 binary would ship
+# undetected (the Smoke step skips that target).
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
-
-permissions:
-  contents: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -36,7 +39,7 @@ jobs:
           - { os: macos-latest, target: aarch64-apple-darwin, zig: false, test: true }
           - { os: macos-latest, target: x86_64-apple-darwin, zig: false, test: false }
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
@@ -45,7 +48,7 @@ jobs:
         with: { key: "${{ matrix.target }}" }
       - if: matrix.zig
         run: |
-          pip3 install --user --break-system-packages ziglang
+          pip3 install --user --break-system-packages ziglang==0.17.1
           cargo install cargo-zigbuild --locked
       - name: Build
         shell: bash
@@ -81,7 +84,7 @@ jobs:
         with:
           name: zen-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/zen-${{ matrix.target }}.zip
-          retention-days: 14
+          retention-days: 3
 
   release:
     # Attach the zips to the tag's GitHub Release. Tag-only: a manual
@@ -91,6 +94,8 @@ jobs:
     needs: [build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
