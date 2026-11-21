@@ -861,27 +861,64 @@ mod tests {
 
     // #11: a single invalid name must be rejected even when the other
     // name is valid. Replacing `||` with `&&` in the validation would
-    // only reject when both names are invalid, so this test kills the
-    // `||` -> `&&` mutant. `feat/sub` and `bad/task` are invalid per
-    // valid_worktree_name (`/` is not allowed) but are valid git branch
-    // names, so the mutant would proceed and `git worktree add` would
-    // succeed instead of returning Err.
+    // only reject when both names are invalid. The `feat/sub` and
+    // `bad/task` cases alone do NOT kill that mutant: the downstream
+    // create_isolation_record repeats the same validation with the
+    // identical message, and rolls the worktree back, so the error
+    // looks the same. Two observable differences do kill it:
+    // (1) an empty branch is invalid for git too, so the mutant leaks
+    // raw git stderr instead of the "invalid worktree name" message;
+    // (2) a rejected create must leave no branch behind, but the
+    // mutant creates the branch first and `git worktree remove` does
+    // not delete it, so the branch survives the rollback.
     #[test]
     fn isolated_create_rejects_single_invalid_name() {
         let Some(dir) = init_repo() else { return };
-        // Invalid branch, valid task.
+        let branch_exists = |dir: &Path, branch: &str| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args([
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}"),
+                ])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        // Invalid branch, valid task: git accepts `feat/sub` as a branch
+        // name, so the mutant would create it and leave it behind.
         let wt = wt_path("feat-sub");
         let err = create_isolated_worktree(&dir, &wt, "feat/sub", "feat1", "sess-1").unwrap_err();
         assert!(
             err.contains("invalid worktree name"),
             "invalid branch must be rejected: {err}"
         );
-        // Valid branch, invalid task.
+        assert!(
+            !branch_exists(&dir, "feat/sub"),
+            "rejected create must not leave branch feat/sub behind"
+        );
+        // Valid branch, invalid task: the mutant would create branch
+        // `feat1` before the record write refuses the task.
         let wt = wt_path("bad-task");
         let err = create_isolated_worktree(&dir, &wt, "feat1", "bad/task", "sess-1").unwrap_err();
         assert!(
             err.contains("invalid worktree name"),
             "invalid task must be rejected: {err}"
+        );
+        assert!(
+            !branch_exists(&dir, "feat1"),
+            "rejected create must not leave branch feat1 behind"
+        );
+        // Empty branch: invalid for git as well, so the mutant leaks raw
+        // git stderr instead of the validation message.
+        let wt = wt_path("empty-branch");
+        let err = create_isolated_worktree(&dir, &wt, "", "feat1", "sess-1").unwrap_err();
+        assert!(
+            err.contains("invalid worktree name"),
+            "empty branch must be rejected with the validation error: {err}"
         );
         // Both invalid is rejected too (control case).
         let wt = wt_path("both-bad");
