@@ -937,6 +937,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // #11: create_isolation_record validates both names itself. The
+    // `||` in its guard must reject when either name alone is invalid;
+    // replacing it with `&&` would only reject when both are invalid
+    // and would write a record carrying the bad name. These tests call
+    // it directly: create_isolated_worktree validates first, so its own
+    // guard would mask this one.
+    #[test]
+    fn isolation_record_rejects_invalid_branch() {
+        let Some(dir) = init_repo() else { return };
+        let wt = wt_path("feat-bad-branch");
+        create_worktree(&dir, &wt, "feat1").expect("plain create");
+        let err = create_isolation_record(&wt, "feat1", "bad branch", "sess-1").unwrap_err();
+        assert!(
+            err.contains("invalid worktree name"),
+            "invalid branch must be rejected: {err}"
+        );
+        assert!(
+            read_isolation_record(&wt).is_none(),
+            "rejected record write must not leave a record behind"
+        );
+        let _ = remove_worktree(&dir, &wt);
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn isolation_record_rejects_invalid_task() {
+        let Some(dir) = init_repo() else { return };
+        let wt = wt_path("bad-task");
+        create_worktree(&dir, &wt, "feat1").expect("plain create");
+        let err = create_isolation_record(&wt, "bad task", "feat1", "sess-1").unwrap_err();
+        assert!(
+            err.contains("invalid worktree name"),
+            "invalid task must be rejected: {err}"
+        );
+        assert!(
+            read_isolation_record(&wt).is_none(),
+            "rejected record write must not leave a record behind"
+        );
+        let _ = remove_worktree(&dir, &wt);
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn isolated_create_refuses_legacy_worktree() {
         let Some(dir) = init_repo() else { return };
