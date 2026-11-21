@@ -260,6 +260,48 @@ mod tests {
         run_demo(1).expect("demo failed under pty");
     }
 
+    /// Build the `script` command that runs `command` under a pty.
+    /// util-linux `script` (Linux) runs a command with `-c`, so the
+    /// invocation is `script -qec <command> /dev/null`. macOS (BSD)
+    /// `script` has no `-c` option at all: `-qec` fails there with
+    /// `illegal option -- c` and exit 1, so the command is passed as
+    /// argv after the typescript file instead: `script -q /dev/null
+    /// sh -c <command>`. macOS `script` always returns the child
+    /// command's exit status, so no `-e` is needed there.
+    #[cfg(unix)]
+    fn pty_script_command(command: &str) -> std::process::Command {
+        use std::process::Command;
+        let mut cmd = Command::new("script");
+        if cfg!(target_os = "macos") {
+            cmd.arg("-q")
+                .arg("/dev/null")
+                .arg("sh")
+                .arg("-c")
+                .arg(command);
+        } else {
+            cmd.arg("-qec").arg(command).arg("/dev/null");
+        }
+        cmd
+    }
+
+    /// The `script` invocation differs per OS (see
+    /// `pty_script_command`): assert the command is built with the
+    /// right flags on the platform the test runs on.
+    #[cfg(unix)]
+    #[test]
+    fn pty_script_command_uses_os_invocation() {
+        let cmd = pty_script_command("echo hi");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        if cfg!(target_os = "macos") {
+            assert_eq!(args, ["-q", "/dev/null", "sh", "-c", "echo hi"]);
+        } else {
+            assert_eq!(args, ["-qec", "echo hi", "/dev/null"]);
+        }
+    }
+
     /// The demo draws a frame and exits on its own once the scripted
     /// scenario finishes: this kills the `run_demo -> Ok(())` mutant,
     /// which would exit at once with no frame drawn. The viewer needs
@@ -270,22 +312,19 @@ mod tests {
     #[test]
     fn demo_draws_and_exits() {
         use std::io::{Read, Write};
-        use std::process::{Command, Stdio};
+        use std::process::Stdio;
         use std::time::{Duration, Instant};
         let exe = std::env::current_exe().expect("current test exe");
-        let mut child = Command::new("script")
-            .arg("-qec")
-            .arg(format!(
-                "stty rows 24 cols 100; exec {} demo_pty_helper --nocapture",
-                exe.display()
-            ))
-            .arg("/dev/null")
-            .env("FLIGHTDECK_PTY_DEMO", "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn `script` (util-linux) for the pty demo test");
+        let mut child = pty_script_command(&format!(
+            "stty rows 24 cols 100; exec {} demo_pty_helper --nocapture",
+            exe.display()
+        ))
+        .env("FLIGHTDECK_PTY_DEMO", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn `script` for the pty demo test");
         let stdin = Arc::new(Mutex::new(child.stdin.take().expect("pty stdin")));
         let mut stdout = child.stdout.take().expect("pty stdout");
         let output = Arc::new(Mutex::new(Vec::<u8>::new()));
