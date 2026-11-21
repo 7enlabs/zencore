@@ -48,14 +48,16 @@ MARKER = re.compile(r"floor-guard:\s*\S.{4,}")
 
 # Layer map from docs/ARCHITECTURE.md, verified against the code: zen-mcp
 # uses zen-tools for the shared output-spill limit (BASH_MAX_CHARS,
-# spill_output); zen-cli uses all five crates; the rest use zen-core only.
+# spill_output); zen-flightdeck renders the live session dashboard and
+# uses zen-core only; zen-cli uses all six crates; the rest use zen-core only.
 LAYER_DEPS: dict[str, frozenset[str]] = {
     "zen-core": frozenset(),
     "zen-agent": frozenset({"zen-core"}),
     "zen-tools": frozenset({"zen-core"}),
     "zen-ext": frozenset({"zen-core"}),
+    "zen-flightdeck": frozenset({"zen-core"}),
     "zen-mcp": frozenset({"zen-core", "zen-tools"}),
-    "zen-cli": frozenset({"zen-core", "zen-agent", "zen-tools", "zen-ext", "zen-mcp"}),
+    "zen-cli": frozenset({"zen-core", "zen-agent", "zen-tools", "zen-ext", "zen-mcp", "zen-flightdeck"}),
 }
 
 ALLOW_RE = re.compile(r"#\s*!?\s*\[\s*allow\s*\(\s*([^)\s,]+)?")

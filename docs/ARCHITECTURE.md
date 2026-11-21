@@ -5,17 +5,17 @@ behavior* of reference agents (see `SPEC.md`) without using any of their code, p
 texts. This document explains how the pieces fit together so you can study the code crate by crate.
 
 ```
-                     ┌──────────────────────────── zen-cli (binary `zen`) ────────────────────────────┐
- argv/stdin ───────▶ │ cli.rs (clap) → settings.rs (precedence) → agent_run.rs (assemble everything)  │
-                     │ repl.rs / commands.rs (slash + custom commands)   output.rs (text/json/stream) │
-                     │ session.rs (JSONL transcripts, resume/continue/fork)  system_prompt.rs, git.rs │
-                     └───────┬──────────────┬──────────────┬───────────────┬──────────────────────────┘
-                             │              │              │               │
-                      zen-agent        zen-tools        zen-ext         zen-mcp
-                   (loop, client,   (built-in tools, (settings layers, (MCP client, agent
-                    compaction,      permission rules) ZEN.md, skills,  definitions, Task
-                    sub-agents)                         hooks)           tool)
-                             └──────────────┴──────┬───────┴───────────────┘
+                     ┌──────────────────────────── zen-cli (binary `zen`) ──────────────────────────────────────┐
+ argv/stdin ───────▶ │ cli.rs (clap) → settings.rs (precedence) → agent_run.rs (assemble everything)            │
+                     │ repl.rs / commands.rs (slash + custom commands)   output.rs (text/json/stream)           │
+                     │ session.rs (JSONL transcripts, resume/continue/fork)  system_prompt.rs, git.rs           │
+                     └───────┬──────────────┬──────────────┬───────────────┬──────────────┬─────────────────────┘
+                             │              │              │               │              │
+                      zen-agent        zen-tools        zen-ext         zen-mcp    zen-flightdeck
+                   (loop, client,   (built-in tools, (settings layers, (MCP client, agent (live dashboard,
+                    compaction,      permission rules) ZEN.md, skills,  definitions, Task ctx %, cost $, agents
+                    sub-agents)                         hooks)           tool)            session log)
+                             └──────────────┴──────┬───────┴───────────────┴──────────────┘
                                                 zen-core
                          (wire types, Tool/LlmBackend/PermissionChecker/HookRunner/EventSink traits)
 ```
@@ -24,7 +24,7 @@ texts. This document explains how the pieces fit together so you can study the c
 built, tested and understood in isolation (they were literally written in parallel by separate
 workers). Only `zen-cli` depends on everything; it is the composition root. The layer map is enforced by `scripts/arch_lint.py` (rule A1). Cross-crate needs that
 would create cycles are expressed as traits in `zen-core` - e.g. the `Task` tool (zen-mcp) needs to run
-an agent (zen-agent), so it receives an `Arc<dyn SubAgentRunner>` that zen-cli builds from zen-agent.
+an agent (zen-agent), so it receives an `Arc<dyn SubAgentRunner>` that zen-cli builds from zen-agent. `zen-flightdeck` (section 11) is the live session dashboard; it depends only on `zen-core`, and only `zen-cli` depends on it.
 
 ## 1. Shared vocabulary: `zen-core`
 
@@ -251,3 +251,15 @@ Errors inside a run still produce a result object with `is_error: true` and exit
   on a reference fix. Results go to `docs/e2e-runs/<date>-bench.json`.
 * `zen-cli/src/lib.rs` exposes the CLI surface, session helpers and output sinks so integration tests
   can reuse them; `git.rs` adds best-effort git context to the system prompt.
+
+## 11. Live session dashboard (`zen-flightdeck`)
+
+`zen flightdeck` opens a live TUI dashboard for the current session (Phase 1): a header with
+context %, cost $, request count and model, a live agents table, and a session log. The crate
+folds the existing `AgentEvent` stream into dashboard state through an `EventSink`
+(`FlightdeckSink`, fanned out by `FanoutSink` so it can sit beside the other sinks), renders it
+with ratatui (`app.rs`, `render.rs`), and ships a scripted demo (`zen flightdeck --demo`,
+`demo.rs`) that needs no model. The live viewer over a real session runs from the REPL
+(`/flightdeck`); after each turn the REPL feeds the result into the shared `FlightdeckState`
+(`note_turn_result`), so the header stays current without polling the agent. The crate depends
+only on `zen-core`; only `zen-cli` depends on it.
