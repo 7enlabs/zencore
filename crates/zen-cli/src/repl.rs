@@ -5219,6 +5219,8 @@ mod pr208_mutant_tests {
         drop(_env);
         let line = if op == "rm" {
             format!("/worktree rm {name}")
+        } else if op == "list" {
+            "/worktree".to_string()
         } else {
             format!("/worktree {name}")
         };
@@ -5377,7 +5379,12 @@ mod pr208_mutant_tests {
         ] {
             let dir = temp_dir("zen_pr208_wtcr");
             let path = if with_path {
-                Some(format!("/tmp/zen_pr208_created_{}", uuid::Uuid::new_v4()))
+                Some(
+                    std::env::temp_dir()
+                        .join(format!("zen_pr208_created_{}", uuid::Uuid::new_v4()))
+                        .display()
+                        .to_string(),
+                )
             } else {
                 None
             };
@@ -5426,7 +5433,10 @@ mod pr208_mutant_tests {
     #[test]
     fn worktree_create_hook_unregistered_path_refused() {
         let dir = temp_dir("zen_pr208_wtunreg");
-        let path = format!("/tmp/zen_pr208_created_{}", uuid::Uuid::new_v4());
+        let path = std::env::temp_dir()
+            .join(format!("zen_pr208_created_{}", uuid::Uuid::new_v4()))
+            .display()
+            .to_string();
         let out = worktree_probe_output(WorktreeScenario {
             op: "create",
             failed: false,
@@ -5444,6 +5454,38 @@ mod pr208_mutant_tests {
         assert!(
             !out.contains("created worktree"),
             "unexpected creation:\n{out}"
+        );
+        std::fs::remove_dir_all(&path).ok();
+        worktree_probe_cleanup(&dir, "feat1");
+    }
+
+    // #11: `/worktree` with no args lists worktrees with their
+    // isolation label. Deleting the list arm would print usage
+    // instead, so this test kills the `delete match arm []` mutant.
+    #[test]
+    fn worktree_list_shows_isolation_label() {
+        let dir = temp_dir("zen_pr208_wtls");
+        let path = std::env::temp_dir().join(format!("zen_pr208_list_{}", uuid::Uuid::new_v4()));
+        setup_registered_worktree(&dir, path.to_str().unwrap(), "feat1");
+        crate::git::create_isolation_record(&path, "feat1", "feat1", "sess-1").expect("record");
+        let out = worktree_probe_output(WorktreeScenario {
+            op: "list",
+            failed: false,
+            blocked: false,
+            worktree_path: None,
+            feedback: None,
+            exists: false,
+            cwd: &dir,
+            name: "feat1",
+        });
+        let leaf = path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            out.contains(leaf),
+            "list shows the worktree path, got:\n{out}"
+        );
+        assert!(
+            out.contains("isolated:feat1"),
+            "list shows the isolation label, got:\n{out}"
         );
         std::fs::remove_dir_all(&path).ok();
         worktree_probe_cleanup(&dir, "feat1");

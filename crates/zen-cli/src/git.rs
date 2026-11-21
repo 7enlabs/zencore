@@ -915,6 +915,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // #11: the isolation record must live in the worktree's gitdir,
+    // not in the process working directory. A `git_dir_of` mutant
+    // returning a default path would read/write a stray
+    // `zen-isolation.json` in the CWD instead.
+    #[test]
+    fn isolation_record_lives_in_worktree_gitdir() {
+        let Some(dir) = init_repo() else { return };
+        let wt = wt_path("feat4");
+        create_isolated_worktree(&dir, &wt, "feat4", "feat4", "sess-1").expect("create");
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&wt)
+            .args(["rev-parse", "--absolute-git-dir"])
+            .output()
+            .expect("git rev-parse");
+        assert!(out.status.success(), "git rev-parse succeeds");
+        let gitdir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let record_path = isolation_record_path(&wt).expect("record path resolves");
+        assert!(
+            record_path.is_absolute(),
+            "record path is absolute: {}",
+            record_path.display()
+        );
+        assert!(
+            record_path.starts_with(&gitdir),
+            "record {} is inside gitdir {gitdir}",
+            record_path.display()
+        );
+        assert!(record_path.is_file(), "record file exists");
+        let _ = remove_worktree(&dir, &wt);
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn unregistered_path_is_not_a_worktree() {
         let Some(dir) = init_repo() else { return };
