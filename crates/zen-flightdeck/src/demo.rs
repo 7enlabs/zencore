@@ -357,6 +357,7 @@ mod tests {
     /// two-byte escapes) so frame text can be asserted on without the
     /// cursor moves ratatui writes between the pieces. Copy of the
     /// helper in app.rs tests: the two test modules cannot share it.
+    #[cfg(unix)]
     fn strip_ansi(bytes: &[u8]) -> String {
         let text = String::from_utf8_lossy(bytes);
         let mut out = String::with_capacity(text.len());
