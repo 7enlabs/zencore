@@ -919,6 +919,18 @@ impl Tool for BashTool {
                 let body = spill_output(&combined, BASH_MAX_CHARS, ctx);
                 if status.success() {
                     ToolOutput::ok(body)
+                } else if code == 126 {
+                    // 126 is the shell's "command cannot execute": inside
+                    // the sandbox that means Landlock denied the real
+                    // binary's path (issue #254). Name the location so
+                    // the failure is diagnosable instead of bare.
+                    let path_var = std::env::var("PATH").unwrap_or_default();
+                    ToolOutput::err(format!(
+                        "Exit code {}\n{}\n{}",
+                        code,
+                        body,
+                        crate::sandbox::exit_126_hint(cmd_str, &path_var)
+                    ))
                 } else {
                     ToolOutput::err(format!("Exit code {}\n{}", code, body))
                 }
@@ -2385,6 +2397,25 @@ mod tests {
         assert!(bad.is_error);
         assert!(bad.content.contains("Exit code 3"), "{}", bad.content);
         assert!(bad.content.contains("boom"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A shell exit of 126 is the sandbox's "command cannot execute"
+    /// signature (issue #254): the tool appends the hint naming the
+    /// blocked location instead of returning the bare exit code.
+    #[tokio::test]
+    async fn bash_exit_126_appends_sandbox_hint() {
+        let dir = tmpdir("bash-126");
+        let ctx = ctx_for(&dir);
+        let out = BashTool.call(json!({"command": "exit 126"}), &ctx).await;
+        assert!(out.is_error);
+        assert!(out.content.contains("Exit code 126"), "{}", out.content);
+        assert!(
+            out.content
+                .contains("hint: exit 126 means the sandbox refused to execute a program"),
+            "{}",
+            out.content
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

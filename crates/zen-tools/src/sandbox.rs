@@ -175,6 +175,136 @@ pub fn toolchain_paths(
     out
 }
 
+/// Whether `path` is a file the shell could execute. On Unix this needs
+/// the executable bit, not just existence: a non-executable `cargo` on
+/// PATH is not the binary the shell would run.
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.is_file()
+        && path
+            .metadata()
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+}
+
+/// Non-Unix fallback: no executable bit to check.
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+/// Follow one level of indirection behind the `cargo` file PATH
+/// resolves to: a symlink is followed to its target, and a `#!` script
+/// is scanned for an `exec <absolute path>` line naming the real
+/// binary. Returns None when the file is already the real binary, or
+/// when its target cannot be determined (for example a wrapper that
+/// builds its path from environment variables).
+fn resolve_cargo_target(path: &Path) -> Option<PathBuf> {
+    if let Ok(target) = std::fs::read_link(path) {
+        if target.is_absolute() {
+            return Some(target);
+        }
+        return path.parent().map(|parent| parent.join(target));
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    if !lines.next().map(|l| l.starts_with("#!")).unwrap_or(false) {
+        return None;
+    }
+    for line in lines {
+        let Some(rest) = line.trim_start().strip_prefix("exec ") else {
+            continue;
+        };
+        let first = rest.split_whitespace().next()?;
+        let first = first.trim_matches(|c| c == '"' || c == '\'');
+        if first.starts_with('/') {
+            return Some(PathBuf::from(first));
+        }
+    }
+    None
+}
+
+/// First executable `cargo` on PATH, if any. Empty entries are
+/// skipped, and a non-executable file named `cargo` does not count.
+/// `cargo.exe` is tried as a fallback so the lookup also works on
+/// Windows, where the binary carries the `.exe` suffix.
+fn find_cargo_on_path(path_var: &str) -> Option<PathBuf> {
+    for dir in std::env::split_paths(path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join("cargo");
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+        let candidate = dir.join("cargo.exe");
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Directories that must stay readable for the `cargo` found on PATH
+/// to run inside the sandbox (issue #254).
+///
+/// The file PATH resolves to is often not the real binary: rustup
+/// shims are symlinks into a toolchain directory, and some hosts ship
+/// `cargo` as a shell wrapper that `exec`s the real binary from
+/// elsewhere (for example `/usr/local/bin/cargo` exec'ing
+/// `/opt/rust/cargo/bin/cargo`). The env-var paths in
+/// `toolchain_paths` never see those layouts, so even `cargo
+/// --version` failed inside the sandbox with exit 126. Resolution
+/// follows one level of symlink or wrapper script and returns the
+/// directory holding the real binary, plus the wrapper's own directory
+/// when it differs, so the shell can reach the wrapper at all. The
+/// first executable `cargo` on PATH wins; empty when none is found.
+pub fn cargo_executable_dirs(path_var: &str) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = vec![];
+    let Some(candidate) = find_cargo_on_path(path_var) else {
+        return out;
+    };
+    if let Some(parent) = candidate.parent() {
+        out.push(parent.to_path_buf());
+    }
+    if let Some(parent) =
+        resolve_cargo_target(&candidate).and_then(|real| real.parent().map(Path::to_path_buf))
+        && !out.contains(&parent)
+    {
+        out.push(parent);
+    }
+    out
+}
+
+/// Hint to append when a sandboxed shell exits 126 ("command cannot
+/// execute"). Inside the sandbox that almost always means Landlock
+/// denied the real binary's path, so the hint names where the `cargo`
+/// on PATH resolves to when the command mentions cargo, and says the
+/// target could not be followed when the wrapper hides it.
+pub fn exit_126_hint(command: &str, path_var: &str) -> String {
+    let mut hint = String::from(
+        "hint: exit 126 means the sandbox refused to execute a program (Landlock denied its path)",
+    );
+    if command.contains("cargo") {
+        match find_cargo_on_path(path_var) {
+            Some(candidate) => {
+                hint.push_str(&format!("; the cargo on PATH is {}", candidate.display()));
+                match resolve_cargo_target(&candidate) {
+                    Some(real) => {
+                        hint.push_str(&format!(", whose real binary is {}", real.display()))
+                    }
+                    None => {
+                        hint.push_str(", whose real binary could not be followed");
+                    }
+                }
+            }
+            None => hint.push_str("; no executable cargo was found on PATH"),
+        }
+    }
+    hint
+}
+
 /// Directories the child may write to, per mode. `read-only` allows no
 /// writes anywhere; `workspace-write` allows writes in the working
 /// directory, additional directories, the session scratch directory and
@@ -477,6 +607,16 @@ mod imp {
                 created = add_beneath(created, &path, read)?;
             }
         }
+        // `cargo` on PATH can be a wrapper or shim whose real binary
+        // lives outside the home directory (issue #254): without the
+        // real binary's directory even `cargo --version` fails with
+        // exit 126.
+        let path_var = std::env::var("PATH").unwrap_or_default();
+        for path in super::cargo_executable_dirs(&path_var) {
+            if path.exists() {
+                created = add_beneath(created, &path, read)?;
+            }
+        }
         for path in super::device_paths() {
             if path.exists() {
                 let device = AccessFs::ReadFile | AccessFs::WriteFile;
@@ -684,6 +824,203 @@ mod tests {
                 PathBuf::from("/opt/rustup/settings.toml"),
             ]
         );
+    }
+
+    /// Unique scratch dir for one cargo-resolution test case, so
+    /// parallel tests never share a layout.
+    #[cfg(unix)]
+    fn cargo_case_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "zen-cargo-dirs-{}-{}-{}",
+            std::process::id(),
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, contents).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A wrapper script that execs the real binary elsewhere must
+    /// resolve to both directories (issue #254): the wrapper's own
+    /// directory, so the shell can reach it, and the real binary's
+    /// directory, so Landlock lets it run.
+    #[cfg(unix)]
+    #[test]
+    fn cargo_executable_dirs_follows_wrapper_script() {
+        let base = cargo_case_dir("wrapper");
+        let real_bin = base.join("realbin");
+        let wrapper_bin = base.join("wrapperbin");
+        std::fs::create_dir_all(&real_bin).unwrap();
+        std::fs::create_dir_all(&wrapper_bin).unwrap();
+        write_executable(&real_bin.join("cargo"), "#!/bin/bash\necho cargo-fake\n");
+        write_executable(
+            &wrapper_bin.join("cargo"),
+            &format!("#!/bin/bash\nexec {}/cargo \"$@\"\n", real_bin.display()),
+        );
+        let path_var = format!("{}:/usr/bin", wrapper_bin.display());
+        assert_eq!(
+            cargo_executable_dirs(&path_var),
+            vec![wrapper_bin, real_bin]
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A wrapper that quotes its exec target must resolve the same way:
+    /// the quotes are stripped before the absolute-path check, so a
+    /// quoted `exec "/path/cargo"` still yields the real binary's
+    /// directory.
+    #[cfg(unix)]
+    #[test]
+    fn cargo_executable_dirs_follows_quoted_wrapper_exec() {
+        let base = cargo_case_dir("quoted");
+        let real_bin = base.join("realbin");
+        let wrapper_bin = base.join("wrapperbin");
+        std::fs::create_dir_all(&real_bin).unwrap();
+        std::fs::create_dir_all(&wrapper_bin).unwrap();
+        write_executable(&real_bin.join("cargo"), "#!/bin/bash\necho cargo-fake\n");
+        write_executable(
+            &wrapper_bin.join("cargo"),
+            &format!(
+                "#!/bin/bash\nexec \"{}/cargo\" \"$@\"\n",
+                real_bin.display()
+            ),
+        );
+        let path_var = format!("{}:/usr/bin", wrapper_bin.display());
+        assert_eq!(
+            cargo_executable_dirs(&path_var),
+            vec![wrapper_bin, real_bin]
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// When the resolved binary lives in the same directory as the
+    /// wrapper, the directory must appear exactly once: the dedup guard
+    /// is what keeps the allowlist from growing a duplicate entry.
+    #[cfg(unix)]
+    #[test]
+    fn cargo_executable_dirs_dedupes_same_directory() {
+        let base = cargo_case_dir("samedir");
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let real = bin.join("real-cargo");
+        write_executable(&real, "#!/bin/bash\necho cargo-fake\n");
+        std::os::unix::fs::symlink(&real, bin.join("cargo")).unwrap();
+        let path_var = format!("{}:/usr/bin", bin.display());
+        assert_eq!(cargo_executable_dirs(&path_var), vec![bin]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A rustup-style symlink must resolve to the toolchain binary's
+    /// directory as well as the shim's own directory.
+    #[cfg(unix)]
+    #[test]
+    fn cargo_executable_dirs_follows_symlink() {
+        let base = cargo_case_dir("symlink");
+        let shim_bin = base.join("shimbin");
+        let toolchain_bin = base.join("toolchain").join("bin");
+        std::fs::create_dir_all(&shim_bin).unwrap();
+        std::fs::create_dir_all(&toolchain_bin).unwrap();
+        let real = toolchain_bin.join("cargo");
+        write_executable(&real, "#!/bin/bash\necho cargo-fake\n");
+        std::os::unix::fs::symlink(&real, shim_bin.join("cargo")).unwrap();
+        let path_var = format!("{}:/usr/bin", shim_bin.display());
+        assert_eq!(
+            cargo_executable_dirs(&path_var),
+            vec![shim_bin, toolchain_bin]
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A plain executable binary needs only its own directory, and a
+    /// PATH with no executable cargo resolves to nothing.
+    #[cfg(unix)]
+    #[test]
+    fn cargo_executable_dirs_plain_binary_and_missing() {
+        let base = cargo_case_dir("plain");
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_executable(&bin.join("cargo"), "#!/bin/bash\necho cargo-fake\n");
+        let path_var = format!("{}:/usr/bin", bin.display());
+        assert_eq!(cargo_executable_dirs(&path_var), vec![bin.clone()]);
+        assert!(cargo_executable_dirs("/nonexistent-dir-xyz").is_empty());
+        assert!(cargo_executable_dirs("").is_empty());
+        // A non-executable file named cargo does not count: the next
+        // PATH entry wins.
+        let dead = base.join("dead");
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::write(dead.join("cargo"), "not executable\n").unwrap();
+        let path_var = format!("{}:{}", dead.display(), bin.display());
+        assert_eq!(cargo_executable_dirs(&path_var), vec![bin]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// On Windows the binary is `cargo.exe`: an executable file by
+    /// that name counts, a non-executable one does not.
+    #[cfg(unix)]
+    #[test]
+    fn cargo_executable_dirs_finds_cargo_exe() {
+        let base = cargo_case_dir("exe");
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_executable(&bin.join("cargo.exe"), "#!/bin/bash\necho cargo-fake\n");
+        let path_var = format!("{}:/usr/bin", bin.display());
+        assert_eq!(cargo_executable_dirs(&path_var), vec![bin.clone()]);
+        // A non-executable cargo.exe does not count, and there is no
+        // plain `cargo` here to fall back to.
+        let dead = base.join("dead");
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::write(dead.join("cargo.exe"), "not executable\n").unwrap();
+        let path_var = format!("{}:/usr/bin", dead.display());
+        assert!(cargo_executable_dirs(&path_var).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A wrapper the resolver cannot follow still yields its own
+    /// directory (the shell must at least reach the wrapper), and the
+    /// 126 hint says so instead of naming a binary it never found.
+    #[cfg(unix)]
+    #[test]
+    fn cargo_executable_dirs_unfollowable_wrapper_and_hint() {
+        let base = cargo_case_dir("unfollowable");
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_executable(
+            &bin.join("cargo"),
+            "#!/bin/bash\nexec \"$SOMEWHERE/bin/cargo\" \"$@\"\n",
+        );
+        let path_var = format!("{}:/usr/bin", bin.display());
+        assert_eq!(cargo_executable_dirs(&path_var), vec![bin.clone()]);
+        let hint = exit_126_hint("cargo --version", &path_var);
+        assert!(
+            hint.contains(&format!(
+                "the cargo on PATH is {}",
+                bin.join("cargo").display()
+            )),
+            "hint: {hint}"
+        );
+        assert!(hint.contains("could not be followed"), "hint: {hint}");
+        // A command that never mentions cargo gets the generic hint
+        // only, with no cargo location attached.
+        let hint = exit_126_hint("git status", &path_var);
+        assert!(hint.contains("exit 126"), "hint: {hint}");
+        assert!(!hint.contains("cargo on PATH"), "hint: {hint}");
+        // No cargo on PATH at all: the hint says so.
+        let hint = exit_126_hint("cargo --version", "/nonexistent-dir-xyz");
+        assert!(
+            hint.contains("no executable cargo was found on PATH"),
+            "hint: {hint}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -985,9 +1322,28 @@ mod tests {
             .await;
             assert_eq!(code, Some(0), "git status output: {out}");
             assert!(out.contains("true"), "output: {out}");
-            let (out, code) = run_sandboxed(&config, "cargo --version").await;
-            assert_eq!(code, Some(0), "cargo output: {out}");
-            assert!(out.contains("cargo "), "output: {out}");
+            // `cargo` runs inside the sandbox only when its location can
+            // be resolved the same way the product resolves it (issue
+            // #254). Without an executable cargo on PATH there is nothing
+            // to check; when the wrapper hides its target, the run fails
+            // closed with the documented 126 instead of anything else.
+            let path_var = std::env::var("PATH").unwrap_or_default();
+            if let Some(candidate) = find_cargo_on_path(&path_var) {
+                let target = resolve_cargo_target(&candidate);
+                let is_script = std::fs::read_to_string(&candidate)
+                    .map(|t| t.starts_with("#!"))
+                    .unwrap_or(false);
+                let (out, code) = run_sandboxed(&config, "cargo --version").await;
+                if target.is_some() || !is_script {
+                    assert_eq!(code, Some(0), "cargo output: {out}");
+                    assert!(out.contains("cargo "), "output: {out}");
+                } else {
+                    assert!(
+                        code == Some(0) || code == Some(126),
+                        "unfollowable cargo wrapper must run or fail closed with 126, got: {code:?} / {out}"
+                    );
+                }
+            }
             let _ = std::fs::remove_dir_all(&dir);
         }
 
