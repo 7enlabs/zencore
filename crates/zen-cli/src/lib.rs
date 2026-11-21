@@ -315,6 +315,24 @@ pub async fn run_with_home(cli: Cli, cwd: &Path, home: Option<&Path>) -> Result<
     Ok(0)
 }
 
+/// Default export format when `--format` is absent (issue #261).
+/// JSON when the global output format is JSON, when stdout is not a
+/// terminal (piped or redirected), or when `--output` writes to a file;
+/// markdown only for interactive terminal output, so `zen export` piped
+/// into `zen import` round-trips by default. Kept pure so the truth
+/// table is unit-testable (the terminal check itself is not).
+fn default_export_format(
+    effective: OutputFormat,
+    stdout_is_terminal: bool,
+    has_output: bool,
+) -> export::ExportFormat {
+    if effective == OutputFormat::Json || !stdout_is_terminal || has_output {
+        export::ExportFormat::Json
+    } else {
+        export::ExportFormat::Markdown
+    }
+}
+
 async fn run_subcommand(cli: &Cli, cwd: &Path, home: Option<&Path>, sub: &Commands) -> Result<i32> {
     match sub {
         Commands::Doctor => {
@@ -507,14 +525,11 @@ async fn run_subcommand(cli: &Cli, cwd: &Path, home: Option<&Path>, sub: &Comman
             // to JSON so `zen import` accepts it; interactive stdout
             // keeps markdown. An explicit --format still wins.
             let format = e.format.unwrap_or_else(|| {
-                if cli.effective_output_format() == OutputFormat::Json
-                    || !std::io::stdout().is_terminal()
-                    || e.output.is_some()
-                {
-                    export::ExportFormat::Json
-                } else {
-                    export::ExportFormat::Markdown
-                }
+                default_export_format(
+                    cli.effective_output_format(),
+                    std::io::stdout().is_terminal(),
+                    e.output.is_some(),
+                )
             });
             export::run_export(
                 cwd,
@@ -2086,5 +2101,34 @@ mod tests {
         }
         assert_eq!(provider_error_hint("invalid model name"), None);
         assert_eq!(provider_error_hint("HTTP 400: bad request"), None);
+    }
+
+    #[test]
+    fn default_export_format_truth_table() {
+        // Issue #261: mutants on PR #264 survived because no test split
+        // the three arms of the default-format condition. Each arm alone
+        // must force JSON, and only interactive stdout with no --output
+        // and no JSON switch keeps markdown.
+        use crate::export::ExportFormat;
+        use OutputFormat::{Json, StreamJson, Text};
+        // (effective, stdout_is_terminal, has_output, expected)
+        let cases = [
+            (Json, true, false, ExportFormat::Json),
+            (Json, false, false, ExportFormat::Json),
+            (Json, true, true, ExportFormat::Json),
+            (Text, false, false, ExportFormat::Json),
+            (Text, false, true, ExportFormat::Json),
+            (Text, true, true, ExportFormat::Json),
+            (StreamJson, false, false, ExportFormat::Json),
+            (Text, true, false, ExportFormat::Markdown),
+            (StreamJson, true, false, ExportFormat::Markdown),
+        ];
+        for (effective, is_terminal, has_output, expected) in cases {
+            assert_eq!(
+                default_export_format(effective, is_terminal, has_output),
+                expected,
+                "effective={effective:?} terminal={is_terminal} output={has_output}"
+            );
+        }
     }
 }
