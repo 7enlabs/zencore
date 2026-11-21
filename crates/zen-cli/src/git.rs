@@ -253,6 +253,177 @@ pub fn remove_worktree(cwd: &Path, path: &Path) -> Result<(), String> {
     }
 }
 
+/// Isolation record for #11 (worktree isolation): one task owns exactly
+/// one worktree, and no other task may claim or remove it. Stored as
+/// `zen-isolation.json` inside the git directory of the worktree
+/// (`git rev-parse --absolute-git-dir`), so it is invisible to the
+/// checkout, moves with `git worktree move`, and disappears with
+/// `git worktree remove`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeIsolation {
+    pub task: String,
+    pub branch: String,
+    pub created_unix: u64,
+    pub created_by_session: String,
+}
+
+const ISOLATION_RECORD_FILE: &str = "zen-isolation.json";
+
+fn git_dir_of(path: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--absolute-git-dir"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if dir.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(dir))
+    }
+}
+
+fn isolation_record_path(worktree_path: &Path) -> Option<PathBuf> {
+    git_dir_of(worktree_path).map(|d| d.join(ISOLATION_RECORD_FILE))
+}
+
+/// Reads the isolation record of a worktree, if it has one. Returns
+/// `None` for worktrees created before #11 (or by hand with plain git)
+/// and for malformed records: both are treated as legacy, unowned
+/// worktrees, never as owned by anyone.
+pub fn read_isolation_record(worktree_path: &Path) -> Option<WorktreeIsolation> {
+    let path = isolation_record_path(worktree_path)?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    Some(WorktreeIsolation {
+        task: v.get("task")?.as_str()?.to_string(),
+        branch: v.get("branch")?.as_str()?.to_string(),
+        created_unix: v.get("created_unix")?.as_u64()?,
+        created_by_session: v
+            .get("created_by_session")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+fn write_isolation_record(worktree_path: &Path, record: &WorktreeIsolation) -> Result<(), String> {
+    let path = isolation_record_path(worktree_path)
+        .ok_or_else(|| "cannot resolve git dir of worktree".to_string())?;
+    let text = serde_json::json!({
+        "task": record.task,
+        "branch": record.branch,
+        "created_unix": record.created_unix,
+        "created_by_session": record.created_by_session,
+    })
+    .to_string();
+    std::fs::write(path, text).map_err(|e| format!("failed to write isolation record: {e}"))
+}
+
+/// Writes (or rewrites) the isolation record for an existing worktree,
+/// e.g. one a WorktreeCreate hook just created. The caller must already
+/// have verified the path is a registered worktree of this repo.
+pub fn create_isolation_record(
+    worktree_path: &Path,
+    task: &str,
+    branch: &str,
+    session_id: &str,
+) -> Result<WorktreeIsolation, String> {
+    if !valid_worktree_name(task) || !valid_worktree_name(branch) {
+        return Err(format!(
+            "invalid worktree name: {task} (letters, digits, - _ .)"
+        ));
+    }
+    let record = WorktreeIsolation {
+        task: task.to_string(),
+        branch: branch.to_string(),
+        created_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        created_by_session: session_id.to_string(),
+    };
+    write_isolation_record(worktree_path, &record)?;
+    Ok(record)
+}
+
+fn canonical_or_raw(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// True when `path` is a worktree registered with the repo at `cwd`.
+pub fn is_registered_worktree(cwd: &Path, path: &Path) -> bool {
+    let want = canonical_or_raw(path);
+    list_worktrees(cwd)
+        .iter()
+        .any(|(p, _, _)| canonical_or_raw(Path::new(p)) == want)
+}
+
+/// Creates a worktree owned by `task` on `branch`, with an isolation
+/// record. Re-attaching the same task to its own worktree is idempotent;
+/// any other task claiming the same path is refused, as is claiming a
+/// legacy worktree that carries no record.
+pub fn create_isolated_worktree(
+    cwd: &Path,
+    path: &Path,
+    branch: &str,
+    task: &str,
+    session_id: &str,
+) -> Result<PathBuf, String> {
+    if !valid_worktree_name(branch) || !valid_worktree_name(task) {
+        return Err(format!(
+            "invalid worktree name: {task} (letters, digits, - _ .)"
+        ));
+    }
+    if is_registered_worktree(cwd, path) {
+        return match read_isolation_record(path) {
+            Some(record) if record.task == task && record.branch == branch => {
+                Ok(path.to_path_buf())
+            }
+            Some(record) => Err(format!(
+                "worktree {} is isolated for task \"{}\" (branch \"{}\"), not \"{}\"",
+                path.display(),
+                record.task,
+                record.branch,
+                task
+            )),
+            None => Err(format!(
+                "worktree {} already exists without an isolation record; remove it first (`/worktree rm {}`) then create it again",
+                path.display(),
+                task
+            )),
+        };
+    }
+    let created = create_worktree(cwd, path, branch)?;
+    if let Err(e) = create_isolation_record(path, task, branch, session_id) {
+        let _ = remove_worktree(cwd, path);
+        return Err(e);
+    }
+    Ok(created)
+}
+
+/// Removes a worktree owned by `task`. Refuses when the worktree
+/// isolation record names a different task; legacy worktrees without a
+/// record may still be removed.
+pub fn remove_isolated_worktree(cwd: &Path, path: &Path, task: &str) -> Result<(), String> {
+    match read_isolation_record(path) {
+        Some(record) if record.task != task => {
+            return Err(format!(
+                "refusing to remove worktree {}: isolated for task \"{}\", not \"{}\"",
+                path.display(),
+                record.task,
+                task
+            ));
+        }
+        _ => {}
+    }
+    remove_worktree(cwd, path)
+}
+
 pub fn changed_files(cwd: &Path) -> Vec<(String, String)> {
     let p = spawn_probe("git", cwd, &["status", "--porcelain"]);
     // A timed-out probe reports no changes rather than erroring: callers
@@ -625,5 +796,285 @@ mod tests {
             colored.contains("\x1b["),
             "colored diff should have ANSI codes"
         );
+    }
+
+    fn wt_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("zen_git_wt_{}_{}", uuid::Uuid::new_v4(), name))
+    }
+
+    #[test]
+    fn isolated_create_writes_record_and_reattaches() {
+        let Some(dir) = init_repo() else { return };
+        let wt = wt_path("feat1");
+        let created =
+            create_isolated_worktree(&dir, &wt, "feat1", "feat1", "sess-1").expect("create");
+        assert_eq!(created, wt);
+        let record = read_isolation_record(&wt).expect("record written");
+        assert_eq!(record.task, "feat1");
+        assert_eq!(record.branch, "feat1");
+        assert_eq!(record.created_by_session, "sess-1");
+        assert!(is_registered_worktree(&dir, &wt));
+        // Same task re-attaching is idempotent and keeps the first record.
+        let again =
+            create_isolated_worktree(&dir, &wt, "feat1", "feat1", "sess-2").expect("re-attach");
+        assert_eq!(again, wt);
+        assert_eq!(
+            read_isolation_record(&wt)
+                .expect("record kept")
+                .created_by_session,
+            "sess-1"
+        );
+        // Windows: `git worktree list --porcelain` prints the path in
+        // git's own form (forward slashes, resolved case), which does
+        // not compare equal to the temp_dir-built path as raw `Path`s
+        // (Windows job log run 44928292749: count 0 vs 1, while
+        // `is_registered_worktree` on the same list passed). Compare
+        // canonicalized paths, like `is_registered_worktree` does.
+        let want = canonical_or_raw(&wt);
+        assert_eq!(
+            list_worktrees(&dir)
+                .iter()
+                .filter(|(p, _, _)| canonical_or_raw(Path::new(p)) == want)
+                .count(),
+            1
+        );
+        let _ = remove_worktree(&dir, &wt);
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn isolated_create_refuses_other_task() {
+        let Some(dir) = init_repo() else { return };
+        let wt = wt_path("feat1");
+        create_isolated_worktree(&dir, &wt, "feat1", "feat1", "sess-1").expect("create");
+        let err = create_isolated_worktree(&dir, &wt, "feat1", "other-task", "sess-1").unwrap_err();
+        assert!(
+            err.contains("feat1"),
+            "refusal names the owning task: {err}"
+        );
+        // Same task but a different branch name is also refused.
+        let err =
+            create_isolated_worktree(&dir, &wt, "other-branch", "feat1", "sess-1").unwrap_err();
+        assert!(
+            err.contains("feat1"),
+            "refusal names the owning task: {err}"
+        );
+        assert!(is_registered_worktree(&dir, &wt));
+        let _ = remove_worktree(&dir, &wt);
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // #11: a single invalid name must be rejected even when the other
+    // name is valid. Replacing `||` with `&&` in the validation would
+    // only reject when both names are invalid. The `feat/sub` and
+    // `bad/task` cases alone do NOT kill that mutant: the downstream
+    // create_isolation_record repeats the same validation with the
+    // identical message, and rolls the worktree back, so the error
+    // looks the same. Two observable differences do kill it:
+    // (1) an empty branch is invalid for git too, so the mutant leaks
+    // raw git stderr instead of the "invalid worktree name" message;
+    // (2) a rejected create must leave no branch behind, but the
+    // mutant creates the branch first and `git worktree remove` does
+    // not delete it, so the branch survives the rollback.
+    #[test]
+    fn isolated_create_rejects_single_invalid_name() {
+        let Some(dir) = init_repo() else { return };
+        let branch_exists = |dir: &Path, branch: &str| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args([
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}"),
+                ])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        // Invalid branch, valid task: git accepts `feat/sub` as a branch
+        // name, so the mutant would create it and leave it behind.
+        let wt = wt_path("feat-sub");
+        let err = create_isolated_worktree(&dir, &wt, "feat/sub", "feat1", "sess-1").unwrap_err();
+        assert!(
+            err.contains("invalid worktree name"),
+            "invalid branch must be rejected: {err}"
+        );
+        assert!(
+            !branch_exists(&dir, "feat/sub"),
+            "rejected create must not leave branch feat/sub behind"
+        );
+        // Valid branch, invalid task: the mutant would create branch
+        // `feat1` before the record write refuses the task.
+        let wt = wt_path("bad-task");
+        let err = create_isolated_worktree(&dir, &wt, "feat1", "bad/task", "sess-1").unwrap_err();
+        assert!(
+            err.contains("invalid worktree name"),
+            "invalid task must be rejected: {err}"
+        );
+        assert!(
+            !branch_exists(&dir, "feat1"),
+            "rejected create must not leave branch feat1 behind"
+        );
+        // Empty branch: invalid for git as well, so the mutant leaks raw
+        // git stderr instead of the validation message.
+        let wt = wt_path("empty-branch");
+        let err = create_isolated_worktree(&dir, &wt, "", "feat1", "sess-1").unwrap_err();
+        assert!(
+            err.contains("invalid worktree name"),
+            "empty branch must be rejected with the validation error: {err}"
+        );
+        // Both invalid is rejected too (control case).
+        let wt = wt_path("both-bad");
+        let err = create_isolated_worktree(&dir, &wt, "a/b", "c/d", "sess-1").unwrap_err();
+        assert!(
+            err.contains("invalid worktree name"),
+            "both invalid must be rejected: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // #11: create_isolation_record validates both names itself. The
+    // `||` in its guard must reject when either name alone is invalid;
+    // replacing it with `&&` would only reject when both are invalid
+    // and would write a record carrying the bad name. These tests call
+    // it directly: create_isolated_worktree validates first, so its own
+    // guard would mask this one.
+    #[test]
+    fn isolation_record_rejects_invalid_branch() {
+        let Some(dir) = init_repo() else { return };
+        let wt = wt_path("feat-bad-branch");
+        create_worktree(&dir, &wt, "feat1").expect("plain create");
+        let err = create_isolation_record(&wt, "feat1", "bad branch", "sess-1").unwrap_err();
+        assert!(
+            err.contains("invalid worktree name"),
+            "invalid branch must be rejected: {err}"
+        );
+        assert!(
+            read_isolation_record(&wt).is_none(),
+            "rejected record write must not leave a record behind"
+        );
+        let _ = remove_worktree(&dir, &wt);
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn isolation_record_rejects_invalid_task() {
+        let Some(dir) = init_repo() else { return };
+        let wt = wt_path("bad-task");
+        create_worktree(&dir, &wt, "feat1").expect("plain create");
+        let err = create_isolation_record(&wt, "bad task", "feat1", "sess-1").unwrap_err();
+        assert!(
+            err.contains("invalid worktree name"),
+            "invalid task must be rejected: {err}"
+        );
+        assert!(
+            read_isolation_record(&wt).is_none(),
+            "rejected record write must not leave a record behind"
+        );
+        let _ = remove_worktree(&dir, &wt);
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn isolated_create_refuses_legacy_worktree() {
+        let Some(dir) = init_repo() else { return };
+        let wt = wt_path("legacy1");
+        create_worktree(&dir, &wt, "legacy1").expect("plain create");
+        assert!(read_isolation_record(&wt).is_none());
+        let err = create_isolated_worktree(&dir, &wt, "legacy1", "legacy1", "sess-1").unwrap_err();
+        assert!(
+            err.contains("without an isolation record"),
+            "legacy refusal explains: {err}"
+        );
+        let _ = remove_worktree(&dir, &wt);
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn isolated_remove_refuses_other_task_and_allows_owner() {
+        let Some(dir) = init_repo() else { return };
+        let wt = wt_path("feat2");
+        create_isolated_worktree(&dir, &wt, "feat2", "feat2", "sess-1").expect("create");
+        let err = remove_isolated_worktree(&dir, &wt, "someone-else").unwrap_err();
+        assert!(err.contains("feat2"), "refusal names the owner: {err}");
+        assert!(is_registered_worktree(&dir, &wt));
+        remove_isolated_worktree(&dir, &wt, "feat2").expect("owner removes");
+        assert!(!is_registered_worktree(&dir, &wt));
+        assert!(read_isolation_record(&wt).is_none());
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn isolated_create_rejects_bad_names() {
+        let Some(dir) = init_repo() else { return };
+        let wt = wt_path("bad");
+        assert!(create_isolated_worktree(&dir, &wt, "-b", "-b", "s").is_err());
+        assert!(create_isolated_worktree(&dir, &wt, "ok", "../escape", "s").is_err());
+        assert!(!wt.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn isolation_record_malformed_is_legacy() {
+        let Some(dir) = init_repo() else { return };
+        let wt = wt_path("feat3");
+        create_isolated_worktree(&dir, &wt, "feat3", "feat3", "sess-1").expect("create");
+        let record_path = isolation_record_path(&wt).expect("gitdir resolves");
+        std::fs::write(&record_path, "not json{").unwrap();
+        assert!(read_isolation_record(&wt).is_none());
+        std::fs::write(&record_path, r#"{"task": "feat3"}"#).unwrap();
+        assert!(read_isolation_record(&wt).is_none());
+        let _ = remove_worktree(&dir, &wt);
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // #11: the isolation record must live in the worktree's gitdir,
+    // not in the process working directory. A `git_dir_of` mutant
+    // returning a default path would read/write a stray
+    // `zen-isolation.json` in the CWD instead.
+    #[test]
+    fn isolation_record_lives_in_worktree_gitdir() {
+        let Some(dir) = init_repo() else { return };
+        let wt = wt_path("feat4");
+        create_isolated_worktree(&dir, &wt, "feat4", "feat4", "sess-1").expect("create");
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&wt)
+            .args(["rev-parse", "--absolute-git-dir"])
+            .output()
+            .expect("git rev-parse");
+        assert!(out.status.success(), "git rev-parse succeeds");
+        let gitdir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let record_path = isolation_record_path(&wt).expect("record path resolves");
+        assert!(
+            record_path.is_absolute(),
+            "record path is absolute: {}",
+            record_path.display()
+        );
+        assert!(
+            record_path.starts_with(&gitdir),
+            "record {} is inside gitdir {gitdir}",
+            record_path.display()
+        );
+        assert!(record_path.is_file(), "record file exists");
+        let _ = remove_worktree(&dir, &wt);
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unregistered_path_is_not_a_worktree() {
+        let Some(dir) = init_repo() else { return };
+        assert!(!is_registered_worktree(&dir, &dir.join("no-such-wt")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
