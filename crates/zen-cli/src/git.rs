@@ -859,6 +859,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // #11: a single invalid name must be rejected even when the other
+    // name is valid. Replacing `||` with `&&` in the validation would
+    // only reject when both names are invalid, so this test kills the
+    // `||` -> `&&` mutant. `feat/sub` and `bad/task` are invalid per
+    // valid_worktree_name (`/` is not allowed) but are valid git branch
+    // names, so the mutant would proceed and `git worktree add` would
+    // succeed instead of returning Err.
+    #[test]
+    fn isolated_create_rejects_single_invalid_name() {
+        let Some(dir) = init_repo() else { return };
+        // Invalid branch, valid task.
+        let wt = wt_path("feat-sub");
+        let err = create_isolated_worktree(&dir, &wt, "feat/sub", "feat1", "sess-1").unwrap_err();
+        assert!(
+            err.contains("invalid worktree name"),
+            "invalid branch must be rejected: {err}"
+        );
+        // Valid branch, invalid task.
+        let wt = wt_path("bad-task");
+        let err = create_isolated_worktree(&dir, &wt, "feat1", "bad/task", "sess-1").unwrap_err();
+        assert!(
+            err.contains("invalid worktree name"),
+            "invalid task must be rejected: {err}"
+        );
+        // Both invalid is rejected too (control case).
+        let wt = wt_path("both-bad");
+        let err = create_isolated_worktree(&dir, &wt, "a/b", "c/d", "sess-1").unwrap_err();
+        assert!(
+            err.contains("invalid worktree name"),
+            "both invalid must be rejected: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn isolated_create_refuses_legacy_worktree() {
         let Some(dir) = init_repo() else { return };

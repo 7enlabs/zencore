@@ -5459,6 +5459,88 @@ mod pr208_mutant_tests {
         worktree_probe_cleanup(&dir, "feat1");
     }
 
+    // #11: when the WorktreeCreate hook returns a worktree that already
+    // carries an isolation record, the handler must announce creation
+    // only when the record's task matches the requested name. Flipping
+    // the `record.task == *name` check would announce a foreign task's
+    // worktree as created (and report the matching one as failed), so
+    // this test kills the `==` -> `!=` mutant.
+    #[test]
+    fn worktree_create_hook_record_task_match() {
+        // Matching record: the hook's worktree is isolated for the
+        // requested task, so creation is announced.
+        let dir = temp_dir("zen_pr208_wtmatch");
+        let path = std::env::temp_dir()
+            .join(format!("zen_pr208_created_{}", uuid::Uuid::new_v4()))
+            .display()
+            .to_string();
+        setup_registered_worktree(&dir, &path, "feat1");
+        crate::git::create_isolation_record(
+            std::path::Path::new(&path),
+            "feat1",
+            "feat1",
+            "sess-1",
+        )
+        .expect("record");
+        let out = worktree_probe_output(WorktreeScenario {
+            op: "create",
+            failed: false,
+            blocked: false,
+            worktree_path: Some(&path),
+            feedback: None,
+            exists: false,
+            cwd: &dir,
+            name: "feat1",
+        });
+        let marker = format!("created worktree {path} on branch feat1");
+        assert!(
+            out.contains(&marker),
+            "matching record must announce creation, got:\n{out}"
+        );
+        assert!(
+            !out.contains("failed:"),
+            "matching record must not report failure, got:\n{out}"
+        );
+        std::fs::remove_dir_all(&path).ok();
+        worktree_probe_cleanup(&dir, "feat1");
+
+        // Mismatched record: the worktree belongs to another task, so
+        // the handler must refuse it, never announce creation.
+        let dir = temp_dir("zen_pr208_wtmismatch");
+        let path = std::env::temp_dir()
+            .join(format!("zen_pr208_created_{}", uuid::Uuid::new_v4()))
+            .display()
+            .to_string();
+        setup_registered_worktree(&dir, &path, "feat1");
+        crate::git::create_isolation_record(
+            std::path::Path::new(&path),
+            "other",
+            "feat1",
+            "sess-1",
+        )
+        .expect("record");
+        let out = worktree_probe_output(WorktreeScenario {
+            op: "create",
+            failed: false,
+            blocked: false,
+            worktree_path: Some(&path),
+            feedback: None,
+            exists: false,
+            cwd: &dir,
+            name: "feat1",
+        });
+        assert!(
+            out.contains("failed: WorktreeCreate hook returned"),
+            "foreign record must be refused, got:\n{out}"
+        );
+        assert!(
+            !out.contains("created worktree"),
+            "foreign record must not announce creation:\n{out}"
+        );
+        std::fs::remove_dir_all(&path).ok();
+        worktree_probe_cleanup(&dir, "feat1");
+    }
+
     // #11: `/worktree` with no args lists worktrees with their
     // isolation label. Deleting the list arm would print usage
     // instead, so this test kills the `delete match arm []` mutant.
