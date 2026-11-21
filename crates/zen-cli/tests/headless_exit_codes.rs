@@ -51,6 +51,36 @@ fn assert_error_result(stdout: &str, status: u16) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn headless_missing_prompt_exits_4() {
+    // Issue #261: `zen -p` with no prompt argument and empty stdin is
+    // a validation failure (exit 4), not the blanket general error (1).
+    let home = TempDir::new("exit_codes_home");
+    let cwd = TempDir::new("exit_codes_cwd");
+    let server = MockServer::single_text("should not be reached").await;
+    let (_stdout, stderr, code) = ZenRun::new("exit_codes", &home, &cwd)
+        .args([
+            "-p",
+            "--output-format",
+            "json",
+            "--bare",
+            "--setting-sources",
+            "",
+        ])
+        .mock("mock-model", &server)
+        .timeout(TEST_TIMEOUT)
+        .run_output();
+    assert_eq!(
+        code, 4,
+        "missing prompt must exit VALIDATION (4):\n{stderr}"
+    );
+    assert!(
+        stderr.contains("No prompt provided"),
+        "stderr must name the missing prompt: {stderr}"
+    );
+    assert_eq!(server.requests().await.len(), 0, "model must not be called");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn headless_exit_code_auth_401() {
     let (stdout, _stderr, code) =
         run_headless(vec![Reply::status(401, "bad key")], TEST_TIMEOUT).await;
