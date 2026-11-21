@@ -233,6 +233,22 @@ exclude_re = [
   # NOTE (2026-11-21, PR #259): the cargo PATH resolution fix moved
   # the code from line 332 to line 457; exclusion updated to match.
   "sandbox\\.rs:457:13: delete match arm \\\"kexec_file_load\\\" in imp::syscall_number",
+  # PR #259, sandbox.rs is_executable_file non-unix fallback
+  # (line 194, col 5): replace the body with true / with false.
+  # EQUIVALENT on Linux (waived by ZC Leader, 2026-11-21; verified
+  # by the local mutants run on the #254 diff: 25 mutants tested,
+  # these 2 are the only ones missed, and the unix version at line
+  # 183 is the one compiled on Linux): the whole function is
+  # #[cfg(not(unix))], so on Linux this code is never compiled and
+  # the mutant cannot change anything the Linux build observes; on
+  # the platforms where it is live, the unix-only tests do not run
+  # there either. No test on Linux can kill these mutants.
+  # EXPIRY: if the mutants job runs on a non-unix platform, or the
+  # fallback is compiled on Linux, these mutants stop being
+  # equivalent: remove these exclusions and kill them with tests
+  # that exercise the non-unix path.
+  "sandbox\\.rs:194:5: replace is_executable_file -> bool with true",
+  "sandbox\\.rs:194:5: replace is_executable_file -> bool with false",
   # Phase 2 #12, sandbox.rs apply_to_command, non-Linux stub
   # (line 559, col 9): replace the body with Ok(Default::default()).
   # EQUIVALENT (waived by ZC Leader, Telegram tin 18631, 2026-11-20;

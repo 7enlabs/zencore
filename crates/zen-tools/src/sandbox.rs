@@ -227,12 +227,18 @@ fn resolve_cargo_target(path: &Path) -> Option<PathBuf> {
 
 /// First executable `cargo` on PATH, if any. Empty entries are
 /// skipped, and a non-executable file named `cargo` does not count.
+/// `cargo.exe` is tried as a fallback so the lookup also works on
+/// Windows, where the binary carries the `.exe` suffix.
 fn find_cargo_on_path(path_var: &str) -> Option<PathBuf> {
-    for dir in path_var.split(':') {
-        if dir.is_empty() {
+    for dir in std::env::split_paths(path_var) {
+        if dir.as_os_str().is_empty() {
             continue;
         }
-        let candidate = Path::new(dir).join("cargo");
+        let candidate = dir.join("cargo");
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+        let candidate = dir.join("cargo.exe");
         if is_executable_file(&candidate) {
             return Some(candidate);
         }
@@ -955,6 +961,27 @@ mod tests {
         std::fs::write(dead.join("cargo"), "not executable\n").unwrap();
         let path_var = format!("{}:{}", dead.display(), bin.display());
         assert_eq!(cargo_executable_dirs(&path_var), vec![bin]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// On Windows the binary is `cargo.exe`: an executable file by
+    /// that name counts, a non-executable one does not.
+    #[cfg(unix)]
+    #[test]
+    fn cargo_executable_dirs_finds_cargo_exe() {
+        let base = cargo_case_dir("exe");
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_executable(&bin.join("cargo.exe"), "#!/bin/bash\necho cargo-fake\n");
+        let path_var = format!("{}:/usr/bin", bin.display());
+        assert_eq!(cargo_executable_dirs(&path_var), vec![bin.clone()]);
+        // A non-executable cargo.exe does not count, and there is no
+        // plain `cargo` here to fall back to.
+        let dead = base.join("dead");
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::write(dead.join("cargo.exe"), "not executable\n").unwrap();
+        let path_var = format!("{}:/usr/bin", dead.display());
+        assert!(cargo_executable_dirs(&path_var).is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }
 
