@@ -179,8 +179,10 @@ exclude_re = [
   # NOTE (2026-11-21, follow-up commit 3a80e9a): the code moved from
   # line 307 to line 318, so the exclusion line numbers were updated
   # to match; the equivalence argument is unchanged.
-  "sandbox\\.rs:318:16: replace < with == in imp::detect_landlock_abi",
-  "sandbox\\.rs:318:16: replace < with <= in imp::detect_landlock_abi",
+  # NOTE (2026-11-21, PR #259): the cargo PATH resolution fix moved
+  # the code from line 318 to line 442; exclusion updated to match.
+  "sandbox\\.rs:442:16: replace < with == in imp::detect_landlock_abi",
+  "sandbox\\.rs:442:16: replace < with <= in imp::detect_landlock_abi",
   # Phase 2 #12, sandbox.rs build_landlock_ruleset (line 443, col 51):
   # replace | with ^ in
   # `AccessFs::from_read(abi) | AccessFs::from_write(abi)`.
@@ -196,7 +198,9 @@ exclude_re = [
   # the two sets overlap.
   # NOTE (2026-11-21): the code moved from line 429 to line 443
   # (follow-up commit 3a80e9a), exclusion updated to match.
-  "sandbox\\.rs:443:51: replace \\| with \\^ in imp::build_landlock_ruleset",
+  # NOTE (2026-11-21, PR #259): the cargo PATH resolution fix moved
+  # the code from line 443 to line 567; exclusion updated to match.
+  "sandbox\\.rs:567:51: replace \\| with \\^ in imp::build_landlock_ruleset",
   # Phase 2 #12, sandbox.rs build_landlock_ruleset (line 482, col 49):
   # replace | with ^ in
   # `AccessFs::ReadFile | AccessFs::WriteFile`.
@@ -210,7 +214,9 @@ exclude_re = [
   # a test.
   # NOTE (2026-11-21): the code moved from line 468 to line 482
   # (follow-up commit 3a80e9a), exclusion updated to match.
-  "sandbox\\.rs:482:49: replace \\| with \\^ in imp::build_landlock_ruleset",
+  # NOTE (2026-11-21, PR #259): the cargo PATH resolution fix moved
+  # the code from line 482 to line 616; exclusion updated to match.
+  "sandbox\\.rs:616:49: replace \\| with \\^ in imp::build_landlock_ruleset",
   # Phase 2 #12, sandbox.rs syscall_number (line 332, col 13):
   # delete match arm "kexec_file_load" in imp::syscall_number.
   # EQUIVALENT on the x86_64 mutants platform (waived by ZC Leader,
@@ -224,7 +230,9 @@ exclude_re = [
   # is removed, this mutant stops being equivalent: remove this
   # exclusion and kill it with a test that calls build_seccomp_filter
   # on aarch64.
-  "sandbox\\.rs:332:13: delete match arm \\\"kexec_file_load\\\" in imp::syscall_number",
+  # NOTE (2026-11-21, PR #259): the cargo PATH resolution fix moved
+  # the code from line 332 to line 457; exclusion updated to match.
+  "sandbox\\.rs:457:13: delete match arm \\\"kexec_file_load\\\" in imp::syscall_number",
   # Phase 2 #12, sandbox.rs apply_to_command, non-Linux stub
   # (line 559, col 9): replace the body with Ok(Default::default()).
   # EQUIVALENT (waived by ZC Leader, Telegram tin 18631, 2026-11-20;
@@ -240,5 +248,7 @@ exclude_re = [
   # remove this exclusion and kill it with a test.
   # NOTE (2026-11-21): the code moved from line 545 to line 559
   # (follow-up commit 3a80e9a), exclusion updated to match.
-  "sandbox\\.rs:559:9: replace imp::apply_to_command -> Result<SandboxOutcome, String> with Ok\\(Default::default\\(\\)\\)",
+  # NOTE (2026-11-21, PR #259): the cargo PATH resolution fix moved
+  # the code from line 559 to line 689; exclusion updated to match.
+  "sandbox\\.rs:689:9: replace imp::apply_to_command -> Result<SandboxOutcome, String> with Ok\\(Default::default\\(\\)\\)",
 ]
