@@ -1882,7 +1882,10 @@ async fn handle_slash(
                         println!("no worktrees (or not a git repo)");
                     } else {
                         for (p, b, c) in wts {
-                            println!("{} [{}] {}", p, b, &c[..7.min(c.len())]);
+                            let label = crate::git::read_isolation_record(std::path::Path::new(&p))
+                                .map(|r| format!("isolated:{}", r.task))
+                                .unwrap_or_else(|| "legacy".to_string());
+                            println!("{} [{}] {} {}", p, b, &c[..7.min(c.len())], label);
                         }
                     }
                 }
@@ -1912,7 +1915,7 @@ async fn handle_slash(
                             eprintln!("worktree removal failed, kept: {}", wt_path.display());
                         }
                     } else {
-                        match crate::git::remove_worktree(cwd, &wt_path) {
+                        match crate::git::remove_isolated_worktree(cwd, &wt_path, name) {
                             Ok(()) => println!("removed worktree {}", wt_path.display()),
                             Err(e) => eprintln!("failed: {}", e),
                         }
@@ -1936,10 +1939,33 @@ async fn handle_slash(
                             .await;
                         match created.worktree_path {
                             Some(p) if !created.blocked && !created.failed => {
-                                println!(
-                                    "created worktree {} on branch {}\ncd to it and run zen there for an isolated session",
-                                    p, name
-                                )
+                                let wt = std::path::PathBuf::from(&p);
+                                if !crate::git::is_registered_worktree(cwd, &wt) {
+                                    eprintln!(
+                                        "failed: WorktreeCreate hook returned {p}, which is not a registered worktree of this repo; not marked isolated"
+                                    );
+                                } else if let Some(record) = crate::git::read_isolation_record(&wt)
+                                {
+                                    if record.task == *name {
+                                        println!(
+                                            "created worktree {p} on branch {name}\ncd to it and run zen there for an isolated session"
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "failed: WorktreeCreate hook returned {p}, isolated for task \"{}\", not \"{name}\"",
+                                            record.task
+                                        );
+                                    }
+                                } else {
+                                    match crate::git::create_isolation_record(
+                                        &wt, name, name, session_id,
+                                    ) {
+                                        Ok(_) => println!(
+                                            "created worktree {p} on branch {name}\ncd to it and run zen there for an isolated session"
+                                        ),
+                                        Err(e) => eprintln!("failed: {e}"),
+                                    }
+                                }
                             }
                             _ => {
                                 let reason = created
@@ -1952,7 +1978,9 @@ async fn handle_slash(
                             }
                         }
                     } else {
-                        match crate::git::create_worktree(cwd, &wt_path, name) {
+                        match crate::git::create_isolated_worktree(
+                            cwd, &wt_path, name, name, session_id,
+                        ) {
                             Ok(p) => println!(
                                 "created worktree {} on branch {}\ncd to it and run zen there for an isolated session",
                                 p.display(),
@@ -5296,11 +5324,48 @@ mod pr208_mutant_tests {
     // Mutants #37-#41 (repl.rs:1869):
     // `Some(p) if !created.blocked && !created.failed`. The guard must
     // pass only when a path was returned and neither flag is set:
+    // #11: every row with a path uses a real registered worktree, so the
+    // isolation check inside the arm passes and the guard stays decisive.
     // #37 (drop the first `!`) flips (blocked=true, failed=false);
     // #38 (guard -> false) flips the all-clear row;
     // #39 (guard -> true) flips every blocked/failed row with a path;
     // #40 (`&&` -> `||`) flips (true,false) and (false,true);
     // #41 (drop the second `!`) flips (false,true).
+    /// Sets up a real git repo at `dir` with a real registered worktree
+    /// at `path` on `branch`, so a WorktreeCreate hook returning `path`
+    /// passes the #11 isolation check in the probe.
+    fn setup_registered_worktree(dir: &Path, path: &str, branch: &str) {
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        assert!(git(&["init", "-q", "-b", "main"]), "setup: git init");
+        assert!(
+            git(&[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ]),
+            "setup: git commit"
+        );
+        assert!(
+            git(&["worktree", "add", "-b", branch, "--", path]),
+            "setup: git worktree add"
+        );
+    }
+
     #[test]
     fn worktree_create_hook_guard_table() {
         for (blocked, failed, with_path, created) in [
@@ -5316,6 +5381,9 @@ mod pr208_mutant_tests {
             } else {
                 None
             };
+            if let Some(p) = &path {
+                setup_registered_worktree(&dir, p, "feat1");
+            }
             let out = worktree_probe_output(WorktreeScenario {
                 op: "create",
                 failed,
@@ -5345,8 +5413,40 @@ mod pr208_mutant_tests {
                     "blocked={blocked} failed={failed} path={path:?}: unexpected creation:\n{out}"
                 );
             }
+            if let Some(p) = &path {
+                std::fs::remove_dir_all(p).ok();
+            }
             worktree_probe_cleanup(&dir, "feat1");
         }
+    }
+
+    // #11: a WorktreeCreate hook returning a path that is not a
+    // registered worktree of this repo is refused, never announced as
+    // an isolated session.
+    #[test]
+    fn worktree_create_hook_unregistered_path_refused() {
+        let dir = temp_dir("zen_pr208_wtunreg");
+        let path = format!("/tmp/zen_pr208_created_{}", uuid::Uuid::new_v4());
+        let out = worktree_probe_output(WorktreeScenario {
+            op: "create",
+            failed: false,
+            blocked: false,
+            worktree_path: Some(&path),
+            feedback: None,
+            exists: false,
+            cwd: &dir,
+            name: "feat1",
+        });
+        assert!(
+            out.contains("failed: WorktreeCreate hook returned"),
+            "expected refusal, got:\n{out}"
+        );
+        assert!(
+            !out.contains("created worktree"),
+            "unexpected creation:\n{out}"
+        );
+        std::fs::remove_dir_all(&path).ok();
+        worktree_probe_cleanup(&dir, "feat1");
     }
 
     // Mutant #42 (repl.rs:1878): the failure reason is the hook's
