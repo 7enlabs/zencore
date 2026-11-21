@@ -25,6 +25,9 @@ const MAX_LOG_LINES: usize = 500;
 const MAX_TEXT_CHARS: usize = 120;
 /// Truncation for a delegate result in the agents table.
 const MAX_RESULT_CHARS: usize = 60;
+/// Cap on a subagent display name (M1): names arrive from event text,
+/// which is unbounded, so the name is truncated like log text.
+const MAX_NAME_CHARS: usize = 64;
 /// Default context window (the `AgentConfig` default) when the session
 /// does not declare one.
 pub const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
@@ -459,7 +462,7 @@ impl FlightdeckState {
                 if text.is_empty() {
                     self.push_log(event.clone());
                 } else {
-                    self.push_log(format!("{event}: {text}"));
+                    self.push_log(format!("{event}: {}", first_line(text, MAX_TEXT_CHARS)));
                 }
             }
             AgentEvent::TextDelta { .. } => {
@@ -505,11 +508,15 @@ impl FlightdeckState {
             .rev()
             .find(|r| r.key != "main" && r.name.starts_with("subagent "))
         {
-            row.name = name.to_string();
+            row.name = first_line(name, MAX_NAME_CHARS);
         }
     }
 
     fn push_log(&mut self, text: String) {
+        // M2: no control character reaches the terminal, whatever the
+        // event text carried. This is the backstop for every log line;
+        // `first_line` sanitizes the paths that truncate.
+        let text = strip_control(&text);
         let time = chrono::Local::now().format("%H:%M:%S").to_string();
         self.log.push(LogLine { time, text });
         if self.log.len() > MAX_LOG_LINES {
@@ -520,13 +527,25 @@ impl FlightdeckState {
 }
 
 /// First line of `s`, truncated to `max` characters (char-boundary safe).
+/// Control characters are stripped first (M2), so the limit counts
+/// visible characters and no escape sequence survives.
 fn first_line(s: &str, max: usize) -> String {
     let line = s.lines().next().unwrap_or("");
-    let mut out: String = line.chars().take(max).collect();
-    if line.chars().count() > max {
+    let clean = strip_control(line);
+    let mut out: String = clean.chars().take(max).collect();
+    if clean.chars().count() > max {
         out.push('…');
     }
     out
+}
+
+/// Remove every control character (M2): C0, DEL, and C1, which covers
+/// ESC, BEL, and the single-code-point CSI (U+009B) / OSC (U+009D).
+/// Stripping ESC also neutralizes multi-byte CSI/OSC sequences, which
+/// cannot start without it, so the dashboard never depends on the
+/// renderer's own filtering.
+fn strip_control(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// Short id for display: the first `SHORT_ID_CHARS` characters.
@@ -1006,5 +1025,135 @@ mod tests {
         assert_eq!(fmt_duration(Duration::from_secs(59)), "59s");
         assert_eq!(fmt_duration(Duration::from_secs(60)), "1m 00s");
         assert_eq!(fmt_duration(Duration::from_secs(125)), "2m 05s");
+    }
+
+    #[test]
+    fn system_message_is_truncated_to_120_chars() {
+        // M1: the SystemMessage branch truncates like Assistant.
+        let mut s = state();
+        let long = "z".repeat(200);
+        s.apply(&AgentEvent::SystemMessage {
+            event: "Note".to_string(),
+            text: long.clone(),
+        });
+        let line = &s.visible_log()[0];
+        assert!(line.contains('…'), "{line}");
+        assert!(!line.contains(&long), "{line}");
+        let shown = line.split_once("Note: ").unwrap().1;
+        assert_eq!(shown.chars().count(), MAX_TEXT_CHARS + 1, "{line}");
+    }
+
+    #[test]
+    fn short_system_message_is_logged_unchanged() {
+        // M1 negative: a short message passes through verbatim.
+        let mut s = state();
+        s.apply(&AgentEvent::SystemMessage {
+            event: "Note".to_string(),
+            text: "skill 'x' not found".to_string(),
+        });
+        let line = &s.visible_log()[0];
+        assert!(line.ends_with("Note: skill 'x' not found"), "{line}");
+        assert!(!line.contains('…'), "{line}");
+    }
+
+    #[test]
+    fn subagent_name_is_limited_to_64_chars() {
+        // M1: a 100-char name is cut to 64 visible chars + ellipsis.
+        let mut s = state();
+        s.apply(&AgentEvent::ToolProgress {
+            tool_use_id: "dlg-9".to_string(),
+            tool_name: "delegate".to_string(),
+            elapsed_ms: 10,
+        });
+        let long_name = "n".repeat(100);
+        s.apply(&AgentEvent::SystemMessage {
+            event: "SubagentStart".to_string(),
+            text: format!("sub-agent '{long_name}': skill 'x' not found"),
+        });
+        let name = &s.agents[1].name;
+        assert_eq!(name.chars().count(), MAX_NAME_CHARS + 1, "{name}");
+        assert!(name.ends_with('…'), "{name}");
+        assert_ne!(name, &long_name);
+    }
+
+    #[test]
+    fn subagent_name_at_exactly_64_chars_is_kept() {
+        // M1 negative: a name at the limit is kept whole, no ellipsis.
+        let mut s = state();
+        s.apply(&AgentEvent::ToolProgress {
+            tool_use_id: "dlg-9".to_string(),
+            tool_name: "delegate".to_string(),
+            elapsed_ms: 10,
+        });
+        let exact = "n".repeat(MAX_NAME_CHARS);
+        s.apply(&AgentEvent::SystemMessage {
+            event: "SubagentStart".to_string(),
+            text: format!("sub-agent '{exact}': skill 'x' not found"),
+        });
+        assert_eq!(s.agents[1].name, exact);
+    }
+
+    #[test]
+    fn log_lines_strip_escape_sequences() {
+        // M2: CSI (colour), OSC (window title), and a bare BEL are all
+        // filtered at the state layer; the payload text survives.
+        let mut s = state();
+        let evil = "\u{1b}[31mRED\u{1b}[0m and \u{1b}]0;title\u{7}done\u{7}";
+        s.apply(&assistant_event(evil));
+        let line = &s.visible_log()[0];
+        assert!(
+            !line.chars().any(|c| c.is_control()),
+            "control chars leaked: {line:?}"
+        );
+        assert!(line.contains("RED"), "{line}");
+        assert!(line.contains("done"), "{line}");
+    }
+
+    #[test]
+    fn push_log_strips_control_chars_without_first_line() {
+        // M2: the ApiRetry error bypasses `first_line`, so `push_log`
+        // itself must filter.
+        let mut s = state();
+        s.apply(&AgentEvent::ApiRetry {
+            attempt: 1,
+            max_retries: 3,
+            retry_delay_ms: 500,
+            error_status: Some(429),
+            error: "\u{1b}[31mboom\u{7}".to_string(),
+        });
+        let line = &s.visible_log()[0];
+        assert!(
+            !line.chars().any(|c| c.is_control()),
+            "control chars leaked: {line:?}"
+        );
+        assert!(line.contains("boom"), "{line}");
+    }
+
+    #[test]
+    fn plain_log_text_is_untouched() {
+        // M2 negative: normal text (with diacritics) passes through
+        // byte-identical.
+        let mut s = state();
+        let text = "Kết quả phần một: xong 100%, không lỗi.";
+        s.apply(&assistant_event(text));
+        let line = &s.visible_log()[0];
+        assert!(line.ends_with(&format!("assistant: {text}")), "{line}");
+    }
+
+    #[test]
+    fn subagent_name_with_escape_is_sanitized() {
+        // M1+M2: an escape sequence inside a subagent name is stripped
+        // when the row is named.
+        let mut s = state();
+        s.apply(&AgentEvent::ToolProgress {
+            tool_use_id: "dlg-9".to_string(),
+            tool_name: "delegate".to_string(),
+            elapsed_ms: 10,
+        });
+        s.apply(&AgentEvent::SystemMessage {
+            event: "SubagentStart".to_string(),
+            text: "sub-agent 'sc\u{1b}[31mout': skill 'x' not found".to_string(),
+        });
+        assert_eq!(s.agents[1].name, "sc[31mout");
     }
 }

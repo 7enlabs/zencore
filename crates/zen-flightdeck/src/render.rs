@@ -300,4 +300,20 @@ mod tests {
         assert!(out.contains("╔ AGENTS LIVE"), "{out}");
         assert!(!out.contains("╔ SESSION LOG"), "{out}");
     }
+
+    #[test]
+    fn render_strips_control_characters_from_log() {
+        // M2: a log line carrying CSI/OSC/BEL renders with no control
+        // character reaching the terminal buffer; the payload survives.
+        let mut s = populated_state();
+        s.apply(&AgentEvent::SystemMessage {
+            event: "Note".to_string(),
+            text: "\u{1b}[31mRED\u{1b}[0m and \u{1b}]0;title\u{7}done\u{7}".to_string(),
+        });
+        let out = render_to_string(&s, 100, 30);
+        assert!(!out.contains('\u{1b}'), "{out}");
+        assert!(!out.contains('\u{7}'), "{out}");
+        assert!(out.contains("RED"), "{out}");
+        assert!(out.contains("done"), "{out}");
+    }
 }
