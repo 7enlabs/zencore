@@ -869,6 +869,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A wrapper that quotes its exec target must resolve the same way:
+    /// the quotes are stripped before the absolute-path check, so a
+    /// quoted `exec "/path/cargo"` still yields the real binary's
+    /// directory.
+    #[cfg(unix)]
+    #[test]
+    fn cargo_executable_dirs_follows_quoted_wrapper_exec() {
+        let base = cargo_case_dir("quoted");
+        let real_bin = base.join("realbin");
+        let wrapper_bin = base.join("wrapperbin");
+        std::fs::create_dir_all(&real_bin).unwrap();
+        std::fs::create_dir_all(&wrapper_bin).unwrap();
+        write_executable(&real_bin.join("cargo"), "#!/bin/bash\necho cargo-fake\n");
+        write_executable(
+            &wrapper_bin.join("cargo"),
+            &format!(
+                "#!/bin/bash\nexec \"{}/cargo\" \"$@\"\n",
+                real_bin.display()
+            ),
+        );
+        let path_var = format!("{}:/usr/bin", wrapper_bin.display());
+        assert_eq!(
+            cargo_executable_dirs(&path_var),
+            vec![wrapper_bin, real_bin]
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// When the resolved binary lives in the same directory as the
+    /// wrapper, the directory must appear exactly once: the dedup guard
+    /// is what keeps the allowlist from growing a duplicate entry.
+    #[cfg(unix)]
+    #[test]
+    fn cargo_executable_dirs_dedupes_same_directory() {
+        let base = cargo_case_dir("samedir");
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let real = bin.join("real-cargo");
+        write_executable(&real, "#!/bin/bash\necho cargo-fake\n");
+        std::os::unix::fs::symlink(&real, bin.join("cargo")).unwrap();
+        let path_var = format!("{}:/usr/bin", bin.display());
+        assert_eq!(cargo_executable_dirs(&path_var), vec![bin]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A rustup-style symlink must resolve to the toolchain binary's
     /// directory as well as the shim's own directory.
     #[cfg(unix)]

@@ -2400,6 +2400,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A shell exit of 126 is the sandbox's "command cannot execute"
+    /// signature (issue #254): the tool appends the hint naming the
+    /// blocked location instead of returning the bare exit code.
+    #[tokio::test]
+    async fn bash_exit_126_appends_sandbox_hint() {
+        let dir = tmpdir("bash-126");
+        let ctx = ctx_for(&dir);
+        let out = BashTool.call(json!({"command": "exit 126"}), &ctx).await;
+        assert!(out.is_error);
+        assert!(out.content.contains("Exit code 126"), "{}", out.content);
+        assert!(
+            out.content
+                .contains("hint: exit 126 means the sandbox refused to execute a program"),
+            "{}",
+            out.content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn bash_cd_persists_between_calls() {
         // The commands below are POSIX (`mkdir -p`, `pwd`); without a
