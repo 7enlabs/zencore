@@ -362,7 +362,9 @@ async fn resume_nonexistent_session_errors() {
     .await
     .expect("timed out");
 
-    assert_ne!(code, 0, "missing session must fail");
+    // Issue #261: an unknown -r session is a not-found failure
+    // (exit 3), not the blanket general error (exit 1).
+    assert_eq!(code, 3, "unknown resume session must exit NOT_FOUND (3)");
     assert!(
         stderr.contains("No conversation found") && stderr.contains("nonexistent-session-id"),
         "stderr: {}",

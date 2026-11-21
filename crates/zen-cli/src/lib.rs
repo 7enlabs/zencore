@@ -497,17 +497,25 @@ async fn run_subcommand(cli: &Cli, cwd: &Path, home: Option<&Path>, sub: &Comman
             Ok(0)
         }
         Commands::Export(e) => {
+            use std::io::IsTerminal;
             // B9/export ruling: an explicit --format always wins; the
             // global JSON switch (--json/--raw/--output-format json)
             // selects the JSON export format only when --format is
-            // absent, and markdown stays the default otherwise.
-            let format =
-                e.format
-                    .unwrap_or(if cli.effective_output_format() == OutputFormat::Json {
-                        export::ExportFormat::Json
-                    } else {
-                        export::ExportFormat::Markdown
-                    });
+            // absent. Issue #261 round-trip default: when the payload
+            // is not going to an interactive terminal (stdout piped or
+            // redirected, or written to a file with --output), default
+            // to JSON so `zen import` accepts it; interactive stdout
+            // keeps markdown. An explicit --format still wins.
+            let format = e.format.unwrap_or_else(|| {
+                if cli.effective_output_format() == OutputFormat::Json
+                    || !std::io::stdout().is_terminal()
+                    || e.output.is_some()
+                {
+                    export::ExportFormat::Json
+                } else {
+                    export::ExportFormat::Markdown
+                }
+            });
             export::run_export(
                 cwd,
                 home,
@@ -844,7 +852,12 @@ async fn run_headless(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result<i32>
     }
     let full_prompt = prompt_parts.join("\n\n");
     if full_prompt.is_empty() {
-        anyhow::bail!("No prompt provided. Pass a prompt argument or pipe stdin with -p.");
+        // Issue #261: a missing prompt is a validation failure (exit 4),
+        // not the blanket general error (exit 1).
+        return Err(coded_error(
+            exit_code::VALIDATION,
+            "No prompt provided. Pass a prompt argument or pipe stdin with -p.",
+        ));
     }
 
     let (session_id, transcript_path, history_from) = resolve_session(cli, cwd, home)?;
@@ -945,7 +958,12 @@ fn resolve_session(
                 None
             } else {
                 Some(session::find_session_path(h, r).ok_or_else(|| {
-                    anyhow::anyhow!("No conversation found with session ID or path: {}", r)
+                    // Issue #261: an unknown -r session is a not-found
+                    // failure (exit 3), not the blanket general error.
+                    coded_error(
+                        exit_code::NOT_FOUND,
+                        format!("No conversation found with session ID or path: {}", r),
+                    )
                 })?)
             }
         } else if cli.continue_session {

@@ -575,10 +575,10 @@ pub struct ContextArgs {
 
 #[derive(Args, Debug, Clone)]
 #[command(
-    after_help = "Examples:\n  zen export                                  Export the latest session as markdown\n  zen export --format json --output s.json    Export as JSON to a file\n  zen export --redact                         Redact secrets from the export"
+    after_help = "Examples:\n  zen export                                  Export the latest session (markdown on a terminal, JSON when stdout is piped or --output is given)\n  zen export --format json --output s.json    Export as JSON to a file\n  zen export --format markdown --output s.md  Export as markdown to a file\n  zen export --redact                         Redact secrets from the export"
 )]
 pub struct ExportArgs {
-    /// Export format (default: markdown, or json when --json is given)
+    /// Export format (default: markdown on an interactive terminal; JSON when stdout is piped/redirected or --output is given, or when --json is given)
     #[arg(long, value_enum)]
     pub format: Option<crate::export::ExportFormat>,
 
@@ -597,7 +597,7 @@ pub struct ExportArgs {
 
 #[derive(Args, Debug, Clone)]
 #[command(
-    after_help = "Examples:\n  zen import session.md          Import a markdown export\n  zen import ./backup/s.json     Import a JSON export"
+    after_help = "Examples:\n  zen import ./backup/s.json     Import a JSON export (only --format json exports can be imported)"
 )]
 pub struct ImportArgs {
     /// Export file to import
