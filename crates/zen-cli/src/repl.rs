@@ -294,14 +294,37 @@ pub async fn run_repl(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result<()> 
 
     let progress_sink = Arc::new(crate::repl_progress::ReplProgressSink::new());
     let progress: Arc<dyn EventSink> = progress_sink.clone();
-    let llm = crate::eventlog::wrap(
-        cfg.gated_llm_client(progress.clone(), home),
-        assembly.recorder.as_ref(),
-    );
 
     let mut config = build_repl_config(cli, &cfg, cwd);
     let _ = &mut config;
     config.diagnostics_provider = assembly.diagnostics_provider.clone();
+
+    // Flightdeck (Phase 1): the dashboard state, fed by a second sink
+    // alongside the existing progress sink. The fan-out delivers every
+    // event to both, so the REPL output does not change; subagent
+    // events, dropped in the REPL until now (the forward target was
+    // never set here), now reach the dashboard.
+    let flightdeck_state =
+        std::sync::Arc::new(std::sync::Mutex::new(zen_flightdeck::FlightdeckState::new(
+            session_id.clone(),
+            config.model.clone(),
+            config.context_window,
+            config.permission_mode,
+            flightdeck_autocompact_label(&config),
+        )));
+    let flightdeck_sink = zen_flightdeck::FlightdeckSink::new(flightdeck_state.clone());
+    let flightdeck_agent_sink: Arc<dyn EventSink> =
+        std::sync::Arc::new(zen_flightdeck::FanoutSink::new(vec![
+            progress.clone(),
+            flightdeck_sink.clone() as Arc<dyn EventSink>,
+        ]));
+    assembly
+        .subagent_sink
+        .set(flightdeck_sink.clone() as Arc<dyn EventSink>);
+    let llm = crate::eventlog::wrap(
+        cfg.gated_llm_client(flightdeck_agent_sink.clone(), home),
+        assembly.recorder.as_ref(),
+    );
 
     let base_system_prompt = config.system_prompt.clone();
     if config.permission_mode == zen_core::PermissionMode::Plan {
@@ -322,7 +345,7 @@ pub async fn run_repl(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result<()> 
         assembly.permissions.clone(),
         Some(Arc::new(crate::agent_run::ReplPrompter)),
         assembly.hooks.clone(),
-        progress.clone(),
+        flightdeck_agent_sink.clone(),
         {
             let mut ctx = crate::agent_run::tool_context_public(cwd, &cfg, cli, &session_id);
 
@@ -375,6 +398,7 @@ pub async fn run_repl(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result<()> 
         scope_seeded: false,
         checkpoints,
         progress: progress_sink.clone(),
+        flightdeck: flightdeck_state.clone(),
         model_rows: Vec::new(),
     };
 
@@ -621,6 +645,10 @@ struct ReplState<'a> {
     checkpoints: Arc<zen_tools::checkpoint::Checkpoints>,
 
     progress: Arc<crate::repl_progress::ReplProgressSink>,
+
+    // Flightdeck (Phase 1): dashboard state shared with the viewer
+    // (`/flightdeck`) and fed by the fan-out sink below.
+    flightdeck: std::sync::Arc<std::sync::Mutex<zen_flightdeck::FlightdeckState>>,
 
     // Model rows for /model Tab completion (B2): (short, provider,
     // id), refreshed whenever /model lists them.
@@ -983,6 +1011,7 @@ async fn handle_line(
     let result = run_turn_interruptible(agent, &prompt, repl.interrupts.as_deref_mut()).await;
     persist(repl.writer, &before, agent);
     record_turn_cost(home, repl.session_id.as_str(), cfg, agent, &usage_before);
+    refresh_flightdeck_after_turn(home, repl.session_id.as_str(), agent, &repl.flightdeck);
 
     if agent.config.permission_mode == zen_core::PermissionMode::Plan
         && let Some(r) = &result
@@ -1782,6 +1811,17 @@ async fn handle_slash(
             "{}",
             commands::cost_report(&agent.usage, &agent.config.model, &cfg.base_url)
         ),
+        "/flightdeck" => {
+            // The viewer owns the terminal while it runs; run it on a
+            // blocking thread so the REPL's runtime keeps working.
+            let state = repl.flightdeck.clone();
+            match tokio::task::spawn_blocking(move || zen_flightdeck::run_viewer(state, None)).await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("flightdeck error: {e:#}"),
+                Err(e) => eprintln!("flightdeck error: {e:#}"),
+            }
+        }
         "/quota" => {
             let store = home.map(zen_agent::RateGate::default_store_path);
             let key_url = zen_agent::rategate::openrouter_key_url(&cfg.base_url);
@@ -2256,6 +2296,7 @@ async fn handle_slash(
             let result =
                 run_turn_interruptible(agent, &prompt, repl.interrupts.as_deref_mut()).await;
             record_turn_cost(home, repl.session_id.as_str(), cfg, agent, &usage_before);
+            refresh_flightdeck_after_turn(home, repl.session_id.as_str(), agent, &repl.flightdeck);
             print_turn(result);
         }
         "/map" => match crate::repomap::repo_map(cwd, cli.map_tokens) {
@@ -2627,6 +2668,12 @@ async fn handle_slash(
                 let result =
                     run_turn_interruptible(agent, &expanded, repl.interrupts.as_deref_mut()).await;
                 record_turn_cost(home, repl.session_id.as_str(), cfg, agent, &usage_before);
+                refresh_flightdeck_after_turn(
+                    home,
+                    repl.session_id.as_str(),
+                    agent,
+                    &repl.flightdeck,
+                );
                 let pinned = agent.config.model.clone();
                 cfg.base_url = saved_base_url;
                 cfg.api_key = saved_api_key;
@@ -2931,6 +2978,46 @@ fn record_turn_cost(
         delta_in,
         delta_out,
     );
+}
+
+/// Dashboard label for the autocompact setting: "auto" when the
+/// resolved threshold is the 80%-of-window default, "off" when
+/// compaction is disabled, else the numeric threshold.
+fn flightdeck_autocompact_label(config: &zen_agent::AgentConfig) -> String {
+    match config.auto_compact_threshold {
+        None => "off".to_string(),
+        Some(t) if t == config.context_window * 80 / 100 => "auto".to_string(),
+        Some(t) => t.to_string(),
+    }
+}
+
+/// Refresh the dashboard's exact numbers after a turn: cumulative
+/// usage from the agent plus the session cost from the ledger.
+/// Called after `record_turn_cost` at every turn site that records
+/// cost; turns that do not record cost (github fix offer, /loop)
+/// still feed the dashboard live events, so only the exact-cost
+/// refresh lags there until the next recorded turn.
+fn refresh_flightdeck_after_turn(
+    home: Option<&Path>,
+    session_id: &str,
+    agent: &zen_agent::Agent,
+    flightdeck: &std::sync::Arc<std::sync::Mutex<zen_flightdeck::FlightdeckState>>,
+) {
+    let cost_usd = home
+        .and_then(|h| crate::cost::load(h, session_id))
+        .map(|ledger| {
+            let summary = crate::cost::summarize(session_id, &ledger.entries);
+            if summary.unknown_pricing.is_empty() {
+                Some(summary.total_cost_usd)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(None);
+    flightdeck
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .note_turn_result(&agent.usage, cost_usd);
 }
 
 #[cfg(test)]
@@ -3473,6 +3560,15 @@ mod model_picker_tests {
                 dir.join("checkpoints"),
             )),
             progress: std::sync::Arc::new(crate::repl_progress::ReplProgressSink::new()),
+            flightdeck: std::sync::Arc::new(std::sync::Mutex::new(
+                zen_flightdeck::FlightdeckState::new(
+                    "test-session",
+                    "mock-model",
+                    128_000,
+                    zen_core::PermissionMode::Default,
+                    "auto",
+                ),
+            )),
             model_rows: Vec::new(),
         };
         assert_eq!(agent.config.model, "google/gemini-4-argon:free");
@@ -3897,6 +3993,15 @@ mod model_picker_tests {
                 dir.join("checkpoints"),
             )),
             progress: std::sync::Arc::new(crate::repl_progress::ReplProgressSink::new()),
+            flightdeck: std::sync::Arc::new(std::sync::Mutex::new(
+                zen_flightdeck::FlightdeckState::new(
+                    "test-session",
+                    "mock-model",
+                    128_000,
+                    zen_core::PermissionMode::Default,
+                    "auto",
+                ),
+            )),
             model_rows: Vec::new(),
         };
         // The env lock only guards setup; drop it before the await
@@ -4605,6 +4710,15 @@ mod pr208_mutant_tests {
                 dir.join("checkpoints"),
             )),
             progress: std::sync::Arc::new(crate::repl_progress::ReplProgressSink::new()),
+            flightdeck: std::sync::Arc::new(std::sync::Mutex::new(
+                zen_flightdeck::FlightdeckState::new(
+                    "test-session",
+                    "mock-model",
+                    128_000,
+                    zen_core::PermissionMode::Default,
+                    "auto",
+                ),
+            )),
             model_rows: Vec::new(),
         }
     }

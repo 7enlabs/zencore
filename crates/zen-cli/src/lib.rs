@@ -13,6 +13,7 @@ pub mod envsnap;
 pub mod eval;
 pub mod eventlog;
 pub mod export;
+pub mod flightdeck;
 pub mod git;
 pub mod github;
 pub mod hook_watch;
@@ -456,6 +457,9 @@ async fn run_subcommand(cli: &Cli, cwd: &Path, home: Option<&Path>, sub: &Comman
         Commands::Cost(args) => {
             cost_subcommand(cli, cwd, home, args)?;
             Ok(0)
+        }
+        Commands::Flightdeck(args) => {
+            crate::flightdeck::run_flightdeck(args.demo, args.demo_seconds).await
         }
         Commands::Context(args) => {
             context::run_context(

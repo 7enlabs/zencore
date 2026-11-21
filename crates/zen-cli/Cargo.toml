@@ -21,6 +21,7 @@ zen-agent.workspace = true
 zen-tools.workspace = true
 zen-ext.workspace = true
 zen-mcp.workspace = true
+zen-flightdeck.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
