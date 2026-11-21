@@ -266,6 +266,7 @@ mod tests {
     /// a real terminal, so the helper above runs under `script` and a
     /// reader thread answers the DSR cursor-position query, exactly
     /// like the viewer pty test in app.rs.
+    #[cfg(unix)]
     #[test]
     fn demo_draws_and_exits() {
         use std::io::{Read, Write};
