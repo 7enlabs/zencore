@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use zen_core::lock_recovery::lock_or_recover;
 use zen_core::{
-    PermissionChecker, PermissionDecision, PermissionMode, PermissionSettings, ToolContext,
+    GateBucket, GateInfo, PermissionChecker, PermissionDecision, PermissionMode,
+    PermissionSettings, ToolContext,
 };
 
 pub fn tool_is_read_only(name: &str) -> bool {
@@ -24,7 +25,7 @@ fn split_rule(rule: &str) -> (&str, Option<&str>) {
     }
 }
 
-fn path_arg(input: &Value) -> Option<&str> {
+pub(crate) fn path_arg(input: &Value) -> Option<&str> {
     input
         .get("file_path")
         .or_else(|| input.get("path"))
@@ -513,7 +514,7 @@ fn substitution_bodies(command: &str) -> Vec<String> {
     out
 }
 
-fn bash_parts(tool_name: &str, input: &Value) -> Option<Option<Vec<String>>> {
+pub(crate) fn bash_parts(tool_name: &str, input: &Value) -> Option<Option<Vec<String>>> {
     if !tool_name.eq_ignore_ascii_case("Bash") {
         return None;
     }
@@ -556,6 +557,8 @@ pub struct RulePermissions {
     pub ask: Vec<String>,
     pub deny: Vec<String>,
     pub local_settings_path: Option<PathBuf>,
+    /// Permissions classifier settings (Flightdeck Phase 2).
+    pub classifier: zen_core::ClassifierSettings,
 
     dynamic_allow: Mutex<Vec<String>>,
 }
@@ -578,6 +581,7 @@ impl RulePermissions {
             ask: settings.ask.clone(),
             deny,
             local_settings_path,
+            classifier: settings.classifier.clone(),
             dynamic_allow: Mutex::new(Vec::new()),
         }
     }
@@ -642,61 +646,209 @@ impl RulePermissions {
         read_only: bool,
         ctx: &ToolContext,
     ) -> PermissionDecision {
+        self.evaluate_full(tool_name, input, read_only, ctx).0
+    }
+
+    /// The full gate evaluation (Flightdeck Phase 2): the decision
+    /// plus the GATE bucket and reason code that produced it. The
+    /// classifier verdict is computed once here and reused by both
+    /// the dangerous hard-deny and the safe auto-allow below.
+    fn evaluate_full(
+        &self,
+        tool_name: &str,
+        input: &Value,
+        read_only: bool,
+        ctx: &ToolContext,
+    ) -> (PermissionDecision, GateInfo) {
         let cwd = ctx.cwd();
+        let mode = self.current_mode();
+        let allowed = allow_covers(&self.effective_allow(), tool_name, input, &cwd);
+        let classification = if self.classifier.enabled {
+            Some(crate::classifier::classify(
+                tool_name,
+                input,
+                &cwd,
+                &self.working_dirs(ctx),
+            ))
+        } else {
+            None
+        };
+        // Reason code for an Ask that reaches the mode fallback: a
+        // labelled mutation (warn.*, sudo escalation) keeps its label
+        // so the approver sees why the call is flagged.
+        let ask_code = match &classification {
+            Some(c)
+                if c.class == crate::classifier::RiskClass::Mutating
+                    && c.reason_code != "mutating.default" =>
+            {
+                c.reason_code.to_string()
+            }
+            _ => format!("mode.{}", mode.as_str()),
+        };
 
+        // 1. Deny rules: the highest layer, unchanged.
         if let Some(rule) = any_rule(&self.deny, tool_name, input, &cwd, RuleKind::Deny) {
-            return PermissionDecision::Deny(format!("Denied by rule '{}'", rule));
-        }
-
-        if self.current_mode() == PermissionMode::Plan && !read_only {
-            return PermissionDecision::Deny(
-                "plan mode: only read-only tools are available".into(),
+            return (
+                PermissionDecision::Deny(format!("Denied by rule '{}'", rule)),
+                GateInfo {
+                    bucket: GateBucket::Denied,
+                    reason_code: format!("rule:{rule}"),
+                },
             );
         }
 
-        if let Some(rule) = any_rule(&self.ask, tool_name, input, &cwd, RuleKind::Ask) {
-            return self.resolve_ask(format!("Ask rule '{}' matches", rule));
+        // 2. Classifier hard-deny of dangerous calls (D2: an exact
+        // allow rule still wins; bypass mode does NOT override this).
+        if let Some(c) = &classification
+            && c.class == crate::classifier::RiskClass::Dangerous
+            && !allowed
+        {
+            return (
+                PermissionDecision::Deny(format!(
+                    "Blocked by classifier [{}]: {}",
+                    c.reason_code, c.reason
+                )),
+                GateInfo {
+                    bucket: GateBucket::Denied,
+                    reason_code: c.reason_code.to_string(),
+                },
+            );
         }
 
-        let allowed = allow_covers(&self.effective_allow(), tool_name, input, &cwd);
+        // 3. Plan mode: only read-only tools run.
+        if mode == PermissionMode::Plan && !read_only {
+            return (
+                PermissionDecision::Deny("plan mode: only read-only tools are available".into()),
+                GateInfo {
+                    bucket: GateBucket::Denied,
+                    reason_code: "mode.plan".into(),
+                },
+            );
+        }
 
-        if self.current_mode() == PermissionMode::BypassPermissions {
-            return PermissionDecision::Allow;
+        // 4. Ask rules.
+        if let Some(rule) = any_rule(&self.ask, tool_name, input, &cwd, RuleKind::Ask) {
+            let decision = self.resolve_ask(format!("Ask rule '{}' matches", rule));
+            let info = match &decision {
+                PermissionDecision::Allow => GateInfo {
+                    bucket: GateBucket::Allowed,
+                    reason_code: "mode.bypassPermissions".into(),
+                },
+                PermissionDecision::Deny(_) => GateInfo {
+                    bucket: GateBucket::Denied,
+                    reason_code: format!("mode.{}", mode.as_str()),
+                },
+                PermissionDecision::Ask => GateInfo {
+                    bucket: GateBucket::Classifier,
+                    reason_code: format!("rule:{rule}"),
+                },
+            };
+            return (decision, info);
+        }
+
+        // 5+6. Allow rules, then bypass mode.
+        if mode == PermissionMode::BypassPermissions {
+            return (
+                PermissionDecision::Allow,
+                GateInfo {
+                    bucket: GateBucket::Allowed,
+                    reason_code: "mode.bypassPermissions".into(),
+                },
+            );
         }
 
         // askAll: an allow rule never self-allows, and a read-only tool
         // never auto-allows. Everything past the deny/ask rules above
         // falls through to the mode match, which asks.
-        if allowed && self.current_mode() != PermissionMode::AskAll {
-            return PermissionDecision::Allow;
+        if allowed && mode != PermissionMode::AskAll {
+            return (
+                PermissionDecision::Allow,
+                GateInfo {
+                    bucket: GateBucket::Allowed,
+                    reason_code: "rule.allow".into(),
+                },
+            );
         }
 
-        if (read_only || tool_is_read_only(tool_name))
-            && self.current_mode() != PermissionMode::AskAll
-        {
-            return PermissionDecision::Allow;
+        // 7. Read-only tools, then classifier-Safe auto-allow (D3:
+        // only when safeAutoAllow is switched on in settings).
+        if (read_only || tool_is_read_only(tool_name)) && mode != PermissionMode::AskAll {
+            return (
+                PermissionDecision::Allow,
+                GateInfo {
+                    bucket: GateBucket::Allowed,
+                    reason_code: "safe.read-only".into(),
+                },
+            );
         }
-        match self.current_mode() {
+        if let Some(c) = &classification
+            && c.class == crate::classifier::RiskClass::Safe
+            && self.classifier.safe_auto_allow
+            && mode != PermissionMode::AskAll
+        {
+            return (
+                PermissionDecision::Allow,
+                GateInfo {
+                    bucket: GateBucket::Allowed,
+                    reason_code: c.reason_code.to_string(),
+                },
+            );
+        }
+
+        // 8. Mode fallback.
+        match mode {
             PermissionMode::AcceptEdits => {
                 let is_edit = is_edit_tool(tool_name);
                 if is_edit && self.path_inside_workdir(input, ctx) {
-                    return PermissionDecision::Allow;
+                    return (
+                        PermissionDecision::Allow,
+                        GateInfo {
+                            bucket: GateBucket::Allowed,
+                            reason_code: "mode.acceptEdits".into(),
+                        },
+                    );
                 }
                 if tool_name == "Bash" {
                     let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
                     if is_simple_fs_command(cmd) && self.fs_args_inside_workdir(cmd, ctx) {
-                        return PermissionDecision::Allow;
+                        return (
+                            PermissionDecision::Allow,
+                            GateInfo {
+                                bucket: GateBucket::Allowed,
+                                reason_code: "mode.acceptEdits".into(),
+                            },
+                        );
                     }
                 }
-                PermissionDecision::Ask
+                (
+                    PermissionDecision::Ask,
+                    GateInfo {
+                        bucket: GateBucket::Classifier,
+                        reason_code: ask_code,
+                    },
+                )
             }
-            PermissionMode::DontAsk => {
-                PermissionDecision::Deny("dontAsk mode: permission request suppressed".into())
-            }
-            PermissionMode::AskAll => PermissionDecision::Ask,
-            PermissionMode::Default | PermissionMode::Plan | PermissionMode::BypassPermissions => {
-                PermissionDecision::Ask
-            }
+            PermissionMode::DontAsk => (
+                PermissionDecision::Deny("dontAsk mode: permission request suppressed".into()),
+                GateInfo {
+                    bucket: GateBucket::Denied,
+                    reason_code: "mode.dontAsk".into(),
+                },
+            ),
+            PermissionMode::AskAll => (
+                PermissionDecision::Ask,
+                GateInfo {
+                    bucket: GateBucket::Classifier,
+                    reason_code: ask_code,
+                },
+            ),
+            PermissionMode::Default | PermissionMode::Plan | PermissionMode::BypassPermissions => (
+                PermissionDecision::Ask,
+                GateInfo {
+                    bucket: GateBucket::Classifier,
+                    reason_code: ask_code,
+                },
+            ),
         }
     }
 
@@ -722,6 +874,16 @@ impl PermissionChecker for RulePermissions {
         ctx: &ToolContext,
     ) -> PermissionDecision {
         self.evaluate(tool_name, input, read_only, ctx)
+    }
+
+    fn gate_decision(
+        &self,
+        tool_name: &str,
+        input: &Value,
+        read_only: bool,
+        ctx: &ToolContext,
+    ) -> (PermissionDecision, GateInfo) {
+        self.evaluate_full(tool_name, input, read_only, ctx)
     }
 
     fn ask_rule_matches(&self, tool_name: &str, input: &Value, ctx: &ToolContext) -> bool {
@@ -944,9 +1106,11 @@ mod tests {
             check_bash(&perms, "echo hi && ls /tmp"),
             PermissionDecision::Allow
         ));
+        // Phase 2: the classifier hard-denies the dangerous part of
+        // a compound even when the other parts are allow-ruled.
         assert!(matches!(
             check_bash(&perms, "echo hi && rm -rf /"),
-            PermissionDecision::Ask
+            PermissionDecision::Deny(_)
         ));
     }
 
@@ -1031,6 +1195,7 @@ mod permission_tests {
             default_mode: None,
             additional_directories: vec![],
             sandbox_mode: None,
+            classifier: Default::default(),
         };
         RulePermissions::new(mode, &settings, vec![], vec![], local)
     }
@@ -1401,12 +1566,12 @@ mod permission_tests {
             false,
             &ctx
         )));
-        assert!(is_ask(&p.check(
-            "Bash",
-            &json!({"command": "rm -rf /"}),
-            false,
-            &ctx
-        )));
+        // Phase 2: dangerous commands are hard-denied by the
+        // classifier in every mode, acceptEdits included.
+        assert!(matches!(
+            p.check("Bash", &json!({"command": "rm -rf /"}), false, &ctx),
+            PermissionDecision::Deny(_)
+        ));
         assert!(is_ask(&p.check(
             "Bash",
             &json!({"command": "cargo test"}),
@@ -1516,12 +1681,12 @@ mod permission_tests {
         let dir = tmpdir("bypass");
         let ctx = ctx_for(&dir);
         let p = perms(PermissionMode::BypassPermissions, &[], &[], &[], None);
-        assert!(is_allow(&p.check(
-            "Bash",
-            &json!({"command": "rm -rf /"}),
-            false,
-            &ctx
-        )));
+        // Phase 2 (D2): bypass does NOT override the classifier's
+        // hard deny of dangerous commands.
+        assert!(matches!(
+            p.check("Bash", &json!({"command": "rm -rf /"}), false, &ctx),
+            PermissionDecision::Deny(_)
+        ));
         assert!(is_allow(&p.check(
             "Write",
             &json!({"file_path": "/etc/x"}),
@@ -1548,6 +1713,113 @@ mod permission_tests {
             p3.check("Bash", &json!({"command": "rm -rf /"}), false, &ctx),
             PermissionDecision::Deny(_)
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn perms_with_classifier(
+        mode: PermissionMode,
+        allow: &[&str],
+        ask: &[&str],
+        deny: &[&str],
+        classifier: zen_core::ClassifierSettings,
+    ) -> RulePermissions {
+        let settings = PermissionSettings {
+            allow: allow.iter().map(|s| s.to_string()).collect(),
+            ask: ask.iter().map(|s| s.to_string()).collect(),
+            deny: deny.iter().map(|s| s.to_string()).collect(),
+            default_mode: None,
+            additional_directories: vec![],
+            sandbox_mode: None,
+            classifier,
+        };
+        RulePermissions::new(mode, &settings, vec![], vec![], None)
+    }
+
+    #[test]
+    fn classifier_gate_order_and_codes() {
+        use zen_core::{GateBucket, PermissionChecker as _};
+        let dir = tmpdir("gateorder");
+        let ctx = ctx_for(&dir);
+
+        // Deny rule beats the classifier: the reason names the rule.
+        let p = perms(PermissionMode::Default, &[], &[], &["Bash(rm *)"], None);
+        let (d, info) = p.gate_decision("Bash", &bash("rm -rf /"), false, &ctx);
+        assert!(matches!(d, PermissionDecision::Deny(_)));
+        assert_eq!(info.bucket, GateBucket::Denied);
+        assert!(
+            info.reason_code.starts_with("rule:"),
+            "{}",
+            info.reason_code
+        );
+
+        // An exact allow rule beats the classifier's dangerous verdict
+        // (D2) — but only for the exact command it covers.
+        let p = perms(PermissionMode::Default, &["Bash(rm -rf /)"], &[], &[], None);
+        let (d, info) = p.gate_decision("Bash", &bash("rm -rf /"), false, &ctx);
+        assert!(matches!(d, PermissionDecision::Allow));
+        assert_eq!(info.bucket, GateBucket::Allowed);
+        let (d, info) = p.gate_decision("Bash", &bash("echo hi && rm -rf /"), false, &ctx);
+        assert!(matches!(d, PermissionDecision::Deny(_)));
+        assert_eq!(info.reason_code, "danger.rm-recursive-root");
+
+        // No rule: the classifier denies with its own code.
+        let p = perms(PermissionMode::Default, &[], &[], &[], None);
+        let (d, info) = p.gate_decision("Bash", &bash("rm -rf /"), false, &ctx);
+        assert!(matches!(d, PermissionDecision::Deny(_)));
+        assert_eq!(info.bucket, GateBucket::Denied);
+        assert_eq!(info.reason_code, "danger.rm-recursive-root");
+
+        // A warn-labelled mutation lands in the Classifier bucket
+        // carrying its label for the approver.
+        let (d, info) = p.gate_decision("Bash", &bash("git reset --hard"), false, &ctx);
+        assert!(matches!(d, PermissionDecision::Ask));
+        assert_eq!(info.bucket, GateBucket::Classifier);
+        assert_eq!(info.reason_code, "warn.git-destructive");
+
+        // DontAsk turns the Classifier bucket into a denial.
+        let p = perms(PermissionMode::DontAsk, &[], &[], &[], None);
+        let (d, info) = p.gate_decision("Bash", &bash("cargo test"), false, &ctx);
+        assert!(matches!(d, PermissionDecision::Deny(_)));
+        assert_eq!(info.bucket, GateBucket::Denied);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classifier_safe_auto_allow_is_opt_in() {
+        use zen_core::{ClassifierSettings, PermissionChecker as _};
+        let dir = tmpdir("gateauto");
+        let ctx = ctx_for(&dir);
+        // Default settings: safeAutoAllow off — a safe command still asks.
+        let p = perms(PermissionMode::Default, &[], &[], &[], None);
+        let (d, _) = p.gate_decision("Bash", &bash("ls -la"), false, &ctx);
+        assert!(matches!(d, PermissionDecision::Ask));
+        // Opted in: the same command is allowed with the safe code.
+        let p = perms_with_classifier(
+            PermissionMode::Default,
+            &[],
+            &[],
+            &[],
+            ClassifierSettings {
+                enabled: true,
+                safe_auto_allow: true,
+            },
+        );
+        let (d, info) = p.gate_decision("Bash", &bash("ls -la"), false, &ctx);
+        assert!(matches!(d, PermissionDecision::Allow));
+        assert_eq!(info.reason_code, "safe.bash-readonly");
+        // Disabled classifier: the dangerous hard-deny goes away too.
+        let p = perms_with_classifier(
+            PermissionMode::Default,
+            &[],
+            &[],
+            &[],
+            ClassifierSettings {
+                enabled: false,
+                safe_auto_allow: false,
+            },
+        );
+        let (d, _) = p.gate_decision("Bash", &bash("rm -rf /"), false, &ctx);
+        assert!(matches!(d, PermissionDecision::Ask));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2200,12 +2472,11 @@ mod permission_tests {
             false,
             &ctx
         )));
-        assert!(is_ask(&p.check(
-            "Bash",
-            &bash("cp a /etc/passwd"),
-            false,
-            &ctx
-        )));
+        // Phase 2: copying into a system path is classifier-dangerous.
+        assert!(matches!(
+            p.check("Bash", &bash("cp a /etc/passwd"), false, &ctx),
+            PermissionDecision::Deny(_)
+        ));
         assert!(is_ask(&p.check(
             "Bash",
             &bash("mv a ../outside"),
