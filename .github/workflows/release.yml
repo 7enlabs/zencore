@@ -1,0 +1,108 @@
+name: Release
+
+# Build the release binaries for every platform CI builds and attach them
+# to the GitHub Release for the tag. v0.1.0 shipped Windows-only because
+# there was no release workflow: the single Windows zip was uploaded by
+# hand. This workflow makes every later tag ship all three platforms.
+# The build matrix is copied verbatim from the `build` job in ci.yml
+# (same OS / target / zig / test rows) so a target CI builds is a target
+# the release ships. Tests run in CI's `build` job on the same tag push
+# and again here for the native targets (test: true rows).
+# Known limits: `cargo install cargo-zigbuild` pulls from crates.io with
+# no checksum verification (`cargo install` has no checksum option);
+# `--locked` only pins the dependency tree, not the downloaded crate.
+# The aarch64-unknown-linux-musl leg only builds: there is no aarch64
+# runner to smoke-test it, so a broken aarch64 binary would ship
+# undetected (the Smoke step skips that target).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, zig: true, test: false }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, zig: true, test: false }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, zig: false, test: true }
+          - { os: macos-latest, target: aarch64-apple-darwin, zig: false, test: true }
+          - { os: macos-latest, target: x86_64-apple-darwin, zig: false, test: false }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
+        with: { toolchain: "stable", targets: "${{ matrix.target }}" }
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with: { key: "${{ matrix.target }}" }
+      - if: matrix.zig
+        run: |
+          pip3 install --user --break-system-packages ziglang==0.17.1
+          cargo install cargo-zigbuild --locked
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.zig }}" = "true" ]; then
+            cargo zigbuild --release -p zen-cli --target ${{ matrix.target }}
+          else
+            cargo build --release -p zen-cli --target ${{ matrix.target }}
+          fi
+      - name: Smoke
+        if: matrix.target != 'aarch64-unknown-linux-musl'
+        shell: bash
+        run: ./target/${{ matrix.target }}/release/zen${{ runner.os == 'Windows' && '.exe' || '' }} --version
+      - name: Test (native runtime)
+        if: matrix.test
+        shell: bash
+        run: cargo test --workspace --no-fail-fast --target ${{ matrix.target }}
+      - name: Package (zip, non-Windows)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          zip -j zen-${{ matrix.target }}.zip zen
+          ls -la zen-${{ matrix.target }}.zip
+      - name: Package (zip, Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cd target/${{ matrix.target }}/release
+          Compress-Archive -Path zen.exe -DestinationPath zen-${{ matrix.target }}.zip
+          Get-ChildItem zen-${{ matrix.target }}.zip
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: zen-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/zen-${{ matrix.target }}.zip
+          retention-days: 3
+
+  release:
+    # Attach the zips to the tag's GitHub Release. Tag-only: a manual
+    # dispatch builds the legs without uploading, so the workflow can be
+    # smoke-tested without touching a release.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: zen-*
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
+        with:
+          files: dist/zen-*.zip
+          fail_on_unmatched_files: true
