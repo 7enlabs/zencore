@@ -608,7 +608,7 @@ fn resolve_target(target: &str, cwd: &Path) -> PathBuf {
 
 fn rm_target_verdict(target: &str, cwd: &Path, workdirs: &[PathBuf]) -> TargetVerdict {
     let resolved = resolve_target(target, cwd);
-    if resolved == Path::new("/") {
+    if resolved == Path::new("/") || is_drive_root(&resolved) {
         return TargetVerdict::Danger;
     }
     if let Some(home) = dirs::home_dir()
@@ -627,8 +627,14 @@ fn rm_target_verdict(target: &str, cwd: &Path, workdirs: &[PathBuf]) -> TargetVe
 }
 
 /// System prefixes on an already-resolved absolute path.
+///
+/// Windows paths arrive with a drive letter (`C:\etc\hosts`, from
+/// `canonicalize_lenient` attaching the current drive to a rooted
+/// path), so the drive is stripped before matching: `c:/etc/hosts`
+/// must match `/etc` exactly like `/etc/hosts` does.
 fn is_system_resolved(p: &Path) -> bool {
     let s = p.to_string_lossy().replace('\\', "/").to_lowercase();
+    let s = strip_drive(&s);
     const PREFIXES: &[&str] = &[
         "/etc",
         "/usr",
@@ -642,14 +648,38 @@ fn is_system_resolved(p: &Path) -> bool {
         "/library",
         "/private/etc",
         "/private/var",
-        "c:/windows",
-        "c:/program files",
-        "c:/program files (x86)",
-        "c:/programdata",
+        "/windows",
+        "/program files",
+        "/program files (x86)",
+        "/programdata",
     ];
     PREFIXES
         .iter()
         .any(|pre| s == *pre || s.starts_with(&format!("{pre}/")))
+}
+
+/// Strip a leading Windows drive letter (`c:`) from a normalised
+/// slash path, so drive-prefixed paths compare like Unix ones.
+/// Returns the input unchanged when there is no drive prefix.
+fn strip_drive(s: &str) -> &str {
+    let b = s.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        &s[2..]
+    } else {
+        s
+    }
+}
+
+/// A Windows drive root (`C:\`, `D:/`) is the same as `/`: deleting
+/// or chmod-ing it recursively is dangerous. String-based so it
+/// holds on every OS, including in tests run on Linux.
+fn is_drive_root(p: &Path) -> bool {
+    let s = p.to_string_lossy().replace('\\', "/").to_lowercase();
+    let b = s.as_bytes();
+    b.len() >= 2
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b.len() == 2 || (b.len() == 3 && b[2] == b'/'))
 }
 
 /// System-path check for a not-yet-resolved write target.
@@ -835,6 +865,34 @@ mod tests {
     fn redirect_into_workdir_is_not_danger() {
         assert_eq!(code("echo x > out.txt"), "mutating.default");
         assert_eq!(code("echo x > /dev/null"), "mutating.default");
+    }
+
+    #[test]
+    fn windows_drive_paths_are_system_paths() {
+        // Regression (PR #274 windows-check): on Windows,
+        // canonicalize_lenient turns "/etc/hosts" into "C:\etc\hosts";
+        // is_system_resolved must still recognise it. Pure string
+        // matching, so this runs on Linux too; the full chain is
+        // covered by windows-check on CI.
+        assert!(is_system_resolved(Path::new("C:/etc/hosts")));
+        assert!(is_system_resolved(Path::new("C:\\Windows\\System32")));
+        assert!(is_system_resolved(Path::new("D:/usr/bin/env")));
+        assert!(is_system_resolved(Path::new("c:/program files/app/x.exe")));
+        assert!(is_system_resolved(Path::new("c:/programdata/x")));
+        assert!(is_system_resolved(Path::new("/etc/hosts")));
+        assert!(!is_system_resolved(Path::new("C:/Users/bob/file.txt")));
+        assert!(!is_system_resolved(Path::new("C:/work/project/src/main.rs")));
+    }
+
+    #[test]
+    fn windows_drive_root_is_root() {
+        assert!(is_drive_root(Path::new("C:/")));
+        assert!(is_drive_root(Path::new("C:\\")));
+        assert!(is_drive_root(Path::new("D:/")));
+        assert!(is_drive_root(Path::new("c:")));
+        assert!(!is_drive_root(Path::new("C:/etc")));
+        assert!(!is_drive_root(Path::new("/etc")));
+        assert!(!is_drive_root(Path::new("/")));
     }
 
     #[test]
