@@ -400,14 +400,14 @@ In a long agent loop the cost driver is rarely the model's answers - it is the
 ever-growing input prefix (system prompt + tool schemas) replayed on every turn.
 Zen ships prompt caching for paid models, on by default, with zero configuration:
 
-- **Anthropic** (`--base-url https://api.anthropic.com`): explicit
+- **Messages API** (`--base-url https://api.anthropic.com`): explicit
   `cache_control: {"type": "ephemeral"}` breakpoints after the tool definitions
   and after the stable system block. Cache reads are billed at **10% of the
   input price** (90% off); the 5-minute TTL refreshes on every read, so an active
   session stays warm.
-- **OpenAI**: automatic - any stable prompt prefix >= 1,024 tokens is served from
+- **Chat-completions API**: automatic - any stable prompt prefix >= 1,024 tokens is served from
   cache at 90% off, no code changes. Zen keeps the prefix stable so hits happen.
-- **Gemini / DeepSeek**: implicit/best-effort caching benefits from the same
+- **Other endpoints**: implicit/best-effort caching benefits from the same
   stable-prefix discipline, free.
 
 Measured savings on real agent trajectories: **-49% to -80% token cost**
@@ -421,7 +421,7 @@ How zen keeps the cache hot:
    marker, so it never poisons the cached prefix.
 2. **Stable tool bundles** - tool definitions are sent in the same order every
    turn. Recomposing the tool list per request would silently invalidate the
-   cache (Anthropic caches tools before everything else).
+   cache (Messages-API endpoints cache tools before everything else).
 3. **No volatile values in the prefix** - a CI test fails the build if today's
    date or a request id ever leaks into the cacheable prefix.
 
@@ -600,7 +600,7 @@ Zen is designed to be a good API citizen so your accounts stay in good standing.
 - Never retries billing/quota errors
 - Identifies itself with a versioned User-Agent on every request
 - Caps concurrent requests per provider (default: 2)
-- Uses Anthropic prompt caching to reduce rate-limit pressure
+- Uses prompt caching to reduce rate-limit pressure
 
 **What you should do:**
 - One API key per machine; never share keys

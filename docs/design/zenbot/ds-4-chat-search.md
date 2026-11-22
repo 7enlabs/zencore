@@ -94,7 +94,7 @@ All claims in this section are `[S]` (source read) with file + line.
 
 ### 2.2 Storage: derived index, logs stay the source of truth
 
-- Sessions live in DeepSeek Harness (DSH) session logs, **not** in SQLite.
+- Sessions live in the harness session logs, **not** in SQLite.
   The index is a **derived cache**: `chat-index.js` `install()` opens
   `<home>/chat-index.sqlite` with `node:sqlite` (Node's built-in SQLite,
   no extra dependency) and `PRAGMA journal_mode = WAL`.

@@ -19,7 +19,7 @@ stay in good standing.
   hard stop with a clear message - retrying a billing error only creates
   failed-request noise on your account.
 - **Classifies errors before retrying:** 429 rate-limit → backoff + retry;
-  529 (Anthropic overloaded) → backoff + suggest a fallback provider;
+  529 (endpoint overloaded) → backoff + suggest a fallback provider;
   other 4xx → fail fast, no retry.
 - **Identifies itself** with a versioned `User-Agent: Zen/<version>
   (+https://runzen.dev)` on every API request, so providers can reach out
@@ -28,7 +28,7 @@ stay in good standing.
   interval between requests and slows down proactively at ~80% of the detected
   rate-limit ceiling (parsed live from response headers).
 - **Concurrency cap:** at most 2 concurrent requests per provider by default.
-- **Anthropic prompt caching** is used to reduce rate-limit pressure (cached
+- **Prompt caching** is used to reduce rate-limit pressure (cached
   input tokens don't count toward per-minute token limits on current models).
 
 ## What you should do
