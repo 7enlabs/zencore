@@ -18,8 +18,7 @@ killed outright (a reference agent CLI's 2,000 req/day tier, April 2026).
 
 Zen has no central API and no token subsidy. "Free" means:
 
-- **Free cloud models** - Zen routes to providers with genuine free tiers
-  (Google AI Studio, Groq, OpenRouter `:free`, Mistral, NVIDIA NIM, Cerebras).
+- **Free cloud models** - Zen routes to model services with genuine free tiers.
   You use *their* free tier with *your* key, through an open protocol.
 - **Local models** - Ollama on your own machine. $0 marginal cost, no rate limits,
   no account, no data leaving your hardware. No company on Earth can rug-pull a
@@ -84,15 +83,15 @@ succeed, with the receipts to prove it.
 ## What models can I use?
 
 Anything speaking OpenAI-compatible `/chat/completions` or the Anthropic Messages
-API - 11+ providers configured out of the box, plus any custom endpoint:
+API - several services configured out of the box, plus any custom endpoint:
 
-- **Free cloud:** Google AI Studio, Groq, OpenRouter `:free`, Mistral, NVIDIA NIM,
-  Cerebras (quotas and catalogs change - `zen models --refresh` probes what's
+- **Free cloud:** free tiers of cloud model services (quotas and catalogs
+  change - `zen models --refresh` probes what's
   actually working *right now*).
 - **Local:** Ollama - Qwen3-Coder, Kimi K2, GLM-5.2, Devstral, gpt-oss. Fully
   offline, fully private.
-- **Paid (your choice):** OpenAI, Anthropic, Google, DeepSeek, Z.ai, Moonshot -
-  set the key in an environment variable (`ZEN_API_KEY`, `OPENAI_API_KEY`, or the variable named by `apiKeyEnv` in settings). Zen does not store keys itself. Paid is supported, never required.
+- **Paid (your choice):** any paid model service -
+  set the key in an environment variable (`ZEN_API_KEY`, or the variable named by `apiKeyEnv` in settings). Zen does not store keys itself. Paid is supported, never required.
 
 `zen models` shows what's available; fallback chains fail over automatically when
 a free quota is exhausted.

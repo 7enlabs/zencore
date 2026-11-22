@@ -202,22 +202,27 @@ fn is_local_url(url: &str) -> bool {
     b.contains("://127.0.0.1") || b.contains("://localhost") || b.contains("://[::1]")
 }
 
+/// Display label for rate-limit/quota messages: the configured base
+/// URL's host, never a hardcoded provider name.
 fn provider_name_for_url(url: &str) -> String {
-    let l = url.to_ascii_lowercase();
-    if l.contains("anthropic") {
-        "Anthropic".to_string()
-    } else if l.contains("openai") {
-        "OpenAI".to_string()
-    } else if l.contains("google") || l.contains("generativelanguage") {
-        "Google".to_string()
-    } else if l.contains("openrouter") {
-        "OpenRouter".to_string()
-    } else if l.contains("groq") {
-        "Groq".to_string()
-    } else if l.contains("ollama") || is_local_url(url) {
-        "local".to_string()
-    } else {
+    let lower = url.to_ascii_lowercase();
+    if lower.contains("ollama") || is_local_url(url) {
+        return "local".to_string();
+    }
+    let host = lower
+        .rsplit("://")
+        .next()
+        .unwrap_or(&lower)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split('@')
+        .next_back()
+        .unwrap_or("");
+    if host.is_empty() {
         "provider".to_string()
+    } else {
+        host.to_string()
     }
 }
 
@@ -362,7 +367,7 @@ pub(crate) fn normalize_arguments(v: Option<Value>) -> String {
 }
 
 /// Parse only the first JSON value in `body`, ignoring trailing content.
-/// Providers (observed OpenRouter 2026-11-10) may append a second JSON
+/// Services (observed 2026-11-10) may append a second JSON
 /// payload after the completion JSON; `serde_json::from_str` rejects that
 /// with "trailing characters". Same first-value approach as `parse_completion`.
 /// A UTF-8 byte order mark at the start of a response body is not
@@ -843,7 +848,7 @@ pub(crate) fn transient_completion(body: &str) -> Option<String> {
 }
 
 pub(crate) fn parse_completion(body: &str) -> anyhow::Result<ChatResponse> {
-    // OpenRouter may append trailing content after the completion JSON
+    // A service may append trailing content after the completion JSON
     // (observed 2026-11-10: leading blank lines + one completion JSON for
     // gen-1794290377-QQ8NMlUaKXWUfJ + a trailing second JSON). Parse only the
     // first JSON value and ignore whatever follows it.
@@ -1088,7 +1093,7 @@ mod tests {
 
     #[test]
     fn parse_completion_tolerates_trailing_content_after_first_json() {
-        // Regression: OpenRouter 2026-11-10 returned leading blank lines + one
+        // Regression: a 2026-11-10 response returned leading blank lines + one
         // completion JSON + a trailing second JSON (gen-1794290377-QQ8NMlUaKXWUfJ);
         // `serde_json::from_str` failed with "trailing characters".
         let completion = json!({
@@ -1123,7 +1128,7 @@ mod tests {
 
     #[test]
     fn transient_completion_tolerates_trailing_content() {
-        // Regression (bug hunt P1-2): OpenRouter 2026-11-10 appended a trailing
+        // Regression (bug hunt P1-2): a 2026-11-10 response appended a trailing
         // second JSON after the completion JSON; `serde_json::from_str` failed
         // with "trailing characters", so the empty-message / gateway-error
         // signals went blind. Same body shape as the PR #85 parse_completion test.
@@ -1891,6 +1896,50 @@ mod tests {
         let pacer = pacer.as_mut().expect("openai url has a pacer");
         assert!(pacer.acquire() < Duration::from_secs(1));
         assert!(pacer.acquire() >= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn provider_name_for_url_returns_exact_host() {
+        // PR #271 mutant kills (client.rs:208): the `-> String` mutant
+        // returning String::new() and the one returning "xyzzy" both die
+        // on these exact-value asserts.
+        assert_eq!(
+            provider_name_for_url("https://api.experientiallabs.ai/api/v1"),
+            "api.experientiallabs.ai"
+        );
+        assert_eq!(
+            provider_name_for_url("https://openrouter.ai/api/v1"),
+            "openrouter.ai"
+        );
+        assert_eq!(
+            provider_name_for_url("https://API.EXAMPLE.COM:8443/v1"),
+            "api.example.com:8443"
+        );
+        assert_eq!(
+            provider_name_for_url("https://user:pass@api.example.com/v1"),
+            "api.example.com"
+        );
+    }
+
+    #[test]
+    fn provider_name_for_url_local_on_either_condition() {
+        // PR #271 mutant kill (client.rs:209): the `||` -> `&&` mutant
+        // dies because each URL here satisfies exactly one of the two
+        // conditions, so only `||` returns "local" for all of them.
+        // Ollama name, not a local URL.
+        assert_eq!(
+            provider_name_for_url("https://ollama.example.com/api"),
+            "local"
+        );
+        // Local URL, no ollama name.
+        assert_eq!(provider_name_for_url("http://localhost:11434"), "local");
+        assert_eq!(provider_name_for_url("http://127.0.0.1:8080/v1"), "local");
+    }
+
+    #[test]
+    fn provider_name_for_url_falls_back_to_provider_label() {
+        assert_eq!(provider_name_for_url(""), "provider");
+        assert_eq!(provider_name_for_url("https://"), "provider");
     }
 }
 

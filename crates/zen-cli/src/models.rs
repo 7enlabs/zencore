@@ -11,8 +11,8 @@ pub struct CatalogModel {
     pub provider: &'static str,
     pub context_window: u32,
     /// Exact model string the serving provider's endpoint accepts.
-    /// OpenRouter-style ids (`provider/model:free`) are only valid on
-    /// OpenRouter; the Experiential gateway wants the bare slug
+    /// Prefixed ids (`provider/model:free`) are only valid on the service
+    /// that serves them; the default gateway wants the bare slug
     /// (`deepseek-v4.1-flash`), so the catalog id must never be sent to it
     /// verbatim - that is what the gateway rejects with HTTP 400
     /// "Invalid Model Name".
@@ -22,7 +22,7 @@ pub struct CatalogModel {
 pub const FREE_MODEL_CATALOG: &[CatalogModel] = &[
     CatalogModel {
         // Default model (Leader decision, tin 7887, 2026-11-08): the
-        // strongest free model on the Experiential gateway Free plan
+        // strongest free model on the default gateway Free plan
         // ($0, public pricing page). Context window 1M tokens per the
         // DeepSeek-V4.1-Flash model card; the gateway accepts the bare
         // slug, so id and gateway_id are the same here.
@@ -84,11 +84,11 @@ pub fn effective_context_window(explicit: Option<u64>, model: &str) -> u64 {
         .unwrap_or(DEFAULT_CONTEXT_WINDOW)
 }
 
-/// Base URL of the OpenRouter provider.
-pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+/// Base URL of the free-model pool.
+pub const FREE_POOL_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
 /// Canonical name of a catalog provider, matched case-insensitively:
-/// provider names are user-facing (`/provider OpenRouter`), so casing
+/// provider names are user-facing (`/provider <name>`), so casing
 /// must not change the meaning. `None` for an unknown provider.
 pub fn canonical_provider(name: &str) -> Option<&'static str> {
     ["experientiallabs", "openrouter"]
@@ -111,7 +111,7 @@ pub fn is_auto_model(model: &str) -> bool {
 /// must start and end with a letter or digit.
 ///
 /// This is format validation only, on purpose. The CLI deliberately
-/// accepts model ids outside the 5-entry free catalog: any OpenRouter
+/// accepts model ids outside the 5-entry free catalog: any prefixed
 /// id, any Ollama local model, any id a custom gateway serves (see
 /// `gateway_model_id`, which passes unknown ids through unchanged),
 /// so a catalog allowlist would reject models that work. A
@@ -173,13 +173,13 @@ pub fn invalid_model_message(model: &str, reason: &str) -> String {
 pub fn provider_base_url(provider: &str) -> Option<&'static str> {
     match canonical_provider(provider) {
         Some("experientiallabs") => Some(crate::settings::DEFAULT_BASE_URL),
-        Some("openrouter") => Some(OPENROUTER_BASE_URL),
+        Some("openrouter") => Some(FREE_POOL_BASE_URL),
         _ => None,
     }
 }
 
-/// Provider serving a base URL: the default base is the Experiential
-/// gateway, the OpenRouter base is OpenRouter. A custom base URL has
+/// Service serving a base URL: the default base is the default
+/// gateway, the free-pool base is the free pool. A custom base URL has
 /// no known provider, so catalog filtering must not exclude anything
 /// there (catalog by real provider).
 pub fn provider_for_base_url(base_url: &str) -> Option<&'static str> {
@@ -189,7 +189,7 @@ pub fn provider_for_base_url(base_url: &str) -> Option<&'static str> {
     let base_url = base_url.trim().trim_end_matches('/');
     if base_url == crate::settings::DEFAULT_BASE_URL {
         Some("experientiallabs")
-    } else if base_url == OPENROUTER_BASE_URL {
+    } else if base_url == FREE_POOL_BASE_URL {
         Some("openrouter")
     } else {
         None
@@ -1383,7 +1383,7 @@ mod tests {
 
     // Bug hunt R2, issue #167: malformed model ids must fail locally,
     // before any network call. Well-formed ids outside the catalog
-    // stay valid: the CLI deliberately accepts any OpenRouter id,
+    // stay valid: the CLI deliberately accepts any prefixed id,
     // Ollama local model or custom gateway id.
     #[test]
     fn invalid_model_reason_accepts_known_shapes() {
@@ -1783,14 +1783,14 @@ mod tests {
 
     #[test]
     fn catalog_gateway_ids_match_what_each_provider_accepts() {
-        // The Experiential gateway wants the bare slug (verified against
+        // The default gateway wants the bare slug (verified against
         // its public model page); sending the catalog id verbatim is the
         // HTTP 400 "Invalid Model Name" bug.
         assert_eq!(
             gateway_model_id("deepseek-v4.1-flash"),
             "deepseek-v4.1-flash"
         );
-        // OpenRouter entries keep their own id: it IS the wire id there.
+        // Free-pool entries keep their own id: it IS the wire id there.
         assert_eq!(
             gateway_model_id("qwen/qwen3-coder:free"),
             "qwen/qwen3-coder:free"
@@ -1823,14 +1823,14 @@ mod tests {
 
     #[test]
     fn catalog_is_scoped_by_provider() {
-        // The default base serves only the Experiential entry; the
-        // OpenRouter base serves only the four OpenRouter entries.
+        // The default base serves only the default entry; the
+        // free-pool base serves only the four free-pool entries.
         assert_eq!(
             provider_for_base_url(crate::settings::DEFAULT_BASE_URL),
             Some("experientiallabs")
         );
         assert_eq!(
-            provider_for_base_url(OPENROUTER_BASE_URL),
+            provider_for_base_url(FREE_POOL_BASE_URL),
             Some("openrouter")
         );
         assert_eq!(provider_for_base_url("https://example.invalid/v1"), None);
@@ -1869,7 +1869,7 @@ mod tests {
 
     #[test]
     fn provider_names_are_case_insensitive() {
-        // `/provider OpenRouter` must mean the same as `openrouter`
+        // `/provider <Name>` must mean the same as `<name>`
         // (PR #72 review follow-up).
         assert_eq!(canonical_provider("OpenRouter"), Some("openrouter"));
         assert_eq!(
@@ -1881,7 +1881,7 @@ mod tests {
             provider_default_model("OpenRouter").map(|e| e.id),
             provider_default_model("openrouter").map(|e| e.id)
         );
-        assert_eq!(provider_base_url("OpenRouter"), Some(OPENROUTER_BASE_URL));
+        assert_eq!(provider_base_url("OpenRouter"), Some(FREE_POOL_BASE_URL));
         assert_eq!(
             models_for_provider("OpenRouter").len(),
             models_for_provider("openrouter").len()

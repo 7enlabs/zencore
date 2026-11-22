@@ -63,11 +63,11 @@ install, update, uninstall, and troubleshooting details.
 Before your first prompt, set the key for your provider:
 
 ```sh
-export ZEN_API_KEY=<your key>   # default gateway (ExperientialLabs)
+export ZEN_API_KEY=<your key>   # default gateway ()
 ```
 
-Or use the provider's own variable (`OPENROUTER_API_KEY`,
-`DEEPSEEK_API_KEY`, ...). Run `zen doctor` to verify the setup: it
+Or use the key variable of the service your base URL points to.
+Run `zen doctor` to verify the setup: it
 warns and exits non-zero when the route needs a key and none is set.
 Without a key, zen stops before the first prompt instead of failing
 with a raw `HTTP 401`. Ollama needs no key at all.
@@ -149,39 +149,20 @@ Configuration lives in `~/.zen/settings.json`, `.zen/settings.json`, `.zen/setti
 (see SPEC §12), project memory in `ZEN.md`, custom commands in `.zen/commands/`, skills in
 `.zen/skills/<name>/SKILL.md`, sub-agents in `.zen/agents/*.md`, MCP servers in `.mcp.json`.
 
-### Named providers
+### Model routing
 
-`--model provider/model` routes directly to a named provider's API when that
-provider's key env var is set (the `provider/` prefix is stripped on the wire).
-Without the key, the value is treated as a gateway model ID on the default
+Zen talks to one model service at a time: a base URL plus a model id. The
+defaults are base URL `https://api.experientiallabs.ai/api/v1` and model
+`deepseek-v4.1-flash` (see Quickstart). Point `ZEN_BASE_URL` at another
+OpenAI-compatible endpoint to use its models, and set the key with
+`ZEN_API_KEY` (or that endpoint's own key variable).
+
+A model id may carry a `service/model` prefix; zen routes it to that
+service's API when its key is set (the prefix is stripped on the wire).
+Without the key, the value is treated as a model id on the default
 endpoint. An explicit `--base-url` / `ZEN_BASE_URL` / settings `baseUrl`
-always wins over the provider default.
+always wins over the service default.
 
-```bash
-ZAI_API_KEY=<key> zen -p "hi" --model zai/glm-5.2
-MOONSHOT_API_KEY=<key> zen -p "hi" --model moonshot/kimi-k2.7
-DEEPSEEK_API_KEY=<key> zen -p "hi" --model deepseek/deepseek-v4-flash
-```
-
-| Provider | Key env var | Models (examples) | Pricing/1M in/out |
-|---|---|---|---|
-| `zai` - Z.ai (Zhipu) | `ZAI_API_KEY` | `glm-5.2`, `glm-4.6` | $1.40 / $4.40 (glm-5.2) |
-| `moonshot` - Moonshot AI | `MOONSHOT_API_KEY` | `kimi-k2.7`, `kimi-k3` | $0.95 / $4.00 (k2.7) |
-| `deepseek` - DeepSeek | `DEEPSEEK_API_KEY` | `deepseek-v4-flash`, `deepseek-reasoner` | **$0.14 / $0.28** (v4-flash) |
-| `openrouter` | `OPENROUTER_API_KEY` | any | varies |
-| `groq` | `GROQ_API_KEY` | any | varies |
-| `anthropic` | `ANTHROPIC_API_KEY` | `claude-opus-4-6`, ... | varies |
-| `openai` | `OPENAI_API_KEY` | any | varies |
-| `ollama` | _(none - local)_ | any local model | $0.00 |
-| `together` / `mistral` / `cerebras` / `fireworks` / `google` | `<PROVIDER>_API_KEY` | any | varies |
-
-All three Chinese providers document Anthropic-compatible endpoints
-(`https://api.z.ai/api/anthropic`, `https://api.moonshot.ai/anthropic`,
-`https://api.deepseek.com/anthropic`); Zen uses their OpenAI-compatible
-endpoints today and switches to the Anthropic endpoint automatically once an
-Anthropic client is available. Pricing feeds the `zen cost` ledger; see
-`crates/zen-agent/src/providers.rs` for the registry, featured models for
-`zen models`, login order for `zen auth`, and cheap-first fallback order.
 ### `/diff` (REPL)
 
 In the interactive REPL, `/diff` shows uncommitted changes as `git diff HEAD`, plus a list of

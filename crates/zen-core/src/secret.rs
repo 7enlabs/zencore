@@ -1762,13 +1762,13 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    fn register_openrouter(store: &SecretStore, now: DateTime<Utc>) -> RegistryEntry {
+    fn register_model_key(store: &SecretStore, now: DateTime<Utc>) -> RegistryEntry {
         register_secret(
             store,
             RegisterInput {
-                name: "OPENROUTER_KEY".to_string(),
+                name: "MODEL_API_KEY".to_string(),
                 class: SecretClass::Seat,
-                service: "openrouter".to_string(),
+                service: "model-service".to_string(),
                 owner: "zc-leader".to_string(),
                 registered_by: "zc-leader".to_string(),
                 default_until_days: 7,
@@ -1800,7 +1800,7 @@ mod tests {
         .unwrap();
     }
 
-    fn request_openrouter(
+    fn request_model_key(
         store: &SecretStore,
         seat: &str,
         until: DateTime<Utc>,
@@ -1809,7 +1809,7 @@ mod tests {
         request_secret(
             store,
             RequestInput {
-                name: "OPENROUTER_KEY".to_string(),
+                name: "MODEL_API_KEY".to_string(),
                 seat: seat.to_string(),
                 task_id: Some("DS-7".to_string()),
                 purpose: "call the provider for the DS-7 verification runs".to_string(),
@@ -1823,8 +1823,8 @@ mod tests {
         .unwrap()
     }
 
-    fn issue_openrouter(store: &SecretStore, seat: &str, now: DateTime<Utc>) -> SecretRequest {
-        let req = request_openrouter(store, seat, now + Duration::days(1), false);
+    fn issue_model_key(store: &SecretStore, seat: &str, now: DateTime<Utc>) -> SecretRequest {
+        let req = request_model_key(store, seat, now + Duration::days(1), false);
         approve_secret(store, &req.request_id, LEADER_APPROVER, "tin 8071", now).unwrap();
         issue_secret(store, &req.request_id, OPERATOR_ISSUER, now).unwrap()
     }
@@ -1850,7 +1850,7 @@ mod tests {
         let err = request_secret(
             &store,
             RequestInput {
-                name: "OPENROUTER_KEY".to_string(),
+                name: "MODEL_API_KEY".to_string(),
                 seat: "zd-developer".to_string(),
                 task_id: None,
                 purpose: "work".to_string(),
@@ -1871,12 +1871,12 @@ mod tests {
     #[test]
     fn unknown_and_typo_names_fail_closed() {
         let (_dir, store) = temp_store("unknown");
-        register_openrouter(&store, fixed_now());
+        register_model_key(&store, fixed_now());
         for bad in [
-            "OPENROUTER_KEYS",
-            "OPENROUTER",
-            "openrouter_key",
-            "OPENROUTER-KEY",
+            "MODEL_API_KEYS",
+            "MODEL_API",
+            "model_api_key",
+            "MODEL-API-KEY",
         ] {
             let err = request_secret(
                 &store,
@@ -1906,7 +1906,7 @@ mod tests {
     fn secret_shaped_values_refused_in_every_field() {
         let (_dir, store) = temp_store("shaped");
         let now = fixed_now();
-        register_openrouter(&store, now);
+        register_model_key(&store, now);
         // Deliberately fake values, obviously not real keys. Each one
         // matches one of the three writer patterns (40-hex, sk-prefix,
         // KEY-assignment) and must be refused wherever it is tried.
@@ -1917,7 +1917,7 @@ mod tests {
             // belongs in source (the repo's gitleaks job scans the full
             // history). It is obviously fake: "live-fake" is in it.
             format!("sk-{}-{}", "live-fake", "0123456789abcdef"),
-            format!("{}={}", "OPENROUTER_KEY", "fake-value-here"),
+            format!("{}={}", "MODEL_API_KEY", "fake-value-here"),
         ];
         let mut attempts = 0;
         for value in &shaped {
@@ -1931,7 +1931,7 @@ mod tests {
                 let err = request_secret(
                     &store,
                     RequestInput {
-                        name: "OPENROUTER_KEY".to_string(),
+                        name: "MODEL_API_KEY".to_string(),
                         seat: "zd-developer".to_string(),
                         task_id: None,
                         purpose,
@@ -1966,12 +1966,12 @@ mod tests {
             .unwrap_err();
             assert!(err.to_string().contains("secret-shaped"), "register: {err}");
             attempts += 1;
-            let req = request_openrouter(&store, "zd-developer", now + Duration::days(1), false);
+            let req = request_model_key(&store, "zd-developer", now + Duration::days(1), false);
             let err =
                 deny_secret(&store, &req.request_id, LEADER_APPROVER, value, now).unwrap_err();
             assert!(err.to_string().contains("secret-shaped"), "deny: {err}");
             attempts += 1;
-            let req = request_openrouter(&store, "zd-developer", now + Duration::days(1), false);
+            let req = request_model_key(&store, "zd-developer", now + Duration::days(1), false);
             let err =
                 approve_secret(&store, &req.request_id, LEADER_APPROVER, value, now).unwrap_err();
             assert!(err.to_string().contains("secret-shaped"), "approve: {err}");
@@ -1980,14 +1980,14 @@ mod tests {
         // 3 patterns x 5 fields = 15 attempts; pad the count with 5
         // more attempts through the revoke reason path.
         for value in &shaped {
-            let req = issue_openrouter(&store, "zd-developer", now);
+            let req = issue_model_key(&store, "zd-developer", now);
             let err =
                 revoke_secret(&store, &req.request_id, LEADER_APPROVER, value, now).unwrap_err();
             assert!(err.to_string().contains("secret-shaped"), "revoke: {err}");
             attempts += 1;
         }
         for _ in 0..2 {
-            let req = request_openrouter(&store, "zd-developer", now + Duration::days(1), false);
+            let req = request_model_key(&store, "zd-developer", now + Duration::days(1), false);
             let err = deny_secret(
                 &store,
                 &req.request_id,
@@ -2018,13 +2018,13 @@ mod tests {
     fn seat_never_approves_its_own_request() {
         let (_dir, store) = temp_store("selfapprove");
         let now = fixed_now();
-        register_openrouter(&store, now);
+        register_model_key(&store, now);
         for i in 0..20 {
             let seat = format!("seat-{i:02}");
             let req = request_secret(
                 &store,
                 RequestInput {
-                    name: "OPENROUTER_KEY".to_string(),
+                    name: "MODEL_API_KEY".to_string(),
                     seat: seat.clone(),
                     task_id: None,
                     purpose: "work".to_string(),
@@ -2100,13 +2100,13 @@ mod tests {
     fn expiry_refuses_after_until() {
         let (_dir, store) = temp_store("expiry");
         let now = fixed_now();
-        register_openrouter(&store, now);
+        register_model_key(&store, now);
         let mut ids = Vec::new();
         for i in 0..20 {
             let req = request_secret(
                 &store,
                 RequestInput {
-                    name: "OPENROUTER_KEY".to_string(),
+                    name: "MODEL_API_KEY".to_string(),
                     seat: "zd-developer".to_string(),
                     task_id: None,
                     purpose: "short work".to_string(),
@@ -2147,8 +2147,8 @@ mod tests {
     fn revocation_is_immediate() {
         let (_dir, store) = temp_store("revoke");
         let now = fixed_now();
-        register_openrouter(&store, now);
-        let issued = issue_openrouter(&store, "zd-developer", now);
+        register_model_key(&store, now);
+        let issued = issue_model_key(&store, "zd-developer", now);
         let check = check_use(&store, &issued.request_id, "zd-developer", now).unwrap();
         assert!(check.allowed);
         revoke_secret(
@@ -2171,8 +2171,8 @@ mod tests {
     fn one_shot_consumed_by_first_real_use_only() {
         let (_dir, store) = temp_store("oneshot");
         let now = fixed_now();
-        register_openrouter(&store, now);
-        let req = request_openrouter(&store, "zd-developer", now + Duration::days(1), true);
+        register_model_key(&store, now);
+        let req = request_model_key(&store, "zd-developer", now + Duration::days(1), true);
         approve_secret(&store, &req.request_id, LEADER_APPROVER, "tin 1", now).unwrap();
         issue_secret(&store, &req.request_id, OPERATOR_ISSUER, now).unwrap();
         // Probes return ALLOW and consume nothing, as often as run.
@@ -2194,14 +2194,14 @@ mod tests {
     fn redaction_covers_verbatim_and_encoded_forms() {
         // Obviously fake values, never real keys.
         let pairs = [
-            ("OPENROUTER_KEY", "test-value-alpha-1234"),
+            ("MODEL_API_KEY", "test-value-alpha-1234"),
             ("OTHER_KEY", "short1"),
         ];
         for i in 0..20 {
             let text = format!("run {i} used test-value-alpha-1234 and short1 and done");
             let redacted = redact_text(&text, &pairs);
             assert!(!redacted.contains("test-value-alpha-1234"), "{redacted}");
-            assert!(redacted.contains("[secret:OPENROUTER_KEY]"), "{redacted}");
+            assert!(redacted.contains("[secret:MODEL_API_KEY]"), "{redacted}");
             // A short value is redacted where it stands alone.
             assert!(redacted.contains("[secret:OTHER_KEY]"), "{redacted}");
         }
@@ -2228,9 +2228,9 @@ mod tests {
     fn request_without_purpose_scope_or_until_is_refused() {
         let (_dir, store) = temp_store("missingfields");
         let now = fixed_now();
-        register_openrouter(&store, now);
+        register_model_key(&store, now);
         let base = |purpose: &str, scope: &str, until: &str| RequestInput {
-            name: "OPENROUTER_KEY".to_string(),
+            name: "MODEL_API_KEY".to_string(),
             seat: "zd-developer".to_string(),
             task_id: None,
             purpose: purpose.to_string(),
@@ -2257,8 +2257,8 @@ mod tests {
     fn near_miss_names_do_not_count() {
         let (_dir, store) = temp_store("nearmiss");
         let now = fixed_now();
-        register_openrouter(&store, now);
-        let issued = issue_openrouter(&store, "zd-developer", now);
+        register_model_key(&store, now);
+        let issued = issue_model_key(&store, "zd-developer", now);
         // The check is by request id and seat: a request for the exact
         // name, presented by another seat, is DENY.
         let check = check_use(&store, &issued.request_id, "zc-developer", now).unwrap();
@@ -2271,7 +2271,7 @@ mod tests {
             load_requests(&store)
                 .unwrap()
                 .iter()
-                .all(|r| r.name == "OPENROUTER_KEY")
+                .all(|r| r.name == "MODEL_API_KEY")
         );
     }
 
@@ -2279,11 +2279,11 @@ mod tests {
     fn deregistration_revokes_live_issuances() {
         let (_dir, store) = temp_store("deregister");
         let now = fixed_now();
-        register_openrouter(&store, now);
-        let issued = issue_openrouter(&store, "zd-developer", now);
+        register_model_key(&store, now);
+        let issued = issue_model_key(&store, "zd-developer", now);
         deregister_secret(
             &store,
-            "OPENROUTER_KEY",
+            "MODEL_API_KEY",
             LEADER_APPROVER,
             "service retired",
             now,
@@ -2298,7 +2298,7 @@ mod tests {
         let err = request_secret(
             &store,
             RequestInput {
-                name: "OPENROUTER_KEY".to_string(),
+                name: "MODEL_API_KEY".to_string(),
                 seat: "zd-developer".to_string(),
                 task_id: None,
                 purpose: "work".to_string(),
@@ -2312,7 +2312,7 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("deregistered"));
         // No live issuance remains under the name.
-        let status = secret_status(&store, Some("OPENROUTER_KEY"), now).unwrap();
+        let status = secret_status(&store, Some("MODEL_API_KEY"), now).unwrap();
         assert!(status[0].live.is_empty());
         assert!(status[0].deregistered);
     }
@@ -2321,7 +2321,7 @@ mod tests {
     fn approver_authority_follows_class_and_paid_flag() {
         let (_dir, store) = temp_store("authority");
         let now = fixed_now();
-        register_openrouter(&store, now);
+        register_model_key(&store, now);
         register_secret(
             &store,
             RegisterInput {
@@ -2339,7 +2339,7 @@ mod tests {
         )
         .unwrap();
         // A seat secret approved by Zen is forbidden; by the Leader ok.
-        let req = request_openrouter(&store, "zd-developer", now + Duration::days(1), false);
+        let req = request_model_key(&store, "zd-developer", now + Duration::days(1), false);
         let err = approve_secret(&store, &req.request_id, ZEN_APPROVER, "tin 1", now).unwrap_err();
         assert_eq!(err.code(), exit_code::FORBIDDEN);
         approve_secret(&store, &req.request_id, LEADER_APPROVER, "tin 1", now).unwrap();
@@ -2370,8 +2370,8 @@ mod tests {
     fn issue_is_gated_on_approval_and_issuer() {
         let (_dir, store) = temp_store("issuegate");
         let now = fixed_now();
-        register_openrouter(&store, now);
-        let req = request_openrouter(&store, "zd-developer", now + Duration::days(1), false);
+        register_model_key(&store, now);
+        let req = request_model_key(&store, "zd-developer", now + Duration::days(1), false);
         // Not approved yet: issuance is refused.
         let err = issue_secret(&store, &req.request_id, OPERATOR_ISSUER, now).unwrap_err();
         assert_eq!(err.code(), exit_code::CONFLICT);
@@ -2385,7 +2385,7 @@ mod tests {
         // D4: one Vault entry per (secret, seat) pair.
         assert_eq!(
             issued.vault_entry.as_deref(),
-            Some("OPENROUTER_KEY:zd-developer")
+            Some("MODEL_API_KEY:zd-developer")
         );
     }
 
@@ -2393,11 +2393,11 @@ mod tests {
     fn lifetime_beyond_registry_default_is_refused() {
         let (_dir, store) = temp_store("lifetime");
         let now = fixed_now();
-        register_openrouter(&store, now);
+        register_model_key(&store, now);
         let err = request_secret(
             &store,
             RequestInput {
-                name: "OPENROUTER_KEY".to_string(),
+                name: "MODEL_API_KEY".to_string(),
                 seat: "zd-developer".to_string(),
                 task_id: None,
                 purpose: "work".to_string(),
@@ -2419,13 +2419,13 @@ mod tests {
     fn one_shot_request_beyond_24h_is_refused() {
         let (_dir, store) = temp_store("oneshot24");
         let now = fixed_now();
-        register_openrouter(&store, now);
+        register_model_key(&store, now);
         // A one-shot asked past 24 hours is refused, even though the
         // registry default for the secret is 7 days (F1).
         let err = request_secret(
             &store,
             RequestInput {
-                name: "OPENROUTER_KEY".to_string(),
+                name: "MODEL_API_KEY".to_string(),
                 seat: "zd-developer".to_string(),
                 task_id: None,
                 purpose: "one call".to_string(),
@@ -2441,10 +2441,10 @@ mod tests {
         assert!(err.to_string().contains("lifetime-exceeds-24h"), "{err}");
         assert!(load_requests(&store).unwrap().is_empty());
         // Exactly 24 hours is the cap, not past it: allowed.
-        let at_cap = request_openrouter(&store, "zd-developer", now + Duration::hours(24), true);
+        let at_cap = request_model_key(&store, "zd-developer", now + Duration::hours(24), true);
         assert_eq!(at_cap.until, rfc3339(now + Duration::hours(24)));
         // A task-scoped request is unchanged: 7 days still allowed.
-        let task = request_openrouter(&store, "zd-developer", now + Duration::days(7), false);
+        let task = request_model_key(&store, "zd-developer", now + Duration::days(7), false);
         assert_eq!(task.until, rfc3339(now + Duration::days(7)));
     }
 
@@ -2530,11 +2530,11 @@ mod tests {
     fn deny_requires_the_approver() {
         let (_dir, store) = temp_store("denyauth");
         let now = fixed_now();
-        register_openrouter(&store, now);
+        register_model_key(&store, now);
         register_user_secret(&store, now);
         // A seat secret is denied by the Leader only: the requesting
         // seat and Zen are both refused (Q2, design section 4.4).
-        let req = request_openrouter(&store, "zd-developer", now + Duration::days(1), false);
+        let req = request_model_key(&store, "zd-developer", now + Duration::days(1), false);
         let err = deny_secret(&store, &req.request_id, "zd-developer", "no", now).unwrap_err();
         assert_eq!(err.code(), exit_code::FORBIDDEN);
         let err = deny_secret(&store, &req.request_id, ZEN_APPROVER, "no", now).unwrap_err();
@@ -2567,9 +2567,9 @@ mod tests {
     fn revoke_requires_issuer_or_leader() {
         let (_dir, store) = temp_store("revokeauth");
         let now = fixed_now();
-        register_openrouter(&store, now);
+        register_model_key(&store, now);
         // Issued by Z Ops: the requesting seat and Zen are refused.
-        let issued = issue_openrouter(&store, "zd-developer", now);
+        let issued = issue_model_key(&store, "zd-developer", now);
         let err = revoke_secret(&store, &issued.request_id, "zd-developer", "no", now).unwrap_err();
         assert_eq!(err.code(), exit_code::FORBIDDEN);
         let err = revoke_secret(&store, &issued.request_id, ZEN_APPROVER, "no", now).unwrap_err();
@@ -2579,7 +2579,7 @@ mod tests {
         assert_eq!(revoked.state, RequestState::Revoked);
         // A second issuance is revoked by the Leader (Q2, design
         // sections 4.4 and 4.7).
-        let issued = issue_openrouter(&store, "zd-developer", now);
+        let issued = issue_model_key(&store, "zd-developer", now);
         let revoked =
             revoke_secret(&store, &issued.request_id, LEADER_APPROVER, "no", now).unwrap();
         assert_eq!(revoked.state, RequestState::Revoked);
@@ -2613,8 +2613,8 @@ mod tests {
     fn withdraw_is_the_requesting_seat_own_act() {
         let (_dir, store) = temp_store("withdraw");
         let now = fixed_now();
-        register_openrouter(&store, now);
-        let req = request_openrouter(&store, "zd-developer", now + Duration::days(1), false);
+        register_model_key(&store, now);
+        let req = request_model_key(&store, "zd-developer", now + Duration::days(1), false);
         // Anyone but the requesting seat is refused: another seat,
         // and the Leader, who denies instead of withdrawing (F1).
         for by in ["zc-developer", LEADER_APPROVER] {
@@ -2686,11 +2686,11 @@ mod tests {
     fn withdraw_only_from_requested() {
         let (_dir, store) = temp_store("withdrawstate");
         let now = fixed_now();
-        register_openrouter(&store, now);
+        register_model_key(&store, now);
         // An approved request cannot be withdrawn: nothing is issued
         // yet, so it lapses at its until; a live issuance is ended by
         // revoke, not by withdraw.
-        let req = request_openrouter(&store, "zd-developer", now + Duration::days(1), false);
+        let req = request_model_key(&store, "zd-developer", now + Duration::days(1), false);
         approve_secret(&store, &req.request_id, LEADER_APPROVER, "tin 1", now).unwrap();
         let err =
             withdraw_secret(&store, &req.request_id, "zd-developer", "too late", now).unwrap_err();
@@ -2699,7 +2699,7 @@ mod tests {
         let stored = load_request(&store, &req.request_id).unwrap();
         assert_eq!(stored.state, RequestState::Approved);
         // A denied request cannot be withdrawn either.
-        let denied = request_openrouter(&store, "zd-developer", now + Duration::days(1), false);
+        let denied = request_model_key(&store, "zd-developer", now + Duration::days(1), false);
         deny_secret(&store, &denied.request_id, LEADER_APPROVER, "no", now).unwrap();
         let err = withdraw_secret(&store, &denied.request_id, "zd-developer", "too late", now)
             .unwrap_err();
@@ -2710,8 +2710,8 @@ mod tests {
     fn withdraw_refuses_a_secret_shaped_reason() {
         let (_dir, store) = temp_store("withdrawshaped");
         let now = fixed_now();
-        register_openrouter(&store, now);
-        let req = request_openrouter(&store, "zd-developer", now + Duration::days(1), false);
+        register_model_key(&store, now);
+        let req = request_model_key(&store, "zd-developer", now + Duration::days(1), false);
         // A 40-hex string built at run time, never a literal in the
         // source: the writer refuses it with the pattern named.
         let shaped = format!("leaked {:040x}", 0xdeadbeefu64);
@@ -2728,7 +2728,7 @@ mod tests {
     fn zen_revokes_a_user_class_broker_grant() {
         let (_dir, store) = temp_store("zenrevoke");
         let now = fixed_now();
-        register_openrouter(&store, now);
+        register_model_key(&store, now);
         register_user_secret(&store, now);
         // A broker grant issued by Z Ops: Zen revokes it directly
         // (F2, Leader tin 8174). The grant is live before, dead after.
@@ -2764,7 +2764,7 @@ mod tests {
         assert_eq!(err.code(), exit_code::FORBIDDEN);
         // Unchanged for a seat secret: Zen still cannot revoke it
         // (revoke_requires_issuer_or_leader pins this).
-        let issued = issue_openrouter(&store, "zd-developer", now);
+        let issued = issue_model_key(&store, "zd-developer", now);
         let err = revoke_secret(&store, &issued.request_id, ZEN_APPROVER, "no", now).unwrap_err();
         assert_eq!(err.code(), exit_code::FORBIDDEN);
     }
@@ -2793,26 +2793,20 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.code(), exit_code::FORBIDDEN);
         assert!(load_registry(&store).unwrap().is_empty());
-        register_openrouter(&store, now);
-        let err = deregister_secret(
-            &store,
-            "OPENROUTER_KEY",
-            "zd-developer",
-            "a seat tries",
-            now,
-        )
-        .unwrap_err();
+        register_model_key(&store, now);
+        let err = deregister_secret(&store, "MODEL_API_KEY", "zd-developer", "a seat tries", now)
+            .unwrap_err();
         assert_eq!(err.code(), exit_code::FORBIDDEN);
-        deregister_secret(&store, "OPENROUTER_KEY", LEADER_APPROVER, "retired", now).unwrap();
+        deregister_secret(&store, "MODEL_API_KEY", LEADER_APPROVER, "retired", now).unwrap();
     }
 
     #[test]
     fn request_ids_are_sequential_per_day() {
         let (_dir, store) = temp_store("ids");
         let now = fixed_now();
-        register_openrouter(&store, now);
-        let first = request_openrouter(&store, "zd-developer", now + Duration::days(1), false);
-        let second = request_openrouter(&store, "zd-developer", now + Duration::days(1), false);
+        register_model_key(&store, now);
+        let first = request_model_key(&store, "zd-developer", now + Duration::days(1), false);
+        let second = request_model_key(&store, "zd-developer", now + Duration::days(1), false);
         assert_eq!(first.request_id, "sr-20261108-001");
         assert_eq!(second.request_id, "sr-20261108-002");
     }
@@ -2821,18 +2815,18 @@ mod tests {
     fn rotation_keeps_old_value_through_grace_then_replaces_it() {
         let (_dir, store) = temp_store("rotate");
         let now = fixed_now();
-        register_openrouter(&store, now);
+        register_model_key(&store, now);
         // The issuance lives 7 days, so the 24-hour rotation grace -
         // not the issuance until - is what ends the old value.
-        let req = request_openrouter(&store, "zd-developer", now + Duration::days(7), false);
+        let req = request_model_key(&store, "zd-developer", now + Duration::days(7), false);
         approve_secret(&store, &req.request_id, LEADER_APPROVER, "tin 1", now).unwrap();
         let issued = issue_secret(&store, &req.request_id, OPERATOR_ISSUER, now).unwrap();
         // Only the owner (or the Leader) rotates.
         let err =
-            rotate_secret(&store, "OPENROUTER_KEY", "zd-developer", "routine", now).unwrap_err();
+            rotate_secret(&store, "MODEL_API_KEY", "zd-developer", "routine", now).unwrap_err();
         assert_eq!(err.code(), exit_code::FORBIDDEN);
         let rotated =
-            rotate_secret(&store, "OPENROUTER_KEY", LEADER_APPROVER, "routine", now).unwrap();
+            rotate_secret(&store, "MODEL_API_KEY", LEADER_APPROVER, "routine", now).unwrap();
         assert_eq!(rotated.rotates.as_deref(), Some(issued.request_id.as_str()));
         assert_eq!(rotated.state, RequestState::Requested);
         assert!(rotated.purpose.contains(&issued.request_id));
@@ -2857,8 +2851,8 @@ mod tests {
     fn denied_requests_are_terminal_and_state_moves_forward_only() {
         let (_dir, store) = temp_store("terminal");
         let now = fixed_now();
-        register_openrouter(&store, now);
-        let req = request_openrouter(&store, "zd-developer", now + Duration::days(1), false);
+        register_model_key(&store, now);
+        let req = request_model_key(&store, "zd-developer", now + Duration::days(1), false);
         deny_secret(&store, &req.request_id, LEADER_APPROVER, "not needed", now).unwrap();
         let err =
             approve_secret(&store, &req.request_id, LEADER_APPROVER, "tin 1", now).unwrap_err();
@@ -2890,12 +2884,12 @@ mod tests {
             )
             .unwrap();
         }
-        register_openrouter(&store, now);
+        register_model_key(&store, now);
         for i in 0..100 {
             request_secret(
                 &store,
                 RequestInput {
-                    name: "OPENROUTER_KEY".to_string(),
+                    name: "MODEL_API_KEY".to_string(),
                     seat: "zd-developer".to_string(),
                     task_id: None,
                     purpose: "seed work".to_string(),
@@ -2912,7 +2906,7 @@ mod tests {
         request_secret(
             &store,
             RequestInput {
-                name: "OPENROUTER_KEY".to_string(),
+                name: "MODEL_API_KEY".to_string(),
                 seat: "zd-developer".to_string(),
                 task_id: None,
                 purpose: "budget probe".to_string(),

@@ -48,11 +48,10 @@ tool* - so Zen was designed to never have a backend in the first place.
 
 ### 2.2 Bring your own model - including free ones
 
-Zen routes to 11+ providers out of the box: free cloud tiers (Google AI Studio,
-Groq, OpenRouter `:free`, Mistral, NVIDIA NIM, Cerebras), paid APIs when you choose
-them, and local models. Fallback chains mean one provider's quota wall is a speed bump,
-not a wall: OpenRouter `:free` hits its limit → Zen fails over to Groq → Mistral →
-local. `zen models` probes and picks the best free model *today*, because free catalogs
+Zen routes to many model services out of the box: free cloud tiers,
+paid APIs when you choose them, and local models. Fallback chains mean one
+service's quota wall is a speed bump, not a wall: one free pool hits its
+limit → Zen fails over to the next → local. `zen models` probes and picks the best free model *today*, because free catalogs
 rotate and static guides go stale on publish day.
 
 ### 2.3 Ollama: the escape hatch that is also the front door

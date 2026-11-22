@@ -469,13 +469,13 @@ mod tests {
 
     #[test]
     fn warning_texts_mention_key_points() {
-        assert!(auth_login_warning("Anthropic").contains("one key per machine"));
-        assert!(parallel_sessions_warning(4, "Anthropic").contains("--i-understand-the-risks"));
-        assert!(concurrency_cap_warning(8, 2, "OpenAI").contains("--i-understand-the-risks"));
-        assert!(repeated_429_warning(4, "Anthropic").contains("backing off"));
-        let q = quota_exhausted_error("OpenAI", "insufficient_quota");
+        assert!(auth_login_warning("TestProvider").contains("one key per machine"));
+        assert!(parallel_sessions_warning(4, "TestProvider").contains("--i-understand-the-risks"));
+        assert!(concurrency_cap_warning(8, 2, "TestProvider").contains("--i-understand-the-risks"));
+        assert!(repeated_429_warning(4, "TestProvider").contains("backing off"));
+        let q = quota_exhausted_error("TestProvider", "insufficient_quota");
         assert!(q.contains("will NOT retry"));
-        assert!(first_429_notice("Google").contains("normal"));
+        assert!(first_429_notice("TestProvider").contains("normal"));
     }
 
     #[test]

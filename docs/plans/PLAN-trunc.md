@@ -1,7 +1,7 @@
 # PLAN-trunc - continue on truncation (branch `feat/continue-on-truncation`)
 
 Problem: when a reply stops because it hit the output token limit (`finish_reason: "length"` on
-OpenAI/OpenRouter; some gateways pass the native `max_tokens` / `MAX_TOKENS` /
+chat-completions APIs; some gateways pass the native `max_tokens` / `MAX_TOKENS` /
 `max_output_tokens`), the loop treats it like a normal reply: a cut-off text answer ends the turn,
 and a half-written tool call goes to repair, whose JSON balancing can turn a truncated object into
 a "valid" call and execute half of it.

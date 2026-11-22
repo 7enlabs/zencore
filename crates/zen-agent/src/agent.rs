@@ -2359,7 +2359,7 @@ mod tests {
     #[test]
     fn default_model_is_the_decided_free_gateway_id() {
         // PR #71 review F8: the old default named a paid model in
-        // its OpenRouter form; the decided default is the free
+        // its prefixed form; the decided default is the free
         // deepseek-v4.1-flash, already in gateway form.
         assert_eq!(AgentConfig::default().model, "deepseek-v4.1-flash");
     }

@@ -50,7 +50,7 @@ Components:
   output before submitting (independence, same rule as the team's Scout v4
   critic step).
 - **Reviewer.** A free model behind an existing seat tool (for example the
-  pi coding agent on free OpenRouter models). Read-only: a reviewer reads
+  pi coding agent on free models). Read-only: a reviewer reads
   and reports, it never edits the artifact and never merges.
 - **Normalizer.** Maps each free-text verdict onto the bucket vocabulary of
   section 3 and extracts the evidence lines (file, line, command output)
@@ -101,14 +101,14 @@ Flow:
 
 ## 4. Model selection
 
-- **Free-only.** Reviewers run on free models only (for example OpenRouter
-  `:free` models through pi). A paid model is used only with a separate
+- **Free-only.** Reviewers run on free models only (for example `:free`
+  models through pi). A paid model is used only with a separate
   per-case approval, and the design must keep working when that approval
   does not exist.
 - **Diversity over strength.** The roster is one reviewer per model
   family, never two seats of the same family, so failure modes do not
   correlate. P1's example roster is nemotron + qwen + gemma families,
-  run free through the local proxy (OpenRouter `:free` + IteraCompute);
+  run free through the local proxy (`:free` models + IteraCompute);
   the exact families are chosen per review from whatever free families
   are available that day, and the choice is recorded with the result.
 - **Cheapest sufficient.** Review depth scales with risk: a docs-only
