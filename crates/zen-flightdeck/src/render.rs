@@ -400,4 +400,33 @@ mod tests {
         assert!(out.contains("RED"), "{out}");
         assert!(out.contains("done"), "{out}");
     }
+
+    #[test]
+    fn gate_pane_height_counts_rows_and_pending_block() {
+        // Kills both + -> * mutants in draw (gate_height): with 2
+        // gate rows and a pending approval the gate pane is 7 lines,
+        // so the log block title sits on line 16, not 17.
+        let mut s = populated_state();
+        s.apply(&AgentEvent::PermissionClassified {
+            tool_use_id: "g1".to_string(),
+            tool_name: "Bash".to_string(),
+            bucket: zen_core::GateBucket::Denied,
+            reason_code: "danger.rm-recursive-root".to_string(),
+            summary: "rm -rf /".to_string(),
+            parent_tool_use_id: None,
+        });
+        s.apply(&AgentEvent::PermissionClassified {
+            tool_use_id: "g2".to_string(),
+            tool_name: "Bash".to_string(),
+            bucket: zen_core::GateBucket::Classifier,
+            reason_code: "warn.git-destructive".to_string(),
+            summary: "git reset --hard".to_string(),
+            parent_tool_use_id: None,
+        });
+        let out = render_to_string(&s, 100, 30);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 30, "{out}");
+        assert!(lines[9].contains("GATE"), "{out}");
+        assert!(lines[16].contains("SESSION LOG"), "{out}");
+    }
 }

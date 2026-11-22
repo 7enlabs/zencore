@@ -2382,4 +2382,60 @@ mod glob_tests {
         let ctx = ToolContext::new(PathBuf::from("/work/dir"), "sess-1");
         assert_eq!(ctx.cwd(), PathBuf::from("/work/dir"));
     }
+
+    #[test]
+    fn summarize_tool_call_uses_command_url_or_path() {
+        // Kills the whole-body replacements and the deleted "Bash"
+        // and "WebFetch" | "WebSearch" arms in summarize_tool_call.
+        let bash = serde_json::json!({ "command": "ls -la" });
+        assert_eq!(summarize_tool_call("Bash", &bash), "ls -la");
+        let web = serde_json::json!({ "url": "https://example.com/x" });
+        assert_eq!(
+            summarize_tool_call("WebFetch", &web),
+            "https://example.com/x"
+        );
+        assert_eq!(
+            summarize_tool_call("WebSearch", &web),
+            "https://example.com/x"
+        );
+        let read = serde_json::json!({ "file_path": "src/main.rs" });
+        assert_eq!(summarize_tool_call("Read", &read), "src/main.rs");
+        let path = serde_json::json!({ "path": "other.txt" });
+        assert_eq!(summarize_tool_call("Edit", &path), "other.txt");
+        // No usable field: the tool name itself, except Bash which
+        // has its own empty fallback.
+        let empty = serde_json::json!({});
+        assert_eq!(summarize_tool_call("Bash", &empty), "");
+        assert_eq!(summarize_tool_call("Read", &empty), "Read");
+        assert_eq!(summarize_tool_call("WebFetch", &empty), "WebFetch");
+    }
+
+    #[test]
+    fn summarize_tool_call_truncates_only_past_80_chars() {
+        // Kills the > mutants in summarize_tool_call: exactly 80
+        // chars stay whole, 81 chars truncate to 79 plus an ellipsis,
+        // and a short string is never truncated.
+        let exact = "x".repeat(80);
+        let cmd = serde_json::json!({ "command": exact });
+        assert_eq!(summarize_tool_call("Bash", &cmd), exact);
+        let over = "y".repeat(81);
+        let cmd = serde_json::json!({ "command": over });
+        let got = summarize_tool_call("Bash", &cmd);
+        assert_eq!(got.chars().count(), 80);
+        assert!(got.ends_with('…'));
+        assert_eq!(&got[..79], &"y".repeat(79));
+        let short = serde_json::json!({ "command": "ls" });
+        assert_eq!(summarize_tool_call("Bash", &short), "ls");
+    }
+
+    #[test]
+    fn classifier_settings_enabled_defaults_to_true() {
+        // Kills the default_true -> false mutant: omitting "enabled"
+        // must leave the classifier on.
+        let s: ClassifierSettings = serde_json::from_str("{}").unwrap();
+        assert!(s.enabled);
+        assert!(!s.safe_auto_allow);
+        let s: ClassifierSettings = serde_json::from_str(r#"{"enabled": false}"#).unwrap();
+        assert!(!s.enabled);
+    }
 }

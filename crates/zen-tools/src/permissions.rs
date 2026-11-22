@@ -2545,4 +2545,20 @@ mod permission_tests {
         assert!(!p.ask_rule_matches("Bash", &bash("ls"), &ctx));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn plain_mutating_ask_keeps_mode_reason_code() {
+        // Kills the guard -> true mutant on the ask_code match: a
+        // Mutating classification with the default reason code must
+        // fall through to "mode.default", not keep "mutating.default".
+        use zen_core::PermissionChecker as _;
+        let dir = tmpdir("plainask");
+        let ctx = ctx_for(&dir);
+        let p = perms(PermissionMode::Default, &[], &[], &[], None);
+        let (d, info) = p.gate_decision("Bash", &bash("cargo test"), false, &ctx);
+        assert!(matches!(d, PermissionDecision::Ask));
+        assert_eq!(info.bucket, GateBucket::Classifier);
+        assert_eq!(info.reason_code, "mode.default");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

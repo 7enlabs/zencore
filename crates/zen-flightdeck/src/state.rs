@@ -1325,4 +1325,72 @@ mod tests {
         });
         assert_eq!(s.agents[1].name, "sc[31mout");
     }
+
+    #[test]
+    fn gate_rows_filter_matches_by_text() {
+        // Kills the || -> && mutant in visible_gate_rows: a
+        // non-empty filter that matches a row must keep it.
+        let mut s = state();
+        s.apply(&AgentEvent::PermissionClassified {
+            tool_use_id: "g1".to_string(),
+            tool_name: "Bash".to_string(),
+            bucket: zen_core::GateBucket::Denied,
+            reason_code: "danger.rm-recursive-root".to_string(),
+            summary: "rm -rf /".to_string(),
+            parent_tool_use_id: None,
+        });
+        assert_eq!(s.visible_gate_rows().len(), 1);
+        s.filter = "rm".to_string();
+        assert_eq!(s.visible_gate_rows().len(), 1);
+        s.filter = "zzz-no-match".to_string();
+        assert!(s.visible_gate_rows().is_empty());
+    }
+
+    #[test]
+    fn gate_rows_are_capped_at_200() {
+        // Kills the > -> == mutant and the - -> + mutant in
+        // FlightdeckState::apply (gate cap): at 201 rows the oldest
+        // row must drain, not pile up or panic the drain range.
+        let mut s = state();
+        for i in 0..201 {
+            s.apply(&AgentEvent::PermissionClassified {
+                tool_use_id: format!("g{i}"),
+                tool_name: "Bash".to_string(),
+                bucket: zen_core::GateBucket::Denied,
+                reason_code: "danger.rm-recursive-root".to_string(),
+                summary: "rm -rf /".to_string(),
+                parent_tool_use_id: None,
+            });
+        }
+        assert_eq!(s.gate_rows.len(), 200);
+        assert_eq!(s.gate_rows[0].tool_use_id, "g1");
+    }
+
+    #[test]
+    fn permission_resolved_marks_the_matching_row_only() {
+        // Kills the && -> || mutant in FlightdeckState::apply: resolving
+        // an older row must not resolve a newer row with another id.
+        let mut s = state();
+        for id in ["g1", "g2"] {
+            s.apply(&AgentEvent::PermissionClassified {
+                tool_use_id: id.to_string(),
+                tool_name: "Bash".to_string(),
+                bucket: zen_core::GateBucket::Classifier,
+                reason_code: "warn.git-destructive".to_string(),
+                summary: "git reset --hard".to_string(),
+                parent_tool_use_id: None,
+            });
+        }
+        s.apply(&AgentEvent::PermissionResolved {
+            tool_use_id: "g1".to_string(),
+            outcome: zen_core::GateOutcome::ApprovedOnce,
+        });
+        assert!(s.gate_rows[0].resolution.is_some());
+        assert!(s.gate_rows[1].resolution.is_none());
+        assert_eq!(
+            s.pending_gate.as_ref().unwrap().tool_use_id,
+            "g2",
+            "resolving g1 must not clear the newer pending gate"
+        );
+    }
 }

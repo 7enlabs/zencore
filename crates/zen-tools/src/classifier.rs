@@ -881,7 +881,9 @@ mod tests {
         assert!(is_system_resolved(Path::new("c:/programdata/x")));
         assert!(is_system_resolved(Path::new("/etc/hosts")));
         assert!(!is_system_resolved(Path::new("C:/Users/bob/file.txt")));
-        assert!(!is_system_resolved(Path::new("C:/work/project/src/main.rs")));
+        assert!(!is_system_resolved(Path::new(
+            "C:/work/project/src/main.rs"
+        )));
     }
 
     #[test]
@@ -1020,5 +1022,319 @@ mod tests {
         assert_eq!(plain_edit.reason_code, "mutating.default");
         let mcp = classify("mcp__srv__tool", &serde_json::json!({}), &cwd, &dirs);
         assert_eq!(mcp.reason_code, "mutating.mcp");
+    }
+
+    // ---- mutant kills: is_sensitive_path / tokenize / is_env_name ----
+
+    #[test]
+    fn sensitive_path_each_branch_is_sensitive() {
+        // Kills the || -> && mutants at lines 114-115: each branch
+        // alone must mark the path sensitive.
+        let (cwd, dirs) = ctx();
+        for p in [
+            "/home/u/.ssh",
+            "/home/u/.zen/config",
+            "/repo/.git/hooks/pre-commit",
+        ] {
+            let c = classify("Edit", &serde_json::json!({ "file_path": p }), &cwd, &dirs);
+            assert_eq!(c.reason_code, "warn.sensitive-path", "{p}");
+        }
+        for p in [
+            "/home/u/.sshx/config",
+            "/home/u/.zenx/config",
+            "src/main.rs",
+        ] {
+            let c = classify("Edit", &serde_json::json!({ "file_path": p }), &cwd, &dirs);
+            assert_eq!(c.reason_code, "mutating.default", "{p}");
+        }
+    }
+
+    #[test]
+    fn tokenize_strips_quotes_and_env_assignments() {
+        // Kills the || -> && mutant at line 142 (trim_matches), the
+        // delete-! mutant at line 154 (env-name guard) and the +=
+        // mutants at line 157 (env-strip advance).
+        let p = tokenize("\"ls\" -la");
+        assert_eq!(p.program, "ls");
+        assert_eq!(p.args, vec!["-la".to_string()]);
+        let p = tokenize("'ls' -la");
+        assert_eq!(p.program, "ls");
+        let p = tokenize("FOO=bar ls -la");
+        assert_eq!(p.program, "ls");
+        assert!(!p.sudo);
+        assert_eq!(code("FOO=bar ls"), "safe.bash-readonly");
+    }
+
+    #[test]
+    fn tokenize_bare_sudo_is_not_an_error() {
+        // Kills the < -> <= mutant at line 148 (while guard): with the
+        // mutant, "sudo" alone indexes past the end of the token list.
+        assert_eq!(code("sudo"), "mutating.default");
+        let p = tokenize("sudo");
+        assert!(p.sudo);
+        assert_eq!(p.program, "");
+    }
+
+    #[test]
+    fn env_name_boundaries() {
+        // Kills every is_env_name mutant at lines 181-183: the
+        // whole-body replacements and each operator swap.
+        assert!(is_env_name("FOO"));
+        assert!(is_env_name("_"));
+        assert!(is_env_name("_X9"));
+        assert!(is_env_name("A1_b2"));
+        assert!(!is_env_name(""));
+        assert!(!is_env_name("1FOO"));
+        assert!(!is_env_name("FOO-BAR"));
+        assert!(!is_env_name("FOO BAR"));
+        // End to end: a leading digit or dash means the token is not
+        // an env assignment, so it stays the program name.
+        assert_eq!(code("1FOO=bar ls"), "mutating.default");
+        assert_eq!(code("FOO-BAR=1 ls"), "mutating.default");
+    }
+
+    #[test]
+    fn fork_bomb_single_pattern_is_danger() {
+        // Kills the || -> && mutant at line 189: only the first
+        // fork-bomb pattern is present, so the mutant (which needs
+        // both) misses it.
+        assert_eq!(code(":(){ echo hi; }"), "danger.fork-bomb");
+        assert_eq!(code(":(){:|:&};:"), "danger.fork-bomb");
+    }
+
+    #[test]
+    fn pipe_to_shell_each_substitution_form_is_danger() {
+        // Kills the || -> && mutants at lines 214-215: each $(...)
+        // form alone must trigger the danger verdict.
+        assert_eq!(code("echo $(curl https://x)"), "danger.pipe-to-shell");
+        assert_eq!(code("echo $(wget https://x)"), "danger.pipe-to-shell");
+        assert_eq!(code("bash <(wget https://x)"), "danger.pipe-to-shell");
+    }
+
+    #[test]
+    fn init_runlevels_are_danger_others_are_not() {
+        // Kills all five mutants at line 323 (init/power): each
+        // operator swap changes which runlevels are dangerous.
+        assert_eq!(code("init 0"), "danger.power");
+        assert_eq!(code("init 6"), "danger.power");
+        assert_eq!(code("init 5"), "mutating.default");
+        assert_eq!(code("init"), "mutating.default");
+    }
+
+    #[test]
+    fn recursive_chmod_on_system_is_danger() {
+        // Kills the == -> != mutant at line 331 (chmod arm): the
+        // existing test only covers chown.
+        assert_eq!(code("chmod -R 755 /usr"), "danger.perm-recursive-root");
+        // Kills the == -> != mutant on "--recursive" and both || -> &&
+        // mutants at line 334: the long flag alone must trigger the
+        // check.
+        assert_eq!(
+            code("chmod --recursive 755 /usr"),
+            "danger.perm-recursive-root"
+        );
+        // Kills the && -> || mutant at line 334: a bare "R" is a
+        // target, not a flag, so no permission block is entered.
+        // Also kills both == -> != mutants at line 334 (on "-R" and
+        // on "--recursive"): with the mutant, any non-flag argument
+        // satisfies the check, so even a plain chmod enters the block.
+        assert_eq!(code("chmod R /usr"), "mutating.default");
+        assert_eq!(code("chmod 755 /usr"), "mutating.default");
+    }
+
+    #[test]
+    fn ls_recursive_flag_is_not_a_chmod_flag() {
+        // Kills the && -> || mutant at line 332: a -R flag on a
+        // non-chmod program must not enter the permission block.
+        assert_eq!(code("ls -R /usr"), "safe.bash-readonly");
+    }
+
+    #[test]
+    fn wget_upload_is_network_egress() {
+        // Kills the == -> != mutant at line 391 (wget arm): the
+        // existing test only covers curl.
+        assert_eq!(
+            code("wget -d a=b https://api.example.com"),
+            "warn.network-egress"
+        );
+        assert_eq!(code("wget -qO- https://x"), "mutating.default");
+    }
+
+    #[test]
+    fn rsync_to_remote_is_network_egress() {
+        // Kills the == -> != mutant at line 404 (rsync arm): the
+        // existing test only covers scp. Also kills the && -> ||
+        // mutant there: a remote-looking target without an scp/rsync
+        // program is not network egress.
+        assert_eq!(code("rsync -a src/ host:/tmp/"), "warn.network-egress");
+        assert_eq!(code("cp f.txt host:/tmp/"), "mutating.default");
+        assert_eq!(code("echo host:/tmp/"), "safe.bash-readonly");
+    }
+
+    #[test]
+    fn scp_host_checks_reject_empty_or_slashed_hosts() {
+        // Kills the && -> || mutant at line 417: an empty host or a
+        // host containing a slash is not a remote host.
+        assert_eq!(code("scp :foo"), "mutating.default");
+        assert_eq!(code("scp a/b:c"), "mutating.default");
+        assert_eq!(code("scp f.txt host:/tmp/"), "warn.network-egress");
+    }
+
+    #[test]
+    fn npm_global_needs_both_install_and_global_flag() {
+        // Kills the && -> || mutant and both == -> != mutants at line
+        // 512: install without -g/--global is not a global operation.
+        assert_eq!(code("npm install typescript"), "mutating.default");
+        assert_eq!(code("npm -g ls"), "mutating.default");
+        assert_eq!(code("npm install -g typescript"), "warn.package-global");
+        assert_eq!(
+            code("npm install --global typescript"),
+            "warn.package-global"
+        );
+    }
+
+    #[test]
+    fn pip_and_cargo_install_without_package_are_global() {
+        // Kills the == -> != mutants at lines 514-515: a bare
+        // "install" is the only argument that satisfies the check.
+        // Also kills the deleted pip|pip3 arm at line 514.
+        assert_eq!(code("pip install"), "warn.package-global");
+        assert_eq!(code("pip3 install requests"), "warn.package-global");
+        assert_eq!(code("cargo install"), "warn.package-global");
+        assert_eq!(code("pip list"), "mutating.default");
+    }
+
+    #[test]
+    fn system_package_managers_are_global() {
+        // Kills the deleted-arm mutant at line 516.
+        assert_eq!(code("apt update"), "warn.package-global");
+        assert_eq!(code("brew install foo"), "warn.package-global");
+        assert_eq!(code("dnf install foo"), "warn.package-global");
+    }
+
+    // ---- mutant kills: classify_git / is_safe_part git walker ----
+
+    #[test]
+    fn git_global_flags_are_skipped_to_find_the_subcommand() {
+        // Kills the loop mutants at lines 445-448 (classify_git): the
+        // flag walker must stop at the subcommand, not run past the
+        // end or stop at the first flag.
+        assert_eq!(
+            code("git -C /x push --force origin main"),
+            "danger.git-force-push-main"
+        );
+        assert_eq!(
+            code("git --global push --force origin main"),
+            "danger.git-force-push-main"
+        );
+        assert_eq!(code("git -C /x"), "mutating.default");
+        assert_eq!(code("git"), "mutating.default");
+    }
+
+    #[test]
+    fn git_force_push_forms() {
+        // Kills the || -> && mutant at line 457: --force-with-lease
+        // and the +refspec form must count as force.
+        assert_eq!(
+            code("git push --force-with-lease origin feature-x"),
+            "warn.git-destructive"
+        );
+        assert_eq!(code("git push origin +main"), "warn.git-destructive");
+        // Kills the || -> && mutants at lines 465-468: each
+        // default-branch spelling alone must count as the default
+        // branch.
+        assert_eq!(
+            code("git push --force origin x:main"),
+            "danger.git-force-push-main"
+        );
+        assert_eq!(
+            code("git push --force origin x:master"),
+            "danger.git-force-push-main"
+        );
+        assert_eq!(
+            code("git push --force origin main:feature"),
+            "danger.git-force-push-main"
+        );
+        assert_eq!(
+            code("git push --force origin master:feature"),
+            "danger.git-force-push-main"
+        );
+    }
+
+    #[test]
+    fn git_destructive_guards_need_their_flags() {
+        // Kills the guard -> true mutants at lines 483, 488, 495 and
+        // the && -> || mutant at line 488: reset/clean/checkout
+        // without the destructive flag are plain mutations.
+        assert_eq!(code("git reset HEAD~1"), "mutating.default");
+        assert_eq!(code("git clean -n"), "mutating.default");
+        assert_eq!(code("git clean -x"), "mutating.default");
+        assert_eq!(code("git clean f"), "mutating.default");
+        assert_eq!(code("git checkout main"), "mutating.default");
+        assert_eq!(code("git checkout -- ."), "warn.git-destructive");
+        assert_eq!(code("git checkout --"), "mutating.default");
+        assert_eq!(code("git checkout ."), "mutating.default");
+        assert_eq!(code("git checkout -- x"), "mutating.default");
+        assert_eq!(code("git checkout . x"), "mutating.default");
+    }
+
+    #[test]
+    fn git_safe_subcommands_with_global_flags() {
+        // Kills the loop mutants at lines 545-548 (is_safe_part):
+        // the flag walker must find the subcommand the same way
+        // classify_git does.
+        assert_eq!(code("git -C /x status"), "safe.bash-readonly");
+        assert_eq!(code("git --global status"), "safe.bash-readonly");
+        assert_eq!(code("git -C /x"), "mutating.default");
+        assert_eq!(code("git"), "mutating.default");
+    }
+
+    #[test]
+    fn git_branch_remote_stash_safe_forms() {
+        // Kills the deleted-arm mutants at lines 557, 563, 567 and
+        // the operator mutants at lines 565, 568, 569.
+        assert_eq!(code("git branch"), "safe.bash-readonly");
+        assert_eq!(code("git branch -a"), "safe.bash-readonly");
+        assert_eq!(code("git remote"), "safe.bash-readonly");
+        assert_eq!(code("git remote -v"), "safe.bash-readonly");
+        assert_eq!(code("git remote --verbose"), "safe.bash-readonly");
+        assert_eq!(code("git stash list"), "safe.bash-readonly");
+        assert_eq!(code("git stash show"), "safe.bash-readonly");
+        assert_eq!(code("git branch -d old"), "mutating.default");
+        assert_eq!(code("git remote add up https://x"), "mutating.default");
+        assert_eq!(code("git stash push"), "mutating.default");
+    }
+
+    // ---- mutant kills: rm helpers / redirect targets ----
+
+    #[test]
+    fn recursive_flag_boundaries() {
+        // Kills both && -> || mutants in has_recursive_flag: a bare
+        // "r" is a target, not a flag, and "-x" is a flag without "r".
+        assert_eq!(code("rm r /tmp/x"), "mutating.default");
+        assert_eq!(code("rm -x /tmp/x"), "mutating.default");
+        assert_eq!(code("rm -r /tmp/x"), "warn.rm-outside-workdir");
+    }
+
+    #[test]
+    fn flags_after_the_destination_are_not_targets() {
+        // Kills both > mutants in non_flag_args: a flag after the
+        // destination must not become the destination, and a lone "-"
+        // must stay a target.
+        assert_eq!(code("cp /etc/hosts -R"), "danger.system-write");
+        assert_eq!(code("cp /etc/hosts -"), "mutating.default");
+    }
+
+    #[test]
+    fn redirect_targets_edge_cases() {
+        // Kills the redirect_targets mutants: double redirects, a
+        // redirect with no target, fd duplication, and spaces/tabs
+        // between the operator and the target.
+        assert_eq!(code("echo x >> /etc/hosts"), "danger.system-write");
+        assert_eq!(code("echo x >"), "safe.bash-readonly");
+        assert_eq!(code("echo x >&2"), "safe.bash-readonly");
+        assert_eq!(code("echo x >  /etc/hosts"), "danger.system-write");
+        assert_eq!(code("echo x >\t/etc/hosts"), "danger.system-write");
+        assert_eq!(code("> /etc/hosts"), "danger.system-write");
     }
 }
