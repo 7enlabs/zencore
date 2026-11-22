@@ -1897,6 +1897,50 @@ mod tests {
         assert!(pacer.acquire() < Duration::from_secs(1));
         assert!(pacer.acquire() >= Duration::from_secs(30));
     }
+
+    #[test]
+    fn provider_name_for_url_returns_exact_host() {
+        // PR #271 mutant kills (client.rs:208): the `-> String` mutant
+        // returning String::new() and the one returning "xyzzy" both die
+        // on these exact-value asserts.
+        assert_eq!(
+            provider_name_for_url("https://api.experientiallabs.ai/api/v1"),
+            "api.experientiallabs.ai"
+        );
+        assert_eq!(
+            provider_name_for_url("https://openrouter.ai/api/v1"),
+            "openrouter.ai"
+        );
+        assert_eq!(
+            provider_name_for_url("https://API.EXAMPLE.COM:8443/v1"),
+            "api.example.com:8443"
+        );
+        assert_eq!(
+            provider_name_for_url("https://user:pass@api.example.com/v1"),
+            "api.example.com"
+        );
+    }
+
+    #[test]
+    fn provider_name_for_url_local_on_either_condition() {
+        // PR #271 mutant kill (client.rs:209): the `||` -> `&&` mutant
+        // dies because each URL here satisfies exactly one of the two
+        // conditions, so only `||` returns "local" for all of them.
+        // Ollama name, not a local URL.
+        assert_eq!(
+            provider_name_for_url("https://ollama.example.com/api"),
+            "local"
+        );
+        // Local URL, no ollama name.
+        assert_eq!(provider_name_for_url("http://localhost:11434"), "local");
+        assert_eq!(provider_name_for_url("http://127.0.0.1:8080/v1"), "local");
+    }
+
+    #[test]
+    fn provider_name_for_url_falls_back_to_provider_label() {
+        assert_eq!(provider_name_for_url(""), "provider");
+        assert_eq!(provider_name_for_url("https://"), "provider");
+    }
 }
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
