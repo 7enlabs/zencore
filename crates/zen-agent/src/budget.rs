@@ -15,7 +15,7 @@ fn price_table(model: &str) -> Option<(f64, f64)> {
         "gemini-2.5-flash" => (0.30, 2.50),
         "gemini-2.5-pro" => (1.25, 10.00),
 
-        // List price on the Experiential gateway (its public models
+        // List price on the default gateway (its public models
         // page, 2026-11-08): Gemini 4 Argon is NOT free, despite the
         // free catalog listing it. Pricing it honestly keeps /cost
         // correct and lets a budget cap actually bite. The $2/$10
@@ -23,7 +23,7 @@ fn price_table(model: &str) -> Option<(f64, f64)> {
         // the list price rises to $4/$20 after - update this entry.
         "gemini-4-argon" => (2.00, 10.00),
 
-        // Free $0 on the Experiential gateway Free plan (public pricing
+        // Free $0 on the default gateway Free plan (public pricing
         // page, 2026-11-08): the default model, so /cost and the budget
         // guard must treat it as free.
         "deepseek-v4.1-flash" => (0.0, 0.0),

@@ -20,15 +20,11 @@ impl ApiStandard {
 pub struct ProviderInfo {
     pub key: &'static str,
 
-    pub display_name: &'static str,
-
     pub openai_base_url: Option<&'static str>,
 
     pub anthropic_base_url: Option<&'static str>,
 
     pub api_key_env: Option<&'static str>,
-
-    pub docs_url: &'static str,
 
     pub model_ids: &'static [&'static str],
 
@@ -74,11 +70,9 @@ pub fn provider_registry() -> Vec<ProviderInfo> {
     vec![
         ProviderInfo {
             key: "openrouter",
-            display_name: "OpenRouter",
             openai_base_url: Some("https://openrouter.ai/api/v1"),
             anthropic_base_url: None,
             api_key_env: Some("OPENROUTER_API_KEY"),
-            docs_url: "https://openrouter.ai/docs",
             model_ids: &[],
             pricing: &[],
             featured: &["qwen/qwen3-coder:free"],
@@ -86,11 +80,9 @@ pub fn provider_registry() -> Vec<ProviderInfo> {
         },
         ProviderInfo {
             key: "groq",
-            display_name: "Groq",
             openai_base_url: Some("https://api.groq.com/openai/v1"),
             anthropic_base_url: None,
             api_key_env: Some("GROQ_API_KEY"),
-            docs_url: "https://console.groq.com/docs",
             model_ids: &[],
             pricing: &[],
             featured: &[],
@@ -98,11 +90,9 @@ pub fn provider_registry() -> Vec<ProviderInfo> {
         },
         ProviderInfo {
             key: "anthropic",
-            display_name: "Anthropic",
             openai_base_url: None,
             anthropic_base_url: Some("https://api.anthropic.com"),
             api_key_env: Some("ANTHROPIC_API_KEY"),
-            docs_url: "https://docs.anthropic.com/",
             model_ids: &["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
             pricing: &[],
             featured: &[],
@@ -110,11 +100,9 @@ pub fn provider_registry() -> Vec<ProviderInfo> {
         },
         ProviderInfo {
             key: "openai",
-            display_name: "OpenAI",
             openai_base_url: Some("https://api.openai.com/v1"),
             anthropic_base_url: None,
             api_key_env: Some("OPENAI_API_KEY"),
-            docs_url: "https://platform.openai.com/docs",
             model_ids: &[],
             pricing: &[],
             featured: &[],
@@ -122,11 +110,9 @@ pub fn provider_registry() -> Vec<ProviderInfo> {
         },
         ProviderInfo {
             key: "ollama",
-            display_name: "Ollama (local)",
             openai_base_url: Some("http://localhost:11434/v1"),
             anthropic_base_url: None,
             api_key_env: None,
-            docs_url: "https://ollama.com/",
             model_ids: &[],
             pricing: &[],
             featured: &["qwen3-coder", "qwen3-coder:30b"],
@@ -134,11 +120,9 @@ pub fn provider_registry() -> Vec<ProviderInfo> {
         },
         ProviderInfo {
             key: "zai",
-            display_name: "Z.ai (Zhipu)",
             openai_base_url: Some("https://api.z.ai/api/paas/v4"),
             anthropic_base_url: Some("https://api.z.ai/api/anthropic"),
             api_key_env: Some("ZAI_API_KEY"),
-            docs_url: "https://docs.z.ai/",
             model_ids: &["glm-5.2", "glm-4.6", "glm-4.5", "glm-4.5-air"],
 
             pricing: &[("glm-5.2", 1.40, 4.40)],
@@ -147,11 +131,9 @@ pub fn provider_registry() -> Vec<ProviderInfo> {
         },
         ProviderInfo {
             key: "moonshot",
-            display_name: "Moonshot AI (Kimi)",
             openai_base_url: Some("https://api.moonshot.ai/v1"),
             anthropic_base_url: Some("https://api.moonshot.ai/anthropic"),
             api_key_env: Some("MOONSHOT_API_KEY"),
-            docs_url: "https://platform.moonshot.ai/docs",
             model_ids: &["kimi-k2.7", "kimi-k3", "kimi-k2.6"],
 
             pricing: &[("kimi-k2.7", 0.95, 4.00), ("kimi-k3", 3.00, 15.00)],
@@ -160,11 +142,9 @@ pub fn provider_registry() -> Vec<ProviderInfo> {
         },
         ProviderInfo {
             key: "deepseek",
-            display_name: "DeepSeek",
             openai_base_url: Some("https://api.deepseek.com/v1"),
             anthropic_base_url: Some("https://api.deepseek.com/anthropic"),
             api_key_env: Some("DEEPSEEK_API_KEY"),
-            docs_url: "https://api-docs.deepseek.com/",
             model_ids: &["deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner"],
 
             pricing: &[("deepseek-v4-flash", 0.14, 0.28)],
@@ -174,14 +154,12 @@ pub fn provider_registry() -> Vec<ProviderInfo> {
         },
         ProviderInfo {
             key: "cloudflare",
-            display_name: "Cloudflare Workers AI",
 
             openai_base_url: Some(
                 "https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1",
             ),
             anthropic_base_url: None,
             api_key_env: Some("CLOUDFLARE_API_TOKEN"),
-            docs_url: "https://developers.cloudflare.com/workers-ai/",
             model_ids: &[
                 "@cf/meta/llama-3.1-8b-instruct",
                 "@cf/cloudflare/clef-flash",
@@ -199,11 +177,9 @@ pub fn provider_registry() -> Vec<ProviderInfo> {
         },
         ProviderInfo {
             key: "together",
-            display_name: "Together AI",
             openai_base_url: Some("https://api.together.xyz/v1"),
             anthropic_base_url: None,
             api_key_env: Some("TOGETHER_API_KEY"),
-            docs_url: "https://docs.together.ai/",
             model_ids: &[],
             pricing: &[],
             featured: &[],
@@ -211,11 +187,9 @@ pub fn provider_registry() -> Vec<ProviderInfo> {
         },
         ProviderInfo {
             key: "mistral",
-            display_name: "Mistral",
             openai_base_url: Some("https://api.mistral.ai/v1"),
             anthropic_base_url: None,
             api_key_env: Some("MISTRAL_API_KEY"),
-            docs_url: "https://docs.mistral.ai/",
             model_ids: &[],
             pricing: &[],
             featured: &[],
@@ -223,11 +197,9 @@ pub fn provider_registry() -> Vec<ProviderInfo> {
         },
         ProviderInfo {
             key: "cerebras",
-            display_name: "Cerebras",
             openai_base_url: Some("https://api.cerebras.ai/v1"),
             anthropic_base_url: None,
             api_key_env: Some("CEREBRAS_API_KEY"),
-            docs_url: "https://inference-docs.cerebras.ai/",
             model_ids: &[],
             pricing: &[],
             featured: &[],
@@ -235,11 +207,9 @@ pub fn provider_registry() -> Vec<ProviderInfo> {
         },
         ProviderInfo {
             key: "fireworks",
-            display_name: "Fireworks AI",
             openai_base_url: Some("https://api.fireworks.ai/inference/v1"),
             anthropic_base_url: None,
             api_key_env: Some("FIREWORKS_API_KEY"),
-            docs_url: "https://docs.fireworks.ai/",
             model_ids: &[],
             pricing: &[],
             featured: &[],
@@ -247,11 +217,9 @@ pub fn provider_registry() -> Vec<ProviderInfo> {
         },
         ProviderInfo {
             key: "google",
-            display_name: "Google AI",
             openai_base_url: Some("https://generativelanguage.googleapis.com/v1beta/openai"),
             anthropic_base_url: None,
             api_key_env: Some("GOOGLE_API_KEY"),
-            docs_url: "https://ai.google.dev/",
             model_ids: &[],
             pricing: &[],
             featured: &[],
@@ -259,11 +227,9 @@ pub fn provider_registry() -> Vec<ProviderInfo> {
         },
         ProviderInfo {
             key: "gemini",
-            display_name: "Google AI (alias)",
             openai_base_url: Some("https://generativelanguage.googleapis.com/v1beta/openai"),
             anthropic_base_url: None,
             api_key_env: Some("GOOGLE_API_KEY"),
-            docs_url: "https://ai.google.dev/",
             model_ids: &[],
             pricing: &[],
             featured: &[],
@@ -668,7 +634,6 @@ mod tests {
     #[test]
     fn cloudflare_entry_is_correct() {
         let p = find_provider("cloudflare").unwrap();
-        assert_eq!(p.display_name, "Cloudflare Workers AI");
         assert_eq!(p.api_key_env, Some("CLOUDFLARE_API_TOKEN"));
         assert!(p.anthropic_base_url.is_none());
 

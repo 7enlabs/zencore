@@ -721,7 +721,7 @@ pub enum TaskSubcommand {
 
 #[derive(Args, Debug, Clone)]
 #[command(
-    after_help = "Examples:\n  zen secret request --name OPENROUTER_KEY --purpose \"verification runs\" --scope task:DS-7 --until 2026-11-15T08:00:00Z --seat zd-developer\n  zen secret list --state issued\n  zen secret approve --request sr-20261108-001 --by zc-leader --evidence \"tin 8071\"\n  zen secret withdraw --request sr-20261108-001 --by zd-developer --reason \"no longer needed\"\n  zen secret issue --request sr-20261108-001 --by z-ops\n  zen secret status --name OPENROUTER_KEY\n  zen secret rotate --name OPENROUTER_KEY --by zc-leader --reason \"90-day rotation\"\n\nSecrets are named, never shown: no command prints a secret value.\nThe seat filing a request is --seat, or the ZEN_SEAT environment variable."
+    after_help = "Examples:\n  zen secret request --name MODEL_API_KEY --purpose \"verification runs\" --scope task:DS-7 --until 2026-11-15T08:00:00Z --seat zd-developer\n  zen secret list --state issued\n  zen secret approve --request sr-20261108-001 --by zc-leader --evidence \"tin 8071\"\n  zen secret withdraw --request sr-20261108-001 --by zd-developer --reason \"no longer needed\"\n  zen secret issue --request sr-20261108-001 --by z-ops\n  zen secret status --name MODEL_API_KEY\n  zen secret rotate --name MODEL_API_KEY --by zc-leader --reason \"90-day rotation\"\n\nSecrets are named, never shown: no command prints a secret value.\nThe seat filing a request is --seat, or the ZEN_SEAT environment variable."
 )]
 pub struct SecretArgs {
     #[command(subcommand)]
@@ -732,7 +732,7 @@ pub struct SecretArgs {
 pub enum SecretSubcommand {
     /// File a secret request (state: requested)
     Request {
-        /// Canonical secret name, e.g. OPENROUTER_KEY
+        /// Canonical secret name, e.g. MODEL_API_KEY
         #[arg(long)]
         name: String,
 
@@ -849,7 +849,7 @@ pub enum SecretSubcommand {
 
     /// Start a rotation: a new request linked to the old one
     Rotate {
-        /// Canonical secret name, e.g. OPENROUTER_KEY
+        /// Canonical secret name, e.g. MODEL_API_KEY
         #[arg(long)]
         name: String,
 
@@ -871,7 +871,7 @@ pub enum SecretSubcommand {
 
     /// Register a secret name (Leader only, design section 4.3)
     Register {
-        /// Canonical secret name, e.g. OPENROUTER_KEY
+        /// Canonical secret name, e.g. MODEL_API_KEY
         #[arg(long)]
         name: String,
 
@@ -879,7 +879,7 @@ pub enum SecretSubcommand {
         #[arg(long)]
         class: String,
 
-        /// Service the secret unlocks, e.g. openrouter
+        /// Service the secret unlocks, e.g. model-service
         #[arg(long)]
         service: String,
 
@@ -910,7 +910,7 @@ pub enum SecretSubcommand {
 
     /// Deregister a secret name (Leader only, design section 4.3)
     Deregister {
-        /// Canonical secret name, e.g. OPENROUTER_KEY
+        /// Canonical secret name, e.g. MODEL_API_KEY
         #[arg(long)]
         name: String,
 
@@ -1633,7 +1633,7 @@ mod tests {
             "secret",
             "request",
             "--name",
-            "OPENROUTER_KEY",
+            "MODEL_API_KEY",
             "--purpose",
             "verification runs",
             "--scope",
@@ -1655,7 +1655,7 @@ mod tests {
                     broker_action,
                     seat,
                 } => {
-                    assert_eq!(name, "OPENROUTER_KEY");
+                    assert_eq!(name, "MODEL_API_KEY");
                     assert_eq!(purpose, "verification runs");
                     assert_eq!(scope, "task:DS-7");
                     assert_eq!(until, "2026-11-15T08:00:00Z");
@@ -1767,7 +1767,7 @@ mod tests {
             "secret",
             "rotate",
             "--name",
-            "OPENROUTER_KEY",
+            "MODEL_API_KEY",
             "--by",
             "zc-leader",
             "--reason",
@@ -1777,11 +1777,11 @@ mod tests {
             cli.subcommand,
             Some(Commands::Secret(s)) if matches!(s.command, SecretSubcommand::Rotate { .. })
         ));
-        let cli = parse(&["secret", "status", "--name", "OPENROUTER_KEY"]);
+        let cli = parse(&["secret", "status", "--name", "MODEL_API_KEY"]);
         match cli.subcommand {
             Some(Commands::Secret(s)) => match s.command {
                 SecretSubcommand::Status { name } => {
-                    assert_eq!(name.as_deref(), Some("OPENROUTER_KEY"));
+                    assert_eq!(name.as_deref(), Some("MODEL_API_KEY"));
                 }
                 other => panic!("expected Status, got {:?}", other),
             },
@@ -1791,11 +1791,11 @@ mod tests {
             "secret",
             "register",
             "--name",
-            "OPENROUTER_KEY",
+            "MODEL_API_KEY",
             "--class",
             "seat",
             "--service",
-            "openrouter",
+            "model-service",
             "--owner",
             "zc-leader",
             "--by",
@@ -1820,9 +1820,9 @@ mod tests {
                     paid,
                     reason,
                 } => {
-                    assert_eq!(name, "OPENROUTER_KEY");
+                    assert_eq!(name, "MODEL_API_KEY");
                     assert_eq!(class, "seat");
-                    assert_eq!(service, "openrouter");
+                    assert_eq!(service, "model-service");
                     assert_eq!(owner, "zc-leader");
                     assert_eq!(by, "zc-leader");
                     assert_eq!(default_until_days, 7);
@@ -1838,7 +1838,7 @@ mod tests {
             "secret",
             "deregister",
             "--name",
-            "OPENROUTER_KEY",
+            "MODEL_API_KEY",
             "--by",
             "zc-leader",
             "--reason",

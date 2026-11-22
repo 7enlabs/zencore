@@ -1164,8 +1164,8 @@ fn available_model_rows(home: Option<&Path>, base_url: &str) -> (Vec<ModelRow>, 
         }
     }
     // The catalog fallback shows only what the current provider
-    // really serves (catalog by real provider): on the Experiential
-    // base the OpenRouter entries must not appear as pickable
+    // really serves (catalog by real provider): on the default
+    // base the free-pool entries must not appear as pickable
     // models. A custom base has no known provider, so the whole
     // catalog stays rather than excluding models that might serve it.
     let rows = match crate::models::provider_for_base_url(base_url) {
@@ -1487,8 +1487,8 @@ fn pick_model(arg: &str, rows: &[ModelRow]) -> Result<String, String> {
 /// provider and the gateway id the provider accepts; picking one must
 /// change the model string, the base URL, the API key and the live
 /// backend together - changing only the string is the HTTP 400
-/// "Invalid Model Name" bug (the old code sent OpenRouter-style ids to
-/// the Experiential gateway, and experiential ids with the wrong shape).
+/// "Invalid Model Name" bug (the old code sent prefixed ids to
+/// the default gateway, and default ids with the wrong shape).
 /// Returns the line to print, or an error to print; on error the switch
 /// is refused and the previous model and backend stay untouched.
 fn apply_model_switch(
@@ -1829,7 +1829,7 @@ async fn handle_slash(
         }
         "/quota" => {
             let store = home.map(zen_agent::RateGate::default_store_path);
-            let key_url = zen_agent::rategate::openrouter_key_url(&cfg.base_url);
+            let key_url = zen_agent::rategate::key_info_url(&cfg.base_url);
             let key = cfg.api_key();
             println!(
                 "{}",
@@ -3693,18 +3693,18 @@ mod model_picker_tests {
     #[test]
     fn catalog_rows_are_scoped_to_the_current_provider() {
         // No probe cache at home None, so the catalog fallback runs.
-        let (experiential, _) = available_model_rows(None, crate::settings::DEFAULT_BASE_URL);
-        assert_eq!(experiential.len(), 1);
-        assert_eq!(experiential[0].id, "deepseek-v4.1-flash");
-        let (openrouter, _) = available_model_rows(None, crate::models::OPENROUTER_BASE_URL);
-        assert_eq!(openrouter.len(), 4);
-        assert!(openrouter.iter().all(|r| r.id != "deepseek-v4.1-flash"));
+        let (default_rows, _) = available_model_rows(None, crate::settings::DEFAULT_BASE_URL);
+        assert_eq!(default_rows.len(), 1);
+        assert_eq!(default_rows[0].id, "deepseek-v4.1-flash");
+        let (free_pool, _) = available_model_rows(None, crate::models::FREE_POOL_BASE_URL);
+        assert_eq!(free_pool.len(), 4);
+        assert!(free_pool.iter().all(|r| r.id != "deepseek-v4.1-flash"));
         // A custom base has no known provider: nothing is excluded.
         let (custom, _) = available_model_rows(None, "https://example.invalid/v1");
         assert_eq!(custom.len(), 5);
         // Numbered picks follow the filtered list, so an id outside
         // the current provider is not pickable at all.
-        assert!(pick_model("qwen/qwen3-coder:free", &experiential).is_err());
+        assert!(pick_model("qwen/qwen3-coder:free", &default_rows).is_err());
     }
 
     #[test]
@@ -3874,7 +3874,7 @@ mod model_picker_tests {
     }
 
     #[tokio::test]
-    async fn switch_to_experiential_model_sends_bare_slug() {
+    async fn switch_to_default_model_sends_bare_slug() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let backend = std::sync::Arc::new(RecordingBackend {
             models: std::sync::Mutex::new(vec![]),
@@ -3917,7 +3917,7 @@ mod model_picker_tests {
     }
 
     #[test]
-    fn switch_to_openrouter_model_changes_provider() {
+    fn switch_to_free_pool_model_changes_provider() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env_guard = EnvGuard::set("OPENROUTER_API_KEY", "test-openrouter-key");
         let backend = std::sync::Arc::new(RecordingBackend {
@@ -4005,7 +4005,7 @@ mod model_picker_tests {
     }
 
     #[test]
-    fn switch_to_openrouter_model_without_key_is_refused() {
+    fn switch_to_free_pool_model_without_key_is_refused() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env_guard = EnvGuard::remove("OPENROUTER_API_KEY");
         let backend = std::sync::Arc::new(RecordingBackend {
@@ -4032,7 +4032,7 @@ mod model_picker_tests {
     }
 
     #[tokio::test]
-    async fn slash_pin_to_openrouter_model_without_key_is_refused() {
+    async fn slash_pin_to_free_pool_model_without_key_is_refused() {
         // Bug hunt #1 (Scout B P1-1 + Scout C F3): a slash command pinning
         // a cross-provider catalog id must route like /model does. With
         // the provider key unset the turn must be refused before any
@@ -4149,8 +4149,8 @@ mod model_picker_tests {
 
     #[test]
     fn switch_round_trip_restores_home_key() {
-        // F1: experiential -> openrouter -> experiential must restore
-        // the startup key, not leak the OpenRouter key.
+        // F1: default -> free-pool -> default must restore
+        // the startup key, not leak the free-pool key.
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env_guard = EnvGuard::set("OPENROUTER_API_KEY", "or-key");
         let backend = std::sync::Arc::new(RecordingBackend {
@@ -4189,7 +4189,7 @@ mod model_picker_tests {
     }
 
     #[test]
-    fn route_keeps_experiential_default_on_default_base() {
+    fn route_keeps_default_model_on_default_base() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut cfg = test_cfg();
         assert_eq!(cfg.model, "deepseek-v4.1-flash");
@@ -4419,7 +4419,7 @@ mod model_picker_tests {
     }
 
     #[test]
-    fn route_moves_openrouter_model_to_its_provider() {
+    fn route_moves_free_pool_model_to_its_service() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env_guard = EnvGuard::set("OPENROUTER_API_KEY", "or-key");
         let mut cfg = test_cfg();
@@ -4431,7 +4431,7 @@ mod model_picker_tests {
     }
 
     #[test]
-    fn route_refuses_openrouter_model_without_key() {
+    fn route_refuses_free_pool_model_without_key() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env_guard = EnvGuard::remove("OPENROUTER_API_KEY");
         let mut cfg = test_cfg();
@@ -4472,11 +4472,11 @@ mod model_picker_tests {
         let routed = crate::settings::route_catalog_model(&mut cfg).unwrap();
         assert!(routed);
         assert_eq!(cfg.model, "deepseek-v4.1-flash");
-        // On the OpenRouter base, auto is that provider's default.
+        // On the free-pool base, auto is that service's default.
         let _env_guard = EnvGuard::set("OPENROUTER_API_KEY", "or-key");
         let mut cfg = test_cfg();
         cfg.model = "auto".to_string();
-        cfg.base_url = crate::models::OPENROUTER_BASE_URL.to_string();
+        cfg.base_url = crate::models::FREE_POOL_BASE_URL.to_string();
         let routed = crate::settings::route_catalog_model(&mut cfg).unwrap();
         assert!(routed);
         assert_eq!(cfg.model, "qwen/qwen3-coder:free");

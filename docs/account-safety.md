@@ -1,7 +1,7 @@
 # Account Safety
 
 Zen is designed to be a **good API citizen** so your paid accounts
-(OpenAI, Anthropic, Google) stay in good standing.
+stay in good standing.
 
 > **Honest disclaimer:** No tool can guarantee your account won't be flagged -
 > providers use automated systems with false positives. Zen minimizes the
@@ -81,17 +81,17 @@ conscious decision. The acknowledgement is logged with a timestamp.
 It **never** disables backoff, never enables retry of quota errors, and never
 bypasses the User-Agent. It only acknowledges *volume* risk you choose to take.
 
-## Provider-specific notes
+## Service-specific notes
 
-- **OpenAI:** 429s come in two flavors - `rate_limit_exceeded` (slow down, retry)
+- **Chat-completions endpoints:** 429s come in two flavors - `rate_limit_exceeded` (slow down, retry)
   vs `insufficient_quota` (out of money - Zen stops immediately). Keep
   `max_tokens` tight: the token limit counts what you *request*, not just what
   is used.
-- **Anthropic:** 429 means *you* hit a limit (respect `retry-after`); 529 means
-  *Anthropic* is overloaded (back off and consider another provider). Prompt
+- **Messages-API endpoints:** 429 means *you* hit a limit (respect `retry-after`); 529 means
+  the service is overloaded (back off and consider another service). Prompt
   caching reduces per-minute token pressure.
-- **Google (AI Studio):** Quotas are per-project and checked in AI Studio.
-  Free-tier content may be used by Google to improve their products - a privacy
+- **Free tiers:** quotas are per-project or per-account.
+  Free-tier content may be used by the service to improve its products - a privacy
   consideration for code, not a ban trigger.
 
 ## FAQ

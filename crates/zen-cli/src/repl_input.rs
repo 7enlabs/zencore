@@ -494,7 +494,7 @@ mod tests {
         let models = vec![
             (
                 "nemo".to_string(),
-                "openrouter".to_string(),
+                "free-pool".to_string(),
                 "nvidia/nemotron-nano-9b-v2:free".to_string(),
             ),
             (

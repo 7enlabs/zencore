@@ -54,7 +54,7 @@ claimed.
 | 5 remaining | | not run | run stopped to protect shared worker |
 
 **Next step:** rerun on a machine with headroom (or against a hosted free
-endpoint, e.g. Experiential Labs / OpenRouter `:free` via `ZEN_API_KEY`)
+endpoint, e.g. a free cloud endpoint via `ZEN_API_KEY`)
 with:
 
 ```sh

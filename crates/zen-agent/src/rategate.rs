@@ -268,7 +268,7 @@ fn format_quota_report(status: &[QuotaStatus], enabled: bool) -> String {
     lines.join("\n")
 }
 
-pub fn openrouter_key_url(base_url: &str) -> Option<String> {
+pub fn key_info_url(base_url: &str) -> Option<String> {
     let lower = base_url.trim().to_ascii_lowercase();
     lower
         .contains("openrouter.ai")
@@ -315,7 +315,7 @@ impl KeyQuota {
 
     pub fn report(&self) -> String {
         let mut lines = vec![format!(
-            "OpenRouter quota ({} UTC, live from /api/v1/key):",
+            "Free-pool quota ({} UTC, live from /api/v1/key):",
             today_utc()
         )];
         match (self.free_used, self.free_limit, self.free_remaining) {

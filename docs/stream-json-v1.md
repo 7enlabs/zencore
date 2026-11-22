@@ -112,13 +112,13 @@ an error / empty body).
 | `error_status` | number \| null | HTTP status, `null` for network errors |
 | `error` | string | short error text (status and truncated body; never request headers) |
 
-A provider error reported inside a `200` body after generation started (OpenRouter
+A provider error reported inside a `200` body after generation started (a
 `finish_reason: "error"` with an `error` object) is retried like the HTTP status it carries:
 `error_status` is that code (e.g. `429`, `502`) and `error` starts with
 `provider error mid-response: HTTP <code> (<error_type>)`. A mid-response 429 retries within
 `retry.maxWaitSecs`; other mid-response errors retry at most 3 times, then the turn ends with an
 `error_during_execution` result carrying the same text. A 402 is never retried, except
-OpenRouter's in-flight budget 402 that sends `Retry-After`.
+An in-flight budget 402 that sends `Retry-After`.
 
 ### `system` / `permission_denied`
 

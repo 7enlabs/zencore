@@ -25,7 +25,7 @@ Cloudflare plans**.
 
 1. Create a free Cloudflare account and an AI Gateway at
    <https://dash.cloudflare.com> → AI → AI Gateway. Name it e.g. `zen`.
-2. In the Gateway, add your providers (OpenAI, Anthropic, …) with their API keys.
+2. In the Gateway, add your model services with their API keys.
    Keys live in Cloudflare - never in your shell history or agent sandbox.
 3. Point Zen at the Gateway instead of the provider directly. The Gateway
    URL format is:
@@ -34,11 +34,11 @@ Cloudflare plans**.
    https://gateway.ai.cloudflare.com/v1/{ACCOUNT_ID}/{GATEWAY_NAME}/{PROVIDER}
    ```
 
-   For example, to route OpenAI traffic through the Gateway:
+   For example, to route one service's traffic through the Gateway:
 
    ```bash
    export ZENCORE_BASE_URL="https://gateway.ai.cloudflare.com/v1/abc123/zen/openai"
-   # or per-provider env override, e.g. OPENAI_BASE_URL
+   # or a per-service env override
    ```
 
 4. (Recommended) Enable **caching** in the Gateway dashboard for deterministic

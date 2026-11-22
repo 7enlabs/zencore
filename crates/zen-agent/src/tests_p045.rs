@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use zen_core::*;
 
 use crate::client::{OpenAiClient, mid_response_error};
-use crate::rategate::{KeyQuota, fetch_key_quota, openrouter_key_url, quota_command_report};
+use crate::rategate::{KeyQuota, fetch_key_quota, key_info_url, quota_command_report};
 use crate::safety::ErrorClass;
 use crate::testutil::*;
 
@@ -93,13 +93,13 @@ fn mid_error(code: u16, error_type: &str, msg: &str) -> String {
 }
 
 #[test]
-fn p0_4_key_url_only_for_openrouter() {
+fn p0_4_key_url_only_for_free_pool() {
     assert_eq!(
-        openrouter_key_url("https://openrouter.ai/api/v1/").as_deref(),
+        key_info_url("https://openrouter.ai/api/v1/").as_deref(),
         Some("https://openrouter.ai/api/v1/key")
     );
-    assert_eq!(openrouter_key_url("https://api.openai.com/v1"), None);
-    assert_eq!(openrouter_key_url("http://127.0.0.1:11434/v1"), None);
+    assert_eq!(key_info_url("https://api.openai.com/v1"), None);
+    assert_eq!(key_info_url("http://127.0.0.1:11434/v1"), None);
 }
 
 #[tokio::test]
@@ -144,13 +144,9 @@ async fn p0_4_quota_lookup_error_is_clear_and_local_counts_still_shown() {
 }
 
 #[tokio::test]
-async fn p0_4_non_openrouter_quota_makes_no_request() {
-    let report = quota_command_report(
-        openrouter_key_url("http://127.0.0.1:9/v1").as_deref(),
-        None,
-        None,
-    )
-    .await;
+async fn p0_4_non_free_pool_quota_makes_no_request() {
+    let report =
+        quota_command_report(key_info_url("http://127.0.0.1:9/v1").as_deref(), None, None).await;
     assert!(report.starts_with("RateGate"), "{report}");
 }
 

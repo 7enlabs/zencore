@@ -74,7 +74,7 @@ the per-turn `system`/`usage` records (deltas - they are summed).
 Strips potential secrets from every string in the export (mirrors the
 account-safety redaction rules):
 
-- Provider keys: `sk-ant-…` (Anthropic), `sk-…` (OpenAI), `AIza…` (Google),
+- API keys: `sk-ant-…`, `sk-…`, `AIza…`,
   `xoxb-/xoxp-/xoxa-/xoxr-…` (Slack), `ghp_/gho_/ghu_/ghs_/ghr_…` (GitHub),
   `glpat-…` (GitLab), `hf_…` (Hugging Face), `AKIA…` (AWS)
 - `Authorization: Bearer <token>` headers

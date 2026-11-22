@@ -207,7 +207,7 @@ IDE integration, Chrome, cloud/teleport/remote-control, background sessions (`--
 
 ## Appendix B - REA black-box findings (merged 2026-10-14; raw notes in SPEC-rea.md)
 REA run: the reference agent 2.1.296 on Railway, 34 turns, black-box only (help output, docs pages, `-p` experiments in a scratch dir).
-Model: started on google/gemini-4-argon:free; that model's free allowance ran out mid-run, so the final run was on nvidia/nemotron-3-super-120b-a12b:free (OpenRouter) via the relay chain.
+Model: started on google/gemini-4-argon:free; that model's free allowance ran out mid-run, so the final run was on nvidia/nemotron-3-super-120b-a12b:free via the relay chain.
 Changes/additions adopted into zen (override the sections above where they differ):
 - B1 (§1) `--allowed-tools` alias of `--allowedTools`; `--agent <name>` picks a sub-agent definition as the main agent; `zen mcp get <name>` and `zen mcp add-json <name> <json>`; `mcp add -e KEY=VAL` and `--header`.
 - B2 (§6/§7) Custom commands and skills share the `/name` namespace; on a name clash the skill wins. Templates support `$ARGUMENTS`, 0-based positional `$0..$9` / `$ARGUMENTS[N]` (per C5.2), `${ZEN_SKILL_DIR}`, `${ZEN_PROJECT_DIR}`, `${ZEN_SESSION_ID}`, inline `` !`cmd` `` (run with permission checks) and `@path`.

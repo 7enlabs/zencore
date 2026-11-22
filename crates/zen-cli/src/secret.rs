@@ -401,9 +401,9 @@ mod tests {
         register_secret(
             &store,
             RegisterInput {
-                name: "OPENROUTER_KEY".to_string(),
+                name: "MODEL_API_KEY".to_string(),
                 class: SecretClass::Seat,
-                service: "openrouter".to_string(),
+                service: "model-service".to_string(),
                 owner: "zc-leader".to_string(),
                 registered_by: "zc-leader".to_string(),
                 default_until_days: 7,
@@ -439,7 +439,7 @@ mod tests {
     fn request_args(until: &str) -> SecretArgs {
         SecretArgs {
             command: SecretSubcommand::Request {
-                name: "OPENROUTER_KEY".to_string(),
+                name: "MODEL_API_KEY".to_string(),
                 purpose: "verification runs".to_string(),
                 scope: "task:DS-7".to_string(),
                 until: until.to_string(),
@@ -497,7 +497,7 @@ mod tests {
         let _env_guard = crate::settings::EnvGuard::remove("ZEN_SEAT");
         let args = SecretArgs {
             command: SecretSubcommand::Request {
-                name: "OPENROUTER_KEY".to_string(),
+                name: "MODEL_API_KEY".to_string(),
                 purpose: "work".to_string(),
                 scope: "task:DS-7".to_string(),
                 until: (Utc::now() + Duration::days(1))
@@ -563,7 +563,7 @@ mod tests {
         );
         let status = SecretArgs {
             command: SecretSubcommand::Status {
-                name: Some("OPENROUTER_KEY".to_string()),
+                name: Some("MODEL_API_KEY".to_string()),
             },
         };
         assert_eq!(
@@ -588,9 +588,9 @@ mod tests {
     fn register_args(by: &str) -> SecretArgs {
         SecretArgs {
             command: SecretSubcommand::Register {
-                name: "OPENROUTER_KEY".to_string(),
+                name: "MODEL_API_KEY".to_string(),
                 class: "seat".to_string(),
-                service: "openrouter".to_string(),
+                service: "model-service".to_string(),
                 owner: "zc-leader".to_string(),
                 by: by.to_string(),
                 default_until_days: 7,
@@ -628,7 +628,7 @@ mod tests {
         .unwrap();
         let deregister = SecretArgs {
             command: SecretSubcommand::Deregister {
-                name: "OPENROUTER_KEY".to_string(),
+                name: "MODEL_API_KEY".to_string(),
                 by: "zc-leader".to_string(),
                 reason: "service retired".to_string(),
             },
@@ -667,9 +667,9 @@ mod tests {
         // An unknown class is a validation error, not a registration.
         let bad_class = SecretArgs {
             command: SecretSubcommand::Register {
-                name: "OPENROUTER_KEY".to_string(),
+                name: "MODEL_API_KEY".to_string(),
                 class: "shared".to_string(),
-                service: "openrouter".to_string(),
+                service: "model-service".to_string(),
                 owner: "zc-leader".to_string(),
                 by: "zc-leader".to_string(),
                 default_until_days: 7,
@@ -817,7 +817,7 @@ mod tests {
         let requests = load_requests(&Store::new(home.join(".zen"))).unwrap();
         let seat_id = requests
             .iter()
-            .find(|r| r.name == "OPENROUTER_KEY")
+            .find(|r| r.name == "MODEL_API_KEY")
             .unwrap()
             .request_id
             .clone();

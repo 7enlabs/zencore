@@ -762,7 +762,7 @@ pub fn resolve_config_with_home(
         .map(str::to_string);
 
     // Catalog ids win over direct provider routing (bug hunt fix #4):
-    // `deepseek/deepseek-r1:free` is a free OpenRouter catalog entry,
+    // `deepseek/deepseek-r1:free` is a free-pool catalog entry,
     // but its `deepseek/` prefix is also a registry provider, so
     // ModelSpec::parse would strip it and route_direct would send it to
     // DeepSeek's paid API. Check the catalog first; only non-catalog
@@ -849,7 +849,7 @@ pub fn resolve_config_with_home(
     // after a full retry when the provider was unreachable). Reject it
     // here, before any network call, as a validation error (exit 4).
     // Format only, not a catalog allowlist: unknown ids are legitimate
-    // (any OpenRouter id, Ollama local model, custom gateway id), so
+    // (any free-pool id, Ollama local model, custom gateway id), so
     // only the shape is checked - see models::invalid_model_reason.
     // This runs after Ollama routing, so the stripped bare id is what
     // is checked, and after resolve_model, so a blank env/settings
@@ -1107,7 +1107,7 @@ mod tests {
 
     fn default_cfg_without_key() -> ResolvedConfig {
         // Resolve the plain default config with no key in the env, so
-        // the route is the default ExperientialLabs gateway (A1).
+        // the route is the default gateway (A1).
         let _env = env_lock();
         let cli = base_cli();
         let _env_guards =
@@ -1163,17 +1163,17 @@ mod tests {
         cli.base_url = Some(" https://openrouter.ai/api/v1/ ".to_string());
         assert_eq!(
             resolve_base_url(&cli, None),
-            crate::models::OPENROUTER_BASE_URL
+            crate::models::FREE_POOL_BASE_URL
         );
         let cli = base_cli();
         assert_eq!(
             resolve_base_url(&cli, Some("https://openrouter.ai/api/v1//")),
-            crate::models::OPENROUTER_BASE_URL
+            crate::models::FREE_POOL_BASE_URL
         );
         let _env_guard = EnvGuard::set("ZEN_BASE_URL", "https://openrouter.ai/api/v1/");
         assert_eq!(
             resolve_base_url(&cli, None),
-            crate::models::OPENROUTER_BASE_URL
+            crate::models::FREE_POOL_BASE_URL
         );
         // Provider recognition tolerates the same sloppiness, so
         // callers holding an unnormalized URL still work.
@@ -1234,7 +1234,7 @@ mod tests {
         fs::create_dir_all(dir.join(".zen")).unwrap();
         let cli = Cli::parse_from(["zen", "--setting-sources", "project", "--trust-folder"]);
 
-        // Cross-provider catalog id on the default (Experiential)
+        // Cross-provider catalog id on the default
         // base: /btw runs on the main backend, so the btw model
         // falls back to the main model with a warning.
         fs::write(
@@ -1884,10 +1884,10 @@ mod tests {
 
     #[test]
     fn catalog_id_wins_over_direct_routing_when_provider_key_set() {
-        // Bug hunt fix #4: `deepseek/deepseek-r1:free` is a free OpenRouter
+        // Bug hunt fix #4: `deepseek/deepseek-r1:free` is a free-pool
         // catalog entry, but its `deepseek/` prefix is also a registry
         // provider, so ModelSpec::parse used to strip it and route_direct
-        // sent it to DeepSeek's paid API. Catalog ids must win.
+        // sent it to the paid API. Catalog ids must win.
         let _env = env_lock();
         let _env_guards_set = EnvGuard::set_many(&[
             ("DEEPSEEK_API_KEY", "test-key-ds"),
@@ -1897,7 +1897,7 @@ mod tests {
         let cli = Cli::parse_from(["zen", "--model", "deepseek/deepseek-r1:free"]);
         let mut cfg = resolve_config(&cli, std::env::temp_dir().as_path()).unwrap();
         // resolve_config alone must keep the full catalog id on the
-        // default base URL (no strip, no DeepSeek re-point).
+        // default base URL (no strip, no re-point to the paid API).
         assert_eq!(cfg.model, "deepseek/deepseek-r1:free");
         assert_eq!(cfg.base_url, DEFAULT_BASE_URL);
         assert!(
@@ -1905,9 +1905,9 @@ mod tests {
                 .iter()
                 .all(|w| !w.contains("provider 'deepseek'"))
         );
-        // The catalog router then sends it to OpenRouter with its key.
+        // The catalog router then sends it to the free pool with its key.
         assert!(route_catalog_model(&mut cfg).unwrap());
-        assert_eq!(cfg.base_url, crate::models::OPENROUTER_BASE_URL);
+        assert_eq!(cfg.base_url, crate::models::FREE_POOL_BASE_URL);
         assert_eq!(cfg.model, "deepseek/deepseek-r1:free");
         assert_eq!(cfg.api_key.as_deref(), Some("test-key-or"));
     }
@@ -1924,8 +1924,8 @@ mod tests {
             "my-custom-model".to_string(),
         ];
         route_catalog_model(&mut cfg).unwrap();
-        // The OpenRouter catalog id is dropped (it would only 400 on
-        // the Experiential gateway); the same-provider entry and the
+        // The free-pool catalog id is dropped (it would only 400 on
+        // the default gateway); the same-provider entry and the
         // non-catalog id stay.
         assert_eq!(
             cfg.fallback_models,
@@ -1945,9 +1945,9 @@ mod tests {
             "qwen/qwen3-coder:free".to_string(),
         ];
         route_catalog_model(&mut cfg).unwrap();
-        assert_eq!(cfg.base_url, crate::models::OPENROUTER_BASE_URL);
+        assert_eq!(cfg.base_url, crate::models::FREE_POOL_BASE_URL);
         // Filtering uses the FINAL base URL: once the primary routes
-        // to OpenRouter, the Experiential entry is the foreign one.
+        // to the free pool, the default entry is the foreign one.
         assert_eq!(cfg.fallback_models, ["qwen/qwen3-coder:free"]);
     }
 
@@ -1961,17 +1961,17 @@ mod tests {
         cfg.api_key = Some("exp-key".to_string());
         let entry = crate::models::catalog_entry("qwen/qwen3-coder:free").unwrap();
         route_to_catalog_entry(&mut cfg, entry, &None).unwrap();
-        assert_eq!(cfg.base_url, crate::models::OPENROUTER_BASE_URL);
+        assert_eq!(cfg.base_url, crate::models::FREE_POOL_BASE_URL);
         assert_eq!(cfg.api_key.as_deref(), Some("or-key"));
         assert_eq!(cfg.model, "qwen/qwen3-coder:free");
     }
 
     #[test]
-    fn catalog_id_not_rerouted_to_paid_api_without_openrouter_key() {
-        // Same catalog id, only the DeepSeek key set: resolve_config must
+    fn catalog_id_not_rerouted_to_paid_api_without_free_pool_key() {
+        // Same catalog id, only the paid-service key set: resolve_config must
         // still not rewrite it, and the catalog router must refuse with
-        // the OpenRouter key hint instead of silently sending the id to
-        // DeepSeek's paid API.
+        // the free-pool key hint instead of silently sending the id to
+        // the paid API.
         let _env = env_lock();
         let _env_guard_set = EnvGuard::set("DEEPSEEK_API_KEY", "test-key-ds");
         let _env_guards_removed =
@@ -1994,7 +1994,7 @@ mod tests {
         cfg.api_key = None;
         let entry = crate::models::catalog_entry("qwen/qwen3-coder:free").unwrap();
         route_to_catalog_entry(&mut cfg, entry, &None).unwrap();
-        assert_eq!(cfg.base_url, crate::models::OPENROUTER_BASE_URL);
+        assert_eq!(cfg.base_url, crate::models::FREE_POOL_BASE_URL);
         assert_eq!(cfg.api_key.as_deref(), Some("or-key"));
     }
 
@@ -2018,7 +2018,7 @@ mod tests {
         let _env = env_lock();
         let mut cfg = resolve_config(&base_cli(), std::env::temp_dir().as_path()).unwrap();
         cfg.model = "qwen/qwen3-coder:free".to_string();
-        cfg.base_url = crate::models::OPENROUTER_BASE_URL.to_string();
+        cfg.base_url = crate::models::FREE_POOL_BASE_URL.to_string();
         cfg.api_key = Some("or-key".to_string());
         let entry = crate::models::catalog_entry("deepseek-v4.1-flash").unwrap();
         route_to_catalog_entry(&mut cfg, entry, &Some("exp-key".to_string())).unwrap();
