@@ -14,7 +14,7 @@ URL; everything else keeps working.
 | Gateway feature | Zen built-in equivalent | How they combine |
 |---|---|---|
 | Universal fallback (dashboard-defined chain) | `--fallback` chains (client-side) | Use the Gateway when you want zero-config server-side fallback; use Zen's built-in chains when you want explicit per-request control. They can be layered: Zen retries through the Gateway, the Gateway retries across providers. |
-| Edge caching of identical completions | Prompt caching (Anthropic) | Gateway cache hits return in <15 ms with **zero downstream cost** - best for repeated identical prompts (CI, evals). |
+| Edge caching of identical completions | Prompt caching (Messages API) | Gateway cache hits return in <15 ms with **zero downstream cost** - best for repeated identical prompts (CI, evals). |
 | Rate limiting & per-key budgets | `--max-budget-usd` | Gateway enforces limits at the edge before requests reach the provider - an extra guardrail under your Zen budget. |
 | Request/token/cost analytics | `zen cost` ledger | Gateway analytics are provider-side aggregates; `zen cost` is your per-session ledger. Use both. |
 
