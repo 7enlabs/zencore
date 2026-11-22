@@ -2920,9 +2920,11 @@ mod tests {
         .unwrap();
         let request_elapsed = start.elapsed();
         eprintln!("budget: request on 100-line files took {request_elapsed:?}");
+        // Budget widened 10 -> 25 ms (Leader decision, tin 19778, 22/11):
+        // macOS arm64 CI measured 13.16 ms once; the hard assert stays.
         assert!(
-            request_elapsed.as_millis() < 10,
-            "request took {request_elapsed:?}, budget is under 10 ms on 100-line files"
+            request_elapsed.as_millis() < 25,
+            "request took {request_elapsed:?}, budget is under 25 ms on 100-line files"
         );
         let start = Instant::now();
         let listed = list_requests(&store, None, None, now).unwrap();
