@@ -859,7 +859,7 @@ async fn instructions_loaded_hook_fires_for_memory_file() {
     let hook_config = r#"{
         "hooks": {
             "InstructionsLoaded": [
-                {"hooks": [{"type": "command", "command": "echo LOADED >> loaded.log", "timeout": 5}]}
+                {"hooks": [{"type": "command", "command": "{ cat; echo; } >> loaded.log", "timeout": 5}]}
             ]
         }
     }"#;
@@ -884,9 +884,27 @@ async fn instructions_loaded_hook_fires_for_memory_file() {
     .expect("timed out");
 
     assert_eq!(code, 0, "stderr: {}", stderr);
+    // `InstructionsLoaded` fires once per memory file found walking up
+    // from the project dir, so ancestors (e.g. an AGENTS.md above TMPDIR)
+    // add extra events depending on the environment. Assert on the payload
+    // instead of the raw count: exactly one event must name this project's
+    // ZEN.md with load_reason "session_start".
+    let log = std::fs::read_to_string(cwd.path().join("loaded.log")).unwrap();
+    let expected = std::fs::canonicalize(cwd.path().join("ZEN.md")).unwrap();
+    let matches = log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|entry| {
+            entry["load_reason"] == "session_start"
+                && entry["file_path"]
+                    .as_str()
+                    .and_then(|path| std::fs::canonicalize(path).ok())
+                    .is_some_and(|path| path == expected)
+        })
+        .count();
     assert_eq!(
-        std::fs::read_to_string(cwd.path().join("loaded.log")).unwrap(),
-        "LOADED\n"
+        matches, 1,
+        "expected exactly one InstructionsLoaded event for {expected:?}, log:\n{log}"
     );
 }
 
