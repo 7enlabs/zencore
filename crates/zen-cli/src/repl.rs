@@ -3876,7 +3876,7 @@ mod model_picker_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[allow(clippy::await_holding_lock)] // floor-guard: ENV_LOCK held across await on purpose, env must not change mid-test
     async fn switch_to_default_model_sends_gateway_id() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The default entry is a catalog id now, so routing needs
@@ -4053,7 +4053,7 @@ mod model_picker_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[allow(clippy::await_holding_lock)] // floor-guard: ENV_LOCK held across await on purpose, env must not change mid-test
     async fn slash_pin_to_free_pool_model_without_key_is_refused() {
         // Bug hunt #1 (Scout B P1-1 + Scout C F3): a slash command pinning
         // a cross-provider catalog id must route like /model does. With
@@ -5015,7 +5015,7 @@ mod pr208_mutant_tests {
     /// `PR208_ASK_EXPECT` it is a no-op. The env value is `"decline"`
     /// or `"proceed"`.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[allow(clippy::await_holding_lock)] // floor-guard: ENV_LOCK held across await on purpose, env must not change mid-test
     async fn __pr208_probe_ask() {
         let Ok(expect) = std::env::var("PR208_ASK_EXPECT") else {
             return;
@@ -5097,7 +5097,7 @@ mod pr208_mutant_tests {
     // or dropping the `!` in the filter (#30, which then keeps only
     // empty feedback) both leave the stash empty.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[allow(clippy::await_holding_lock)] // floor-guard: ENV_LOCK held across await on purpose, env must not change mid-test
     async fn post_model_switch_feedback_is_stashed_for_next_turn() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The switch target is a catalog entry now, so routing needs
@@ -5136,7 +5136,7 @@ mod pr208_mutant_tests {
     // context. Dropping the `!` keeps exactly the whitespace feedback
     // and stashes it.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[allow(clippy::await_holding_lock)] // floor-guard: ENV_LOCK held across await on purpose, env must not change mid-test
     async fn post_model_switch_whitespace_feedback_is_not_stashed() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The switch target is a catalog entry now, so routing needs
@@ -5806,7 +5806,7 @@ mod pr208_mutant_tests {
     // flipped to `==` the restore call is skipped exactly when the
     // model changed, so the stash stays empty.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[allow(clippy::await_holding_lock)] // floor-guard: ENV_LOCK held across await on purpose, env must not change mid-test
     async fn slash_command_model_pin_restores_route_and_fires_post_hook() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The pinned model is a catalog entry now, so routing needs
