@@ -598,7 +598,14 @@ pub fn install_builtin(home: &Path, name: &str) -> Result<RegistryEntry> {
 
     let dest = skills_root(home).join(name);
     if dest.exists() {
-        std::fs::remove_dir_all(&dest)?;
+        return Err(crate::coded_error(
+            crate::exit_code::CONFLICT,
+            format!(
+                "skill {:?} is already installed at {}",
+                name,
+                dest.display()
+            ),
+        ));
     }
     std::fs::create_dir_all(&dest)?;
     std::fs::write(dest.join("SKILL.md"), skill_md)?;
@@ -632,6 +639,38 @@ pub fn remove_skill(home: &Path, name: &str) -> Result<()> {
     registry.skills.remove(name);
     save_registry(home, &registry)?;
     Ok(())
+}
+
+/// Remove an installed skill, honouring `--yes` like `sessions delete`:
+/// without it, a non-interactive stdin refuses with FORBIDDEN (5) and an
+/// interactive terminal is asked [y/N]; declining cancels the removal.
+/// Returns true when the skill was removed.
+fn cmd_remove(home: &Path, name: &str, yes: bool) -> Result<bool> {
+    if !yes && !confirm_remove_prompt(name)? {
+        return Ok(false);
+    }
+    remove_skill(home, name)?;
+    Ok(true)
+}
+
+/// Confirmation prompt for `skill remove`, mirroring
+/// `session_mgmt::confirm_delete_prompt`.
+fn confirm_remove_prompt(name: &str) -> Result<bool> {
+    use std::io::{BufRead, IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return Err(crate::coded_error(
+            crate::exit_code::FORBIDDEN,
+            "refusing to remove skill without --yes on non-interactive stdin",
+        ));
+    }
+    eprint!(
+        "Permanently remove skill {:?}? This cannot be undone. [y/N] ",
+        name
+    );
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    Ok(crate::session_mgmt::parse_confirmation_answer(&answer))
 }
 
 fn clone_skill_repo(url: &str, dest: &Path) -> Result<(String, Option<String>)> {
@@ -1251,10 +1290,13 @@ pub async fn skill_command(
             }
             Ok(0)
         }
-        crate::cli::SkillSubcommand::Remove { name } => {
-            remove_skill(&home, name)?;
-            if !cli.quiet {
-                println!("removed skill {:?}", name);
+        crate::cli::SkillSubcommand::Remove { name, yes } => {
+            if cmd_remove(&home, name, *yes)? {
+                if !cli.quiet {
+                    println!("removed skill {:?}", name);
+                }
+            } else if !cli.quiet {
+                println!("remove cancelled");
             }
             Ok(0)
         }
@@ -1354,6 +1396,12 @@ fn cmd_install(
     }
 
     if let Some(name) = source.strip_prefix("builtin:") {
+        if !yes {
+            return Err(crate::coded_error(
+                crate::exit_code::FORBIDDEN,
+                "refusing to install without explicit approval: re-run with --yes after reviewing permissions",
+            ));
+        }
         let entry = install_builtin(home, name)?;
         println!(
             "installed builtin skill {} v{} {}",
@@ -2395,6 +2443,62 @@ mod tests {
                 .join("zen-plugin.json")
                 .exists()
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cmd_install_builtin_without_yes_is_forbidden() {
+        let home = tmp_home("cmd-install-builtin-no-yes");
+        let err = cmd_install(&home, "builtin:tdd", false, None).unwrap_err();
+        assert_eq!(
+            crate::exit_code_for_error(&err),
+            crate::exit_code::FORBIDDEN
+        );
+        assert!(
+            !skills_root(&home).join("tdd").exists(),
+            "a refused install must not write the skill"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cmd_install_builtin_second_install_is_conflict() {
+        let home = tmp_home("cmd-install-builtin-twice");
+        cmd_install(&home, "builtin:tdd", true, None).unwrap();
+        let marker = "edited by the user - must survive a reinstall";
+        std::fs::write(skills_root(&home).join("tdd").join("SKILL.md"), marker).unwrap();
+        let err = cmd_install(&home, "builtin:tdd", true, None).unwrap_err();
+        assert_eq!(crate::exit_code_for_error(&err), crate::exit_code::CONFLICT);
+        assert_eq!(
+            std::fs::read_to_string(skills_root(&home).join("tdd").join("SKILL.md")).unwrap(),
+            marker
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cmd_remove_without_yes_is_forbidden_on_non_interactive_stdin() {
+        let home = tmp_home("cmd-remove-no-yes");
+        cmd_install(&home, "builtin:tdd", true, None).unwrap();
+        let err = cmd_remove(&home, "tdd", false).unwrap_err();
+        assert_eq!(
+            crate::exit_code_for_error(&err),
+            crate::exit_code::FORBIDDEN
+        );
+        assert!(
+            skills_root(&home).join("tdd").join("SKILL.md").exists(),
+            "a refused remove must not delete the skill"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cmd_remove_with_yes_removes_skill() {
+        let home = tmp_home("cmd-remove-yes");
+        cmd_install(&home, "builtin:tdd", true, None).unwrap();
+        assert!(cmd_remove(&home, "tdd", true).unwrap());
+        assert!(!skills_root(&home).join("tdd").exists());
+        assert!(!load_registry(&home).skills.contains_key("tdd"));
         std::fs::remove_dir_all(&home).ok();
     }
 

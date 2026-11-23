@@ -1014,6 +1014,10 @@ pub enum SkillSubcommand {
     Remove {
         /// Skill name
         name: String,
+
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Run the tests of a skill
