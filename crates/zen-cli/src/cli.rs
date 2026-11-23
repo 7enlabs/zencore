@@ -906,6 +906,11 @@ pub enum SecretSubcommand {
         /// Reason for the registration: a group message id or task card id
         #[arg(long)]
         reason: String,
+
+        /// Replace a live registration under the same name; without it
+        /// a taken name is refused (issue #278)
+        #[arg(long)]
+        force: bool,
     },
 
     /// Deregister a secret name (Leader only, design section 4.3)
@@ -1819,6 +1824,7 @@ mod tests {
                     rotation_days,
                     paid,
                     reason,
+                    force,
                 } => {
                     assert_eq!(name, "MODEL_API_KEY");
                     assert_eq!(class, "seat");
@@ -1829,6 +1835,7 @@ mod tests {
                     assert_eq!(rotation_days, 90);
                     assert!(!paid);
                     assert_eq!(reason, "tin 8071");
+                    assert!(!force);
                 }
                 other => panic!("expected Register, got {:?}", other),
             },
@@ -1848,6 +1855,35 @@ mod tests {
             cli.subcommand,
             Some(Commands::Secret(s)) if matches!(s.command, SecretSubcommand::Deregister { .. })
         ));
+        // --force is off by default and on when passed (issue #278).
+        let cli = parse(&[
+            "secret",
+            "register",
+            "--name",
+            "MODEL_API_KEY",
+            "--class",
+            "seat",
+            "--service",
+            "model-service",
+            "--owner",
+            "zc-leader",
+            "--by",
+            "zc-leader",
+            "--default-until-days",
+            "7",
+            "--rotation-days",
+            "90",
+            "--reason",
+            "tin 8071",
+            "--force",
+        ]);
+        match cli.subcommand {
+            Some(Commands::Secret(s)) => match s.command {
+                SecretSubcommand::Register { force, .. } => assert!(force),
+                other => panic!("expected Register, got {:?}", other),
+            },
+            _ => panic!("expected Secret"),
+        }
     }
 
     #[test]

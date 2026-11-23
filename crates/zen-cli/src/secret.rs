@@ -293,6 +293,7 @@ pub fn run_secret(
             rotation_days,
             paid,
             reason,
+            force,
         } => {
             let class = SecretClass::parse(class).ok_or_else(|| {
                 coded_error(
@@ -312,6 +313,7 @@ pub fn run_secret(
                     rotation_days: *rotation_days,
                     paid: *paid,
                     reason: reason.clone(),
+                    force: *force,
                 },
                 now,
             )
@@ -410,6 +412,7 @@ mod tests {
                 rotation_days: 90,
                 paid: false,
                 reason: "provider key for verification runs".to_string(),
+                force: false,
             },
             Utc::now(),
         )
@@ -430,6 +433,7 @@ mod tests {
                 rotation_days: 30,
                 paid: false,
                 reason: "broker-only personal login".to_string(),
+                force: false,
             },
             Utc::now(),
         )
@@ -586,6 +590,10 @@ mod tests {
     }
 
     fn register_args(by: &str) -> SecretArgs {
+        register_args_force(by, false)
+    }
+
+    fn register_args_force(by: &str, force: bool) -> SecretArgs {
         SecretArgs {
             command: SecretSubcommand::Register {
                 name: "MODEL_API_KEY".to_string(),
@@ -597,8 +605,54 @@ mod tests {
                 rotation_days: 90,
                 paid: false,
                 reason: "tin 8071".to_string(),
+                force,
             },
         }
+    }
+
+    #[test]
+    fn secret_register_duplicate_name_is_refused_without_force() {
+        let home = temp_home("regdupcli");
+        assert_eq!(
+            run_secret(
+                &register_args("zc-leader"),
+                &OutputFormat::Text,
+                true,
+                false,
+                Some(&home)
+            )
+            .unwrap(),
+            0
+        );
+        // A second registration under the same name is refused through
+        // the CLI too (issue #278), exit 7, and the first card stands.
+        let err = run_secret(
+            &register_args("zc-leader"),
+            &OutputFormat::Text,
+            true,
+            false,
+            Some(&home),
+        )
+        .unwrap_err();
+        assert_eq!(crate::exit_code_for_error(&err), exit_code::CONFLICT);
+        let entries = zen_core::secret::load_registry(&Store::new(home.join(".zen"))).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].class, SecretClass::Seat);
+        // --force replaces the live card in place.
+        assert_eq!(
+            run_secret(
+                &register_args_force("zc-leader", true),
+                &OutputFormat::Text,
+                true,
+                false,
+                Some(&home)
+            )
+            .unwrap(),
+            0
+        );
+        let entries = zen_core::secret::load_registry(&Store::new(home.join(".zen"))).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].class, SecretClass::Seat);
     }
 
     #[test]
@@ -676,6 +730,7 @@ mod tests {
                 rotation_days: 90,
                 paid: false,
                 reason: "tin 8071".to_string(),
+                force: false,
             },
         };
         let err =
