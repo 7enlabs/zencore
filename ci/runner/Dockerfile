@@ -2,7 +2,7 @@
 # One container = one registration = one job. See README.md.
 # Base image pinned by digest (ubuntu:24.04 index digest, checked 2026-11-02).
 # Bump the digest on purpose; `docker pull ubuntu:24.04` then read RepoDigests.
-FROM ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
+FROM ubuntu:24.04@sha256:9c7f200c07e3d4a03e7249d2c16bf66a51120fb876aa2242cf31451412543289
 
 # Pinned runner release. v2.338.0 is the newest stable release past the
 # team's 7-day package cooldown on 2026-11-01. Bump RUNNER_VERSION and
