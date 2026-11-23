@@ -3191,4 +3191,56 @@ mod tests {
             "status took {status_elapsed:?}, budget is under 50 ms"
         );
     }
+
+    #[test]
+    fn preview_register_secret_reports_the_entry_it_would_replace() {
+        // Kills the == -> != mutant at the `existing` lookup:
+        // cargo-mutants tests only the mutated package, so a zen-cli
+        // integration test cannot kill a zen-core mutant; this unit
+        // test is the one that runs for it.
+        let (_dir, store) = temp_store("preview_replace");
+        let now = fixed_now();
+        register_model_key(&store, now);
+
+        // A fresh name has nothing to replace.
+        let (_, existing) = preview_register_secret(
+            &store,
+            &RegisterInput {
+                name: "FRESH_KEY".to_string(),
+                class: SecretClass::Seat,
+                service: "model-service".to_string(),
+                owner: "zc-leader".to_string(),
+                registered_by: "zc-leader".to_string(),
+                default_until_days: 7,
+                rotation_days: 90,
+                paid: false,
+                reason: "fresh key".to_string(),
+                force: false,
+            },
+            now,
+        )
+        .unwrap();
+        assert!(existing.is_none(), "fresh name must replace nothing");
+
+        // A taken name reports the entry it would replace.
+        let (_, existing) = preview_register_secret(
+            &store,
+            &RegisterInput {
+                name: "MODEL_API_KEY".to_string(),
+                class: SecretClass::Seat,
+                service: "model-service".to_string(),
+                owner: "zc-leader".to_string(),
+                registered_by: "zc-leader".to_string(),
+                default_until_days: 7,
+                rotation_days: 90,
+                paid: false,
+                reason: "provider key for verification runs".to_string(),
+                force: true,
+            },
+            now,
+        )
+        .unwrap();
+        let old = existing.expect("preview must report the entry it would replace");
+        assert_eq!(old.name, "MODEL_API_KEY");
+    }
 }
