@@ -10,8 +10,8 @@
 //! Numbers in the demo are derived from the scripted event stream
 //! itself: token use comes from the production `estimate_tokens`
 //! applied to the scripted messages, and the cost is $0.00 because the
-//! demo model is the free default (`deepseek-v4.1-flash`, priced $0 in
-//! the repo's own table). Cost correctness for priced models is covered
+//! demo model is the free default (`nvidia/nemotron-3-ultra-550b-a55b:free`, priced $0 via
+//! the :free suffix rule). Cost correctness for priced models is covered
 //! by the state unit tests and by the real-subagent integration test,
 //! not by this script.
 
@@ -35,7 +35,7 @@ use crate::state::{DEFAULT_CONTEXT_WINDOW, FlightdeckState};
 pub fn run_demo(auto_exit_secs: u64) -> io::Result<()> {
     let state = Arc::new(Mutex::new(FlightdeckState::new(
         "demo-session",
-        "deepseek-v4.1-flash",
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
         DEFAULT_CONTEXT_WINDOW,
         PermissionMode::Default,
         "auto",
@@ -200,7 +200,7 @@ mod tests {
     fn scenario_completes_three_subagents() {
         let state = Arc::new(Mutex::new(FlightdeckState::new(
             "demo-test",
-            "deepseek-v4.1-flash",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
             DEFAULT_CONTEXT_WINDOW,
             PermissionMode::Default,
             "auto",

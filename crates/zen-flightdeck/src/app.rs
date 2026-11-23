@@ -174,7 +174,7 @@ mod tests {
     fn state() -> Arc<Mutex<FlightdeckState>> {
         Arc::new(Mutex::new(FlightdeckState::new(
             "sess-1",
-            "deepseek-v4.1-flash",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
             128_000,
             PermissionMode::Default,
             "auto",

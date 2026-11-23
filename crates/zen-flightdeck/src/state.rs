@@ -607,7 +607,7 @@ mod tests {
     fn state() -> FlightdeckState {
         FlightdeckState::new(
             "sess-0123456789abcdef",
-            "deepseek-v4.1-flash",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
             128_000,
             PermissionMode::Default,
             "auto",
@@ -623,7 +623,10 @@ mod tests {
         let header = s.header_line();
         assert!(header.contains("ctx "), "{header}");
         assert!(header.contains("req 1"), "{header}");
-        assert!(header.contains("deepseek-v4.1-flash"), "{header}");
+        assert!(
+            header.contains("nvidia/nemotron-3-ultra-550b-a55b:free"),
+            "{header}"
+        );
         assert!(
             header.contains("mode: default (autocompact: auto)"),
             "{header}"

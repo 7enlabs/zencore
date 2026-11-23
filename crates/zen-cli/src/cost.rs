@@ -69,7 +69,6 @@ pub fn provider_from_base_url(base_url: &str) -> String {
         ("groq.com", "groq"),
         ("mistral.ai", "mistral"),
         ("api.x.ai", "xai"),
-        ("experientiallabs.ai", "experientiallabs"),
         ("cerebras.ai", "cerebras"),
         ("nvidia.com", "nvidia"),
     ] {
@@ -337,10 +336,6 @@ mod tests {
         );
         assert_eq!(provider_from_base_url("http://localhost:11434/v1"), "local");
         assert_eq!(provider_from_base_url("http://127.0.0.1:11434/v1"), "local");
-        assert_eq!(
-            provider_from_base_url("https://api.experientiallabs.ai/api/v1"),
-            "experientiallabs"
-        );
         assert_eq!(
             provider_from_base_url("https://llm.example-corp.net/v1"),
             "llm.example-corp.net"

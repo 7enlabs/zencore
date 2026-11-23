@@ -84,7 +84,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 ## Run
 
 ```bash
-# defaults: base URL https://api.experientiallabs.ai/api/v1, model deepseek-v4.1-flash
+# defaults: base URL https://openrouter.ai/api/v1, model nvidia/nemotron-3-ultra-550b-a55b:free
 zen                                   # interactive REPL
 zen -p "list files and summarize README" --output-format json
 echo "explain this log" | zen -p --output-format text
@@ -121,9 +121,10 @@ provider's best free model. In the REPL:
 - `/model <name>` - pin a model; auto mode turns off. Pinning the
   provider's default model is still a pin, not auto.
 - `/model auto` - turn auto mode back on.
-- `/provider <name>` - switch provider (`experientiallabs` or
-  `openrouter`, case-insensitive); the model resets to that provider's
-  best free model and auto mode turns on.
+- `/provider <name>` - switch provider (`openrouter`,
+  case-insensitive); the model resets to that provider's best free
+  model and auto mode turns on. (Ollama is local only: use
+  `--provider ollama` or an `ollama/<name>` model instead.)
 
 Auto mode does not apply to Ollama: local models have no catalog, so
 `--provider ollama --model auto` is rejected - name a local model
@@ -152,8 +153,8 @@ Configuration lives in `~/.zen/settings.json`, `.zen/settings.json`, `.zen/setti
 ### Model routing
 
 Zen talks to one model service at a time: a base URL plus a model id. The
-defaults are base URL `https://api.experientiallabs.ai/api/v1` and model
-`deepseek-v4.1-flash` (see Quickstart). Point `ZEN_BASE_URL` at another
+defaults are base URL `https://openrouter.ai/api/v1` and model
+`nvidia/nemotron-3-ultra-550b-a55b:free` (see Quickstart). Point `ZEN_BASE_URL` at another
 OpenAI-compatible endpoint to use its models, and set the key with
 `ZEN_API_KEY` (or that endpoint's own key variable).
 

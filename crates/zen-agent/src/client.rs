@@ -1904,10 +1904,6 @@ mod tests {
         // returning String::new() and the one returning "xyzzy" both die
         // on these exact-value asserts.
         assert_eq!(
-            provider_name_for_url("https://api.experientiallabs.ai/api/v1"),
-            "api.experientiallabs.ai"
-        );
-        assert_eq!(
             provider_name_for_url("https://openrouter.ai/api/v1"),
             "openrouter.ai"
         );

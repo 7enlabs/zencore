@@ -23,11 +23,9 @@ fn price_table(model: &str) -> Option<(f64, f64)> {
         // the list price rises to $4/$20 after - update this entry.
         "gemini-4-argon" => (2.00, 10.00),
 
-        // Free $0 on the default gateway Free plan (public pricing
-        // page, 2026-11-08): the default model, so /cost and the budget
-        // guard must treat it as free.
-        "deepseek-v4.1-flash" => (0.0, 0.0),
-
+        // Free models on the default gateway carry the :free suffix,
+        // priced $0 by the rule in price_per_1m below; no table
+        // entry is needed for the default model.
         "grok-4" => (3.00, 15.00),
         "grok-code-fast-1" => (0.20, 1.50),
 
@@ -157,7 +155,7 @@ mod tests {
         assert_eq!(price_per_1m("qwen/qwen3-coder:FREE"), Some((0.0, 0.0)));
         assert_eq!(price_per_1m("ollama/qwen3-coder:30b"), Some((0.0, 0.0)));
         assert!(is_free_model("deepseek/deepseek-chat:free"));
-        assert!(is_free_model("deepseek-v4.1-flash"));
+        assert!(is_free_model("nvidia/nemotron-3-ultra-550b-a55b:free"));
         assert!(!is_free_model("gpt-4o"));
     }
 

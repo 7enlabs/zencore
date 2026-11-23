@@ -545,8 +545,8 @@ mod tests {
             Some("openrouter.ai".into())
         );
         assert_eq!(
-            RateGate::provider_key("https://api.experientiallabs.ai/api/v1/"),
-            Some("api.experientiallabs.ai".into())
+            RateGate::provider_key("https://api.deepseek.com/v1/"),
+            Some("api.deepseek.com".into())
         );
         assert_eq!(
             RateGate::provider_key("http://example.com:8080/x"),

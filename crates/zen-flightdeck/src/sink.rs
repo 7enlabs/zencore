@@ -120,7 +120,7 @@ mod tests {
     fn fanout_delivers_every_event_to_every_sink() {
         let state = Arc::new(Mutex::new(FlightdeckState::new(
             "sess-1",
-            "deepseek-v4.1-flash",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
             128_000,
             PermissionMode::Default,
             "auto",
@@ -183,7 +183,7 @@ mod tests {
     fn flightdeck_sink_survives_a_poisoned_state_lock() {
         let state = Arc::new(Mutex::new(FlightdeckState::new(
             "sess-1",
-            "deepseek-v4.1-flash",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
             128_000,
             PermissionMode::Default,
             "auto",

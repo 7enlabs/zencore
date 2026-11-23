@@ -223,7 +223,7 @@ mod tests {
         let (m, u, k, o) = apply_ollama_routing(
             false,
             "ollama/qwen3-coder:30b",
-            "https://api.experientiallabs.ai/api/v1",
+            "https://openrouter.ai/api/v1",
             false,
             Some("secret".into()),
             "http://localhost:11434/v1",
