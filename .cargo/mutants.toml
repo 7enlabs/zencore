@@ -328,4 +328,99 @@ exclude_re = [
   # window stops splitting on non-alphanumerics, this mutant stops
   # being equivalent: remove this exclusion and kill it with a test.
   "github\\.rs:329:20: replace \\+ with \\* in negated_before",
+  # PR #274, classifier.rs tokenize (line 167, col 32):
+  # replace > with >= in `tokens.len() > 1`.
+  # EQUIVALENT (waived by ZC Leader, 2026-11-23, per Zen delegation
+  # in main chat 23/11/2026; proof verified by reading tokenize):
+  # the operators differ only at len == 1; then the original returns
+  # Vec::new() and the mutant returns tokens[1..] which is also empty.
+  # No input changes `args`, so no test can kill this mutant.
+  # EXPIRY: if the `if` branch stops returning `tokens[1..]` (for
+  # example it indexes `tokens[1]` directly), this mutant stops being
+  # equivalent: remove the exclusion and kill it with a test that
+  # tokenizes a single-token command and checks the args are empty.
+  "classifier\\.rs:167:32: replace > with >= in tokenize",
+  # PR #274, classifier.rs classify_bash (line 195, col 30):
+  # replace match guard !parts.is_empty() with true.
+  # EQUIVALENT (waived by ZC Leader, 2026-11-23, per Zen delegation
+  # in main chat 23/11/2026; proof verified by reading
+  # split_compound in permissions.rs and the classify_bash fall-through):
+  # the versions differ only when bash_parts returns Some(Some([])),
+  # which happens only for empty/whitespace/separator-only commands;
+  # both paths return mutating.default for those. No test can kill it.
+  # EXPIRY: if `bash_parts` can return an empty list for a command
+  # that is not empty/whitespace/separator-only, or if `classify_part`
+  # gains a pattern matching `""` or `";"`, this mutant stops being
+  # equivalent: remove the exclusion and kill it with a test on an
+  # empty command that asserts the fallback verdict.
+  "classifier\\.rs:195:30: replace match guard !parts.is_empty() with true in classify_bash",
+  # PR #274, classifier.rs classify_bash (line 211, col 48):
+  # replace > with >= in `parsed.len() > 1` (pipe-to-shell check).
+  # EQUIVALENT (waived by ZC Leader, 2026-11-23, per Zen delegation
+  # in main chat 23/11/2026; proof in mutants-equivalent-candidates.md
+  # §3): the operators differ only at len == 1; one part has one
+  # program, and the shell set {sh, bash, zsh, dash, fish} and the
+  # fetch set {curl, wget} are disjoint, so has_shell && has_fetch
+  # is false either way.
+  # EXPIRY: if a program name ever belongs to both the shell set and
+  # the fetch set, or if `has_shell`/`has_fetch` stop being
+  # per-program checks, this mutant stops being equivalent: remove the
+  # exclusion and kill it with a test where a single part is both a
+  # shell and a fetch program.
+  "classifier\\.rs:211:48: replace > with >= in classify_bash",
+  # PR #274, classifier.rs classify_git (line 453, col 24):
+  # replace + with * in `&args[i + 1..]` (rest after the subcommand).
+  # EQUIVALENT (waived by ZC Leader, 2026-11-23, per Zen delegation
+  # in main chat 23/11/2026; proof in mutants-equivalent-candidates.md
+  # §4): `rest` is only read through any(...) checks, and none of the
+  # four subcommand names (push, reset, clean, checkout) matches any
+  # check, so including the subcommand itself cannot change any verdict.
+  # EXPIRY: if a new subcommand is added whose name matches one of
+  # the checks (for example a subcommand literally named `"main"`),
+  # or if `rest` is read in any other way, this mutant stops being
+  # equivalent: remove the exclusion and kill it with a test using
+  # that subcommand.
+  "classifier\\.rs:453:24: replace + with * in classify_git",
+  # PR #274, classifier.rs is_safe_part (line 557, col 43):
+  # replace + with * in `&args[i + 1..]` (git branch flag search).
+  # EQUIVALENT (waived by ZC Leader, 2026-11-23, per Zen delegation
+  # in main chat 23/11/2026; proof in mutants-equivalent-candidates.md
+  # §5): this arm runs only when args[i] == "branch", and "branch"
+  # equals none of the six flags (-d, -D, -m, -M, --delete, --move),
+  # so including it cannot change the safe verdict.
+  # EXPIRY: if the flag list gains an entry equal to `"branch"`, or
+  # if the slice is read in any other way, this mutant stops being
+  # equivalent: remove the exclusion and kill it with a test on
+  # `git branch` with that flag present.
+  "classifier\\.rs:557:43: replace + with * in is_safe_part",
+  # PR #274, state.rs FlightdeckState::apply (line 553, col 41):
+  # replace > with >= in the gate cap check (same shape as the
+  # already-waived push_log mutant, state.rs:515, waived by ZC Leader,
+  # Telegram tin 19373, 2026-11-21).
+  # EQUIVALENT (waived by ZC Leader, 2026-11-23, per Zen delegation
+  # in main chat 23/11/2026; proof verified by reading
+  # state.rs:544-555): the operators differ only at len == 200; then
+  # excess is 200 - 200 = 0 and drain(..0) removes nothing, exactly
+  # like skipping the drain.
+  # EXPIRY: if the drain is changed so the boundary case can remove
+  # rows (for example the drain range stops starting at 0), this
+  # mutant stops being equivalent: remove the exclusion and kill it
+  # with a test that pushes exactly 200 gate rows and checks the
+  # rows are unchanged.
+  "state\\.rs:553:41: replace > with >= in FlightdeckState::apply",
+  # PR #274, state.rs FlightdeckState::apply (line 554, col 55):
+  # replace - with / in the excess computation (same shape as the
+  # already-waived push_log mutant, state.rs:516, waived by ZC Leader,
+  # Telegram tin 19373, 2026-11-21).
+  # EQUIVALENT (waived by ZC Leader, 2026-11-23, per Zen delegation
+  # in main chat 23/11/2026; proof verified by reading
+  # state.rs:544-555 and grepping gate_rows): the drain runs after
+  # every push, so inside the len > 200 branch len is exactly 201,
+  # and 201 - 200 == 201 / 200 == 1 (integer division).
+  # EXPIRY: if `gate_rows` can grow anywhere other than this `apply`
+  # arm, or if `apply` stops draining to 200 after every push, this
+  # mutant stops being equivalent: remove the exclusion and kill it
+  # with a test that overfills the gate rows and checks which rows
+  # survive.
+  "state\\.rs:554:55: replace - with / in FlightdeckState::apply",
 ]
