@@ -1026,7 +1026,7 @@ pub enum SkillSubcommand {
 
 #[derive(Args, Debug, Clone)]
 #[command(
-    after_help = "Examples:\n  zen mcp list               List configured servers\n  zen mcp get my-server      Show one server\n  zen mcp add my-server -- npx my-mcp-server  Add a stdio server\n  zen mcp remove my-server   Remove a server"
+    after_help = "Examples:\n  zen mcp list               List configured servers\n  zen mcp get my-server      Show one server\n  zen mcp add my-server -- npx my-mcp-server  Add a stdio server\n  zen mcp add --scope project srv -- cmd  Scope flags go before the name\n  zen mcp remove my-server   Remove a server"
 )]
 pub struct McpArgs {
     #[command(subcommand)]
