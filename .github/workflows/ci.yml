@@ -13,6 +13,9 @@ env:
   # Tiered pipeline (buffer task): incremental artifacts bloat the
   # rust-cache and slow restores, and CI builds are one-shot anyway.
   CARGO_INCREMENTAL: "0"
+  # Tests spawn the real `zen` binary with a fresh temp HOME, so opt out
+  # of the first-run telemetry notice + ping for every CI run.
+  DO_NOT_TRACK: "1"
 jobs:
   changes:
     # Paths filter by PR type: the expensive cross-platform build
