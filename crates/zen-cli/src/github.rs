@@ -294,13 +294,61 @@ impl Severity {
     }
 }
 
+/// A word character for keyword matching: letters, digits, `-` and `_`
+/// join compound words and identifiers into one token, so `over-blocking`
+/// and `non_blocking` do not match `blocking`.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '-' || c == '_'
+}
+
+/// Whether `needle` occurs at a token start in `haystack`: the char
+/// before the match must not be a word char. The char after is not
+/// checked, so stems ("vulnerab") and plurals ("suggestions") still
+/// match, while "debug" does not match "bug" and "insecurity" does not
+/// match "security".
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    haystack.match_indices(needle).any(|(i, _)| {
+        haystack[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_word_char(c))
+            && !negated_before(haystack, i)
+    })
+}
+
+/// Whether a negation word ("no", "not", "without", "zero", "none")
+/// appears as a whole word in the same clause just before `index`:
+/// look back to the last clause boundary (`.`, `!`, `?`, `;`, `:`,
+/// newline) or 32 chars, whichever is nearer. "No security concerns
+/// identified" is negated; "security vulnerability found" is not.
+fn negated_before(haystack: &str, index: usize) -> bool {
+    const NEGATIONS: &[&str] = &["no", "not", "without", "zero", "none"];
+    let before = &haystack[..index];
+    let clause_start = before
+        .rfind(['.', '!', '?', ';', ':', '\n'])
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let window_start = before
+        .char_indices()
+        .rev()
+        .nth(32)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let start = clause_start.max(window_start);
+    before[start..]
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|w| NEGATIONS.contains(&w))
+}
+
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|n| haystack.contains(n))
+    needles.iter().any(|n| contains_word(haystack, n))
 }
 
 /// Keyword heuristic for triage ordering only, not a security judgment:
 /// checked in Critical-first order, case-insensitively, and anything
 /// matching no keyword defaults to Medium rather than to the lowest tier.
+/// Keywords match at token starts (see `contains_word`) and never fire
+/// on their own negation (see `negated_before`).
 pub fn severity_of(body: &str) -> Severity {
     let b = body.to_lowercase();
     if contains_any(
@@ -733,6 +781,39 @@ mod tests {
         assert_eq!(severity_of("maybe rename this"), Severity::Low);
         assert_eq!(severity_of("why is this needed?"), Severity::Medium);
         assert_eq!(severity_of("looks good"), Severity::Medium);
+        // Issue #286: a negated phrase and a compound word must not
+        // fire the keyword they contain.
+        assert_eq!(
+            severity_of("no security concerns identified"),
+            Severity::Medium
+        );
+        assert_eq!(
+            severity_of("over-blocking of shell edits"),
+            Severity::Medium
+        );
+        assert_eq!(
+            severity_of("without any security risk here"),
+            Severity::Medium
+        );
+        // The same keywords still fire when they are real findings.
+        assert_eq!(
+            severity_of("security vulnerability found"),
+            Severity::Critical
+        );
+        assert_eq!(
+            severity_of("this panics on empty input"),
+            Severity::Critical
+        );
+        assert_eq!(
+            severity_of("vulnerability in the parser"),
+            Severity::Critical
+        );
+        // Token starts only: "debug" is not "bug", "insecurity" is not
+        // "security"; plurals and stems still match.
+        assert_eq!(severity_of("debugging this now"), Severity::Medium);
+        assert_eq!(severity_of("insecurity is a problem"), Severity::Medium);
+        assert_eq!(severity_of("a few suggestions"), Severity::Low);
+        assert_eq!(severity_of("no bug here"), Severity::Medium);
     }
 
     #[test]
