@@ -344,6 +344,15 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| contains_word(haystack, n))
 }
 
+/// Whether a comment is a bot-generated summary (PR-Agent): authored
+/// by github-actions[bot] or carrying the `<!-- pr-agent:` marker.
+/// Such a comment gets the [BOT SUMMARY] label and no severity, so a
+/// summary saying "No security concerns identified" is never shown
+/// as [CRITICAL] on the word "security".
+pub fn is_bot_summary(c: &PrComment) -> bool {
+    c.author == "github-actions[bot]" || c.body.contains("<!-- pr-agent:")
+}
+
 /// Keyword heuristic for triage ordering only, not a security judgment:
 /// checked in Critical-first order, case-insensitively, and anything
 /// matching no keyword defaults to Medium rather than to the lowest tier.
@@ -447,12 +456,12 @@ pub fn format_comments_text(fetched: &FetchedComments) -> String {
                 Some(l) => format!(":{l}"),
                 None => String::new(),
             };
-            s.push_str(&format!(
-                "  [{}] @{}{}\n",
-                severity_of(&c.body).label(),
-                c.author,
-                loc
-            ));
+            let label = if is_bot_summary(c) {
+                "BOT SUMMARY"
+            } else {
+                severity_of(&c.body).label()
+            };
+            s.push_str(&format!("  [{label}] @{}{}\n", c.author, loc));
             for line in c.body.lines().take(15) {
                 s.push_str(&format!("  > {line}\n"));
             }
@@ -626,12 +635,15 @@ pub fn pr_fix_prompt(fetched: &FetchedComments) -> String {
     for g in group_comments(fetched) {
         p.push_str(&format!("### {}\n", g.title));
         for c in &g.comments {
-            p.push_str(&format!(
-                "- @{} [{}]: {}\n",
-                c.author,
-                severity_of(&c.body).label(),
-                c.body
-            ));
+            // Same label rule as format_comments_text: a bot summary
+            // gets [BOT SUMMARY] and no severity, so the agent is not
+            // sent to fix a summary that says there is nothing to fix.
+            let label = if is_bot_summary(c) {
+                "BOT SUMMARY"
+            } else {
+                severity_of(&c.body).label()
+            };
+            p.push_str(&format!("- @{} [{}]: {}\n", c.author, label, c.body));
         }
         p.push('\n');
     }
@@ -831,6 +843,45 @@ mod tests {
         );
     }
 
+    fn bot_summary_comment(author: &str, body: &str) -> PrComment {
+        PrComment {
+            id: 301,
+            author: author.to_string(),
+            body: body.to_string(),
+            kind: CommentKind::Review,
+            path: Some("src/main.rs".to_string()),
+            line: Some(42),
+            diff_hunk: None,
+            created_at: "2026-11-23T00:00:00Z".to_string(),
+            url: "https://github.com/o/r/pull/1#discussion_r301".to_string(),
+        }
+    }
+
+    #[test]
+    fn bot_summary_gets_its_own_label_not_severity() {
+        // Leader decision (tin 21654/21658): trust either marker —
+        // author github-actions[bot] OR a `<!-- pr-agent:` marker in
+        // the body. A bot summary gets [BOT SUMMARY] and no severity,
+        // even when its body contains a Critical keyword.
+        let by_author =
+            bot_summary_comment("github-actions[bot]", "No security concerns identified.");
+        assert!(is_bot_summary(&by_author));
+        let by_marker = bot_summary_comment(
+            "someone",
+            "<!-- pr-agent: summary -->\nNo security concerns identified.",
+        );
+        assert!(is_bot_summary(&by_marker));
+        let human = bot_summary_comment("lead-reviewer", "security vulnerability here");
+        assert!(!is_bot_summary(&human));
+
+        let mut fetched = sample_fetched();
+        fetched.review_comments.push(by_author);
+        let text = format_comments_text(&fetched);
+        assert!(text.contains("[BOT SUMMARY] @github-actions[bot]"));
+        assert!(!text.contains("[CRITICAL] @github-actions[bot]"));
+        // The real finding keeps its own severity label.
+        assert!(text.contains("[CRITICAL] @lead-reviewer"));
+    }
     #[test]
     fn is_word_char_joins_compound_words() {
         // Kills the mutants that replace is_word_char with false and
@@ -951,6 +1002,23 @@ mod tests {
         assert!(p.contains("@lead-reviewer"));
         assert!(p.contains("[CRITICAL]"));
         assert!(p.contains("Do not post replies on GitHub"));
+    }
+
+    #[test]
+    fn pr_fix_prompt_labels_bot_summary_not_critical() {
+        // Follow-up #286: the prompt must use the same label rule as
+        // the text view, or the agent is sent to fix a summary that
+        // says "No security concerns identified".
+        let mut fetched = sample_fetched();
+        fetched.review_comments.push(bot_summary_comment(
+            "github-actions[bot]",
+            "No security concerns identified.",
+        ));
+        let p = pr_fix_prompt(&fetched);
+        assert!(p.contains("@github-actions[bot] [BOT SUMMARY]"));
+        assert!(!p.contains("@github-actions[bot] [CRITICAL]"));
+        // The real finding keeps its own severity label.
+        assert!(p.contains("@lead-reviewer [CRITICAL]"));
     }
 
     #[test]
