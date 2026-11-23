@@ -24,6 +24,16 @@ const DIAGNOSTICS_TIMEOUT: Duration = Duration::from_secs(3);
 /// resolves (a reference agent's `DIAGNOSTICS_DEBOUNCE_MS = 150`).
 const DIAGNOSTICS_DEBOUNCE: Duration = Duration::from_millis(150);
 
+/// Maximum body size of one LSP frame.
+///
+/// `read_frame` allocates the body up front from the server-declared
+/// `Content-Length`, so without a cap a misbehaving or compromised
+/// server can abort the process by forcing a huge allocation
+/// (issue #277). 10 MiB is generous: realistic messages are kilobytes,
+/// the largest (a big `workspace/symbol` result or a full diagnostic
+/// set) are low megabytes.
+pub(crate) const MAX_FRAME_BYTES: usize = 10 * 1024 * 1024;
+
 type Pending = Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Value>>>>;
 
 /// Latest diagnostics per file URI, as published by the server.
@@ -271,10 +281,17 @@ where
         if let Some((k, v)) = line.split_once(':')
             && k.trim().eq_ignore_ascii_case("content-length")
         {
-            content_length = v.trim().parse().ok();
+            content_length = Some(
+                v.trim()
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("LSP frame has invalid Content-Length"))?,
+            );
         }
     }
     let len = content_length.ok_or_else(|| anyhow::anyhow!("LSP frame without Content-Length"))?;
+    if len > MAX_FRAME_BYTES {
+        anyhow::bail!("LSP frame of {len} bytes exceeds the {MAX_FRAME_BYTES} byte limit");
+    }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body).await?;
     Ok(serde_json::from_slice(&body)?)

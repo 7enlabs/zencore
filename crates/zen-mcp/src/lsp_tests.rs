@@ -12,7 +12,7 @@ use crate::lsp::{
     parse_locations, parse_publish_diagnostics, path_to_uri, render_hover, server_spec,
     uri_to_path, utf16_to_col,
 };
-use crate::lsp::{read_frame, write_frame};
+use crate::lsp::{MAX_FRAME_BYTES, read_frame, write_frame};
 use crate::lsp_tools::{DiagnosticsTool, FindReferencesTool, GotoDefinitionTool, HoverTool};
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -358,6 +358,64 @@ async fn read_frame_errors_without_content_length() {
         .unwrap();
     let err = read_frame(&mut BufReader::new(&mut b)).await.unwrap_err();
     assert!(err.to_string().contains("Content-Length"), "got: {err}");
+}
+
+#[tokio::test]
+async fn read_frame_errors_on_huge_content_length() {
+    // Issue #277: a 100 GB Content-Length used to make `read_frame` try
+    // to allocate the whole body up front and abort the process
+    // (SIGABRT) instead of returning an error.
+    let (mut a, mut b) = tokio::io::duplex(65536);
+    tokio::spawn(async move {
+        a.write_all(b"Content-Length: 107374182400\r\n\r\n{")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    });
+    let err = read_frame(&mut BufReader::new(&mut b)).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains(&format!("exceeds the {MAX_FRAME_BYTES} byte limit")),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn read_frame_errors_one_byte_over_cap() {
+    // Boundary: cap + 1 is rejected without allocating the body.
+    let (mut a, mut b) = tokio::io::duplex(65536);
+    tokio::spawn(async move {
+        a.write_all(format!("Content-Length: {}\r\n\r\n{{", MAX_FRAME_BYTES + 1).as_bytes())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    });
+    let err = read_frame(&mut BufReader::new(&mut b)).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains(&format!("exceeds the {MAX_FRAME_BYTES} byte limit")),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn read_frame_accepts_frame_at_cap() {
+    // A frame of exactly MAX_FRAME_BYTES must still read fine; only
+    // frames *over* the cap are rejected (issue #277). The writer runs
+    // in a task because the 10 MiB body does not fit the 64 KiB duplex
+    // buffer and would deadlock a sequential write.
+    let (mut a, mut b) = tokio::io::duplex(65536);
+    let body = format!("{{\"data\":\"{}\"}}", "x".repeat(MAX_FRAME_BYTES - 11));
+    assert_eq!(body.len(), MAX_FRAME_BYTES);
+    let len = body.len();
+    tokio::spawn(async move {
+        a.write_all(format!("Content-Length: {len}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        a.write_all(body.as_bytes()).await.unwrap();
+    });
+    let got = read_frame(&mut BufReader::new(&mut b)).await.unwrap();
+    assert_eq!(got["data"].as_str().unwrap().len(), MAX_FRAME_BYTES - 11);
 }
 
 #[tokio::test]
