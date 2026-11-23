@@ -1912,7 +1912,8 @@ mod tests {
             "api.example.com:8443"
         );
         assert_eq!(
-            provider_name_for_url("https://user:pass@api.example.com/v1"),
+            // Test fixture: fake userinfo on a non-existent domain, not a secret.
+            provider_name_for_url("https://user:pass@api.example.com/v1"), // trufflehog:ignore
             "api.example.com"
         );
     }
