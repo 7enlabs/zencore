@@ -110,6 +110,18 @@ pub fn select_builtin_tools(
         .filter(|e| e.starts_with('+') || e.starts_with('-'))
         .count();
     if deltas == 0 {
+        // Issue #283: a plain-list name that matches nothing must fail
+        // like the delta form does, instead of silently dropping the
+        // entry and running with fewer tools than requested.
+        let names: Vec<&str> = all.iter().map(|t| t.name()).collect();
+        for want in &entries {
+            if !names.iter().any(|n| n.eq_ignore_ascii_case(want)) {
+                anyhow::bail!(
+                    "--tools: unknown built-in tool '{want}' (available: {})",
+                    names.join(", ")
+                );
+            }
+        }
         return Ok(all
             .into_iter()
             .filter(|t| entries.iter().any(|a| a.eq_ignore_ascii_case(t.name())))
@@ -2371,6 +2383,19 @@ mod tools_flag_tests {
             unknown.to_string().contains("unknown built-in tool 'Bsh'"),
             "{unknown}"
         );
+    }
+
+    #[test]
+    fn tools_flag_plain_list_rejects_unknown() {
+        // Issue #283: a plain-list typo must fail like the delta form
+        // does, naming the unknown tool and the valid set, instead of
+        // silently running with fewer tools than requested.
+        let unknown = select_builtin_tools(Some("Read,Bsh"), zen_tools::builtin_tools())
+            .err()
+            .unwrap();
+        let msg = unknown.to_string();
+        assert!(msg.contains("unknown built-in tool 'Bsh'"), "{msg}");
+        assert!(msg.contains("available: "), "{msg}");
     }
 }
 
