@@ -732,6 +732,12 @@ async fn mcp_add_duplicate_refuses_without_force() {
         err
     );
     assert!(err.contains("already exists"), "stderr: {}", err);
+    // The conflict names the existing server, so the old URL must show.
+    assert!(
+        err.contains("http://127.0.0.1:8931/"),
+        "stderr should name the existing server: {}",
+        err
+    );
     assert_eq!(read_url(), "http://127.0.0.1:8931/");
 
     let (out, err, code) = run(s(&[
@@ -746,4 +752,19 @@ async fn mcp_add_duplicate_refuses_without_force() {
     assert_eq!(code, 0, "{}", err);
     assert!(out.contains("replaced"), "stdout: {}", out);
     assert_eq!(read_url(), "http://127.0.0.1:9999/");
+
+    // Same for a stdio server: the conflict must name its command.
+    let (_, err, code) = run(s(&["mcp", "add", "std1", "echo", "hi"]));
+    assert_eq!(code, 0, "{}", err);
+    let (_, err, code) = run(s(&["mcp", "add", "std1", "echo", "bye"]));
+    assert_eq!(
+        code, 7,
+        "stdio duplicate without --force must be a conflict: {}",
+        err
+    );
+    assert!(
+        err.contains("command echo hi"),
+        "stderr should name the existing stdio server: {}",
+        err
+    );
 }
