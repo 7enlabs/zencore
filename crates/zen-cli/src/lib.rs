@@ -702,15 +702,21 @@ fn cost_subcommand(
     };
 
     let session_id = match &args.session {
-        Some(s) => {
-            if let Some(p) = session::find_session_path(home, s) {
-                p.file_stem()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| s.clone())
-            } else {
-                s.clone()
+        Some(s) => match session::find_session_path(home, s) {
+            Some(p) => p
+                .file_stem()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| s.clone()),
+            // An explicit id that is not on disk is not found (issue
+            // #279): the same code `sessions archive` uses, so a typo
+            // in a session id never reads as a free session.
+            None => {
+                return Err(coded_error(
+                    exit_code::NOT_FOUND,
+                    format!("no session found: {s}"),
+                ));
             }
-        }
+        },
         None => cost::latest_session_id(home)
             .ok_or_else(|| anyhow::anyhow!("no sessions found under ~/.zen/projects"))?,
     };
@@ -2041,6 +2047,38 @@ mod tests {
         assert_ne!(id, "orig");
         assert!(path.unwrap().ends_with(format!("{}.jsonl", id)));
         assert_eq!(src.unwrap(), p, "fork replays the original transcript");
+    }
+
+    #[test]
+    fn cost_unknown_session_is_not_found() {
+        // Issue #279: `zen cost --session <unknown>` must error (exit
+        // 3, not found) instead of inventing a zero-cost record; a
+        // real session with no ledger still reports no data, exit 0.
+        let dir = std::env::temp_dir().join(format!("zen_lib_cost279_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // One real session on disk.
+        let proj = session::ensure_session_dir(&dir, &dir, "real-one").unwrap();
+        let p = session::session_path(&proj, "real-one");
+        session::append_typed(&p, "user", "hi", "cwd", "u", None, None, None).unwrap();
+
+        let cli = Cli::parse_from(["zen"]);
+        // Unknown id: not found in text and in JSON alike (no invented
+        // `"type":"cost"` record).
+        for format in [OutputFormat::Text, OutputFormat::Json] {
+            let args = CostArgs {
+                session: Some("nope".to_string()),
+                output_format: format,
+            };
+            let err = cost_subcommand(&cli, &dir, Some(&dir), &args).unwrap_err();
+            assert_eq!(exit_code_for_error(&err), exit_code::NOT_FOUND);
+        }
+        // Real session, no ledger yet: the legitimate zero case stays.
+        let args = CostArgs {
+            session: Some("real-one".to_string()),
+            output_format: OutputFormat::Text,
+        };
+        cost_subcommand(&cli, &dir, Some(&dir), &args).unwrap();
     }
 
     #[test]
