@@ -242,3 +242,120 @@ fn import_dry_run_prints_unless_quiet() {
         "quiet dry-run must print nothing, stdout: {out}"
     );
 }
+
+#[test]
+fn builtin_install_writes_the_named_skill_content() {
+    // Kills skills.rs:607: install_builtin finds the builtin by name, so
+    // flipping `==` to `!=` would install another skill's files under
+    // this name. The manifest comes from the name, but SKILL.md comes
+    // from the found entry, so assert on the file content.
+    let home = TempDir::new("dry_quiet_home6");
+    let cwd = TempDir::new("dry_quiet_cwd6");
+    let run = |args: &[&str]| {
+        let args: Vec<String> = args.iter().map(|x| x.to_string()).collect();
+        ZenRun::new("dry_quiet", &home, &cwd)
+            .args(args)
+            .run_output()
+    };
+
+    let (_, err, code) = run(&["skill", "install", "--yes", "builtin:tdd"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let skill_md = std::fs::read_to_string(home.path().join(".zen/skills/tdd/SKILL.md")).unwrap();
+    assert!(
+        skill_md.contains("name: tdd"),
+        "installed SKILL.md is not the tdd one: {skill_md}"
+    );
+    assert!(
+        !skill_md.contains("name: token-diet"),
+        "installed SKILL.md came from another builtin: {skill_md}"
+    );
+}
+
+#[test]
+fn secret_register_dry_run_reports_what_it_would_replace() {
+    // Kills secret.rs:917 (zen-core preview_register_secret): the
+    // existing entry is found by name, so flipping `==` to `!=` reports
+    // no replacement for a name that is already taken.
+    let home = TempDir::new("dry_quiet_home7");
+    let cwd = TempDir::new("dry_quiet_cwd7");
+    let run = |args: &[&str]| {
+        let args: Vec<String> = args.iter().map(|x| x.to_string()).collect();
+        ZenRun::new("dry_quiet", &home, &cwd)
+            .args(args)
+            .run_output()
+    };
+    let base = [
+        "secret",
+        "register",
+        "--name",
+        "DRY_Q_KEY",
+        "--class",
+        "seat",
+        "--service",
+        "model-service",
+        "--owner",
+        "zc-developer",
+        "--by",
+        "zc-leader",
+        "--default-until-days",
+        "30",
+        "--rotation-days",
+        "30",
+        "--reason",
+        "msg-1",
+    ];
+
+    let (_, err, code) = run(&base);
+    assert_eq!(code, 0, "stderr: {err}");
+
+    // A taken name is refused without --force, even for a preview:
+    // pass --force so the dry run shows the replacement instead.
+    let mut dry = base.to_vec();
+    dry.push("--force");
+    dry.push("--dry-run");
+    let (out, err, code) = run(&dry);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("replaces: DRY_Q_KEY"),
+        "dry-run must name the registration it would replace, stdout: {out}"
+    );
+}
+
+#[test]
+fn skill_install_local_dry_run_uses_manifest_name() {
+    // Kills skills.rs:1490: with a manifest present the manifest name
+    // wins over the directory name, so dropping the `!` in
+    // `if !m.name.trim().is_empty()` prints the directory name instead.
+    let home = TempDir::new("dry_quiet_home8");
+    let cwd = TempDir::new("dry_quiet_cwd8");
+    let run = |args: &[&str]| {
+        let args: Vec<String> = args.iter().map(|x| x.to_string()).collect();
+        ZenRun::new("dry_quiet", &home, &cwd)
+            .args(args)
+            .run_output()
+    };
+
+    let fixture = cwd.path().join("local-dir");
+    std::fs::create_dir_all(&fixture).unwrap();
+    std::fs::write(
+        fixture.join("SKILL.md"),
+        "---\nname: manifest-named\ndescription: Manifest named skill\nallowed-tools: read\n---\n\n# M\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.join("zen-plugin.json"),
+        "{\"name\": \"manifest-named\", \"version\": \"0.3.0\", \"description\": \"Manifest named skill\", \"author\": \"\"}",
+    )
+    .unwrap();
+
+    let (out, err, code) = run(&["skill", "install", "--dry-run", "./local-dir"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("would install skill manifest-named v0.3.0"),
+        "stdout: {out}"
+    );
+    assert!(
+        !out.contains("would install skill local-dir"),
+        "manifest name must win over the directory name, stdout: {out}"
+    );
+}
