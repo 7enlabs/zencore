@@ -698,6 +698,35 @@ fn write_mcp_file(path: &Path, root: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Flags that belong to `zen mcp add` itself (issue #275). With
+/// `trailing_var_arg` on `McpSubcommand::Add::args`, clap puts every token
+/// after `<NAME>` into the server command, so a zen flag written after the
+/// name would silently land in the server's `args` array and the server
+/// would be written to the wrong scope. Reject such tokens instead of
+/// writing the wrong file. A literal `--` token ends the scan: everything
+/// after it was explicitly separated from zen's flags, e.g.
+/// `zen mcp add srv echo -- --scope project`.
+fn reject_swallowed_mcp_flags(rest: &[String]) -> Result<()> {
+    const ZEN_FLAGS: &[&str] = &["--scope", "--transport", "--env", "--header", "-e", "-s"];
+    for tok in rest {
+        if tok == "--" {
+            break;
+        }
+        let looks_like_zen_flag = ZEN_FLAGS.contains(&tok.as_str())
+            || tok.starts_with("--scope=")
+            || tok.starts_with("--transport=")
+            || tok.starts_with("--env=")
+            || tok.starts_with("--header=");
+        if looks_like_zen_flag {
+            return Err(anyhow!(
+                "flag-like token {:?} in server command; `mcp add` flags (--scope, --transport, -e, --env, --header, -s) must come before the server name, e.g. `zen mcp add --scope project srv echo hi`. If the token belongs to the server command, separate it with `--` after the command, e.g. `zen mcp add srv echo -- --scope project`",
+                tok
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub async fn mcp_command(
     cli: &crate::cli::Cli,
     cwd: &Path,
@@ -754,6 +783,7 @@ pub async fn mcp_command(
             env,
             header,
         } => {
+            reject_swallowed_mcp_flags(rest)?;
             if transport != "stdio" && transport != "http" {
                 return Err(anyhow!(
                     "unsupported transport {:?} (expected stdio or http)",
@@ -1414,5 +1444,26 @@ mod tests {
         assert_eq!(help_group("/help"), "Session & model");
         assert_eq!(help_group("/commit"), "Code & review");
         assert_eq!(help_group("/not-a-command"), "Tools");
+    }
+
+    #[test]
+    fn mcp_add_rejects_swallowed_zen_flags() {
+        // Issue #275: a zen flag after the server name must be rejected,
+        // never silently swallowed into the server's args.
+        let t = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert!(reject_swallowed_mcp_flags(&t(&["echo", "hi", "--scope", "project"])).is_err());
+        assert!(reject_swallowed_mcp_flags(&t(&["echo", "hi", "--scope=project"])).is_err());
+        assert!(reject_swallowed_mcp_flags(&t(&["echo", "hi", "-s", "project"])).is_err());
+        assert!(reject_swallowed_mcp_flags(&t(&["echo", "hi", "--transport", "http"])).is_err());
+        assert!(reject_swallowed_mcp_flags(&t(&["echo", "hi", "-e", "K=V"])).is_err());
+        assert!(reject_swallowed_mcp_flags(&t(&["echo", "hi", "--env", "K=V"])).is_err());
+        assert!(reject_swallowed_mcp_flags(&t(&["echo", "hi", "--header", "A: b"])).is_err());
+        // A server command's own flags stay untouched.
+        assert!(reject_swallowed_mcp_flags(&t(&["npx", "-y", "pkg", "/tmp"])).is_ok());
+        assert!(reject_swallowed_mcp_flags(&t(&["echo", "--foo", "bar"])).is_ok());
+        // Everything after a literal `--` is the server's own command.
+        assert!(reject_swallowed_mcp_flags(&t(&["echo", "--", "--scope", "project"])).is_ok());
+        assert!(reject_swallowed_mcp_flags(&t(&["echo", "--", "-e", "hi"])).is_ok());
+        assert!(reject_swallowed_mcp_flags(&[]).is_ok());
     }
 }

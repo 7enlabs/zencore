@@ -519,3 +519,83 @@ async fn c7_5_mcp_subcommands_round_trip() {
     let (_, _, code) = run(s(&["mcp", "get", "-s", "local", "fake"]));
     assert_ne!(code, 0);
 }
+
+// Issue #275: `zen mcp add` swallowed `--scope` written after the server
+// name into the server's args and wrote to the wrong (local) scope.
+#[test]
+fn mcp_add_scope_flag_after_name_is_rejected() {
+    let home = TempDir::new("mcp_275_home");
+    let cwd = TempDir::new("mcp_275_cwd");
+    let run = |args: Vec<String>| ZenRun::new("mcp_275", &home, &cwd).args(args).run_output();
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+    // Flag before the name: honoured, server lands in the project file.
+    let (_, err, code) = run(s(&[
+        "mcp", "add", "--scope", "project", "projA", "echo", "hij",
+    ]));
+    assert_eq!(code, 0, "{err}");
+    let project: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cwd.path().join(".mcp.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        project["mcpServers"]["projA"]["args"],
+        serde_json::json!(["hij"])
+    );
+    assert!(!cwd.path().join(".zen/mcp.json").exists());
+
+    // Flag after the name: rejected, nothing written anywhere.
+    let (_, err, code) = run(s(&[
+        "mcp", "add", "projB", "echo", "hij", "--scope", "project",
+    ]));
+    assert_ne!(code, 0, "swallowed --scope must fail, stderr: {err}");
+    assert!(
+        err.contains("--scope"),
+        "stderr should name the flag: {err}"
+    );
+    assert!(!cwd.path().join(".zen/mcp.json").exists());
+
+    // Invalid scope after the name: rejected like before the name.
+    let (_, _, code) = run(s(&["mcp", "add", "--scope", "racxyz", "a1", "echo", "hi"]));
+    assert_ne!(code, 0);
+    let (_, err, code) = run(s(&["mcp", "add", "a2", "echo", "hi", "--scope", "racxyz"]));
+    assert_ne!(code, 0, "swallowed invalid scope must fail, stderr: {err}");
+    assert!(!cwd.path().join(".zen/mcp.json").exists());
+
+    // Short -s form after the name: rejected too.
+    let (_, _, code) = run(s(&["mcp", "add", "projC", "echo", "hi", "-s", "project"]));
+    assert_ne!(code, 0);
+    assert!(!cwd.path().join(".zen/mcp.json").exists());
+
+    // The server's own flags still work.
+    let (_, err, code) = run(s(&[
+        "mcp",
+        "add",
+        "srv",
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/tmp",
+    ]));
+    assert_eq!(code, 0, "{err}");
+    let local: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cwd.path().join(".zen/mcp.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        local["mcpServers"]["srv"]["args"],
+        serde_json::json!(["-y", "@modelcontextprotocol/server-filesystem", "/tmp"])
+    );
+
+    // A literal `--` after the command escapes a server arg that looks
+    // like a zen flag.
+    let (_, err, code) = run(s(&[
+        "mcp", "add", "srv2", "echo", "--", "--scope", "project",
+    ]));
+    assert_eq!(code, 0, "{err}");
+    let local: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cwd.path().join(".zen/mcp.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        local["mcpServers"]["srv2"]["args"],
+        serde_json::json!(["--", "--scope", "project"])
+    );
+}
