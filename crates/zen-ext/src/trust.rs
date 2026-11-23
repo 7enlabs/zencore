@@ -103,6 +103,17 @@ pub(crate) fn gated_keys(layer: &Value) -> Vec<&'static str> {
     if non_empty(layer.pointer("/permissions/additionalDirectories")) {
         out.push("permissions.additionalDirectories");
     }
+    // Only the bypassPermissions value is gated: a project layer may
+    // pick any other default mode, but it must never grant itself
+    // permission bypass (issue #282). Value-conditional, like
+    // allowPrivateNetwork below.
+    if layer
+        .pointer("/permissions/defaultMode")
+        .and_then(Value::as_str)
+        == Some("bypassPermissions")
+    {
+        out.push("permissions.defaultMode");
+    }
     if non_empty(layer.get("env")) {
         out.push("env");
     }
@@ -135,6 +146,11 @@ pub(crate) fn strip_gated(layer: &mut Value) -> Vec<&'static str> {
         if let Some(Value::Object(p)) = m.get_mut("permissions") {
             p.remove("allow");
             p.remove("additionalDirectories");
+            // Only the bypass value is stripped; any other default
+            // mode from a project layer survives (issue #282).
+            if p.get("defaultMode").and_then(Value::as_str) == Some("bypassPermissions") {
+                p.remove("defaultMode");
+            }
         }
     }
     found
@@ -295,5 +311,33 @@ mod tests {
 
         fs::write(proj.join(".zen/hooks.json"), r#"[1,2]"#).unwrap();
         assert!(gated_project_config(proj).is_empty());
+    }
+
+    #[test]
+    fn gated_default_mode_only_bypass_is_gated() {
+        // Issue #282: only the bypassPermissions value is gated - a
+        // project layer may pick any other default mode.
+        let mut v = json!({"permissions": {"defaultMode": "bypassPermissions", "deny": ["Write"]}});
+        let removed = strip_gated(&mut v);
+        assert_eq!(removed, vec!["permissions.defaultMode"]);
+        assert_eq!(v, json!({"permissions": {"deny": ["Write"]}}));
+
+        let mut v = json!({"permissions": {"defaultMode": "plan"}});
+        let removed = strip_gated(&mut v);
+        assert!(removed.is_empty(), "removed: {removed:?}");
+        assert_eq!(v, json!({"permissions": {"defaultMode": "plan"}}));
+
+        let t = TempDir::new();
+        let proj = t.path();
+        fs::create_dir_all(proj.join(".zen")).unwrap();
+        fs::write(
+            proj.join(".zen/settings.json"),
+            r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            gated_project_config(proj),
+            vec![".zen/settings.json: permissions.defaultMode".to_string()]
+        );
     }
 }

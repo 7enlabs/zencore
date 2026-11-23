@@ -201,6 +201,15 @@ fn load_file_layer_bypass(
     skipped: &mut Vec<String>,
 ) {
     if let Some(mut layer) = read_json_file(path, label, warnings) {
+        // Issue #282: this loader drops a bypassPermissions ask from a
+        // project layer (a repo must not grant itself bypass). Detect
+        // the ask before any stripping so the downgrade is reported in
+        // both the trusted and the untrusted path; it used to be
+        // silent, which read as "the setting is broken".
+        let asks_bypass = layer
+            .pointer("/permissions/defaultMode")
+            .and_then(Value::as_str)
+            == Some("bypassPermissions");
         if !trusted {
             let removed = crate::trust::strip_gated(&mut layer);
             if !removed.is_empty() {
@@ -208,11 +217,13 @@ fn load_file_layer_bypass(
             }
         }
 
-        if let Some(Value::Object(permissions)) = layer.get_mut("permissions")
-            && let Some(Value::String(default_mode)) = permissions.get_mut("defaultMode")
-            && default_mode == "bypassPermissions"
-        {
-            permissions.remove("defaultMode");
+        if asks_bypass {
+            if let Some(Value::Object(permissions)) = layer.get_mut("permissions") {
+                permissions.remove("defaultMode");
+            }
+            warnings.push(format!(
+                "permissions.defaultMode=bypassPermissions in {label} settings was ignored (project settings cannot enable bypassPermissions); set it in ~/.zen/settings.json or pass --permission-mode bypassPermissions if you intend to run without prompts"
+            ));
         }
         *merged = merge_json(merged.clone(), layer);
         sources.push(label.to_string());
@@ -629,6 +640,49 @@ mod tests {
         assert_eq!(s.permissions.default_mode, Some("plan".to_string()));
         assert_eq!(s.max_turns, Some(20));
         assert_eq!(loaded.sources.len(), 5);
+    }
+
+    #[test]
+    fn test_project_bypass_default_mode_is_dropped_and_reported() {
+        // Issue #282: a project layer asking for bypassPermissions is
+        // downgraded (the key is dropped), and the drop must be
+        // reported - as a warning in both trust states, and in the
+        // skipped list when the folder is untrusted.
+        let tmp = TempDir::new();
+        let home = tmp.path().join("home");
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(home.join(".zen")).unwrap();
+        fs::create_dir_all(proj.join(".zen")).unwrap();
+        fs::write(
+            proj.join(".zen/settings.json"),
+            r#"{"permissions": {"defaultMode": "bypassPermissions"}}"#,
+        )
+        .unwrap();
+
+        for trusted in [true, false] {
+            let loaded = load_settings_trust(&proj, Some(&home), None, None, trusted);
+            assert_eq!(loaded.settings.permissions.default_mode, None);
+            assert!(
+                loaded
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("bypassPermissions")),
+                "trusted={trusted}, warnings: {:?}",
+                loaded.warnings
+            );
+            if trusted {
+                assert!(loaded.skipped.is_empty(), "skipped: {:?}", loaded.skipped);
+            } else {
+                assert!(
+                    loaded
+                        .skipped
+                        .iter()
+                        .any(|s| s.contains("permissions.defaultMode")),
+                    "skipped: {:?}",
+                    loaded.skipped
+                );
+            }
+        }
     }
 
     #[test]

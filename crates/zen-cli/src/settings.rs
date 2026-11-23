@@ -1334,6 +1334,81 @@ mod tests {
     }
 
     #[test]
+    fn config_default_mode_bypass_from_project_is_downgraded_with_warning() {
+        // Issue #282: a project file asking for bypassPermissions must
+        // not get it (a repo cannot grant itself bypass), but the
+        // downgrade must be reported, not silent.
+        let _env = env_lock();
+        let dir = std::env::temp_dir().join(format!("zen_cfg_test_bypass_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".zen")).unwrap();
+        fs::write(
+            dir.join(".zen/settings.json"),
+            r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#,
+        )
+        .unwrap();
+        let home =
+            std::env::temp_dir().join(format!("zen_cfg_test_bypass_home_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+
+        // Trusted folder: the mode stays default and a warning names
+        // the ignored setting.
+        let cli = Cli::parse_from(["zen", "--setting-sources", "project", "--trust-folder"]);
+        let cfg = resolve_config_with_home(&cli, &dir, Some(&home)).unwrap();
+        assert_eq!(cfg.permission_mode, PermissionMode::Default);
+        assert!(
+            cfg.warnings.iter().any(|w| w.contains("bypassPermissions")),
+            "warnings: {:?}",
+            cfg.warnings
+        );
+
+        // Untrusted folder: the gated key is also reported in
+        // trust_skipped, like the other gated keys.
+        let cli = Cli::parse_from(["zen", "--setting-sources", "project"]);
+        let cfg = resolve_config_with_home(&cli, &dir, Some(&home)).unwrap();
+        assert_eq!(cfg.permission_mode, PermissionMode::Default);
+        assert!(
+            cfg.trust_skipped
+                .iter()
+                .any(|s| s.contains("permissions.defaultMode")),
+            "trust_skipped: {:?}",
+            cfg.trust_skipped
+        );
+    }
+
+    #[test]
+    fn config_default_mode_bypass_from_user_settings_applies() {
+        // Issue #282 control case: the same value in user settings is
+        // the user's own choice and applies normally, with no warning.
+        let _env = env_lock();
+        let dir =
+            std::env::temp_dir().join(format!("zen_cfg_test_bypass_user_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "zen_cfg_test_bypass_user_home_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(home.join(".zen")).unwrap();
+        fs::write(
+            home.join(".zen/settings.json"),
+            r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#,
+        )
+        .unwrap();
+
+        let cli = Cli::parse_from(["zen", "--setting-sources", "user"]);
+        let cfg = resolve_config_with_home(&cli, &dir, Some(&home)).unwrap();
+        assert_eq!(cfg.permission_mode, PermissionMode::BypassPermissions);
+        assert!(
+            !cfg.warnings.iter().any(|w| w.contains("bypassPermissions")),
+            "warnings: {:?}",
+            cfg.warnings
+        );
+    }
+
+    #[test]
     fn config_settings_file_merge() {
         let _env = env_lock();
         let dir = std::env::temp_dir().join(format!("zen_cfg_test_{}", std::process::id()));
