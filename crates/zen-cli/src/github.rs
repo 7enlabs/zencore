@@ -817,6 +817,21 @@ mod tests {
     }
 
     #[test]
+    fn negation_after_leading_clause_separator_is_still_negation() {
+        // Kills the i + 1 -> i - 1 mutant in negated_before: the ';'
+        // sits at index 0, so the mutant computes 0 - 1 and panics.
+        // The original must treat the phrase as negated.
+        assert!(!contains_word(
+            "; no security concerns identified",
+            "security"
+        ));
+        assert_eq!(
+            severity_of("; no security concerns identified"),
+            Severity::Medium
+        );
+    }
+
+    #[test]
     fn is_word_char_joins_compound_words() {
         // Kills the mutants that replace is_word_char with false and
         // that turn its second `||` into `&&`: `-` and `_` must count
