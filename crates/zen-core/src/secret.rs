@@ -800,14 +800,9 @@ pub struct RegisterInput {
     pub force: bool,
 }
 
-/// Register a secret name. A request naming an unregistered name is
-/// refused; a typo'd name fails closed instead of matching something
-/// near it, because names match exactly and nothing else.
-pub fn register_secret(
-    store: &SecretStore,
-    input: RegisterInput,
-    now: DateTime<Utc>,
-) -> SecretResult<RegistryEntry> {
+/// Validate a registration input without writing anything. Shared by
+/// register_secret and preview_register_secret (issue #281).
+fn validate_register_input(store: &SecretStore, input: &RegisterInput) -> SecretResult<()> {
     if !valid_secret_name(&input.name) {
         return Err(SecretError::validation(format!(
             "invalid secret name '{}': use upper snake case, starting with a letter, at most {MAX_SECRET_NAME_LEN} characters",
@@ -849,23 +844,47 @@ pub fn register_secret(
             existing.rotation_days
         )));
     }
-    let entry = RegistryEntry {
+    Ok(())
+}
+
+/// Build the registry entry a registration would append, without
+/// writing anything. Shared by register_secret and
+/// preview_register_secret.
+fn build_registry_entry(input: &RegisterInput, now: DateTime<Utc>) -> RegistryEntry {
+    RegistryEntry {
         v: 1,
         name: input.name.clone(),
         class: input.class,
-        service: input.service,
-        owner: input.owner,
-        registered_by: input.registered_by,
+        service: input.service.clone(),
+        owner: input.owner.clone(),
+        registered_by: input.registered_by.clone(),
         registered_at: rfc3339(now),
         default_until_days: input.default_until_days,
         rotation_days: input.rotation_days,
         paid: input.paid,
-        reason: input.reason,
+        reason: input.reason.clone(),
         deregistered: false,
-    };
-    if existing.as_ref().is_some_and(|e| !e.deregistered) {
-        // --force replaces the live card in place, so the file keeps
-        // one card per name instead of a shadow card.
+    }
+}
+
+/// Register a secret name. A request naming an unregistered name is
+/// refused; a typo'd name fails closed instead of matching something
+/// near it, because names match exactly and nothing else.
+pub fn register_secret(
+    store: &SecretStore,
+    input: RegisterInput,
+    now: DateTime<Utc>,
+) -> SecretResult<RegistryEntry> {
+    validate_register_input(store, &input)?;
+    let entry = build_registry_entry(&input, now);
+    // --force replaces the live card in place, so the file keeps
+    // one card per name instead of a shadow card. Only reachable
+    // with --force: validate refuses a taken live name otherwise.
+    let registry = load_registry(store)?;
+    if registry
+        .iter()
+        .any(|e| e.name == entry.name && !e.deregistered)
+    {
         let mut entries = registry;
         if let Some(slot) = entries.iter_mut().find(|e| e.name == entry.name) {
             *slot = entry.clone();
@@ -881,6 +900,22 @@ pub fn register_secret(
     })?;
     append_line(&store.registry_path(), &line)?;
     Ok(entry)
+}
+
+/// Preview of register_secret: validate the input and return the entry
+/// that would be appended plus the existing entry for the same name
+/// (if any), without writing anything (issue #281 --dry-run).
+pub fn preview_register_secret(
+    store: &SecretStore,
+    input: &RegisterInput,
+    now: DateTime<Utc>,
+) -> SecretResult<(RegistryEntry, Option<RegistryEntry>)> {
+    validate_register_input(store, input)?;
+    let entry = build_registry_entry(input, now);
+    let existing = load_registry(store)?
+        .into_iter()
+        .find(|e| e.name == entry.name);
+    Ok((entry, existing))
 }
 
 /// Deregister a secret name: a new registry line marks it deregistered,
@@ -1145,14 +1180,18 @@ fn required_approver(req: &SecretRequest, registry: &[RegistryEntry]) -> &'stati
 /// Move a request to `approved` (D1). Refused when the approver is the
 /// requesting seat (exit 5), or when the approver lacks the authority
 /// for the secret class (exit 5).
-pub fn approve_secret(
+/// Validate an approval without writing anything: the request must
+/// exist, be requested, not be the approver's own, be approved by the
+/// right approver, carry shaped evidence, and not have expired. Shared
+/// by approve_secret and preview_approve_secret (issue #281).
+fn validate_approve(
     store: &SecretStore,
     request_id: &str,
     by: &str,
     evidence: &str,
     now: DateTime<Utc>,
 ) -> SecretResult<SecretRequest> {
-    let mut req = load_request(store, request_id)?;
+    let req = load_request(store, request_id)?;
     if req.state != RequestState::Requested {
         return Err(SecretError::conflict(format!(
             "request '{request_id}' is {} and cannot be approved; only a requested request can be approved",
@@ -1180,12 +1219,41 @@ pub fn approve_secret(
             req.until
         )));
     }
+    Ok(req)
+}
+
+pub fn approve_secret(
+    store: &SecretStore,
+    request_id: &str,
+    by: &str,
+    evidence: &str,
+    now: DateTime<Utc>,
+) -> SecretResult<SecretRequest> {
+    let mut req = validate_approve(store, request_id, by, evidence, now)?;
     req.state = RequestState::Approved;
     req.decided_by = Some(by.to_string());
     req.decided_at = Some(rfc3339(now));
     req.evidence = Some(evidence.to_string());
     append_request(store, &req)?;
     audit(store, &req, by, "request approved", now)?;
+    Ok(req)
+}
+
+/// Preview of approve_secret: validate the approval and return the
+/// request as it would look approved, without writing anything
+/// (issue #281 --dry-run).
+pub fn preview_approve_secret(
+    store: &SecretStore,
+    request_id: &str,
+    by: &str,
+    evidence: &str,
+    now: DateTime<Utc>,
+) -> SecretResult<SecretRequest> {
+    let mut req = validate_approve(store, request_id, by, evidence, now)?;
+    req.state = RequestState::Approved;
+    req.decided_by = Some(by.to_string());
+    req.decided_at = Some(rfc3339(now));
+    req.evidence = Some(evidence.to_string());
     Ok(req)
 }
 

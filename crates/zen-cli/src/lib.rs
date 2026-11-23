@@ -554,7 +554,7 @@ async fn run_subcommand(cli: &Cli, cwd: &Path, home: Option<&Path>, sub: &Comman
                 );
                 return Ok(3);
             }
-            export::run_import(cwd, home, &i.file)?;
+            export::run_import(cwd, home, &i.file, i.dry_run, cli.quiet)?;
             Ok(0)
         }
         Commands::Skill(skill) => {

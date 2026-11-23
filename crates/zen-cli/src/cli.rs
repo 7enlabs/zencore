@@ -602,6 +602,10 @@ pub struct ExportArgs {
 pub struct ImportArgs {
     /// Export file to import
     pub file: PathBuf,
+
+    /// Preview the import without writing a session file
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -789,6 +793,10 @@ pub enum SecretSubcommand {
         /// Evidence link: a group message id or a task card id
         #[arg(long)]
         evidence: String,
+
+        /// Preview the approval without writing anything
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Deny a request, with the reason named
@@ -911,6 +919,9 @@ pub enum SecretSubcommand {
         /// a taken name is refused (issue #278)
         #[arg(long)]
         force: bool,
+        /// Preview the registration without writing anything
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Deregister a secret name (Leader only, design section 4.3)
@@ -984,6 +995,10 @@ pub enum SkillSubcommand {
         /// Registry URL to use
         #[arg(long)]
         registry: Option<String>,
+
+        /// Preview the install without writing anything
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Search skills
@@ -1018,6 +1033,10 @@ pub enum SkillSubcommand {
         /// Skip the confirmation prompt
         #[arg(long)]
         yes: bool,
+
+        /// Preview the removal without writing anything
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Run the tests of a skill
@@ -1030,6 +1049,10 @@ pub enum SkillSubcommand {
     Create {
         /// Skill name
         name: String,
+
+        /// Preview the scaffold without writing anything
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -1065,6 +1088,11 @@ pub enum McpSubcommand {
         #[arg(long = "header", value_name = "KEY=VALUE")]
         header: Vec<String>,
 
+        /// Preview the add without writing anything. Put flags before
+        /// the server name: tokens after it are the server command.
+        #[arg(long)]
+        dry_run: bool,
+
         /// Server name
         name: String,
 
@@ -1081,6 +1109,10 @@ pub enum McpSubcommand {
 
         /// Server name
         name: String,
+
+        /// Preview the removal without writing anything
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Show one MCP server
@@ -1207,6 +1239,102 @@ mod tests {
         match cli.subcommand {
             Some(Commands::Import(i)) => assert_eq!(i.file, PathBuf::from("sess.json")),
             _ => panic!("expected Import"),
+        }
+    }
+
+    #[test]
+    fn parse_dry_run_flags() {
+        // Issue #281: every write command takes --dry-run.
+        let cli = parse(&["mcp", "add", "--dry-run", "srv", "echo", "hi"]);
+        match cli.subcommand {
+            Some(Commands::Mcp(a)) => match a.command {
+                crate::cli::McpSubcommand::Add { dry_run, .. } => assert!(dry_run),
+                _ => panic!("expected mcp add"),
+            },
+            _ => panic!("expected mcp"),
+        }
+        let cli = parse(&["mcp", "remove", "--dry-run", "srv"]);
+        match cli.subcommand {
+            Some(Commands::Mcp(a)) => match a.command {
+                crate::cli::McpSubcommand::Remove { dry_run, .. } => assert!(dry_run),
+                _ => panic!("expected mcp remove"),
+            },
+            _ => panic!("expected mcp"),
+        }
+        let cli = parse(&["skill", "install", "--dry-run", "builtin:tdd"]);
+        match cli.subcommand {
+            Some(Commands::Skill(a)) => match a.command {
+                crate::cli::SkillSubcommand::Install { dry_run, .. } => assert!(dry_run),
+                _ => panic!("expected skill install"),
+            },
+            _ => panic!("expected skill"),
+        }
+        let cli = parse(&["skill", "remove", "--dry-run", "tdd"]);
+        match cli.subcommand {
+            Some(Commands::Skill(a)) => match a.command {
+                crate::cli::SkillSubcommand::Remove { dry_run, .. } => assert!(dry_run),
+                _ => panic!("expected skill remove"),
+            },
+            _ => panic!("expected skill"),
+        }
+        let cli = parse(&["skill", "create", "--dry-run", "my-skill"]);
+        match cli.subcommand {
+            Some(Commands::Skill(a)) => match a.command {
+                crate::cli::SkillSubcommand::Create { dry_run, .. } => assert!(dry_run),
+                _ => panic!("expected skill create"),
+            },
+            _ => panic!("expected skill"),
+        }
+        let cli = parse(&[
+            "secret",
+            "register",
+            "--dry-run",
+            "--name",
+            "K",
+            "--class",
+            "user",
+            "--service",
+            "s",
+            "--owner",
+            "zen",
+            "--by",
+            "zc-leader",
+            "--default-until-days",
+            "7",
+            "--rotation-days",
+            "30",
+            "--reason",
+            "tin 1",
+        ]);
+        match cli.subcommand {
+            Some(Commands::Secret(a)) => match a.command {
+                crate::cli::SecretSubcommand::Register { dry_run, .. } => assert!(dry_run),
+                _ => panic!("expected secret register"),
+            },
+            _ => panic!("expected secret"),
+        }
+        let cli = parse(&[
+            "secret",
+            "approve",
+            "--dry-run",
+            "--request",
+            "sr-20261108-001",
+            "--by",
+            "zc-leader",
+            "--evidence",
+            "tin 1",
+        ]);
+        match cli.subcommand {
+            Some(Commands::Secret(a)) => match a.command {
+                crate::cli::SecretSubcommand::Approve { dry_run, .. } => assert!(dry_run),
+                _ => panic!("expected secret approve"),
+            },
+            _ => panic!("expected secret"),
+        }
+        let cli = parse(&["import", "--dry-run", "sess.json"]);
+        match cli.subcommand {
+            Some(Commands::Import(i)) => assert!(i.dry_run),
+            _ => panic!("expected import"),
         }
     }
 
@@ -1698,10 +1826,12 @@ mod tests {
                     request,
                     by,
                     evidence,
+                    dry_run,
                 } => {
                     assert_eq!(request, "sr-20261108-001");
                     assert_eq!(by, "zc-leader");
                     assert_eq!(evidence, "tin 8071");
+                    assert!(!dry_run);
                 }
                 other => panic!("expected Approve, got {:?}", other),
             },
@@ -1829,6 +1959,7 @@ mod tests {
                     paid,
                     reason,
                     force,
+                    dry_run,
                 } => {
                     assert_eq!(name, "MODEL_API_KEY");
                     assert_eq!(class, "seat");
@@ -1840,6 +1971,7 @@ mod tests {
                     assert!(!paid);
                     assert_eq!(reason, "tin 8071");
                     assert!(!force);
+                    assert!(!dry_run);
                 }
                 other => panic!("expected Register, got {:?}", other),
             },
@@ -1904,10 +2036,12 @@ mod tests {
                     source,
                     yes,
                     registry,
+                    dry_run,
                 } => {
                     assert_eq!(source, "builtin:tdd");
                     assert!(yes);
                     assert!(registry.is_none());
+                    assert!(!dry_run);
                 }
                 other => panic!("expected Install, got {:?}", other),
             },

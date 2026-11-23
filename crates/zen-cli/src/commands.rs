@@ -782,8 +782,24 @@ pub async fn mcp_command(
             args: rest,
             env,
             header,
+            dry_run,
         } => {
             reject_swallowed_mcp_flags(rest)?;
+            // Issue #281: --dry-run is a clap flag of this variant, so it
+            // is only read before the server name. A --dry-run after the
+            // name would land in the server's args (trailing_var_arg);
+            // refuse it with the same guidance as #275 instead.
+            for tok in rest {
+                if tok == "--" {
+                    break;
+                }
+                if tok == "--dry-run" || tok.starts_with("--dry-run=") {
+                    return Err(anyhow!(
+                        "flag-like token {:?} in server command; `mcp add` flags (--scope, --transport, -e, --env, --header, --dry-run) must come before the server name, e.g. `zen mcp add --dry-run --scope project srv echo hi`. If the token belongs to the server command, separate it with `--` after the command, e.g. `zen mcp add srv echo -- --dry-run`",
+                        tok
+                    ));
+                }
+            }
             if transport != "stdio" && transport != "http" {
                 return Err(anyhow!(
                     "unsupported transport {:?} (expected stdio or http)",
@@ -824,6 +840,17 @@ pub async fn mcp_command(
                     header_map.insert(k, Value::String(v));
                 }
                 cfg["headers"] = Value::Object(header_map);
+            }
+            if *dry_run {
+                if !cli.quiet {
+                    println!("would write {}", path.display());
+                    println!("  + mcpServers.{name} = {}", serde_json::to_string(&cfg)?);
+                    if let Some(old) = root["mcpServers"].get(name) {
+                        println!("  replaces: {}", serde_json::to_string(old)?);
+                    }
+                    println!("(no change made; drop --dry-run to apply)");
+                }
+                return Ok(());
             }
             root["mcpServers"][name] = cfg;
             write_mcp_file(&path, &root)?;
@@ -870,9 +897,28 @@ pub async fn mcp_command(
             }
             Ok(())
         }
-        McpSubcommand::Remove { scope, name } => {
+        McpSubcommand::Remove {
+            scope,
+            name,
+            dry_run,
+        } => {
             let path = mcp_scope_path(scope, cwd, home)?;
             let mut root = read_mcp_file(&path);
+            if *dry_run {
+                match root["mcpServers"].get(name) {
+                    Some(old) => {
+                        if !cli.quiet {
+                            println!("would remove MCP server {name:?} from {}", path.display());
+                            println!("  was: {}", serde_json::to_string(old)?);
+                            println!("(no change made; drop --dry-run to apply)");
+                        }
+                    }
+                    None => {
+                        eprintln!("no MCP server {name:?} in {}", path.display());
+                    }
+                }
+                return Ok(());
+            }
             let removed = root["mcpServers"]
                 .as_object_mut()
                 .map(|o| o.remove(name).is_some())

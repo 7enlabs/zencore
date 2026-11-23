@@ -628,3 +628,63 @@ fn mcp_add_scope_flag_after_name_is_rejected() {
         serde_json::json!(["--", "--scope", "project"])
     );
 }
+
+#[test]
+fn mcp_add_dry_run_writes_nothing() {
+    let home = TempDir::new("mcp_dry_home");
+    let cwd = TempDir::new("mcp_dry_cwd");
+    let run = |args: Vec<String>| ZenRun::new("mcp_dry", &home, &cwd).args(args).run_output();
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+    // Dry run: exit 0, preview printed, no config file created.
+    let (out, err, code) = run(s(&["mcp", "add", "--dry-run", "srv", "echo", "hi"]));
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("would write"), "stdout: {out}");
+    assert!(out.contains("mcpServers.srv"), "stdout: {out}");
+    assert!(out.contains("no change made"), "stdout: {out}");
+    assert!(!cwd.path().join(".zen/mcp.json").exists());
+
+    // A real add still works, then dry-run remove previews without deleting.
+    let (_, err, code) = run(s(&["mcp", "add", "srv", "echo", "hi"]));
+    assert_eq!(code, 0, "stderr: {err}");
+    let (out, err, code) = run(s(&["mcp", "remove", "--dry-run", "srv"]));
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("would remove MCP server"), "stdout: {out}");
+    assert!(out.contains("was:"), "stdout: {out}");
+    assert!(cwd.path().join(".zen/mcp.json").exists());
+
+    // The real remove still deletes it.
+    let (_, err, code) = run(s(&["mcp", "remove", "srv"]));
+    assert_eq!(code, 0, "stderr: {err}");
+    let (out, err, code) = run(s(&["mcp", "get", "srv"]));
+    assert_ne!(code, 0, "server must be gone: {out} {err}");
+
+    // Dry-run remove of a missing server keeps the current notice.
+    let (_, err, code) = run(s(&["mcp", "remove", "--dry-run", "srv"]));
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(err.contains("no MCP server"), "stderr: {err}");
+}
+
+#[test]
+fn mcp_add_dry_run_after_name_is_rejected() {
+    let home = TempDir::new("mcp_dry_home2");
+    let cwd = TempDir::new("mcp_dry_cwd2");
+    let run = |args: Vec<String>| ZenRun::new("mcp_dry", &home, &cwd).args(args).run_output();
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+    // --dry-run after the name is a server arg, not the flag: refuse it
+    // instead of silently adding a server with a bogus arg.
+    let (_, err, code) = run(s(&["mcp", "add", "srv", "echo", "hi", "--dry-run"]));
+    assert_ne!(code, 0, "swallowed --dry-run must be rejected");
+    assert!(err.contains("--dry-run"), "stderr: {err}");
+    assert!(!cwd.path().join(".zen/mcp.json").exists());
+
+    // ... but --dry-run after -- still belongs to the server command.
+    let (_, err, code) = run(s(&["mcp", "add", "srv", "echo", "--", "--dry-run"]));
+    assert_eq!(code, 0, "stderr: {err}");
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cwd.path().join(".zen/mcp.json")).unwrap())
+            .unwrap();
+    let args = doc["mcpServers"]["srv"]["args"].as_array().unwrap();
+    assert!(args.iter().any(|a| a == "--dry-run"), "args: {args:?}");
+}

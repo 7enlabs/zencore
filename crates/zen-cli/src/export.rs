@@ -660,7 +660,13 @@ pub fn run_export(
     Ok(())
 }
 
-pub fn run_import(cwd: &Path, home: Option<&Path>, file: &Path) -> Result<String> {
+pub fn run_import(
+    cwd: &Path,
+    home: Option<&Path>,
+    file: &Path,
+    dry_run: bool,
+    quiet: bool,
+) -> Result<String> {
     let home = home.ok_or_else(|| anyhow!("cannot determine home directory"))?;
     let raw =
         std::fs::read_to_string(file).with_context(|| format!("cannot read {}", file.display()))?;
@@ -686,6 +692,24 @@ pub fn run_import(cwd: &Path, home: Option<&Path>, file: &Path) -> Result<String
     }
 
     let new_id = crate::session::new_session_id();
+    if dry_run {
+        // project_dir/session_path only compute the path; unlike
+        // ensure_session_path they do not create the directory, so a
+        // dry run writes nothing (issue #281).
+        let dir = crate::session::project_dir(home, &crate::session::encode_cwd(cwd));
+        let path = crate::session::session_path(&dir, &new_id);
+        if !quiet {
+            println!(
+                "would import {} message(s) from {}",
+                exp.messages.len(),
+                file.display()
+            );
+            println!("  original session: {}", exp.session_id);
+            println!("  would write {}", path.display());
+            println!("(no change made; drop --dry-run to apply)");
+        }
+        return Ok(new_id);
+    }
     let path = crate::session::ensure_session_path(home, cwd, &new_id)?;
     let cwd_s = cwd.to_string_lossy().into_owned();
     crate::session::append_typed(
@@ -966,7 +990,7 @@ mod tests {
 
         let file = home.join("export.json");
         fs::write(&file, render_json(&exp).unwrap()).unwrap();
-        let new_id = run_import(&cwd, Some(home.as_path()), &file).unwrap();
+        let new_id = run_import(&cwd, Some(home.as_path()), &file, false, false).unwrap();
         assert_ne!(new_id, "sess-rt-1");
 
         let new_path = crate::session::find_session_path(&home, &new_id).unwrap();
@@ -978,6 +1002,23 @@ mod tests {
         assert!(kinds.contains(&"assistant"));
         assert!(kinds.contains(&"tool"));
         assert!(kinds.contains(&"summary"));
+    }
+
+    #[test]
+    fn import_dry_run_writes_nothing() {
+        let home = tmp_home("dry-run");
+        let cwd = tmp_home("dry-run-cwd");
+        let path = sample_transcript(&home, &cwd, "sess-dry-1");
+        let exp = export_session(&path, false).unwrap();
+        let n_messages = exp.messages.len();
+
+        let file = home.join("export.json");
+        fs::write(&file, render_json(&exp).unwrap()).unwrap();
+        let new_id = run_import(&cwd, Some(home.as_path()), &file, true, false).unwrap();
+        assert_ne!(new_id, "sess-dry-1");
+        assert!(n_messages > 0);
+        // No session file was created for the would-be id.
+        assert!(crate::session::find_session_path(&home, &new_id).is_none());
     }
 
     #[test]
@@ -999,7 +1040,7 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let err = run_import(&cwd, Some(home.as_path()), &file).unwrap_err();
+        let err = run_import(&cwd, Some(home.as_path()), &file, false, false).unwrap_err();
         assert!(err.to_string().contains("newer than this zen"));
     }
 
@@ -1009,7 +1050,7 @@ mod tests {
         let cwd = tmp_home("nonjsoncwd");
         let file = home.join("export.md");
         fs::write(&file, "# zen session x\n").unwrap();
-        let err = run_import(&cwd, Some(home.as_path()), &file).unwrap_err();
+        let err = run_import(&cwd, Some(home.as_path()), &file, false, false).unwrap_err();
         assert!(err.to_string().contains("only `--format json` exports"));
     }
 
