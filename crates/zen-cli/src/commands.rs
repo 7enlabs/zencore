@@ -727,6 +727,31 @@ fn reject_swallowed_mcp_flags(rest: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// One-line summary of an existing server entry, for conflict errors.
+fn describe_mcp_server(cfg: &Value) -> String {
+    match cfg.get("type").and_then(|t| t.as_str()) {
+        Some("http") => match cfg.get("url").and_then(|u| u.as_str()) {
+            Some(url) => format!("url {url}"),
+            None => "http server".to_string(),
+        },
+        Some("stdio") => {
+            let cmd = cfg.get("command").and_then(|c| c.as_str()).unwrap_or("");
+            let args = cfg
+                .get("args")
+                .and_then(|a| a.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+            format!("command {cmd} {args}").trim_end().to_string()
+        }
+        _ => "server".to_string(),
+    }
+}
+
 pub async fn mcp_command(
     cli: &crate::cli::Cli,
     cwd: &Path,
@@ -783,6 +808,7 @@ pub async fn mcp_command(
             env,
             header,
             dry_run,
+            force,
         } => {
             reject_swallowed_mcp_flags(rest)?;
             // Issue #281: --dry-run is a clap flag of this variant, so it
@@ -852,10 +878,31 @@ pub async fn mcp_command(
                 }
                 return Ok(());
             }
+            // Issue #285: a taken name must not be replaced silently.
+            // Refuse with a conflict (exit 7, like `secret register`)
+            // unless --force was given.
+            let existing = root["mcpServers"].get(name).cloned();
+            if let Some(old) = &existing
+                && !force
+            {
+                return Err(crate::coded_error(
+                    crate::exit_code::CONFLICT,
+                    format!(
+                        "MCP server {:?} already exists in {} ({}); pass --force to replace it",
+                        name,
+                        path.display(),
+                        describe_mcp_server(old),
+                    ),
+                ));
+            }
             root["mcpServers"][name] = cfg;
             write_mcp_file(&path, &root)?;
             if !cli.quiet {
-                println!("added MCP server {:?} to {}", name, path.display());
+                if existing.is_some() {
+                    println!("replaced MCP server {:?} in {}", name, path.display());
+                } else {
+                    println!("added MCP server {:?} to {}", name, path.display());
+                }
             }
             Ok(())
         }

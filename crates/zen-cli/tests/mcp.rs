@@ -688,3 +688,62 @@ fn mcp_add_dry_run_after_name_is_rejected() {
     let args = doc["mcpServers"]["srv"]["args"].as_array().unwrap();
     assert!(args.iter().any(|a| a == "--dry-run"), "args: {args:?}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_add_duplicate_refuses_without_force() {
+    // Issue #285: adding a server whose name already exists must fail
+    // with exit 7 instead of silently replacing it; --force replaces.
+    let home = TempDir::new("mcp_dup_home");
+    let cwd = TempDir::new("mcp_dup_cwd");
+    let run = |args: Vec<String>| ZenRun::new("mcp_dup", &home, &cwd).args(args).run_output();
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let mcp_path = cwd.path().join(".zen/mcp.json");
+    let read_url = || {
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&mcp_path).unwrap()).unwrap();
+        doc["mcpServers"]["probe"]["url"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let (_, err, code) = run(s(&[
+        "mcp",
+        "add",
+        "--transport",
+        "http",
+        "probe",
+        "http://127.0.0.1:8931/",
+    ]));
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(read_url(), "http://127.0.0.1:8931/");
+
+    let (_, err, code) = run(s(&[
+        "mcp",
+        "add",
+        "--transport",
+        "http",
+        "probe",
+        "http://127.0.0.1:9999/",
+    ]));
+    assert_eq!(
+        code, 7,
+        "duplicate without --force must be a conflict: {}",
+        err
+    );
+    assert!(err.contains("already exists"), "stderr: {}", err);
+    assert_eq!(read_url(), "http://127.0.0.1:8931/");
+
+    let (out, err, code) = run(s(&[
+        "mcp",
+        "add",
+        "--transport",
+        "http",
+        "--force",
+        "probe",
+        "http://127.0.0.1:9999/",
+    ]));
+    assert_eq!(code, 0, "{}", err);
+    assert!(out.contains("replaced"), "stdout: {}", out);
+    assert_eq!(read_url(), "http://127.0.0.1:9999/");
+}

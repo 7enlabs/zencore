@@ -1093,6 +1093,10 @@ pub enum McpSubcommand {
         #[arg(long)]
         dry_run: bool,
 
+        /// Replace the server if the name already exists
+        #[arg(long)]
+        force: bool,
+
         /// Server name
         name: String,
 
@@ -2391,6 +2395,39 @@ mod tests {
                     assert_eq!(header, &vec!["Authorization=Bearer x".to_string()]);
                     assert_eq!(name, "srv");
                 }
+                other => panic!("expected Add, got {:?}", other),
+            },
+            other => panic!("expected Mcp, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_mcp_add_force() {
+        // --force lives in the same flag layer as --transport/--scope:
+        // it must come before the server name (see #275).
+        let cli = parse(&[
+            "mcp",
+            "add",
+            "--transport",
+            "http",
+            "--force",
+            "srv",
+            "http://localhost:1",
+        ]);
+        match &cli.subcommand {
+            Some(Commands::Mcp(m)) => match &m.command {
+                McpSubcommand::Add { force, name, .. } => {
+                    assert!(*force);
+                    assert_eq!(name, "srv");
+                }
+                other => panic!("expected Add, got {:?}", other),
+            },
+            other => panic!("expected Mcp, got {:?}", other),
+        }
+        let cli = parse(&["mcp", "add", "srv", "http://localhost:1"]);
+        match &cli.subcommand {
+            Some(Commands::Mcp(m)) => match &m.command {
+                McpSubcommand::Add { force, .. } => assert!(!force),
                 other => panic!("expected Add, got {:?}", other),
             },
             other => panic!("expected Mcp, got {:?}", other),
