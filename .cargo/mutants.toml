@@ -309,4 +309,23 @@ exclude_re = [
   # mutant stops being equivalent: remove this exclusion and kill it
   # with a test that overfills the log and checks the oldest lines.
   "state\\.rs:516:41: replace - with / in FlightdeckState::push_log",
+  # PR #307, github.rs negated_before (line 329, col 20):
+  # replace + with * in `i + 1` (clause_start).
+  # EQUIVALENT (waived by ZC Leader, 2026-11-23; verified by reading
+  # github.rs:322-340): the mutant computes clause_start = i * 1 = i,
+  # one byte before the original i + 1, where i is the index of a
+  # clause-boundary char ('.', '!', '?', ';', ':', newline). The
+  # window before[start..] then starts AT that boundary char, which
+  # is non-alphanumeric, so split() on non-alphanumerics yields the
+  # same word set (only an empty leading piece is added); the
+  # negation-word check is unchanged. When window_start dominates,
+  # start is identical in both versions. No observable behaviour
+  # changes and no test can kill this mutant. (The + with - sibling
+  # IS killable: i - 1 underflows when the boundary sits at index 0,
+  # and test negation_after_leading_clause_separator_is_still_negation
+  # kills it.)
+  # EXPIRY: if the boundary set gains an alphanumeric char, or the
+  # window stops splitting on non-alphanumerics, this mutant stops
+  # being equivalent: remove this exclusion and kill it with a test.
+  "github\\.rs:329:20: replace \\+ with \\* in negated_before",
 ]
