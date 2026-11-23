@@ -922,11 +922,14 @@ pub async fn sessions_command(
             if cli.quiet {
                 return Ok(());
             }
-            println!("ID         MODIFIED (UTC)    MSGS   TOKENS in/out  STATUS    TITLE");
+            println!(
+                "{:<36} {:<16} {:>5} {:>15}  {:<9} TITLE",
+                "ID", "MODIFIED (UTC)", "MSGS", "TOKENS in/out", "STATUS"
+            );
             for s in &sessions {
                 println!(
-                    "{:<10} {:<16} {:>5} {:>15}  {:<9} {}",
-                    sm::short_id(&s.id),
+                    "{:<36} {:<16} {:>5} {:>15}  {:<9} {}",
+                    s.id,
                     sm::fmt_mtime(s.modified),
                     s.message_count,
                     format!("{}/{}", s.input_tokens, s.output_tokens),

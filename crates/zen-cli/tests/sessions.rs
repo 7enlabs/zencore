@@ -618,3 +618,44 @@ async fn dtr_killed_mid_turn_resume_keeps_finished_tool_result() {
         requests[0].split("\r\n\r\n").nth(1).unwrap().as_bytes()
     );
 }
+
+// Issue #280: `sessions list` text view printed 8-char prefixes that no
+// other command accepts; it must print the full UUID like the JSON view.
+#[test]
+fn sessions_list_text_view_prints_full_uuid() {
+    let home = TempDir::new("list_full_uuid_home");
+    let cwd = TempDir::new("list_full_uuid_cwd");
+    let id = "fbafc85b-1111-4000-8000-000000000001";
+    let proj = home.path().join(".zen").join("projects").join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join(format!("{id}.jsonl")),
+        "{\"type\":\"message\",\"role\":\"user\",\"content\":\"hi\"}\n",
+    )
+    .unwrap();
+    let run = |args: Vec<String>| {
+        ZenRun::new("list_full_uuid", &home, &cwd)
+            .args(args)
+            .run_output()
+    };
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+    // Text view: full UUID present, starting the ID column.
+    let (out, err, code) = run(s(&["sessions", "list"]));
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains(id),
+        "text view must print the full UUID:\n{out}"
+    );
+    let first_data_line = out.lines().nth(1).unwrap_or("");
+    assert!(
+        first_data_line.starts_with(id),
+        "ID column must start with the full UUID:\n{out}"
+    );
+
+    // JSON view: same full UUID.
+    let (out, err, code) = run(s(&["sessions", "list", "--json"]));
+    assert_eq!(code, 0, "{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v[0]["id"].as_str(), Some(id));
+}
