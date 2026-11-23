@@ -56,8 +56,8 @@ fn skill_remove_dry_run_keeps_installed_skill() {
     assert_eq!(code, 0);
     assert!(out.contains("tdd"), "stdout: {out}");
 
-    // The real remove still works.
-    let (_, err, code) = run(&["skill", "remove", "tdd"]);
+    // The real remove still works (needs --yes on non-interactive stdin since #291).
+    let (_, err, code) = run(&["skill", "remove", "--yes", "tdd"]);
     assert_eq!(code, 0, "stderr: {err}");
     assert!(!home.path().join(".zen/skills/tdd").exists());
 
