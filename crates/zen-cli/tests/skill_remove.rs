@@ -4,9 +4,13 @@
 
 mod common;
 
-use common::{TempDir, ZenRun, scrub_zen_env, zen_bin};
+use common::{TempDir, ZenRun};
+#[cfg(unix)]
+use common::{scrub_zen_env, zen_bin};
+#[cfg(unix)]
 use std::io::Write;
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 
 fn install_tdd(home: &TempDir, cwd: &TempDir) {
@@ -62,7 +66,7 @@ fn run_remove_under_pty(home: &TempDir, cwd: &TempDir, quiet: bool) -> String {
     } else {
         format!("{} skill remove tdd", bin.display())
     };
-    let mut cmd = if cfg!(target_os = "macos") {
+    let cmd = if cfg!(target_os = "macos") {
         let mut c = Command::new("script");
         c.args(["-q", "/dev/null", "sh", "-c", &inner]);
         c
