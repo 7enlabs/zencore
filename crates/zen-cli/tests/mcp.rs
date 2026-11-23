@@ -566,6 +566,35 @@ fn mcp_add_scope_flag_after_name_is_rejected() {
     assert_ne!(code, 0);
     assert!(!cwd.path().join(".zen/mcp.json").exists());
 
+    // Attached forms after the name: rejected too (issue #275 follow-up).
+    let (_, err, code) = run(s(&["mcp", "add", "projD", "echo", "hi", "--scope=project"]));
+    assert_ne!(
+        code, 0,
+        "swallowed --scope=project must fail, stderr: {err}"
+    );
+    assert!(
+        err.contains("--scope=project"),
+        "stderr should name the flag: {err}"
+    );
+    assert!(!cwd.path().join(".zen/mcp.json").exists());
+    let (_, err, code) = run(s(&[
+        "mcp",
+        "add",
+        "projE",
+        "echo",
+        "hi",
+        "--transport=stdio",
+    ]));
+    assert_ne!(
+        code, 0,
+        "swallowed --transport=stdio must fail, stderr: {err}"
+    );
+    assert!(
+        err.contains("--transport=stdio"),
+        "stderr should name the flag: {err}"
+    );
+    assert!(!cwd.path().join(".zen/mcp.json").exists());
+
     // The server's own flags still work.
     let (_, err, code) = run(s(&[
         "mcp",

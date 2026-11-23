@@ -1453,6 +1453,9 @@ mod tests {
         let t = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         assert!(reject_swallowed_mcp_flags(&t(&["echo", "hi", "--scope", "project"])).is_err());
         assert!(reject_swallowed_mcp_flags(&t(&["echo", "hi", "--scope=project"])).is_err());
+        assert!(reject_swallowed_mcp_flags(&t(&["echo", "hi", "--transport=stdio"])).is_err());
+        assert!(reject_swallowed_mcp_flags(&t(&["echo", "hi", "--env=K=V"])).is_err());
+        assert!(reject_swallowed_mcp_flags(&t(&["echo", "hi", "--header=A: b"])).is_err());
         assert!(reject_swallowed_mcp_flags(&t(&["echo", "hi", "-s", "project"])).is_err());
         assert!(reject_swallowed_mcp_flags(&t(&["echo", "hi", "--transport", "http"])).is_err());
         assert!(reject_swallowed_mcp_flags(&t(&["echo", "hi", "-e", "K=V"])).is_err());
