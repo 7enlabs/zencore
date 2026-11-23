@@ -597,6 +597,47 @@ fn append_line(path: &Path, line: &str) -> SecretResult<()> {
     Ok(())
 }
 
+/// Rewrite the registry file with exactly the given entries, one line
+/// per name. Written through a temp file and renamed over, so a
+/// --force replacement never leaves a half-written registry.
+fn write_registry(store: &SecretStore, entries: &[RegistryEntry]) -> SecretResult<()> {
+    let path = store.registry_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            SecretError::new(
+                exit_code::GENERAL,
+                format!("cannot create {}: {e}", parent.display()),
+            )
+        })?;
+    }
+    let mut text = String::new();
+    for entry in entries {
+        let line = serde_json::to_string(entry).map_err(|e| {
+            SecretError::new(
+                exit_code::GENERAL,
+                format!("cannot serialize registry entry: {e}"),
+            )
+        })?;
+        text.push_str(&line);
+        text.push('\n');
+    }
+    let tmp = path.with_extension("jsonl.tmp");
+    if let Err(e) = std::fs::write(&tmp, &text) {
+        return Err(SecretError::new(
+            exit_code::GENERAL,
+            format!("cannot write {}: {e}", tmp.display()),
+        ));
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        SecretError::new(
+            exit_code::GENERAL,
+            format!("cannot replace {}: {e}", path.display()),
+        )
+    })?;
+    Ok(())
+}
+
 fn load_jsonl<T>(path: &Path, what: &str) -> SecretResult<Vec<T>>
 where
     T: for<'de> Deserialize<'de>,
@@ -753,6 +794,10 @@ pub struct RegisterInput {
     pub rotation_days: i64,
     pub paid: bool,
     pub reason: String,
+    /// Replace a live registration under the same name. Without it, a
+    /// taken name is refused (issue #278): a stale re-run must not
+    /// silently move the policy class.
+    pub force: bool,
 }
 
 /// Register a secret name. A request naming an unregistered name is
@@ -788,6 +833,22 @@ pub fn register_secret(
     if input.rotation_days < 1 {
         return Err(SecretError::validation("rotation_days must be at least 1"));
     }
+    // A taken name is refused unless the caller passes --force (issue
+    // #278): a stale re-run must not silently move the policy class.
+    // A deregistered name is free to re-register.
+    let registry = load_registry(store)?;
+    let existing = registry.iter().find(|e| e.name == input.name).cloned();
+    if let Some(existing) = &existing
+        && !existing.deregistered
+        && !input.force
+    {
+        return Err(SecretError::conflict(format!(
+            "secret '{}' is already registered (class={}, rotation-days={}); pass --force to replace it",
+            input.name,
+            existing.class.as_str(),
+            existing.rotation_days
+        )));
+    }
     let entry = RegistryEntry {
         v: 1,
         name: input.name.clone(),
@@ -802,6 +863,16 @@ pub fn register_secret(
         reason: input.reason,
         deregistered: false,
     };
+    if existing.as_ref().is_some_and(|e| !e.deregistered) {
+        // --force replaces the live card in place, so the file keeps
+        // one card per name instead of a shadow card.
+        let mut entries = registry;
+        if let Some(slot) = entries.iter_mut().find(|e| e.name == entry.name) {
+            *slot = entry.clone();
+        }
+        write_registry(store, &entries)?;
+        return Ok(entry);
+    }
     let line = serde_json::to_string(&entry).map_err(|e| {
         SecretError::new(
             exit_code::GENERAL,
@@ -1775,6 +1846,7 @@ mod tests {
                 rotation_days: 90,
                 paid: false,
                 reason: "provider key for verification runs".to_string(),
+                force: false,
             },
             now,
         )
@@ -1794,6 +1866,7 @@ mod tests {
                 rotation_days: 30,
                 paid: false,
                 reason: "broker-only personal login".to_string(),
+                force: false,
             },
             now,
         )
@@ -1960,6 +2033,7 @@ mod tests {
                     rotation_days: 90,
                     paid: false,
                     reason: format!("because {value}"),
+                    force: false,
                 },
                 now,
             )
@@ -2334,6 +2408,7 @@ mod tests {
                 rotation_days: 30,
                 paid: true,
                 reason: "unlocks paid use".to_string(),
+                force: false,
             },
             now,
         )
@@ -2497,6 +2572,7 @@ mod tests {
                 rotation_days: 30,
                 paid: false,
                 reason: "broker-only personal login".to_string(),
+                force: false,
             },
             now,
         )
@@ -2787,6 +2863,7 @@ mod tests {
                 rotation_days: 90,
                 paid: false,
                 reason: "proposed by a seat".to_string(),
+                force: false,
             },
             now,
         )
@@ -2798,6 +2875,106 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), exit_code::FORBIDDEN);
         deregister_secret(&store, "MODEL_API_KEY", LEADER_APPROVER, "retired", now).unwrap();
+    }
+
+    /// Raw lines for a name in the registry file: the folded view hides
+    /// shadow cards, so count the file itself (issue #278).
+    fn registry_lines(store: &SecretStore, name: &str) -> usize {
+        let text = std::fs::read_to_string(store.registry_path()).unwrap();
+        text.lines()
+            .filter(|l| l.contains(&format!("\"name\":\"{name}\"")))
+            .count()
+    }
+
+    #[test]
+    fn register_duplicate_name_is_refused_without_force() {
+        let (_dir, store) = temp_store("regdup");
+        let now = fixed_now();
+        register_secret(
+            &store,
+            RegisterInput {
+                name: "K".to_string(),
+                class: SecretClass::Seat,
+                service: "s".to_string(),
+                owner: "zen".to_string(),
+                registered_by: LEADER_APPROVER.to_string(),
+                default_until_days: 7,
+                rotation_days: 30,
+                paid: false,
+                reason: "lan1".to_string(),
+                force: false,
+            },
+            now,
+        )
+        .unwrap();
+        // A second registration under the same name is refused (issue
+        // #278): the policy class must not move silently.
+        let err = register_secret(
+            &store,
+            RegisterInput {
+                name: "K".to_string(),
+                class: SecretClass::User,
+                service: "s".to_string(),
+                owner: "zen".to_string(),
+                registered_by: LEADER_APPROVER.to_string(),
+                default_until_days: 90,
+                rotation_days: 365,
+                paid: false,
+                reason: "lan2".to_string(),
+                force: false,
+            },
+            now,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), exit_code::CONFLICT);
+        // Nothing changed: the class is still seat, and the file still
+        // holds one card for the name (no shadow card).
+        let entries = load_registry(&store).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].class, SecretClass::Seat);
+        assert_eq!(registry_lines(&store, "K"), 1);
+        // --force replaces in place: one card per name, new class.
+        let replaced = register_secret(
+            &store,
+            RegisterInput {
+                name: "K".to_string(),
+                class: SecretClass::User,
+                service: "s".to_string(),
+                owner: "zen".to_string(),
+                registered_by: LEADER_APPROVER.to_string(),
+                default_until_days: 90,
+                rotation_days: 365,
+                paid: false,
+                reason: "lan2".to_string(),
+                force: true,
+            },
+            now,
+        )
+        .unwrap();
+        assert_eq!(replaced.class, SecretClass::User);
+        assert_eq!(registry_lines(&store, "K"), 1);
+        let entries = load_registry(&store).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].class, SecretClass::User);
+        // After a deregistration, re-registration stays free.
+        deregister_secret(&store, "K", LEADER_APPROVER, "retired", now).unwrap();
+        register_secret(
+            &store,
+            RegisterInput {
+                name: "K".to_string(),
+                class: SecretClass::Seat,
+                service: "s".to_string(),
+                owner: "zen".to_string(),
+                registered_by: LEADER_APPROVER.to_string(),
+                default_until_days: 7,
+                rotation_days: 30,
+                paid: false,
+                reason: "lan3".to_string(),
+                force: false,
+            },
+            now,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2879,6 +3056,7 @@ mod tests {
                     rotation_days: 90,
                     paid: false,
                     reason: "budget seed".to_string(),
+                    force: false,
                 },
                 now,
             )
