@@ -2,8 +2,8 @@ use crate::cli::{Cli, PermissionMode, invalid_permission_mode_error, invalid_san
 use anyhow::Result;
 use zen_core::{PermissionSettings, SandboxMode, Settings};
 
-pub const DEFAULT_BASE_URL: &str = "https://api.experientiallabs.ai/api/v1";
-pub const DEFAULT_MODEL: &str = "deepseek-v4.1-flash";
+pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
+pub const DEFAULT_MODEL: &str = "nvidia/nemotron-3-ultra-550b-a55b:free";
 pub const DEFAULT_MAX_TURNS: usize = 50;
 
 /// Process-wide lock serializing tests that mutate process env vars.
@@ -37,6 +37,7 @@ pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 /// serialize access. The guard itself holds no lock, so it is safe
 /// to keep across an `await` in async tests. Async tests release the
 /// lock across `.await` points and re-acquire it before asserting.
+///
 #[cfg(test)]
 #[must_use = "a guard dropped immediately restores the var at once; bind it for the whole test"]
 pub(crate) struct EnvGuard {
@@ -762,10 +763,10 @@ pub fn resolve_config_with_home(
         .map(str::to_string);
 
     // Catalog ids win over direct provider routing (bug hunt fix #4):
-    // `deepseek/deepseek-r1:free` is a free-pool catalog entry,
-    // but its `deepseek/` prefix is also a registry provider, so
+    // `google/gemma-4-31b-it:free` is a free-pool catalog entry,
+    // but its `google/` prefix is also a registry provider, so
     // ModelSpec::parse would strip it and route_direct would send it to
-    // DeepSeek's paid API. Check the catalog first; only non-catalog
+    // the paid Google API. Check the catalog first; only non-catalog
     // ids take the direct path.
     let is_catalog_id = crate::models::catalog_entry(&raw_model).is_some();
     let spec = zen_agent::providers::ModelSpec::parse(&raw_model, DEFAULT_BASE_URL, false);
@@ -1183,7 +1184,7 @@ mod tests {
         );
         assert_eq!(
             crate::models::provider_for_base_url(&format!("{DEFAULT_BASE_URL}/")),
-            Some("experientiallabs")
+            Some("openrouter")
         );
         assert_eq!(
             crate::models::provider_for_base_url("https://example.com/v1/"),
@@ -1218,7 +1219,13 @@ mod tests {
     }
 
     #[test]
-    fn btw_model_is_translated_or_replaced_across_providers() {
+    fn btw_model_same_provider_kept_unknown_passes_through() {
+        // The cross-provider replacement this test used to cover
+        // died with the second provider: every catalog entry now
+        // serves the default base, so no catalog btw id is foreign
+        // any more. What remains: a same-provider catalog id is
+        // kept (translated to its gateway id), and an unknown id
+        // passes through trimmed, with no warning.
         let _env = env_lock();
         let _env_guard_set = EnvGuard::set("ZEN_MODEL", "custom-main-model");
         let _env_guard_removed = EnvGuard::remove("ZEN_BASE_URL");
@@ -1234,32 +1241,15 @@ mod tests {
         fs::create_dir_all(dir.join(".zen")).unwrap();
         let cli = Cli::parse_from(["zen", "--setting-sources", "project", "--trust-folder"]);
 
-        // Cross-provider catalog id on the default
-        // base: /btw runs on the main backend, so the btw model
-        // falls back to the main model with a warning.
-        fs::write(
-            dir.join(".zen/settings.json"),
-            r#"{"btw":{"model":"qwen/qwen3-coder:free"}}"#,
-        )
-        .unwrap();
-        let cfg = resolve_config_with_home(&cli, &dir, Some(&home)).unwrap();
-        assert_eq!(cfg.model, "custom-main-model");
-        assert_eq!(cfg.btw_model.as_deref(), Some("custom-main-model"));
-        assert!(
-            cfg.warnings.iter().any(|w| w.contains("btw model")),
-            "cross-provider btw warning: {:?}",
-            cfg.warnings
-        );
-
         // Same-provider catalog id is kept (translated to its
         // gateway id; identical for this entry).
         fs::write(
             dir.join(".zen/settings.json"),
-            r#"{"btw":{"model":"deepseek-v4.1-flash"}}"#,
+            r#"{"btw":{"model":"google/gemma-4-31b-it:free"}}"#,
         )
         .unwrap();
         let cfg = resolve_config_with_home(&cli, &dir, Some(&home)).unwrap();
-        assert_eq!(cfg.btw_model.as_deref(), Some("deepseek-v4.1-flash"));
+        assert_eq!(cfg.btw_model.as_deref(), Some("google/gemma-4-31b-it:free"));
         assert!(
             !cfg.warnings.iter().any(|w| w.contains("btw model")),
             "same-provider btw must not warn: {:?}",
@@ -1884,104 +1874,120 @@ mod tests {
 
     #[test]
     fn catalog_id_wins_over_direct_routing_when_provider_key_set() {
-        // Bug hunt fix #4: `deepseek/deepseek-r1:free` is a free-pool
-        // catalog entry, but its `deepseek/` prefix is also a registry
+        // Bug hunt fix #4: `google/gemma-4-31b-it:free` is a free-pool
+        // catalog entry, but its `google/` prefix is also a registry
         // provider, so ModelSpec::parse used to strip it and route_direct
         // sent it to the paid API. Catalog ids must win.
         let _env = env_lock();
         let _env_guards_set = EnvGuard::set_many(&[
-            ("DEEPSEEK_API_KEY", "test-key-ds"),
+            ("GOOGLE_API_KEY", "test-key-google"),
             ("OPENROUTER_API_KEY", "test-key-or"),
         ]);
         let _env_guards_removed = EnvGuard::remove_many(&["ZEN_MODEL", "ZEN_BASE_URL"]);
-        let cli = Cli::parse_from(["zen", "--model", "deepseek/deepseek-r1:free"]);
+        let cli = Cli::parse_from(["zen", "--model", "google/gemma-4-31b-it:free"]);
         let mut cfg = resolve_config(&cli, std::env::temp_dir().as_path()).unwrap();
         // resolve_config alone must keep the full catalog id on the
         // default base URL (no strip, no re-point to the paid API).
-        assert_eq!(cfg.model, "deepseek/deepseek-r1:free");
+        assert_eq!(cfg.model, "google/gemma-4-31b-it:free");
         assert_eq!(cfg.base_url, DEFAULT_BASE_URL);
         assert!(
             cfg.warnings
                 .iter()
-                .all(|w| !w.contains("provider 'deepseek'"))
+                .all(|w| !w.contains("provider 'google'"))
         );
-        // The catalog router then sends it to the free pool with its key.
+        // The catalog router then keeps it on the default base (which
+        // IS the free pool) with the key resolve_config picked up.
         assert!(route_catalog_model(&mut cfg).unwrap());
         assert_eq!(cfg.base_url, crate::models::FREE_POOL_BASE_URL);
-        assert_eq!(cfg.model, "deepseek/deepseek-r1:free");
-        assert_eq!(cfg.api_key.as_deref(), Some("test-key-or"));
+        assert_eq!(cfg.model, "google/gemma-4-31b-it:free");
+        assert_eq!(cfg.api_key.as_deref(), Some("test-key-google"));
     }
 
     #[test]
-    fn route_catalog_model_drops_cross_provider_fallbacks() {
+    fn route_catalog_model_keeps_fallbacks_on_default_base() {
+        // The cross-provider drop this test used to cover died with
+        // the second provider: every catalog entry now serves the
+        // default base, so no catalog fallback is foreign any more
+        // and all of them stay (the drop branch only triggers for a
+        // future second provider).
         let _env = env_lock();
         let mut cfg = resolve_config(&base_cli(), std::env::temp_dir().as_path()).unwrap();
         cfg.model = DEFAULT_MODEL.to_string();
         cfg.base_url = DEFAULT_BASE_URL.to_string();
         cfg.fallback_models = vec![
-            "deepseek-v4.1-flash".to_string(),
-            "qwen/qwen3-coder:free".to_string(),
+            "google/gemma-4-31b-it:free".to_string(),
             "my-custom-model".to_string(),
         ];
         route_catalog_model(&mut cfg).unwrap();
-        // The free-pool catalog id is dropped (it would only 400 on
-        // the default gateway); the same-provider entry and the
-        // non-catalog id stay.
         assert_eq!(
             cfg.fallback_models,
-            ["deepseek-v4.1-flash", "my-custom-model"]
+            ["google/gemma-4-31b-it:free", "my-custom-model"]
         );
     }
 
     #[test]
     fn route_catalog_model_filters_fallbacks_by_the_routed_provider() {
+        // Filtering uses the FINAL base URL: the primary routes to
+        // the free pool, so a same-provider fallback stays and a
+        // non-catalog id stays too (there is no foreign catalog
+        // provider left to drop).
         let _env = env_lock();
         let _env_guard = EnvGuard::set("OPENROUTER_API_KEY", "or-key");
         let mut cfg = resolve_config(&base_cli(), std::env::temp_dir().as_path()).unwrap();
-        cfg.model = "deepseek/deepseek-r1:free".to_string();
+        cfg.model = "google/gemma-4-31b-it:free".to_string();
         cfg.base_url = DEFAULT_BASE_URL.to_string();
         cfg.fallback_models = vec![
-            "deepseek-v4.1-flash".to_string(),
-            "qwen/qwen3-coder:free".to_string(),
+            "nvidia/nemotron-3-ultra-550b-a55b:free".to_string(),
+            "my-custom-model".to_string(),
         ];
         route_catalog_model(&mut cfg).unwrap();
         assert_eq!(cfg.base_url, crate::models::FREE_POOL_BASE_URL);
-        // Filtering uses the FINAL base URL: once the primary routes
-        // to the free pool, the default entry is the foreign one.
-        assert_eq!(cfg.fallback_models, ["qwen/qwen3-coder:free"]);
+        assert_eq!(
+            cfg.fallback_models,
+            ["nvidia/nemotron-3-ultra-550b-a55b:free", "my-custom-model"]
+        );
     }
 
     #[test]
     fn route_to_catalog_entry_routes_cross_provider_pin() {
+        // The default base IS the free pool now, so the cross-provider
+        // pin starts from a custom base URL instead.
         let _env = env_lock();
         let _env_guard = EnvGuard::set("OPENROUTER_API_KEY", "or-key");
         let mut cfg = resolve_config(&base_cli(), std::env::temp_dir().as_path()).unwrap();
         cfg.model = DEFAULT_MODEL.to_string();
-        cfg.base_url = DEFAULT_BASE_URL.to_string();
-        cfg.api_key = Some("exp-key".to_string());
-        let entry = crate::models::catalog_entry("qwen/qwen3-coder:free").unwrap();
+        cfg.base_url = "http://127.0.0.1:9".to_string();
+        cfg.api_key = Some("old-key".to_string());
+        let entry = crate::models::catalog_entry("nvidia/nemotron-3-ultra-550b-a55b:free").unwrap();
         route_to_catalog_entry(&mut cfg, entry, &None).unwrap();
         assert_eq!(cfg.base_url, crate::models::FREE_POOL_BASE_URL);
         assert_eq!(cfg.api_key.as_deref(), Some("or-key"));
-        assert_eq!(cfg.model, "qwen/qwen3-coder:free");
+        assert_eq!(cfg.model, "nvidia/nemotron-3-ultra-550b-a55b:free");
     }
 
     #[test]
-    fn catalog_id_not_rerouted_to_paid_api_without_free_pool_key() {
+    fn catalog_id_stays_on_default_base_when_only_paid_key_set() {
         // Same catalog id, only the paid-service key set: resolve_config must
-        // still not rewrite it, and the catalog router must refuse with
-        // the free-pool key hint instead of silently sending the id to
-        // the paid API.
+        // still not rewrite it, and the catalog router must keep it on the
+        // default base (the provider of the entry IS the default now) instead of
+        // silently sending the id to the paid API.
         let _env = env_lock();
-        let _env_guard_set = EnvGuard::set("DEEPSEEK_API_KEY", "test-key-ds");
+        let _env_guard_set = EnvGuard::set("GOOGLE_API_KEY", "test-key-google");
         let _env_guards_removed =
             EnvGuard::remove_many(&["OPENROUTER_API_KEY", "ZEN_MODEL", "ZEN_BASE_URL"]);
-        let cli = Cli::parse_from(["zen", "--model", "deepseek/deepseek-r1:free"]);
+        let cli = Cli::parse_from(["zen", "--model", "google/gemma-4-31b-it:free"]);
         let mut cfg = resolve_config(&cli, std::env::temp_dir().as_path()).unwrap();
-        assert_eq!(cfg.model, "deepseek/deepseek-r1:free");
+        assert_eq!(cfg.model, "google/gemma-4-31b-it:free");
         assert_eq!(cfg.base_url, DEFAULT_BASE_URL);
-        let err = route_catalog_model(&mut cfg).unwrap_err();
-        assert!(err.to_string().contains("OPENROUTER_API_KEY"), "{err}");
+        assert!(
+            cfg.warnings
+                .iter()
+                .all(|w| !w.contains("provider 'google'"))
+        );
+        let routed = route_catalog_model(&mut cfg).unwrap();
+        assert!(routed);
+        assert_eq!(cfg.model, "google/gemma-4-31b-it:free");
+        assert_eq!(cfg.base_url, DEFAULT_BASE_URL);
     }
 
     #[test]
@@ -1992,7 +1998,7 @@ mod tests {
         cfg.model = DEFAULT_MODEL.to_string();
         cfg.base_url = "http://127.0.0.1:9".to_string();
         cfg.api_key = None;
-        let entry = crate::models::catalog_entry("qwen/qwen3-coder:free").unwrap();
+        let entry = crate::models::catalog_entry("nvidia/nemotron-3-ultra-550b-a55b:free").unwrap();
         route_to_catalog_entry(&mut cfg, entry, &None).unwrap();
         assert_eq!(cfg.base_url, crate::models::FREE_POOL_BASE_URL);
         assert_eq!(cfg.api_key.as_deref(), Some("or-key"));
@@ -2005,26 +2011,12 @@ mod tests {
         let mut cfg = resolve_config(&base_cli(), std::env::temp_dir().as_path()).unwrap();
         cfg.model = DEFAULT_MODEL.to_string();
         cfg.base_url = DEFAULT_BASE_URL.to_string();
-        cfg.api_key = Some("exp-key".to_string());
+        cfg.api_key = Some("old-key".to_string());
         let before = (cfg.model.clone(), cfg.base_url.clone(), cfg.api_key.clone());
-        let entry = crate::models::catalog_entry("qwen/qwen3-coder:free").unwrap();
+        let entry = crate::models::catalog_entry("nvidia/nemotron-3-ultra-550b-a55b:free").unwrap();
         let err = route_to_catalog_entry(&mut cfg, entry, &None).unwrap_err();
         assert!(err.to_string().contains("OPENROUTER_API_KEY"), "{err}");
         assert_eq!((cfg.model, cfg.base_url, cfg.api_key), before);
-    }
-
-    #[test]
-    fn route_to_catalog_entry_restores_home_key_for_home_provider() {
-        let _env = env_lock();
-        let mut cfg = resolve_config(&base_cli(), std::env::temp_dir().as_path()).unwrap();
-        cfg.model = "qwen/qwen3-coder:free".to_string();
-        cfg.base_url = crate::models::FREE_POOL_BASE_URL.to_string();
-        cfg.api_key = Some("or-key".to_string());
-        let entry = crate::models::catalog_entry("deepseek-v4.1-flash").unwrap();
-        route_to_catalog_entry(&mut cfg, entry, &Some("exp-key".to_string())).unwrap();
-        assert_eq!(cfg.base_url, DEFAULT_BASE_URL);
-        assert_eq!(cfg.api_key.as_deref(), Some("exp-key"));
-        assert_eq!(cfg.model, "deepseek-v4.1-flash");
     }
 
     /// Remove the ollama-related env vars, returning guards that

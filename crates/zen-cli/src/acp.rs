@@ -3631,7 +3631,7 @@ mod tests {
     #[test]
     fn usage_cost_known_and_unknown_models() {
         // The free default model costs $0, honestly reported.
-        let cost = usage_cost("deepseek-v4.1-flash", 10, 5).expect("priced");
+        let cost = usage_cost("nvidia/nemotron-3-ultra-550b-a55b:free", 10, 5).expect("priced");
         assert_eq!(cost.amount, 0.0);
         assert_eq!(cost.currency, "USD");
         // gpt-4o: $2.50/$10 per 1M tokens.
@@ -6554,7 +6554,7 @@ mod tests {
             Arc::clone(&state),
             vec![
                 init_line(1),
-                json!({"jsonrpc": "2.0", "id": 2, "method": "session/set_config_option", "params": {"sessionId": "s1", "configOptionId": "model", "valueId": "qwen/qwen3-coder:free"}}).to_string(),
+                json!({"jsonrpc": "2.0", "id": 2, "method": "session/set_config_option", "params": {"sessionId": "s1", "configOptionId": "model", "valueId": "google/gemma-4-31b-it:free"}}).to_string(),
                 json!({"jsonrpc": "2.0", "id": 3, "method": "session/set_config_option", "params": {"sessionId": "s1", "configOptionId": "model", "valueId": "no-such-model"}}).to_string(),
                 json!({"jsonrpc": "2.0", "id": 4, "method": "session/set_config_option", "params": {"sessionId": "s1", "configOptionId": "model", "type": "boolean", "value": true}}).to_string(),
                 json!({"jsonrpc": "2.0", "id": 5, "method": "session/set_config_option", "params": {"sessionId": "s1", "configOptionId": "bogus", "valueId": "x"}}).to_string(),
@@ -6569,15 +6569,15 @@ mod tests {
         let ok = find_response(&lines, 2).unwrap();
         assert!(ok.get("error").is_none(), "{lines:?}");
         assert_eq!(
-            ok["result"]["configOptions"][0]["currentValue"], "qwen/qwen3-coder:free",
+            ok["result"]["configOptions"][0]["currentValue"], "google/gemma-4-31b-it:free",
             "{lines:?}"
         );
         {
             let sessions = lock_or_recover(&state.sessions, "acp sessions");
             let s = sessions.get("s1").unwrap();
-            assert_eq!(s.current_model(), "qwen/qwen3-coder:free");
+            assert_eq!(s.current_model(), "google/gemma-4-31b-it:free");
             let agent = s.agent.try_lock().expect("agent must be idle");
-            assert_eq!(agent.config.model, "qwen/qwen3-coder:free");
+            assert_eq!(agent.config.model, "google/gemma-4-31b-it:free");
         }
         for (id, msg) in [
             (3, "unknown model"),
@@ -6686,7 +6686,10 @@ mod tests {
         );
         // The fake session has no model, so the value falls back to the
         // default catalog entry.
-        assert_eq!(current, "deepseek-v4.1-flash", "{options:?}");
+        assert_eq!(
+            current, "nvidia/nemotron-3-ultra-550b-a55b:free",
+            "{options:?}"
+        );
     }
 
     /// M6: the session-new clamp passes advertised modes through and

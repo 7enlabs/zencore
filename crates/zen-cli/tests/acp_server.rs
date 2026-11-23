@@ -397,12 +397,12 @@ fn acp_set_mode_and_set_config_option_roundtrip() {
     acp.send(&req(
         5,
         "session/set_config_option",
-        json!({"sessionId": session_id, "configOptionId": "model", "valueId": "qwen/qwen3-coder:free"}),
+        json!({"sessionId": session_id, "configOptionId": "model", "valueId": "google/gemma-4-31b-it:free"}),
     ));
     let resp = acp.next_line();
     assert!(resp.get("error").is_none(), "unexpected error: {resp}");
     assert_eq!(
-        resp["result"]["configOptions"][0]["currentValue"], "qwen/qwen3-coder:free",
+        resp["result"]["configOptions"][0]["currentValue"], "google/gemma-4-31b-it:free",
         "{resp}"
     );
     // An unknown model is rejected.

@@ -11,49 +11,37 @@ pub struct CatalogModel {
     pub provider: &'static str,
     pub context_window: u32,
     /// Exact model string the serving provider's endpoint accepts.
-    /// Prefixed ids (`provider/model:free`) are only valid on the service
-    /// that serves them; the default gateway wants the bare slug
-    /// (`deepseek-v4.1-flash`), so the catalog id must never be sent to it
+    /// Prefixed ids are only valid on the service that serves them,
+    /// so a catalog id must never be sent to another gateway
     /// verbatim - that is what the gateway rejects with HTTP 400
-    /// "Invalid Model Name".
+    /// "Invalid Model Name". The free-pool ids are the wire ids.
     pub gateway_id: &'static str,
 }
 
 pub const FREE_MODEL_CATALOG: &[CatalogModel] = &[
     CatalogModel {
-        // Default model (Leader decision, tin 7887, 2026-11-08): the
-        // strongest free model on the default gateway Free plan
-        // ($0, public pricing page). Context window 1M tokens per the
-        // DeepSeek-V4.1-Flash model card; the gateway accepts the bare
-        // slug, so id and gateway_id are the same here.
-        id: "deepseek-v4.1-flash",
-        provider: "experientiallabs",
-        context_window: 1_000_000,
-        gateway_id: "deepseek-v4.1-flash",
-    },
-    CatalogModel {
-        id: "qwen/qwen3-coder:free",
-        provider: "openrouter",
-        context_window: 262_144,
-        gateway_id: "qwen/qwen3-coder:free",
-    },
-    CatalogModel {
-        id: "deepseek/deepseek-r1:free",
-        provider: "openrouter",
-        context_window: 131_072,
-        gateway_id: "deepseek/deepseek-r1:free",
-    },
-    CatalogModel {
+        // Default model: the free-pool entry verified live against
+        // OpenRouter on 2026-11-23 (chat completions 200, including a
+        // code-completion probe). The proposed default,
+        // qwen/qwen3-coder:free, 404s there and is absent from the
+        // listing, so it is not in the catalog at all. Context
+        // window 1M tokens per the OpenRouter model listing; id and
+        // gateway_id are the same here.
         id: "nvidia/nemotron-3-ultra-550b-a55b:free",
         provider: "openrouter",
-        context_window: 131_072,
+        context_window: 1_000_000,
         gateway_id: "nvidia/nemotron-3-ultra-550b-a55b:free",
     },
     CatalogModel {
-        id: "cohere/north-mini-code:free",
+        // Second free-pool entry: listed free on OpenRouter
+        // (2026-11-23); the endpoint routes to it (rate-limited,
+        // HTTP 429, at verification time, not a 404). Its google/
+        // prefix is also a registry provider, which keeps the
+        // catalog-wins-over-direct-routing regression covered.
+        id: "google/gemma-4-31b-it:free",
         provider: "openrouter",
-        context_window: 131_072,
-        gateway_id: "cohere/north-mini-code:free",
+        context_window: 262_144,
+        gateway_id: "google/gemma-4-31b-it:free",
     },
 ];
 
@@ -76,8 +64,8 @@ pub const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
 /// Effective context window for a session (bug hunt B2, direction (a),
 /// Leader decision tin 9607): an explicit `context_window` setting wins,
 /// else the catalog window of the configured model, else the 128k
-/// default. The default model (`deepseek-v4.1-flash`, 1M) used to
-/// compact at ~100k because the 128k default was used blindly.
+/// default. The default model (nvidia/nemotron-3-ultra-550b-a55b:free,
+/// 1M) used to compact at ~100k because the 128k default was used blindly.
 pub fn effective_context_window(explicit: Option<u64>, model: &str) -> u64 {
     explicit
         .or_else(|| catalog_entry(model).map(|m| u64::from(m.context_window)))
@@ -91,7 +79,7 @@ pub const FREE_POOL_BASE_URL: &str = "https://openrouter.ai/api/v1";
 /// provider names are user-facing (`/provider <name>`), so casing
 /// must not change the meaning. `None` for an unknown provider.
 pub fn canonical_provider(name: &str) -> Option<&'static str> {
-    ["experientiallabs", "openrouter"]
+    ["openrouter"]
         .into_iter()
         .find(|p| p.eq_ignore_ascii_case(name))
 }
@@ -172,24 +160,20 @@ pub fn invalid_model_message(model: &str, reason: &str) -> String {
 /// the current base URL stays.
 pub fn provider_base_url(provider: &str) -> Option<&'static str> {
     match canonical_provider(provider) {
-        Some("experientiallabs") => Some(crate::settings::DEFAULT_BASE_URL),
         Some("openrouter") => Some(FREE_POOL_BASE_URL),
         _ => None,
     }
 }
 
-/// Service serving a base URL: the default base is the default
-/// gateway, the free-pool base is the free pool. A custom base URL has
-/// no known provider, so catalog filtering must not exclude anything
-/// there (catalog by real provider).
+/// Service serving a base URL: the default base is the free pool.
+/// A custom base URL has no known provider, so catalog filtering
+/// must not exclude anything there (catalog by real provider).
 pub fn provider_for_base_url(base_url: &str) -> Option<&'static str> {
     // A hand-set base URL often arrives with a trailing slash or
     // stray whitespace (copy-paste); normalize before comparing so
     // the provider is still recognized (bug hunt C F4).
     let base_url = base_url.trim().trim_end_matches('/');
-    if base_url == crate::settings::DEFAULT_BASE_URL {
-        Some("experientiallabs")
-    } else if base_url == FREE_POOL_BASE_URL {
+    if base_url == FREE_POOL_BASE_URL {
         Some("openrouter")
     } else {
         None
@@ -1315,7 +1299,7 @@ mod tests {
     fn merge_candidates_dedupes_and_keeps_catalog_metadata() {
         let discovered = vec![
             DiscoveredModel {
-                id: "qwen/qwen3-coder:free".to_string(),
+                id: "google/gemma-4-31b-it:free".to_string(),
                 free: true,
             },
             DiscoveredModel {
@@ -1329,12 +1313,12 @@ mod tests {
         ];
         let merged = merge_candidates(FREE_MODEL_CATALOG, &discovered);
         assert_eq!(merged.len(), FREE_MODEL_CATALOG.len() + 1);
-        let qwen = merged
+        let gemma = merged
             .iter()
-            .find(|c| c.id == "qwen/qwen3-coder:free")
+            .find(|c| c.id == "google/gemma-4-31b-it:free")
             .unwrap();
-        assert_eq!(qwen.provider, "openrouter");
-        assert_eq!(qwen.context_window, Some(262_144));
+        assert_eq!(gemma.provider, "openrouter");
+        assert_eq!(gemma.context_window, Some(262_144));
         assert!(merged.iter().any(|c| c.id == "new/model:free"));
         assert!(!merged.iter().any(|c| c.id == "paid/model"));
     }
@@ -1643,7 +1627,7 @@ mod tests {
         // when it scores highest.
         let discovered = vec![
             DiscoveredModel {
-                id: "qwen/qwen3-coder:free".to_string(),
+                id: "google/gemma-4-31b-it:free".to_string(),
                 free: false,
             },
             DiscoveredModel {
@@ -1652,18 +1636,18 @@ mod tests {
             },
         ];
         let merged = merge_candidates(FREE_MODEL_CATALOG, &discovered);
-        let qwen = merged
+        let gemma = merged
             .iter()
-            .find(|c| c.id == "qwen/qwen3-coder:free")
+            .find(|c| c.id == "google/gemma-4-31b-it:free")
             .unwrap();
         assert!(
-            !qwen.free,
+            !gemma.free,
             "discovery reporting paid must flip the catalog entry"
         );
         let other = merged.iter().find(|c| c.id == "other/model:free").unwrap();
         assert!(other.free);
         let results = vec![
-            paid_probe("qwen/qwen3-coder:free", 0.99),
+            paid_probe("google/gemma-4-31b-it:free", 0.99),
             probe("other/model:free", true, 0.5),
         ];
         assert_eq!(
@@ -1783,17 +1767,13 @@ mod tests {
 
     #[test]
     fn catalog_gateway_ids_match_what_each_provider_accepts() {
-        // The default gateway wants the bare slug (verified against
-        // its public model page); sending the catalog id verbatim is the
-        // HTTP 400 "Invalid Model Name" bug.
+        // Free-pool entries keep their own id: it IS the wire id
+        // there. (The bare-slug case died with the old default
+        // gateway: every entry now carries its provider/model:free
+        // id verbatim, so there is no slug translation left.)
         assert_eq!(
-            gateway_model_id("deepseek-v4.1-flash"),
-            "deepseek-v4.1-flash"
-        );
-        // Free-pool entries keep their own id: it IS the wire id there.
-        assert_eq!(
-            gateway_model_id("qwen/qwen3-coder:free"),
-            "qwen/qwen3-coder:free"
+            gateway_model_id("google/gemma-4-31b-it:free"),
+            "google/gemma-4-31b-it:free"
         );
         assert_eq!(
             gateway_model_id("nvidia/nemotron-3-ultra-550b-a55b:free"),
@@ -1805,10 +1785,7 @@ mod tests {
 
     #[test]
     fn catalog_provider_routing() {
-        assert_eq!(
-            provider_base_url("experientiallabs"),
-            Some(crate::settings::DEFAULT_BASE_URL)
-        );
+        assert_eq!(provider_base_url("experientiallabs"), None);
         assert_eq!(
             provider_base_url("openrouter"),
             Some("https://openrouter.ai/api/v1")
@@ -1823,30 +1800,25 @@ mod tests {
 
     #[test]
     fn catalog_is_scoped_by_provider() {
-        // The default base serves only the default entry; the
-        // free-pool base serves only the four free-pool entries.
+        // The default base and the free-pool base are the same
+        // service now, so both resolve to the one provider.
         assert_eq!(
             provider_for_base_url(crate::settings::DEFAULT_BASE_URL),
-            Some("experientiallabs")
+            Some("openrouter")
         );
         assert_eq!(
             provider_for_base_url(FREE_POOL_BASE_URL),
             Some("openrouter")
         );
         assert_eq!(provider_for_base_url("https://example.invalid/v1"), None);
-        let experiential = models_for_provider("experientiallabs");
-        assert_eq!(experiential.len(), 1);
-        assert_eq!(experiential[0].id, "deepseek-v4.1-flash");
+        assert!(models_for_provider("experientiallabs").is_empty());
+        assert!(provider_default_model("experientiallabs").is_none());
         let openrouter = models_for_provider("openrouter");
-        assert_eq!(openrouter.len(), 4);
+        assert_eq!(openrouter.len(), 2);
         assert!(openrouter.iter().all(|m| m.provider == "openrouter"));
         assert_eq!(
-            provider_default_model("experientiallabs").unwrap().id,
-            "deepseek-v4.1-flash"
-        );
-        assert_eq!(
             provider_default_model("openrouter").unwrap().id,
-            "qwen/qwen3-coder:free"
+            "nvidia/nemotron-3-ultra-550b-a55b:free"
         );
         assert!(provider_default_model("unknown-provider").is_none());
     }
@@ -1872,10 +1844,7 @@ mod tests {
         // `/provider <Name>` must mean the same as `<name>`
         // (PR #72 review follow-up).
         assert_eq!(canonical_provider("OpenRouter"), Some("openrouter"));
-        assert_eq!(
-            canonical_provider("EXPERIENTIALLABS"),
-            Some("experientiallabs")
-        );
+        assert_eq!(canonical_provider("EXPERIENTIALLABS"), None);
         assert_eq!(canonical_provider("unknown-provider"), None);
         assert_eq!(
             provider_default_model("OpenRouter").map(|e| e.id),
@@ -1900,11 +1869,11 @@ mod tests {
         // whose catalog id was sent to the gateway unchanged.
         let entry = catalog_entry(crate::settings::DEFAULT_MODEL)
             .expect("default model must be listed in FREE_MODEL_CATALOG");
-        assert_eq!(entry.provider, "experientiallabs");
-        assert_eq!(entry.gateway_id, "deepseek-v4.1-flash");
+        assert_eq!(entry.provider, "openrouter");
+        assert_eq!(entry.gateway_id, "nvidia/nemotron-3-ultra-550b-a55b:free");
         assert_eq!(
             gateway_model_id(crate::settings::DEFAULT_MODEL),
-            "deepseek-v4.1-flash"
+            "nvidia/nemotron-3-ultra-550b-a55b:free"
         );
         assert!(zen_agent::budget::is_free_model(
             crate::settings::DEFAULT_MODEL
@@ -1964,23 +1933,19 @@ mod tests {
     fn effective_context_window_uses_catalog_window() {
         // Bug hunt B2, direction (a): the catalog window is the real one.
         assert_eq!(
-            effective_context_window(None, "deepseek-v4.1-flash"),
+            effective_context_window(None, "nvidia/nemotron-3-ultra-550b-a55b:free"),
             1_000_000
         );
         assert_eq!(
-            effective_context_window(None, "qwen/qwen3-coder:free"),
+            effective_context_window(None, "google/gemma-4-31b-it:free"),
             262_144
-        );
-        assert_eq!(
-            effective_context_window(None, "deepseek/deepseek-r1:free"),
-            131_072
         );
     }
 
     #[test]
     fn effective_context_window_explicit_setting_wins_over_catalog() {
         assert_eq!(
-            effective_context_window(Some(50_000), "deepseek-v4.1-flash"),
+            effective_context_window(Some(50_000), "nvidia/nemotron-3-ultra-550b-a55b:free"),
             50_000
         );
     }

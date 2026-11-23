@@ -163,7 +163,7 @@ mod tests {
     fn populated_state() -> FlightdeckState {
         let mut s = FlightdeckState::new(
             "sess-0123456789abcdef",
-            "deepseek-v4.1-flash",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
             128_000,
             PermissionMode::Default,
             "auto",
@@ -242,7 +242,7 @@ mod tests {
     fn empty_state_renders_without_panic() {
         let s = FlightdeckState::new(
             "sess-empty",
-            "deepseek-v4.1-flash",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
             128_000,
             PermissionMode::Plan,
             "off",
@@ -282,7 +282,7 @@ mod tests {
     fn single_agent_row_is_not_clipped() {
         let s = FlightdeckState::new(
             "sess-empty",
-            "deepseek-v4.1-flash",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
             128_000,
             PermissionMode::Plan,
             "off",

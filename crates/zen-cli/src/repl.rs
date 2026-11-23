@@ -1753,7 +1753,7 @@ async fn handle_slash(
             // wrong gateway (the PR #71 HTTP 400 bug).
             if arg.is_empty() {
                 println!(
-                    "usage: /provider <experientiallabs|openrouter> — switch provider; model resets to that provider's best free model"
+                    "usage: /provider <openrouter> — switch provider; model resets to that provider's best free model"
                 );
             } else {
                 match crate::models::provider_default_model(&arg) {
@@ -1786,7 +1786,7 @@ async fn handle_slash(
                             Err(e) => eprintln!("{e}"),
                         }
                     }
-                    None => eprintln!("unknown provider '{arg}' (experientiallabs, openrouter)"),
+                    None => eprintln!("unknown provider '{arg}' (openrouter)"),
                 }
             }
         }
@@ -3693,15 +3693,17 @@ mod model_picker_tests {
     #[test]
     fn catalog_rows_are_scoped_to_the_current_provider() {
         // No probe cache at home None, so the catalog fallback runs.
+        // The default base IS the free pool now, so both lists are
+        // the same two entries, default first.
         let (default_rows, _) = available_model_rows(None, crate::settings::DEFAULT_BASE_URL);
-        assert_eq!(default_rows.len(), 1);
-        assert_eq!(default_rows[0].id, "deepseek-v4.1-flash");
+        assert_eq!(default_rows.len(), 2);
+        assert_eq!(default_rows[0].id, "nvidia/nemotron-3-ultra-550b-a55b:free");
         let (free_pool, _) = available_model_rows(None, crate::models::FREE_POOL_BASE_URL);
-        assert_eq!(free_pool.len(), 4);
+        assert_eq!(free_pool.len(), 2);
         assert!(free_pool.iter().all(|r| r.id != "deepseek-v4.1-flash"));
         // A custom base has no known provider: nothing is excluded.
         let (custom, _) = available_model_rows(None, "https://example.invalid/v1");
-        assert_eq!(custom.len(), 5);
+        assert_eq!(custom.len(), 2);
         // Numbered picks follow the filtered list, so an id outside
         // the current provider is not pickable at all.
         assert!(pick_model("qwen/qwen3-coder:free", &default_rows).is_err());
@@ -3874,14 +3876,19 @@ mod model_picker_tests {
     }
 
     #[tokio::test]
-    async fn switch_to_default_model_sends_bare_slug() {
+    #[allow(clippy::await_holding_lock)]
+    async fn switch_to_default_model_sends_gateway_id() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The default entry is a catalog id now, so routing needs
+        // the provider key; same key on both sides keeps the backend.
+        let _key_guard = EnvGuard::set("OPENROUTER_API_KEY", "test-openrouter-key");
         let backend = std::sync::Arc::new(RecordingBackend {
             models: std::sync::Mutex::new(vec![]),
         });
         let mut agent = test_agent(backend.clone());
         let mut cfg = test_cfg();
         assert_eq!(cfg.base_url, crate::settings::DEFAULT_BASE_URL);
+        cfg.api_key = Some("test-openrouter-key".to_string());
         let old_llm = agent.llm.clone();
 
         let msg = apply_model_switch(
@@ -3890,19 +3897,24 @@ mod model_picker_tests {
             None,
             None,
             &None,
-            "deepseek-v4.1-flash",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
         )
         .unwrap();
-        assert!(msg.contains("deepseek-v4.1-flash"), "{msg}");
-        assert_eq!(agent.config.model, "deepseek-v4.1-flash");
+        assert!(
+            msg.contains("nvidia/nemotron-3-ultra-550b-a55b:free"),
+            "{msg}"
+        );
+        assert_eq!(agent.config.model, "nvidia/nemotron-3-ultra-550b-a55b:free");
         assert_eq!(cfg.base_url, crate::settings::DEFAULT_BASE_URL);
         // Same provider, same key: the backend is left alone.
         assert!(std::sync::Arc::ptr_eq(&old_llm, &agent.llm));
 
         // The request the agent would send carries the gateway id,
         // not the catalog id the gateway rejects with HTTP 400.
-        // The env lock only guards setup; drop it before the await.
-        drop(_env);
+        // The env lock stays held across the await: the switch
+        // reads OPENROUTER_API_KEY from the env during the await,
+        // and a sibling test changing it mid-await flakes this
+        // test (see the allow on this test).
         let req = zen_core::ChatRequest {
             model: agent.config.model.clone(),
             messages: vec![zen_core::ChatMessage::user("hi")],
@@ -3912,12 +3924,14 @@ mod model_picker_tests {
         agent.llm.chat(req).await.unwrap();
         assert_eq!(
             backend.models.lock().unwrap().as_slice(),
-            ["deepseek-v4.1-flash"]
+            ["nvidia/nemotron-3-ultra-550b-a55b:free"]
         );
     }
 
     #[test]
     fn switch_to_free_pool_model_changes_provider() {
+        // The default base IS the free pool now, so the switch
+        // starts from a custom base URL instead.
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env_guard = EnvGuard::set("OPENROUTER_API_KEY", "test-openrouter-key");
         let backend = std::sync::Arc::new(RecordingBackend {
@@ -3925,6 +3939,8 @@ mod model_picker_tests {
         });
         let mut agent = test_agent(backend.clone());
         let mut cfg = test_cfg();
+        cfg.base_url = "https://custom.example/v1".to_string();
+        cfg.api_key = Some("custom-key".to_string());
         let old_llm = agent.llm.clone();
 
         let msg = apply_model_switch(
@@ -3933,11 +3949,11 @@ mod model_picker_tests {
             None,
             None,
             &None,
-            "qwen/qwen3-coder:free",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
         )
         .unwrap();
         assert!(msg.contains("openrouter.ai"), "{msg}");
-        assert_eq!(agent.config.model, "qwen/qwen3-coder:free");
+        assert_eq!(agent.config.model, "nvidia/nemotron-3-ultra-550b-a55b:free");
         assert_eq!(cfg.base_url, "https://openrouter.ai/api/v1");
         assert_eq!(cfg.api_key.as_deref(), Some("test-openrouter-key"));
         // Provider changed: the live backend must have been rebuilt.
@@ -3953,7 +3969,10 @@ mod model_picker_tests {
         });
         let mut agent = test_agent(backend.clone());
         let mut cfg = test_cfg();
-        // Same key on both sides: only the base URL moves.
+        // Same key on both sides: only the base URL moves. The
+        // default base IS the free pool now, so the move starts
+        // from a custom base URL instead.
+        cfg.base_url = "https://custom.example/v1".to_string();
         cfg.api_key = Some("shared-key".to_string());
         let old_llm = agent.llm.clone();
 
@@ -3963,7 +3982,7 @@ mod model_picker_tests {
             None,
             None,
             &None,
-            "qwen/qwen3-coder:free",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
         )
         .unwrap();
         assert!(msg.contains("openrouter.ai"), "{msg}");
@@ -3977,13 +3996,15 @@ mod model_picker_tests {
     #[test]
     fn switch_rebuilds_backend_when_only_key_changes() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // A stale key from an earlier switch (PR #71 review F1): the
+        // base URL is already the free pool, only the key moves, so
+        // the switch moves between two free-pool models.
+        let _env_guard = EnvGuard::set("OPENROUTER_API_KEY", "fresh-key");
         let backend = std::sync::Arc::new(RecordingBackend {
             models: std::sync::Mutex::new(vec![]),
         });
         let mut agent = test_agent(backend.clone());
         let mut cfg = test_cfg();
-        // A stale key from an earlier switch (PR #71 review F1): the
-        // base URL is already the home gateway, only the key moves.
         cfg.api_key = Some("stale-key".to_string());
         let old_llm = agent.llm.clone();
 
@@ -3993,12 +4014,12 @@ mod model_picker_tests {
             None,
             None,
             &None,
-            "deepseek-v4.1-flash",
+            "google/gemma-4-31b-it:free",
         )
         .unwrap();
-        assert!(msg.contains("deepseek-v4.1-flash"), "{msg}");
+        assert!(msg.contains("google/gemma-4-31b-it:free"), "{msg}");
+        assert_eq!(cfg.api_key.as_deref(), Some("fresh-key"));
         assert_eq!(cfg.base_url, crate::settings::DEFAULT_BASE_URL);
-        assert_eq!(cfg.api_key, None);
         // The live backend was built with the stale key, so it must
         // be rebuilt even though the base URL is identical.
         assert!(!std::sync::Arc::ptr_eq(&old_llm, &agent.llm));
@@ -4021,7 +4042,7 @@ mod model_picker_tests {
             None,
             None,
             &None,
-            "qwen/qwen3-coder:free",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
         )
         .unwrap_err();
         assert!(err.contains("OPENROUTER_API_KEY"), "{err}");
@@ -4032,6 +4053,7 @@ mod model_picker_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn slash_pin_to_free_pool_model_without_key_is_refused() {
         // Bug hunt #1 (Scout B P1-1 + Scout C F3): a slash command pinning
         // a cross-provider catalog id must route like /model does. With
@@ -4046,7 +4068,7 @@ mod model_picker_tests {
         std::fs::create_dir_all(&cmd_dir).unwrap();
         std::fs::write(
             cmd_dir.join("probe.md"),
-            "---\nmodel: qwen/qwen3-coder:free\n---\nSay hi.\n",
+            "---\nmodel: nvidia/nemotron-3-ultra-550b-a55b:free\n---\nSay hi.\n",
         )
         .unwrap();
         let backend = std::sync::Arc::new(RecordingBackend {
@@ -4091,9 +4113,10 @@ mod model_picker_tests {
             )),
             model_rows: Vec::new(),
         };
-        // The env lock only guards setup; drop it before the await
-        // (clippy::await_holding_lock), as the sibling async test does.
-        drop(_env);
+        // The env lock stays held across the await: the switch
+        // reads OPENROUTER_API_KEY from the env during the await,
+        // and a sibling test changing it mid-await flakes this
+        // test (see the allow on this test).
         let action = handle_slash(
             "/probe hi",
             &cli,
@@ -4111,8 +4134,6 @@ mod model_picker_tests {
         assert_eq!(agent.config.model, "google/gemini-4-argon:free");
         assert_eq!(cfg.base_url, crate::settings::DEFAULT_BASE_URL);
 
-        // Re-acquire the lock for the env restore.
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4148,9 +4169,12 @@ mod model_picker_tests {
     }
 
     #[test]
-    fn switch_round_trip_restores_home_key() {
-        // F1: default -> free-pool -> default must restore
-        // the startup key, not leak the free-pool key.
+    fn switch_round_trip_keeps_provider_key() {
+        // F1, single-provider form: switching between two
+        // free-pool models and back must not leak or change the
+        // provider key. (The home-key restore this test used to
+        // cover died with the second provider: every catalog
+        // entry now takes its key from the same env var.)
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env_guard = EnvGuard::set("OPENROUTER_API_KEY", "or-key");
         let backend = std::sync::Arc::new(RecordingBackend {
@@ -4158,16 +4182,15 @@ mod model_picker_tests {
         });
         let mut agent = test_agent(backend.clone());
         let mut cfg = test_cfg();
-        cfg.api_key = Some("exp-key".to_string());
-        let home_key = cfg.api_key.clone();
+        cfg.api_key = Some("or-key".to_string());
 
         apply_model_switch(
             &mut cfg,
             &mut agent,
             None,
             None,
-            &home_key,
-            "qwen/qwen3-coder:free",
+            &None,
+            "google/gemma-4-31b-it:free",
         )
         .unwrap();
         assert_eq!(cfg.api_key.as_deref(), Some("or-key"));
@@ -4178,24 +4201,24 @@ mod model_picker_tests {
             &mut agent,
             None,
             None,
-            &home_key,
-            "deepseek-v4.1-flash",
+            &None,
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
         )
         .unwrap();
-        assert_eq!(cfg.api_key.as_deref(), Some("exp-key"));
+        assert_eq!(cfg.api_key.as_deref(), Some("or-key"));
         assert_eq!(cfg.base_url, crate::settings::DEFAULT_BASE_URL);
-        assert_eq!(agent.config.model, "deepseek-v4.1-flash");
-        assert_eq!(cfg.model, "deepseek-v4.1-flash");
+        assert_eq!(agent.config.model, "nvidia/nemotron-3-ultra-550b-a55b:free");
+        assert_eq!(cfg.model, "nvidia/nemotron-3-ultra-550b-a55b:free");
     }
 
     #[test]
     fn route_keeps_default_model_on_default_base() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut cfg = test_cfg();
-        assert_eq!(cfg.model, "deepseek-v4.1-flash");
+        assert_eq!(cfg.model, "nvidia/nemotron-3-ultra-550b-a55b:free");
         let routed = crate::settings::route_catalog_model(&mut cfg).unwrap();
         assert!(routed);
-        assert_eq!(cfg.model, "deepseek-v4.1-flash");
+        assert_eq!(cfg.model, "nvidia/nemotron-3-ultra-550b-a55b:free");
         assert_eq!(cfg.base_url, crate::settings::DEFAULT_BASE_URL);
     }
 
@@ -4208,7 +4231,7 @@ mod model_picker_tests {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let cli = crate::cli::Cli::parse_from(["zen"]);
         let mut cfg = test_cfg();
-        assert_eq!(cfg.model, "deepseek-v4.1-flash");
+        assert_eq!(cfg.model, "nvidia/nemotron-3-ultra-550b-a55b:free");
         assert_eq!(cfg.context_window, None);
         let config = build_repl_config(&cli, &cfg, &std::env::temp_dir());
         assert_eq!(config.context_window, 1_000_000);
@@ -4290,7 +4313,9 @@ mod model_picker_tests {
         // Bug hunt #2 (Scout A B1 + Scout C F2): /model persists the
         // model id but not its base URL, so a cross-provider switch
         // breaks after restart - and /model auto silently loses the
-        // provider. A restart must land on the same provider.
+        // provider. A restart must land on the same provider. The
+        // default base IS the free pool now, so the switch starts
+        // from a custom base URL instead.
         use clap::Parser;
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env_guard_set = EnvGuard::set("OPENROUTER_API_KEY", "or-key");
@@ -4305,7 +4330,8 @@ mod model_picker_tests {
         let mut agent = test_agent(backend);
         let cli = crate::cli::Cli::parse_from(["zen", "--trust-folder"]);
         let mut cfg = crate::settings::resolve_config_with_home(&cli, &dir, Some(&home)).unwrap();
-        assert_eq!(cfg.base_url, crate::settings::DEFAULT_BASE_URL);
+        cfg.base_url = "https://custom.example/v1".to_string();
+        cfg.api_key = Some("custom-key".to_string());
         let home_key = cfg.api_key.clone();
         apply_model_switch(
             &mut cfg,
@@ -4313,13 +4339,13 @@ mod model_picker_tests {
             None,
             None,
             &home_key,
-            "qwen/qwen3-coder:free",
+            "google/gemma-4-31b-it:free",
         )
         .unwrap();
         assert_eq!(cfg.base_url, "https://openrouter.ai/api/v1");
         report_model_switch(&dir, false, &cfg.model, &cfg.base_url, "switched");
         let cfg2 = crate::settings::resolve_config_with_home(&cli, &dir, Some(&home)).unwrap();
-        assert_eq!(cfg2.model, "qwen/qwen3-coder:free");
+        assert_eq!(cfg2.model, "google/gemma-4-31b-it:free");
         assert_eq!(cfg2.base_url, "https://openrouter.ai/api/v1");
         // /model auto after the pin must keep the provider too.
         report_model_switch(&dir, true, &cfg.model, &cfg.base_url, "switched (auto)");
@@ -4420,10 +4446,14 @@ mod model_picker_tests {
 
     #[test]
     fn route_moves_free_pool_model_to_its_service() {
+        // The free pool IS the default service now, so routing a
+        // free-pool model keeps it on the default base and must not
+        // clobber the key that is already set.
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env_guard = EnvGuard::set("OPENROUTER_API_KEY", "or-key");
         let mut cfg = test_cfg();
-        cfg.model = "qwen/qwen3-coder:free".to_string();
+        cfg.model = "google/gemma-4-31b-it:free".to_string();
+        cfg.api_key = Some("or-key".to_string());
         let routed = crate::settings::route_catalog_model(&mut cfg).unwrap();
         assert!(routed);
         assert_eq!(cfg.base_url, "https://openrouter.ai/api/v1");
@@ -4431,13 +4461,20 @@ mod model_picker_tests {
     }
 
     #[test]
-    fn route_refuses_free_pool_model_without_key() {
+    fn route_keeps_free_pool_model_without_key_on_default_base() {
+        // The refusal this test used to cover died with the second
+        // provider: the free pool IS the default base now, so the
+        // startup router keeps a free-pool model there without
+        // needing the key (the /model switch path still refuses
+        // without it; the startup key gate is require_api_key).
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env_guard = EnvGuard::remove("OPENROUTER_API_KEY");
         let mut cfg = test_cfg();
-        cfg.model = "qwen/qwen3-coder:free".to_string();
-        let err = crate::settings::route_catalog_model(&mut cfg).unwrap_err();
-        assert!(err.to_string().contains("OPENROUTER_API_KEY"), "{err}");
+        cfg.model = "google/gemma-4-31b-it:free".to_string();
+        let routed = crate::settings::route_catalog_model(&mut cfg).unwrap();
+        assert!(routed);
+        assert_eq!(cfg.base_url, crate::settings::DEFAULT_BASE_URL);
+        assert_eq!(cfg.model, "google/gemma-4-31b-it:free");
     }
 
     #[test]
@@ -4471,15 +4508,16 @@ mod model_picker_tests {
         cfg.model = "auto".to_string();
         let routed = crate::settings::route_catalog_model(&mut cfg).unwrap();
         assert!(routed);
-        assert_eq!(cfg.model, "deepseek-v4.1-flash");
-        // On the free-pool base, auto is that service's default.
+        assert_eq!(cfg.model, "nvidia/nemotron-3-ultra-550b-a55b:free");
+        // The free-pool base is the default base now, so auto
+        // resolves the same way there.
         let _env_guard = EnvGuard::set("OPENROUTER_API_KEY", "or-key");
         let mut cfg = test_cfg();
         cfg.model = "auto".to_string();
         cfg.base_url = crate::models::FREE_POOL_BASE_URL.to_string();
         let routed = crate::settings::route_catalog_model(&mut cfg).unwrap();
         assert!(routed);
-        assert_eq!(cfg.model, "qwen/qwen3-coder:free");
+        assert_eq!(cfg.model, "nvidia/nemotron-3-ultra-550b-a55b:free");
         // Casing must not change the meaning (PR #73 review
         // follow-up): `Auto` and `AUTO` resolve the same way.
         for spelling in ["Auto", "AUTO"] {
@@ -4487,7 +4525,10 @@ mod model_picker_tests {
             cfg.model = spelling.to_string();
             let routed = crate::settings::route_catalog_model(&mut cfg).unwrap();
             assert!(routed, "{spelling}");
-            assert_eq!(cfg.model, "deepseek-v4.1-flash", "{spelling}");
+            assert_eq!(
+                cfg.model, "nvidia/nemotron-3-ultra-550b-a55b:free",
+                "{spelling}"
+            );
         }
         // A custom base has no known provider: auto refuses clearly
         // instead of sending the literal string "auto" to the gateway.
@@ -4506,12 +4547,14 @@ mod model_picker_tests {
         // does not own - that broke working custom-base setups.
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut cfg = test_cfg();
-        cfg.base_url = "https://openrouter.ai/api/v1".to_string();
+        // The free-pool URL is the default base now, not a custom
+        // one, so the custom endpoint is a different host.
+        cfg.base_url = "https://custom.example/v1".to_string();
         cfg.api_key = Some("custom-key".to_string());
         let routed = crate::settings::route_catalog_model(&mut cfg).unwrap();
         assert!(!routed);
-        assert_eq!(cfg.model, "deepseek-v4.1-flash");
-        assert_eq!(cfg.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(cfg.model, "nvidia/nemotron-3-ultra-550b-a55b:free");
+        assert_eq!(cfg.base_url, "https://custom.example/v1");
         assert_eq!(cfg.api_key.as_deref(), Some("custom-key"));
     }
 
@@ -4951,7 +4994,7 @@ mod pr208_mutant_tests {
         let mut repl = make_repl(&mut session_id, &mut writer, &dir);
         drop(_env);
         let result = switch_model_with_hooks(ModelSwitchRequest {
-            requested: "deepseek-v4.1-flash",
+            requested: "nvidia/nemotron-3-ultra-550b-a55b:free",
             source: "test",
             cfg: &mut cfg,
             agent: &mut agent,
@@ -4972,11 +5015,15 @@ mod pr208_mutant_tests {
     /// `PR208_ASK_EXPECT` it is a no-op. The env value is `"decline"`
     /// or `"proceed"`.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn __pr208_probe_ask() {
         let Ok(expect) = std::env::var("PR208_ASK_EXPECT") else {
             return;
         };
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The switch target is a catalog entry now, so routing needs
+        // the provider key; the probe asserts on the hook arms.
+        let _key_guard = EnvGuard::set("OPENROUTER_API_KEY", "test-openrouter-key");
         let hooks = ScriptedHooks::new(|event, _, _| match event {
             zen_core::HookEvent::PreModelSwitch => zen_core::HookOutcome {
                 permission_override: Some(zen_core::PermissionDecision::Ask),
@@ -4986,9 +5033,12 @@ mod pr208_mutant_tests {
         });
         let (mut cfg, mut agent, mut session_id, mut writer, dir) = switch_setup(hooks.clone());
         let mut repl = make_repl(&mut session_id, &mut writer, &dir);
-        drop(_env);
+        // The env lock stays held across the await: the switch
+        // reads OPENROUTER_API_KEY from the env during the await,
+        // and a sibling test changing it mid-await flakes this
+        // test (see the allow on this test).
         let result = switch_model_with_hooks(ModelSwitchRequest {
-            requested: "deepseek-v4.1-flash",
+            requested: "nvidia/nemotron-3-ultra-550b-a55b:free",
             source: "test",
             cfg: &mut cfg,
             agent: &mut agent,
@@ -5005,7 +5055,7 @@ mod pr208_mutant_tests {
             }
             "proceed" => {
                 assert!(result.is_ok(), "{result:?}");
-                assert_eq!(agent.config.model, "deepseek-v4.1-flash");
+                assert_eq!(agent.config.model, "nvidia/nemotron-3-ultra-550b-a55b:free");
                 assert!(hooks.called("PostModelSwitch"));
             }
             _ => panic!("unknown PR208_ASK_EXPECT value: {expect}"),
@@ -5047,8 +5097,12 @@ mod pr208_mutant_tests {
     // or dropping the `!` in the filter (#30, which then keeps only
     // empty feedback) both leave the stash empty.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn post_model_switch_feedback_is_stashed_for_next_turn() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The switch target is a catalog entry now, so routing needs
+        // the provider key; the test asserts on the hook feedback.
+        let _key_guard = EnvGuard::set("OPENROUTER_API_KEY", "test-openrouter-key");
         let hooks = ScriptedHooks::new(|event, _, _| match event {
             zen_core::HookEvent::PostModelSwitch => zen_core::HookOutcome {
                 feedback: Some("post-switch context".into()),
@@ -5058,9 +5112,12 @@ mod pr208_mutant_tests {
         });
         let (mut cfg, mut agent, mut session_id, mut writer, dir) = switch_setup(hooks.clone());
         let mut repl = make_repl(&mut session_id, &mut writer, &dir);
-        drop(_env);
+        // The env lock stays held across the await: the switch
+        // reads OPENROUTER_API_KEY from the env during the await,
+        // and a sibling test changing it mid-await flakes this
+        // test (see the allow on this test).
         let result = switch_model_with_hooks(ModelSwitchRequest {
-            requested: "deepseek-v4.1-flash",
+            requested: "nvidia/nemotron-3-ultra-550b-a55b:free",
             source: "test",
             cfg: &mut cfg,
             agent: &mut agent,
@@ -5069,7 +5126,7 @@ mod pr208_mutant_tests {
         })
         .await;
         assert!(result.is_ok(), "{result:?}");
-        assert_eq!(agent.config.model, "deepseek-v4.1-flash");
+        assert_eq!(agent.config.model, "nvidia/nemotron-3-ultra-550b-a55b:free");
         assert!(hooks.called("PostModelSwitch"));
         assert_eq!(agent.pending_hook_context, vec!["post-switch context"]);
         std::fs::remove_dir_all(&dir).ok();
@@ -5079,8 +5136,12 @@ mod pr208_mutant_tests {
     // context. Dropping the `!` keeps exactly the whitespace feedback
     // and stashes it.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn post_model_switch_whitespace_feedback_is_not_stashed() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The switch target is a catalog entry now, so routing needs
+        // the provider key; the test asserts on the hook feedback.
+        let _key_guard = EnvGuard::set("OPENROUTER_API_KEY", "test-openrouter-key");
         let hooks = ScriptedHooks::new(|event, _, _| match event {
             zen_core::HookEvent::PostModelSwitch => zen_core::HookOutcome {
                 feedback: Some("   ".into()),
@@ -5090,9 +5151,12 @@ mod pr208_mutant_tests {
         });
         let (mut cfg, mut agent, mut session_id, mut writer, dir) = switch_setup(hooks.clone());
         let mut repl = make_repl(&mut session_id, &mut writer, &dir);
-        drop(_env);
+        // The env lock stays held across the await: the switch
+        // reads OPENROUTER_API_KEY from the env during the await,
+        // and a sibling test changing it mid-await flakes this
+        // test (see the allow on this test).
         let result = switch_model_with_hooks(ModelSwitchRequest {
-            requested: "deepseek-v4.1-flash",
+            requested: "nvidia/nemotron-3-ultra-550b-a55b:free",
             source: "test",
             cfg: &mut cfg,
             agent: &mut agent,
@@ -5742,8 +5806,12 @@ mod pr208_mutant_tests {
     // flipped to `==` the restore call is skipped exactly when the
     // model changed, so the stash stays empty.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn slash_command_model_pin_restores_route_and_fires_post_hook() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The pinned model is a catalog entry now, so routing needs
+        // the provider key.
+        let _key_guard = EnvGuard::set("OPENROUTER_API_KEY", "test-openrouter-key");
         let hooks = ScriptedHooks::new(|event, _, payload| match event {
             zen_core::HookEvent::PostModelSwitch
                 if payload.get("source").and_then(|s| s.as_str()) == Some("auto") =>
@@ -5760,14 +5828,18 @@ mod pr208_mutant_tests {
         });
         let mut agent = test_agent_with_hooks(backend.clone(), hooks);
         let mut cfg = test_cfg();
+        cfg.api_key = Some("test-openrouter-key".to_string());
         let dir = temp_dir("zen_pr208_pin");
-        write_probe_command(&dir, "deepseek-v4.1-flash");
+        write_probe_command(&dir, "nvidia/nemotron-3-ultra-550b-a55b:free");
         let cli = crate::cli::Cli::parse_from(["zen"]);
         let mut session_id = crate::session::new_session_id();
         let mut writer =
             crate::session::TranscriptWriter::new(dir.join("session.jsonl"), &session_id, &dir);
         let mut repl = make_repl(&mut session_id, &mut writer, &dir);
-        drop(_env);
+        // The env lock stays held across the await: the switch
+        // reads OPENROUTER_API_KEY from the env during the await,
+        // and a sibling test changing it mid-await flakes this
+        // test (see the allow on this test).
         let action = handle_slash(
             "/probe hi",
             &cli,
