@@ -1337,4 +1337,61 @@ mod tests {
         assert_eq!(code("echo x >\t/etc/hosts"), "danger.system-write");
         assert_eq!(code("> /etc/hosts"), "danger.system-write");
     }
+
+    #[test]
+    fn curl_x_get_is_not_a_network_upload() {
+        // Kills the 404 `&&` mutant: with `||`, `-X GET` would warn
+        // as an upload even though GET only downloads.
+        assert_ne!(
+            code("curl -X GET http://example.com"),
+            "warn.network-egress"
+        );
+    }
+
+    #[test]
+    fn curl_x_post_is_a_network_upload() {
+        // Kills the 404 `==` mutant: with `!=`, `-X POST` would stop
+        // warning even though POST is an upload method.
+        assert_eq!(
+            code("curl -X POST http://example.com"),
+            "warn.network-egress"
+        );
+    }
+
+    #[test]
+    fn strip_drive_only_strips_a_drive_letter() {
+        // Kills both 666 `&&` mutants: "1:foo" has a colon but no
+        // drive letter, and "c" is too short for a drive prefix.
+        assert_eq!(strip_drive("1:foo"), "1:foo");
+        assert_eq!(strip_drive("c"), "c");
+        assert_eq!(strip_drive("ab"), "ab");
+        assert_eq!(strip_drive("c:/etc/hosts"), "/etc/hosts");
+    }
+
+    #[test]
+    fn redirect_targets_fd_duplication_and_bare_redirect() {
+        // Kills the 739 `<` mutant both ways: a bare `>` at the end of
+        // the line leaves no target (the `<=` mutant would index past
+        // the end), and `>&2` is an fd sink, not a target (the `>`
+        // mutant would report "&2").
+        // Also kills the 740 `+` mutant: under it, `>&2` loops back
+        // to the same `>` forever, so cargo-mutants times it out.
+        let targets: Vec<&str> = redirect_targets("echo x >").collect();
+        assert!(targets.is_empty());
+        let targets: Vec<&str> = redirect_targets("echo x >&2").collect();
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn redirect_targets_trim_quotes() {
+        // Kills the 748 `||` mutant: with `&&`, a target wrapped in
+        // only one kind of quote would keep its quotes.
+        let targets: Vec<&str> = redirect_targets("echo x > 'out.txt'").collect();
+        assert_eq!(targets, vec!["out.txt"]);
+        let targets: Vec<&str> = redirect_targets("echo x > \"out.txt\"").collect();
+        assert_eq!(targets, vec!["out.txt"]);
+        // And at classifier level the unquoted system path is danger.
+        assert_eq!(code("echo x > '/etc/hosts'"), "danger.system-write");
+        assert_eq!(code("echo x > \"/etc/hosts\""), "danger.system-write");
+    }
 }
