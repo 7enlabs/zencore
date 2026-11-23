@@ -518,6 +518,64 @@ pub fn parse_workflow_runs(json: &str) -> Result<Vec<FailingCheck>> {
         .collect())
 }
 
+/// Strip ANSI escapes, drop the `UNKNOWN STEP` placeholder column, and
+/// trim ISO timestamps to time-of-day in a `gh run view --log-failed`
+/// excerpt. Applied once, when the excerpt is stored, so the text
+/// output, the JSON payload and the fix prompt all see clean text
+/// (issue #287; `--no-color` is a superset of this, not a replacement).
+pub fn clean_ci_log(log: &str) -> String {
+    fn ansi() -> &'static regex::Regex {
+        static ANSI: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        ANSI.get_or_init(|| regex::Regex::new(r"\x1b\[[0-9;]*[A-Za-z]").unwrap())
+    }
+    let mut cleaned = Vec::new();
+    for raw in log.lines() {
+        let line = ansi().replace_all(raw, "");
+        let mut fields = line.splitn(4, '\t');
+        let job = fields.next().unwrap_or("");
+        let step = fields.next();
+        let ts = fields.next();
+        let rest = fields.next();
+        // Some lines carry the message after a space in the timestamp
+        // field instead of a fourth tab-separated field.
+        let (ts, rest) = match (ts, rest) {
+            (Some(ts), None) => match ts.split_once(' ') {
+                Some((t, tail)) => (Some(t), Some(tail)),
+                None => (Some(ts), None),
+            },
+            other => other,
+        };
+        let out = match (step, ts, rest) {
+            (Some("UNKNOWN STEP"), Some(ts), Some(rest)) => {
+                format!("{job}\t{}\t{rest}", short_time(ts))
+            }
+            (Some("UNKNOWN STEP"), Some(ts), None) => {
+                format!("{job}\t{}", short_time(ts))
+            }
+            (Some(step), Some(ts), Some(rest)) => {
+                format!("{job}\t{step}\t{}\t{rest}", short_time(ts))
+            }
+            _ => line.into_owned(),
+        };
+        cleaned.push(out);
+    }
+    let mut out = cleaned.join("\n");
+    if log.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// `2026-11-22T21:01:43.7947889Z` -> `21:01:43`; anything else passes
+/// through unchanged.
+fn short_time(ts: &str) -> &str {
+    let Some(time) = ts.split('T').nth(1) else {
+        return ts;
+    };
+    let end = time.find(['.', 'Z']).unwrap_or(time.len());
+    &time[..end]
+}
+
 /// Keep the tail of the log, not the head: CI failures are conventionally
 /// reported at the end, and the omitted-line count is printed so the
 /// excerpt is never mistaken for the full log.
@@ -583,7 +641,7 @@ pub fn fetch_ci_status(cwd: &Path) -> Result<CiStatus> {
     let mut failing = parse_workflow_runs(&runs_json)?;
     for f in failing.iter_mut() {
         if let Ok(log) = run_gh(cwd, &["run", "view", &f.run_id.to_string(), "--log-failed"]) {
-            f.log_excerpt = Some(truncate_log(&log, MAX_LOG_LINES));
+            f.log_excerpt = Some(truncate_log(&clean_ci_log(&log), MAX_LOG_LINES));
         }
     }
     Ok(CiStatus {
@@ -957,6 +1015,35 @@ mod tests {
         assert!(!t.contains("line 0\n"));
 
         assert_eq!(truncate_log("a\nb", 120), "a\nb");
+    }
+
+    #[test]
+    fn clean_ci_log_strips_ansi_drops_unknown_step_and_trims_time() {
+        // Issue #287: the excerpt must carry no ANSI escapes and no
+        // UNKNOWN STEP placeholder, and the timestamp is time-of-day.
+        let log = "mutants (6)\tUNKNOWN STEP\t2026-11-22T21:01:43.7947889Z\t\x1b[36;1mCACHE_ON_FAILURE: false\x1b[0m\nmutants (6)\tBuild\t2026-11-22T21:11:18.8317803Z\t##[error]Process completed with exit code 3.\nplain line, no columns\njob\tUNKNOWN STEP\t2026-11-22T21:01:43Z \x1b[36;1mtext\x1b[0m\nsolo\tUNKNOWN STEP\t2026-11-22T21:01:43.7947889Z\n";
+        let out = clean_ci_log(log);
+        assert!(!out.contains('\x1b'), "escape survived: {out:?}");
+        assert!(
+            !out.contains("UNKNOWN STEP"),
+            "placeholder survived: {out:?}"
+        );
+        assert!(
+            out.contains("mutants (6)\t21:01:43\tCACHE_ON_FAILURE: false"),
+            "got: {out:?}"
+        );
+        assert!(
+            out.contains(
+                "mutants (6)\tBuild\t21:11:18\t##[error]Process completed with exit code 3."
+            ),
+            "got: {out:?}"
+        );
+        assert!(out.contains("plain line, no columns"), "got: {out:?}");
+        assert!(out.contains("job\t21:01:43\ttext"), "got: {out:?}");
+        // A bare UNKNOWN STEP line with a timestamp and no message must
+        // still drop the placeholder and trim the time.
+        assert!(out.contains("solo\t21:01:43"), "got: {out:?}");
+        assert!(out.ends_with('\n'), "trailing newline lost: {out:?}");
     }
 
     #[test]
