@@ -323,7 +323,8 @@ pub fn request_tool_names(raw: &str) -> Vec<String> {
 /// helper (or `ZenRun::command`, which calls it): it pins a hermetic
 /// baseline so a developer's shell cannot smuggle a key, model, base URL
 /// or settings path into the child - ZEN_API_KEY=dummy, ZEN_MODEL /
-/// ZEN_BASE_URL / OPENAI_API_KEY / ZEN_SETTINGS removed, ZEN_TRUST_FOLDER=1.
+/// ZEN_BASE_URL / OPENAI_API_KEY / ZEN_SETTINGS removed, ZEN_TRUST_FOLDER=1,
+/// DO_NOT_TRACK=1 (telemetry notice + ping off in tests).
 /// HOME/USERPROFILE stay per-site: each test owns its temp home.
 pub fn scrub_zen_env(mut cmd: std::process::Command) -> std::process::Command {
     cmd.env("ZEN_API_KEY", "dummy")
@@ -331,7 +332,10 @@ pub fn scrub_zen_env(mut cmd: std::process::Command) -> std::process::Command {
         .env_remove("ZEN_BASE_URL")
         .env_remove("OPENAI_API_KEY")
         .env_remove("ZEN_SETTINGS")
-        .env("ZEN_TRUST_FOLDER", "1");
+        .env("ZEN_TRUST_FOLDER", "1")
+        // Opt out of telemetry in tests (telemetry.rs `opted_out`): a fresh temp
+        // HOME would otherwise print the first-run notice + ping on every run.
+        .env("DO_NOT_TRACK", "1");
     cmd
 }
 

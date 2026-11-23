@@ -27,6 +27,7 @@ fn update_check_reports_prebuilt_install() {
         .arg("update")
         .arg("--check")
         .env("HOME", dir.path())
+        .env("DO_NOT_TRACK", "1")
         .env_remove("ZENCORE_SRC_DIR")
         .env_remove("ZENCORE_REPO")
         .output()
