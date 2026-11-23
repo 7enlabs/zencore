@@ -1021,7 +1021,7 @@ mod tests {
     fn clean_ci_log_strips_ansi_drops_unknown_step_and_trims_time() {
         // Issue #287: the excerpt must carry no ANSI escapes and no
         // UNKNOWN STEP placeholder, and the timestamp is time-of-day.
-        let log = "mutants (6)\tUNKNOWN STEP\t2026-11-22T21:01:43.7947889Z\t\x1b[36;1mCACHE_ON_FAILURE: false\x1b[0m\nmutants (6)\tBuild\t2026-11-22T21:11:18.8317803Z\t##[error]Process completed with exit code 3.\nplain line, no columns\njob\tUNKNOWN STEP\t2026-11-22T21:01:43Z \x1b[36;1mtext\x1b[0m\n";
+        let log = "mutants (6)\tUNKNOWN STEP\t2026-11-22T21:01:43.7947889Z\t\x1b[36;1mCACHE_ON_FAILURE: false\x1b[0m\nmutants (6)\tBuild\t2026-11-22T21:11:18.8317803Z\t##[error]Process completed with exit code 3.\nplain line, no columns\njob\tUNKNOWN STEP\t2026-11-22T21:01:43Z \x1b[36;1mtext\x1b[0m\nsolo\tUNKNOWN STEP\t2026-11-22T21:01:43.7947889Z\n";
         let out = clean_ci_log(log);
         assert!(!out.contains('\x1b'), "escape survived: {out:?}");
         assert!(
@@ -1040,6 +1040,9 @@ mod tests {
         );
         assert!(out.contains("plain line, no columns"), "got: {out:?}");
         assert!(out.contains("job\t21:01:43\ttext"), "got: {out:?}");
+        // A bare UNKNOWN STEP line with a timestamp and no message must
+        // still drop the placeholder and trim the time.
+        assert!(out.contains("solo\t21:01:43"), "got: {out:?}");
         assert!(out.ends_with('\n'), "trailing newline lost: {out:?}");
     }
 
