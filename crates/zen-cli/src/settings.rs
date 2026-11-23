@@ -817,20 +817,53 @@ pub fn resolve_config_with_home(
         None => resolve_api_key(merged.api_key_env.as_deref()),
     };
 
+    // Issue #284: --provider used to accept only "ollama" and reject the
+    // provider the binary actually uses by default. Validate against the
+    // real set instead: ollama (local runtime) plus every catalog provider
+    // (models::canonical_provider, today just openrouter). Provider names
+    // are user-facing, so casing must not change the meaning: normalize
+    // to the canonical name first, so "OpenRouter"/"Ollama" work too.
     let provider = cli
         .provider
         .clone()
-        .or_else(|| std::env::var("ZEN_PROVIDER").ok().filter(|s| !s.is_empty()));
+        .or_else(|| std::env::var("ZEN_PROVIDER").ok().filter(|s| !s.is_empty()))
+        .map(|p| {
+            if p.eq_ignore_ascii_case("ollama") {
+                "ollama".to_string()
+            } else if let Some(canonical) = crate::models::canonical_provider(&p) {
+                canonical.to_string()
+            } else {
+                p
+            }
+        });
     if let Some(p) = provider.as_deref()
         && p != "ollama"
+        && crate::models::canonical_provider(p).is_none()
     {
-        anyhow::bail!("unknown --provider '{p}' (supported providers: ollama)");
+        anyhow::bail!("unknown --provider '{p}' (supported providers: ollama, openrouter)");
     }
     let base_url_explicit = cli.base_url.is_some()
         || std::env::var("ZEN_BASE_URL")
             .map(|v| !v.is_empty())
             .unwrap_or(false)
         || merged.base_url.as_deref().is_some_and(|s| !s.is_empty());
+    // --provider openrouter routes to the free pool unless the base URL
+    // was set explicitly (mirrors the ollama path below); the key comes
+    // from OPENROUTER_API_KEY, or none when it is unset.
+    let (base_url, api_key) = if provider
+        .as_deref()
+        .is_some_and(|p| crate::models::canonical_provider(p) == Some("openrouter"))
+        && !base_url_explicit
+    {
+        (
+            crate::models::FREE_POOL_BASE_URL.to_string(),
+            crate::models::provider_api_key_env("openrouter")
+                .and_then(|e| std::env::var(e).ok())
+                .filter(|v| !v.is_empty()),
+        )
+    } else {
+        (base_url, api_key)
+    };
     let (model, base_url, api_key, ollama) = crate::ollama::apply_ollama_routing(
         provider.as_deref() == Some("ollama"),
         &model,
@@ -2141,6 +2174,71 @@ mod tests {
             err.to_string().contains("unknown --provider"),
             "unexpected: {err}"
         );
+    }
+
+    #[test]
+    fn openrouter_provider_flag_accepted() {
+        let _env = env_lock();
+        let _ollama_env = clear_ollama_env();
+        let mut cli = base_cli();
+        cli.provider = Some("openrouter".into());
+        let cfg = resolve_config(&cli, std::env::temp_dir().as_path()).unwrap();
+        assert!(!cfg.ollama);
+        assert_eq!(cfg.base_url, DEFAULT_BASE_URL);
+    }
+
+    #[test]
+    fn openrouter_provider_flag_routes_direct_model_to_free_pool() {
+        let _env = env_lock();
+        let _ollama_env = clear_ollama_env();
+        let _key = EnvGuard::set("OPENAI_API_KEY", "test-key");
+        // A bare non-catalog id routes direct to its own provider when
+        // the key is set: without the flag the base URL leaves the pool.
+        let mut cli = base_cli();
+        cli.model = Some("openai/gpt-4o".into());
+        let cfg = resolve_config(&cli, std::env::temp_dir().as_path()).unwrap();
+        assert_ne!(cfg.base_url, DEFAULT_BASE_URL);
+        // Naming openrouter brings it back to the free pool.
+        let mut cli = base_cli();
+        cli.provider = Some("openrouter".into());
+        cli.model = Some("openai/gpt-4o".into());
+        let cfg = resolve_config(&cli, std::env::temp_dir().as_path()).unwrap();
+        assert!(!cfg.ollama);
+        assert_eq!(cfg.base_url, DEFAULT_BASE_URL);
+    }
+
+    #[test]
+    fn provider_names_are_case_insensitive() {
+        let _env = env_lock();
+        let _ollama_env = clear_ollama_env();
+        let mut cli = base_cli();
+        cli.provider = Some("OpenRouter".into());
+        let cfg = resolve_config(&cli, std::env::temp_dir().as_path()).unwrap();
+        assert_eq!(cfg.base_url, DEFAULT_BASE_URL);
+        let mut cli = base_cli();
+        cli.provider = Some("Ollama".into());
+        cli.model = Some("llama3.1".into());
+        let cfg = resolve_config(&cli, std::env::temp_dir().as_path()).unwrap();
+        assert!(cfg.ollama);
+    }
+
+    #[test]
+    fn removed_provider_rejected_with_real_list() {
+        let _env = env_lock();
+        let _ollama_env = clear_ollama_env();
+        // experientiallabs is gone since #289; anthropic/openai were
+        // never catalog providers; "wat" never was one.
+        for name in ["experientiallabs", "anthropic", "openai", "wat"] {
+            let mut cli = base_cli();
+            cli.provider = Some(name.into());
+            let err = resolve_config(&cli, std::env::temp_dir().as_path()).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!(
+                    "unknown --provider '{name}' (supported providers: ollama, openrouter)"
+                )),
+                "unexpected: {err}"
+            );
+        }
     }
 
     #[test]
