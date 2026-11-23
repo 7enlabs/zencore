@@ -76,7 +76,7 @@ TASK_VIEC = re.compile(r"\bviệc\s*(\d+)\b", re.IGNORECASE)
 TASK_STEP = re.compile(r"\bP0-(\d+)[-\s]*(?:step|bước)[-\s]*(\d+)\b", re.IGNORECASE)
 TASK_PSTEP = re.compile(r"\bp0(\d)[-\s]?s(?:tep)?[-\s]*(\d+)\b", re.IGNORECASE)
 TASK_PHASE = re.compile(r"\bphase\s*(\d+)\s*#\s*(\d+)\b", re.IGNORECASE)
-EXEMPT_BRANCH_PREFIXES = ("dependabot/",)
+EXEMPT_BRANCH_PREFIXES = ("dependabot/", "renovate/")
 
 
 @dataclass
