@@ -207,6 +207,9 @@ class TaskGuard(unittest.TestCase):
     def test_t1_dependabot_exempt(self):
         self.assertEqual(fg.check_task_code("dependabot/cargo/serde-1.0.0", ""), [])
 
+    def test_t1_renovate_exempt(self):
+        self.assertEqual(fg.check_task_code("renovate/rustyline-19.x", ""), [])
+
     def test_t2_duplicate_found(self):
         prs = [
             {"number": 61, "headRefName": "dev/p03-sweep", "body": "P0-3 step 3"},
