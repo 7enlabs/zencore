@@ -357,6 +357,15 @@ impl LspClient {
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
             while let Ok(val) = read_frame(&mut reader).await {
+                // A JSON-RPC frame is always an object. A non-object
+                // means the server is misbehaving: break out instead of
+                // looping on it. Without this, a read that returns a
+                // default value without consuming input spins here at
+                // 100% CPU and starves the runtime (issue #277
+                // follow-up).
+                if !val.is_object() {
+                    break;
+                }
                 if let Some(id) = val.get("id").and_then(id_to_u64) {
                     let tx = lock_or_recover(&reader_pending, "reader_pending").remove(&id);
                     if let Some(tx) = tx {

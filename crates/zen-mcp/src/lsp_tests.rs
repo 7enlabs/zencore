@@ -8,9 +8,9 @@ use zen_core::{DiagnosticsProvider, Tool, ToolContext};
 
 use crate::lsp::LspClient;
 use crate::lsp::{
-    LspLanguage, LspManager, col_to_utf16, detect_language, find_binary, find_project_root,
-    parse_locations, parse_publish_diagnostics, path_to_uri, render_hover, server_spec,
-    uri_to_path, utf16_to_col,
+    LspConnection, LspLanguage, LspManager, col_to_utf16, detect_language, find_binary,
+    find_project_root, parse_locations, parse_publish_diagnostics, path_to_uri, render_hover,
+    server_spec, uri_to_path, utf16_to_col,
 };
 use crate::lsp::{MAX_FRAME_BYTES, read_frame, write_frame};
 use crate::lsp_tools::{DiagnosticsTool, FindReferencesTool, GotoDefinitionTool, HoverTool};
@@ -419,6 +419,44 @@ async fn read_frame_accepts_frame_at_cap() {
 }
 
 #[tokio::test]
+async fn read_frame_cap_is_ten_mib_written_literally() {
+    // The cap is 10 MiB = 10485760 bytes, written literally here. The
+    // earlier cap tests derive their sizes from MAX_FRAME_BYTES, so a
+    // mutant changing the constant changed the test inputs too and
+    // survived (issue #277 follow-up).
+    let (mut a, mut b) = tokio::io::duplex(65536);
+    let body = format!("{{\"data\":\"{}\"}}", "x".repeat(10_485_760 - 11));
+    assert_eq!(body.len(), 10_485_760);
+    let len = body.len();
+    tokio::spawn(async move {
+        a.write_all(format!("Content-Length: {len}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        a.write_all(body.as_bytes()).await.unwrap();
+    });
+    let got = read_frame(&mut BufReader::new(&mut b)).await.unwrap();
+    assert_eq!(got["data"].as_str().unwrap().len(), 10_485_760 - 11);
+}
+
+#[tokio::test]
+async fn read_frame_rejects_one_byte_over_ten_mib_written_literally() {
+    // Boundary with a literal size, so the error message names the real
+    // 10485760-byte limit even if the constant is mutated.
+    let (mut a, mut b) = tokio::io::duplex(65536);
+    tokio::spawn(async move {
+        a.write_all(b"Content-Length: 10485761\r\n\r\n{")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    });
+    let err = read_frame(&mut BufReader::new(&mut b)).await.unwrap_err();
+    assert!(
+        err.to_string().contains("exceeds the 10485760 byte limit"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
 async fn mock_server_full_roundtrip() {
     let Some(setup) = mock_setup() else {
         eprintln!("SKIP: python3 not found");
@@ -550,6 +588,75 @@ async fn request_timeout_is_surfaced_not_hung() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("timed out"), "got: {err}");
+}
+
+/// A fake server that answers `initialize` with a bare JSON number
+/// instead of an object: not a valid JSON-RPC frame.
+const MOCK_NON_OBJECT_SERVER: &str = r##"#!/usr/bin/env python3
+import sys, time
+
+def read_msg():
+    headers = {}
+    while True:
+        raw = sys.stdin.buffer.readline()
+        if not raw:
+            return None
+        line = raw.decode("utf-8", "replace")
+        if line in ("\r\n", "\n", ""):
+            break
+        if ":" in line:
+            k, v = line.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+    n = int(headers.get("content-length", "0"))
+    if n <= 0:
+        return None
+    return sys.stdin.buffer.read(n)
+
+msg = read_msg()
+if msg is not None:
+    sys.stdout.buffer.write(b"Content-Length: 1\r\n\r\n5")
+    sys.stdout.buffer.flush()
+time.sleep(30)
+"##;
+
+#[tokio::test]
+async fn non_object_frame_ends_connection_promptly() {
+    // Issue #277 follow-up: a server answering with a non-object frame
+    // used to leave the reader loop spinning on it, pinning the CPU and
+    // hanging every test that waits on the connection. The loop now
+    // treats a non-object as a dead connection, so start fails at once
+    // instead of waiting out the 30 s initialize timeout.
+    let Some(py) = find_binary("python3") else {
+        eprintln!("SKIP: python3 not found");
+        return;
+    };
+    let tmp = unique_tmpdir("non-object");
+    let script = tmp.join("mock_non_object.py");
+    write_file(&script, MOCK_NON_OBJECT_SERVER);
+    let log = tmp.join("methods.log");
+    write_file(&log, "");
+    let start = Instant::now();
+    let err = match LspConnection::start(
+        LspLanguage::Rust,
+        py.to_str().unwrap(),
+        &[
+            script.to_string_lossy().into_owned(),
+            log.to_string_lossy().into_owned(),
+            "file:///none".to_string(),
+        ],
+        tmp.as_path(),
+    )
+    .await
+    {
+        Ok(_) => panic!("start must fail on a non-object frame"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("LSP server closed"), "got: {err}");
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "connection must fail promptly, took {:?}",
+        start.elapsed()
+    );
 }
 
 fn loc_result(uri: &str, sl: u64, sc: u64, el: u64, ec: u64) -> Value {
