@@ -817,6 +817,25 @@ mod tests {
     }
 
     #[test]
+    fn is_word_char_joins_compound_words() {
+        // Kills the mutants that replace is_word_char with false and
+        // that turn its second `||` into `&&`: `-` and `_` must count
+        // as word chars, so `over-blocking` and `non_blocking` do not
+        // match `blocking`.
+        assert!(is_word_char('a'));
+        assert!(is_word_char('Z'));
+        assert!(is_word_char('7'));
+        assert!(is_word_char('-'));
+        assert!(is_word_char('_'));
+        assert!(!is_word_char(' '));
+        assert!(!is_word_char('.'));
+        assert!(!is_word_char('/'));
+        assert!(!contains_word("over-blocking issue", "blocking"));
+        assert!(!contains_word("non_blocking call", "blocking"));
+        assert!(contains_word("blocking call", "blocking"));
+    }
+
+    #[test]
     fn group_comments_by_file_severity_first() {
         let f = sample_fetched();
         let groups = group_comments(&f);
