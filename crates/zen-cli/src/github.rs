@@ -635,12 +635,15 @@ pub fn pr_fix_prompt(fetched: &FetchedComments) -> String {
     for g in group_comments(fetched) {
         p.push_str(&format!("### {}\n", g.title));
         for c in &g.comments {
-            p.push_str(&format!(
-                "- @{} [{}]: {}\n",
-                c.author,
-                severity_of(&c.body).label(),
-                c.body
-            ));
+            // Same label rule as format_comments_text: a bot summary
+            // gets [BOT SUMMARY] and no severity, so the agent is not
+            // sent to fix a summary that says there is nothing to fix.
+            let label = if is_bot_summary(c) {
+                "BOT SUMMARY"
+            } else {
+                severity_of(&c.body).label()
+            };
+            p.push_str(&format!("- @{} [{}]: {}\n", c.author, label, c.body));
         }
         p.push('\n');
     }
@@ -999,6 +1002,23 @@ mod tests {
         assert!(p.contains("@lead-reviewer"));
         assert!(p.contains("[CRITICAL]"));
         assert!(p.contains("Do not post replies on GitHub"));
+    }
+
+    #[test]
+    fn pr_fix_prompt_labels_bot_summary_not_critical() {
+        // Follow-up #286: the prompt must use the same label rule as
+        // the text view, or the agent is sent to fix a summary that
+        // says "No security concerns identified".
+        let mut fetched = sample_fetched();
+        fetched.review_comments.push(bot_summary_comment(
+            "github-actions[bot]",
+            "No security concerns identified.",
+        ));
+        let p = pr_fix_prompt(&fetched);
+        assert!(p.contains("@github-actions[bot] [BOT SUMMARY]"));
+        assert!(!p.contains("@github-actions[bot] [CRITICAL]"));
+        // The real finding keeps its own severity label.
+        assert!(p.contains("@lead-reviewer [CRITICAL]"));
     }
 
     #[test]
