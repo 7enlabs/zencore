@@ -563,8 +563,11 @@ pub fn builtin_skill_names() -> Vec<&'static str> {
     BUILTIN_SKILLS.iter().map(|(n, _, _, _)| *n).collect()
 }
 
-pub fn install_builtin(home: &Path, name: &str) -> Result<RegistryEntry> {
-    let (_, skill_md, manifest_json, test_md) = BUILTIN_SKILLS
+/// Parse, validate and verify the embedded manifest of a builtin skill
+/// without writing anything. Shared by install_builtin and the --dry-run
+/// preview in cmd_install (issue #281).
+fn builtin_manifest(name: &str) -> Result<PluginManifest> {
+    let (_, _, manifest_json, _) = BUILTIN_SKILLS
         .iter()
         .find(|(n, _, _, _)| *n == name)
         .ok_or_else(|| {
@@ -595,6 +598,22 @@ pub fn install_builtin(home: &Path, name: &str) -> Result<RegistryEntry> {
             ));
         }
     }
+    Ok(manifest)
+}
+
+pub fn install_builtin(home: &Path, name: &str) -> Result<RegistryEntry> {
+    let (_, skill_md, manifest_json, test_md) = BUILTIN_SKILLS
+        .iter()
+        .find(|(n, _, _, _)| *n == name)
+        .ok_or_else(|| {
+            anyhow!(
+                "no builtin skill named {:?} (available: {})",
+                name,
+                builtin_skill_names().join(", ")
+            )
+        })?;
+
+    let manifest = builtin_manifest(name)?;
 
     let dest = skills_root(home).join(name);
     if dest.exists() {
@@ -1009,7 +1028,9 @@ const SCAFFOLD_TEST_MD: &str = r#"# Tests for {name}
 - CHECK instructions contains "TODO"
 "#;
 
-pub fn create_skill(home: &Path, name: &str) -> Result<PathBuf> {
+/// Validate a skill name without writing anything. Shared by
+/// create_skill and the --dry-run preview in skill_command (issue #281).
+fn validate_skill_name(name: &str) -> Result<()> {
     if name.trim().is_empty()
         || !name
             .chars()
@@ -1020,6 +1041,11 @@ pub fn create_skill(home: &Path, name: &str) -> Result<PathBuf> {
             "skill name must be [a-zA-Z0-9_-]+",
         ));
     }
+    Ok(())
+}
+
+pub fn create_skill(home: &Path, name: &str) -> Result<PathBuf> {
+    validate_skill_name(name)?;
     let dir = skills_root(home).join(name);
     if dir.exists() {
         return Err(crate::coded_error(
@@ -1215,8 +1241,16 @@ pub async fn skill_command(
             source,
             yes,
             registry,
+            dry_run,
         } => {
-            cmd_install(&home, source, *yes, registry.as_deref())?;
+            cmd_install(
+                &home,
+                source,
+                *yes,
+                registry.as_deref(),
+                *dry_run,
+                cli.quiet,
+            )?;
             Ok(0)
         }
         crate::cli::SkillSubcommand::Search {
@@ -1290,7 +1324,31 @@ pub async fn skill_command(
             }
             Ok(0)
         }
-        crate::cli::SkillSubcommand::Remove { name, yes } => {
+        crate::cli::SkillSubcommand::Remove { name, yes, dry_run } => {
+            if *dry_run {
+                let registry = load_registry(&home);
+                let entry = registry
+                    .skills
+                    .get(name)
+                    .ok_or_else(|| anyhow!("no installed skill named {:?}", name))?;
+                if !cli.quiet {
+                    let dest = skills_root(&home).join(name);
+                    let files = std::fs::read_dir(&dest).map(|d| d.count()).unwrap_or(0);
+                    println!(
+                        "would remove skill {} v{} from {}",
+                        entry.name,
+                        entry.version,
+                        dest.display()
+                    );
+                    println!(
+                        "  registry entry: {} v{} (installed {})",
+                        entry.name, entry.version, entry.installed_at
+                    );
+                    println!("  {files} file(s) in {}", dest.display());
+                    println!("(no change made; drop --dry-run to apply)");
+                }
+                return Ok(0);
+            }
             if cmd_remove(&home, name, *yes)? {
                 if !cli.quiet {
                     println!("removed skill {:?}", name);
@@ -1304,7 +1362,24 @@ pub async fn skill_command(
             let code = cmd_test(&home, name)?;
             Ok(code)
         }
-        crate::cli::SkillSubcommand::Create { name } => {
+        crate::cli::SkillSubcommand::Create { name, dry_run } => {
+            if *dry_run {
+                validate_skill_name(name)?;
+                let dir = skills_root(&home).join(name);
+                if dir.exists() {
+                    return Err(crate::coded_error(
+                        crate::exit_code::CONFLICT,
+                        format!("skill {:?} already exists at {}", name, dir.display()),
+                    ));
+                }
+                if !cli.quiet {
+                    println!("would create skill {name} at {}", dir.display());
+                    println!("  + SKILL.md, zen-plugin.json, test.md");
+                    println!("  registry entry: {name} v0.1.0 (unverified)");
+                    println!("(no change made; drop --dry-run to apply)");
+                }
+                return Ok(0);
+            }
             let dir = create_skill(&home, name)?;
             if !cli.quiet {
                 println!("created skill {:?} at {}", name, dir.display());
@@ -1380,6 +1455,8 @@ fn cmd_install(
     source: &str,
     yes: bool,
     registry_override: Option<&str>,
+    dry_run: bool,
+    quiet: bool,
 ) -> Result<()> {
     if let Some(name) = source.strip_prefix("registry:") {
         let reg = crate::skill_registry::load_community_registry(registry_override)?;
@@ -1392,10 +1469,29 @@ fn cmd_install(
         };
         println!("registry:{} → {}", entry.name, resolved);
         println!("{}", crate::skill_registry::format_skill_info(entry));
-        return cmd_install(home, &resolved, yes, registry_override);
+        return cmd_install(home, &resolved, yes, registry_override, dry_run, quiet);
     }
 
     if let Some(name) = source.strip_prefix("builtin:") {
+        if dry_run {
+            let manifest = builtin_manifest(name)?;
+            if !quiet {
+                let dest = skills_root(home).join(name);
+                println!(
+                    "would install builtin skill {name} v{} to {}",
+                    manifest.version,
+                    dest.display()
+                );
+                if let Some(old) = load_registry(home).skills.get(name) {
+                    println!(
+                        "  replaces: {name} v{} (installed {})",
+                        old.version, old.installed_at
+                    );
+                }
+                println!("(no change made; drop --dry-run to apply)");
+            }
+            return Ok(());
+        }
         if !yes {
             return Err(crate::coded_error(
                 crate::exit_code::FORBIDDEN,
@@ -1418,15 +1514,36 @@ fn cmd_install(
         std::fs::remove_dir_all(&staging)?;
     }
     std::fs::create_dir_all(&staging)?;
+    // The name install_skill would install under: the clone/copy
+    // source name, overridden by the manifest name, then by the SKILL.md
+    // frontmatter name - the same order as install_skill.
+    let mut preview_name: Option<String> = match &src {
+        InstallSource::Local(p) => p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .filter(|n| !n.is_empty()),
+        _ => None,
+    };
     let preview_manifest: Option<PluginManifest> = match &src {
-        InstallSource::Git(url) => clone_skill_repo(url, &staging)
-            .ok()
-            .and_then(|_| load_manifest(&staging).ok()),
+        InstallSource::Git(url) => clone_skill_repo(url, &staging).ok().and_then(|(n, _)| {
+            preview_name = Some(n);
+            load_manifest(&staging).ok()
+        }),
         InstallSource::Local(p) => copy_dir_all(p, &staging)
             .ok()
             .and_then(|_| load_manifest(&staging).ok()),
         InstallSource::Builtin => None,
     };
+    if let Some(m) = &preview_manifest {
+        if !m.name.trim().is_empty() {
+            preview_name = Some(m.name.clone());
+        }
+    } else if let Ok(skill_md) = std::fs::read_to_string(staging.join("SKILL.md"))
+        && let (Some(fm), _) = zen_ext::split_frontmatter(&skill_md)
+        && let Some(n) = fm.name.filter(|n| !n.trim().is_empty())
+    {
+        preview_name = Some(n);
+    }
     std::fs::remove_dir_all(&staging).ok();
 
     match &preview_manifest {
@@ -1445,6 +1562,32 @@ fn cmd_install(
         None => {
             println!("no zen-plugin.json found → will install as [⚠ unverified] (sandboxed).");
         }
+    }
+    if dry_run {
+        let name = preview_name.ok_or_else(|| {
+            anyhow!(
+                "cannot preview install of {source:?}: no skill found (clone/copy failed or no SKILL.md)"
+            )
+        })?;
+        let version = preview_manifest
+            .as_ref()
+            .map(|m| m.version.clone())
+            .unwrap_or_else(|| "0.0.0".to_string());
+        if !quiet {
+            let dest = skills_root(home).join(&name);
+            println!(
+                "would install skill {name} v{version} from {source} to {}",
+                dest.display()
+            );
+            if let Some(old) = load_registry(home).skills.get(&name) {
+                println!(
+                    "  replaces: {name} v{} (installed {})",
+                    old.version, old.installed_at
+                );
+            }
+            println!("(no change made; drop --dry-run to apply)");
+        }
+        return Ok(());
     }
     if !yes {
         println!("re-run with --yes to approve and install.");
@@ -2435,7 +2578,7 @@ mod tests {
     #[test]
     fn cmd_install_builtin_installs_skill() {
         let home = tmp_home("cmd-install-builtin");
-        cmd_install(&home, "builtin:tdd", true, None).unwrap();
+        cmd_install(&home, "builtin:tdd", true, None, false, false).unwrap();
         assert!(skills_root(&home).join("tdd").join("SKILL.md").exists());
         assert!(
             skills_root(&home)
@@ -2449,7 +2592,7 @@ mod tests {
     #[test]
     fn cmd_install_builtin_without_yes_is_forbidden() {
         let home = tmp_home("cmd-install-builtin-no-yes");
-        let err = cmd_install(&home, "builtin:tdd", false, None).unwrap_err();
+        let err = cmd_install(&home, "builtin:tdd", false, None, false, false).unwrap_err();
         assert_eq!(
             crate::exit_code_for_error(&err),
             crate::exit_code::FORBIDDEN
@@ -2464,10 +2607,10 @@ mod tests {
     #[test]
     fn cmd_install_builtin_second_install_is_conflict() {
         let home = tmp_home("cmd-install-builtin-twice");
-        cmd_install(&home, "builtin:tdd", true, None).unwrap();
+        cmd_install(&home, "builtin:tdd", true, None, false, false).unwrap();
         let marker = "edited by the user - must survive a reinstall";
         std::fs::write(skills_root(&home).join("tdd").join("SKILL.md"), marker).unwrap();
-        let err = cmd_install(&home, "builtin:tdd", true, None).unwrap_err();
+        let err = cmd_install(&home, "builtin:tdd", true, None, false, false).unwrap_err();
         assert_eq!(crate::exit_code_for_error(&err), crate::exit_code::CONFLICT);
         assert_eq!(
             std::fs::read_to_string(skills_root(&home).join("tdd").join("SKILL.md")).unwrap(),
@@ -2479,7 +2622,7 @@ mod tests {
     #[test]
     fn cmd_remove_without_yes_is_forbidden_on_non_interactive_stdin() {
         let home = tmp_home("cmd-remove-no-yes");
-        cmd_install(&home, "builtin:tdd", true, None).unwrap();
+        cmd_install(&home, "builtin:tdd", true, None, false, false).unwrap();
         let err = cmd_remove(&home, "tdd", false).unwrap_err();
         assert_eq!(
             crate::exit_code_for_error(&err),
@@ -2495,7 +2638,7 @@ mod tests {
     #[test]
     fn cmd_remove_with_yes_removes_skill() {
         let home = tmp_home("cmd-remove-yes");
-        cmd_install(&home, "builtin:tdd", true, None).unwrap();
+        cmd_install(&home, "builtin:tdd", true, None, false, false).unwrap();
         assert!(cmd_remove(&home, "tdd", true).unwrap());
         assert!(!skills_root(&home).join("tdd").exists());
         assert!(!load_registry(&home).skills.contains_key("tdd"));
