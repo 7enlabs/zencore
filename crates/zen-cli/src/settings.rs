@@ -2208,6 +2208,49 @@ mod tests {
     }
 
     #[test]
+    fn zen_provider_env_openrouter_routes_direct_model_to_free_pool() {
+        // Kills the mutant that deletes `!` in the ZEN_PROVIDER empty
+        // filter (line 829): a non-empty ZEN_PROVIDER must reach the
+        // provider routing, so naming openrouter via env brings a
+        // direct-routed model back to the free pool.
+        let _env = env_lock();
+        let _ollama_env = clear_ollama_env();
+        let _key = EnvGuard::set("OPENAI_API_KEY", "test-key");
+        let _provider = EnvGuard::set("ZEN_PROVIDER", "openrouter");
+        let mut cli = base_cli();
+        cli.model = Some("openai/gpt-4o".into());
+        let cfg = resolve_config(&cli, std::env::temp_dir().as_path()).unwrap();
+        assert!(!cfg.ollama);
+        assert_eq!(cfg.base_url, DEFAULT_BASE_URL);
+    }
+
+    #[test]
+    fn empty_zen_provider_env_is_ignored() {
+        // Kills the same line-829 mutant from the other side: an empty
+        // ZEN_PROVIDER must be ignored, not treated as an unknown
+        // provider name.
+        let _env = env_lock();
+        let _ollama_env = clear_ollama_env();
+        let _provider = EnvGuard::set("ZEN_PROVIDER", "");
+        let cfg = resolve_config(&base_cli(), std::env::temp_dir().as_path()).unwrap();
+        assert!(!cfg.ollama);
+    }
+
+    #[test]
+    fn openrouter_provider_flag_keeps_openrouter_api_key() {
+        // Kills the mutant that deletes `!` in the OPENROUTER_API_KEY
+        // empty filter (line 862): a set key must survive as the
+        // resolved api_key instead of being dropped.
+        let _env = env_lock();
+        let _ollama_env = clear_ollama_env();
+        let _key = EnvGuard::set("OPENROUTER_API_KEY", "sk-test-key");
+        let mut cli = base_cli();
+        cli.provider = Some("openrouter".into());
+        let cfg = resolve_config(&cli, std::env::temp_dir().as_path()).unwrap();
+        assert_eq!(cfg.api_key.as_deref(), Some("sk-test-key"));
+    }
+
+    #[test]
     fn provider_names_are_case_insensitive() {
         let _env = env_lock();
         let _ollama_env = clear_ollama_env();
