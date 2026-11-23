@@ -353,7 +353,7 @@ exclude_re = [
   # gains a pattern matching `""` or `";"`, this mutant stops being
   # equivalent: remove the exclusion and kill it with a test on an
   # empty command that asserts the fallback verdict.
-  "classifier\\.rs:195:30: replace match guard !parts.is_empty() with true in classify_bash",
+  "classifier\\.rs:195:30: replace match guard !parts\\.is_empty\\(\\) with true in classify_bash",
   # PR #274, classifier.rs classify_bash (line 211, col 48):
   # replace > with >= in `parsed.len() > 1` (pipe-to-shell check).
   # EQUIVALENT (waived by ZC Leader, 2026-11-23, per Zen delegation
@@ -380,7 +380,7 @@ exclude_re = [
   # or if `rest` is read in any other way, this mutant stops being
   # equivalent: remove the exclusion and kill it with a test using
   # that subcommand.
-  "classifier\\.rs:453:24: replace + with * in classify_git",
+  "classifier\\.rs:453:24: replace \\+ with \\* in classify_git",
   # PR #274, classifier.rs is_safe_part (line 557, col 43):
   # replace + with * in `&args[i + 1..]` (git branch flag search).
   # EQUIVALENT (waived by ZC Leader, 2026-11-23, per Zen delegation
@@ -392,7 +392,7 @@ exclude_re = [
   # if the slice is read in any other way, this mutant stops being
   # equivalent: remove the exclusion and kill it with a test on
   # `git branch` with that flag present.
-  "classifier\\.rs:557:43: replace + with * in is_safe_part",
+  "classifier\\.rs:557:43: replace \\+ with \\* in is_safe_part",
   # PR #274, state.rs FlightdeckState::apply (line 553, col 41):
   # replace > with >= in the gate cap check (same shape as the
   # already-waived push_log mutant, state.rs:515, waived by ZC Leader,
