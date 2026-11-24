@@ -315,9 +315,9 @@ pub async fn assemble(
     let agents = if cli.tools.as_deref() == Some("") || (cli.bare && cli.agents.is_none()) {
         Vec::new()
     } else if cli.bare {
-        zen_mcp::load_cli_agents(cli.agents.as_deref())
+        zen_mcp::load_cli_agents(cli.agents.as_deref())?
     } else {
-        zen_mcp::load_agents(cwd, home, cli.agents.as_deref())
+        zen_mcp::load_agents(cwd, home, cli.agents.as_deref())?
     };
     if let Some(name) = &cli.agent
         && let Some(def) = agents.iter().find(|d| d.name == *name)

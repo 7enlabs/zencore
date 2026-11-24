@@ -2584,7 +2584,7 @@ async fn handle_slash(
             }
         }
         "/agents" => {
-            let agents = zen_mcp::load_agents(cwd, home, cli.agents.as_deref());
+            let agents = zen_mcp::load_agents(cwd, home, cli.agents.as_deref())?;
             for a in agents {
                 println!("{}: {}", a.name, a.description);
             }
