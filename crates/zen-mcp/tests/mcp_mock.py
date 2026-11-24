@@ -25,6 +25,31 @@ Modes:
     exact_tools     - tools/list returns exactly 10,000 tools in one page (#377)
     hang            - tools/call sleeps 120s (in-flight request tests)
     spawn_worker    - tools/call spawns a long-lived grandchild, writes its PID
+    die_after_first_call - tools/list answers once, then the server exits
+                      (regression aid for zencore #375: the client must
+                      evict the dead cached session and reconnect)
+    die_after_first_call also exits after one tools/call (same idea, for
+                      the call path: the client must evict + retry with
+                      the same arguments)
+    hang_first_list - first tools/list sleeps 120s, later ones answer
+                      (child stays alive, so the liveness probe cannot
+                      heal: only evict-on-transport-error can)
+    hang_first_call - first tools/call sleeps 120s, later ones answer
+    die_first_spawn_after_first_list - first spawned server answers one
+                      tools/list then exits; later spawns stay healthy
+                      (concurrent-failure aid: retries share one fresh
+                      server, so a stale evict must not kill it)
+    die_after_first_call_then_list_error_once - spawn 1 dies after its
+                      first list, spawn 2 always fails tools/list, spawn
+                      3+ answer normally (probe aid: the single retry is
+                      only enough if the probe runs before any attempt)
+    die_after_first_call_then_list_error_twice - spawn 1 dies after its
+                      first list, spawns 2 and 3 always fail tools/list,
+                      spawn 4+ answer normally (retry-once aid: the
+                      request must fail after exactly one retry)
+    hang_first_list_then_refuse - first list hangs, and any later spawn
+                      exits immediately at startup (reconnect-failure
+                      aid: the client must report "reconnect failed")
 """
 
 import sys
@@ -66,6 +91,59 @@ if env_dump:
                 f.write("{}={}\n".format(k, os.environ[k]))
     except OSError:
         pass
+
+
+def spawn_index():
+    """1-based count of server processes started for this log path."""
+    path = log_path + ".spawn" if log_path else None
+    if not path:
+        return 1
+    try:
+        with open(path) as f:
+            n = int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        n = 0
+    n += 1
+    try:
+        with open(path, "w") as f:
+            f.write(str(n))
+    except OSError:
+        pass
+    return n
+
+
+def once(path):
+    """True the first time this path is seen, False afterwards."""
+    if not path:
+        return True
+    try:
+        with open(path) as f:
+            f.read()
+        return False
+    except OSError:
+        pass
+    try:
+        with open(path, "w") as f:
+            f.write("1")
+    except OSError:
+        pass
+    return True
+
+
+# Modes that tell spawns apart need the spawn number up front. Spawns are
+# serialized by the client's session lock, so the counter file never races.
+_SPAWN_MODES = (
+    "die_first_spawn_after_first_list",
+    "die_after_first_call_then_list_error_once",
+    "die_after_first_call_then_list_error_twice",
+    "hang_first_list_then_refuse",
+)
+spawn_no = spawn_index() if mode in _SPAWN_MODES else 1
+if mode == "hang_first_list_then_refuse" and spawn_no >= 2:
+    # Regression aid for zencore #375: the reconnect target itself is
+    # gone, so the client must report "reconnect failed" instead of
+    # hanging or returning the raw first error.
+    sys.exit(1)
 
 TOOLS = [
     {
@@ -219,8 +297,46 @@ for line in sys.stdin:
                         }],
                     },
                 })
+        elif mode in ("hang_first_list", "hang_first_list_then_refuse") and once(
+            log_path + ".once_list" if log_path else None
+        ):
+            # First list hangs: the client must time out (transport
+            # error), evict, and reconnect. The child stays alive, so
+            # the liveness probe cannot heal this; only eviction can.
+            time.sleep(120)
+            send({"jsonrpc": "2.0", "id": mid, "result": {"tools": TOOLS}})
+        elif mode == "die_first_spawn_after_first_list" and spawn_no == 1:
+            send({"jsonrpc": "2.0", "id": mid, "result": {"tools": TOOLS}})
+            sys.stdout.flush()
+            sys.exit(0)
+        elif mode == "die_after_first_call_then_list_error_once" and spawn_no == 1:
+            send({"jsonrpc": "2.0", "id": mid, "result": {"tools": TOOLS}})
+            sys.stdout.flush()
+            sys.exit(0)
+        elif mode == "die_after_first_call_then_list_error_once" and spawn_no == 2:
+            send({
+                "jsonrpc": "2.0",
+                "id": mid,
+                "error": {"code": -32603, "message": "list boom"},
+            })
+        elif mode == "die_after_first_call_then_list_error_twice" and spawn_no == 1:
+            send({"jsonrpc": "2.0", "id": mid, "result": {"tools": TOOLS}})
+            sys.stdout.flush()
+            sys.exit(0)
+        elif mode == "die_after_first_call_then_list_error_twice" and spawn_no in (2, 3):
+            send({
+                "jsonrpc": "2.0",
+                "id": mid,
+                "error": {"code": -32603, "message": "list boom"},
+            })
         else:
             send({"jsonrpc": "2.0", "id": mid, "result": {"tools": TOOLS}})
+            if mode == "die_after_first_call":
+                # Regression aid for zencore #375: answer one call, then
+                # die, so the client must evict the dead cached session
+                # and reconnect instead of failing forever.
+                sys.stdout.flush()
+                sys.exit(0)
     elif method == "tools/call":
         params = msg.get("params") or {}
         name = params.get("name")
@@ -327,6 +443,23 @@ for line in sys.stdin:
                     }],
                 },
             })
+        elif mode == "hang_first_call" and once(
+            log_path + ".once_call" if log_path else None
+        ):
+            # First call hangs: same evict isolation as hang_first_list,
+            # on the call path. Later calls answer normally.
+            time.sleep(120)
+            text = args.get("text", "")
+            send({
+                "jsonrpc": "2.0",
+                "id": mid,
+                "result": {
+                    "content": [
+                        {"type": "text", "text": "echo: " + str(text)},
+                        {"type": "text", "text": "second part"},
+                    ],
+                },
+            })
         else:
             text = args.get("text", "")
             send({
@@ -339,6 +472,11 @@ for line in sys.stdin:
                     ],
                 },
             })
+            if mode == "die_after_first_call":
+                # Same one-shot death as for tools/list, for the call
+                # path: answer one call, then die.
+                sys.stdout.flush()
+                sys.exit(0)
     elif method == "ping":
         send({"jsonrpc": "2.0", "id": mid, "result": {}})
     elif method in ("shutdown", "exit"):
