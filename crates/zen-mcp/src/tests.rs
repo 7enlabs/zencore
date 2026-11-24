@@ -715,6 +715,7 @@ impl SubAgentRunner for RecordingRunner {
         def: &AgentDefinition,
         prompt: &str,
         parent_tool_use_id: &str,
+        _parent_depth: usize,
     ) -> anyhow::Result<String> {
         self.calls.lock().unwrap().push((
             def.name.clone(),

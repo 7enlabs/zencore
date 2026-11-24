@@ -195,9 +195,9 @@ async fn three_parallel_subagents_show_live_then_done() {
     // Run all three in parallel, exactly like a parent delegating one
     // task split into three parts.
     let (r_alpha, r_beta, r_gamma) = tokio::join!(
-        executors[0].run_subagent(&def_alpha, "do part alpha", "demo-alpha"),
-        executors[1].run_subagent(&def_beta, "do part beta", "demo-beta"),
-        executors[2].run_subagent(&def_gamma, "do part gamma", "demo-gamma"),
+        executors[0].run_subagent(&def_alpha, "do part alpha", "demo-alpha", 0),
+        executors[1].run_subagent(&def_beta, "do part beta", "demo-beta", 0),
+        executors[2].run_subagent(&def_gamma, "do part gamma", "demo-gamma", 0),
     );
     let results = [
         ("demo-alpha", r_alpha),

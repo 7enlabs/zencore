@@ -94,7 +94,11 @@ impl Tool for TaskTool {
             .clone()
             .unwrap_or_else(|| "task".to_string());
 
-        match self.runner.run_subagent(&def, &prompt, &parent_id).await {
+        match self
+            .runner
+            .run_subagent(&def, &prompt, &parent_id, ctx.agent_depth)
+            .await
+        {
             Ok(text) => ToolOutput::ok(text),
             Err(e) => ToolOutput::err(format!("Sub-agent '{}' failed: {}", def.name, e)),
         }
