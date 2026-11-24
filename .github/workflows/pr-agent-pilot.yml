@@ -45,13 +45,16 @@ jobs:
       - name: PR Agent action step
         uses: docker://pragent/pr-agent@sha256:8978ae8f025883159ccc6f5bec51e6553347c77d14dbc5ca4bf3bb4a8726eb43
         with:
-          # cli.py needs the command as a positional argument (it
-          # errors with "the following arguments are required: command"
-          # without one) and the PR URL, which it does not derive from
-          # the GitHub event on its own: without --pr_url it only
-          # prints help and exits. The pilot runs the review tool only.
+          # Run the official GitHub Action runner, not cli.py directly:
+          # cli.py does not map GITHUB_TOKEN to github.user_token, so
+          # the review fails with "GitHub token is required when using
+          # user deployment". The runner reads the event, sets the
+          # token from GITHUB_TOKEN, and derives the PR URL and the
+          # review command from the event (opened / reopened /
+          # ready_for_review, per github_action_config.pr_actions).
+          # No --pr_url or command argument is needed.
           entrypoint: /app/.venv/bin/python
-          args: /app/pr_agent/cli.py --pr_url=${{ github.event.pull_request.html_url }} review
+          args: /app/pr_agent/servers/github_action_runner.py
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
