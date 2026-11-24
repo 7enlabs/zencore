@@ -2300,6 +2300,56 @@ async fn plan_mode_rejects_hallucinated_mutating_call_by_the_harness() {
     assert_paired(agent.messages());
 }
 
+/// #355: read-only-but-denied tools (Task, delegate, JobOutput) report
+/// `is_read_only() == true`, so the old `plan_mode && !read_only` gate in
+/// `prepare_call` let a hallucinated call to them run in plan mode even
+/// though `plan_mode_hides` hides them from the model.
+#[tokio::test]
+async fn plan_mode_rejects_read_only_but_denied_tools() {
+    let llm = MockLlm::new(vec![
+        resp_tool("Task", r#"{"prompt":"x"}"#, "t1"),
+        resp_tool("delegate", r#"{"task":"x"}"#, "t2"),
+        resp_tool("JobOutput", r#"{"job_id":"j"}"#, "t3"),
+        resp("plan done"),
+    ]);
+    let reg = registry_with(vec![
+        fake("Read", true, "r"),
+        fake("Task", true, "TASK_RAN"),
+        fake("delegate", true, "DELEGATE_RAN"),
+        fake("JobOutput", true, "JOBOUTPUT_RAN"),
+    ]);
+    let cfg = AgentConfig {
+        permission_mode: PermissionMode::Plan,
+        ..base_cfg()
+    };
+    let (mut agent, _s, _h) = build_agent(llm, reg, allow(), cfg);
+    let r = agent.run_turn("go").await;
+    let tool_contents: Vec<&str> = agent
+        .messages()
+        .iter()
+        .filter(|m| m.role == "tool")
+        .filter_map(|m| m.text_ref())
+        .collect();
+    assert_eq!(tool_contents.len(), 3, "one tool result per call expected");
+    for content in &tool_contents {
+        assert!(
+            content.contains("not available in plan mode"),
+            "plan mode must reject the denied tool, got: {content}"
+        );
+    }
+    for marker in ["TASK_RAN", "DELEGATE_RAN", "JOBOUTPUT_RAN"] {
+        assert!(
+            !agent
+                .messages()
+                .iter()
+                .any(|m| m.text_ref().unwrap_or("").contains(marker)),
+            "denied tool {marker} must never execute in plan mode"
+        );
+    }
+    assert_eq!(r.result, "plan done");
+    assert_paired(agent.messages());
+}
+
 use std::sync::atomic::Ordering;
 
 #[tokio::test]
