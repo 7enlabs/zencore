@@ -3304,6 +3304,52 @@ mod tests {
         assert!(!denied.allowed);
     }
 
+    /// Issue #319: a store locked by another process fails closed
+    /// with the locked message after the bounded wait, instead of
+    /// hanging or writing through the other holder.
+    #[test]
+    fn locked_store_fails_closed_after_bounded_wait() {
+        use fs2::FileExt;
+        let (_dir, store) = temp_store("lock-held");
+        let now = fixed_now();
+        register_model_key(&store, now);
+        // Hold the lock from outside the store API, as another CLI
+        // invocation would.
+        let lock_path = store.dir.join(LOCK_FILE);
+        std::fs::create_dir_all(&store.dir).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        held.lock_exclusive().unwrap();
+        let start = std::time::Instant::now();
+        let err = register_secret(
+            &store,
+            RegisterInput {
+                name: "OTHER_KEY".to_string(),
+                class: SecretClass::Seat,
+                service: "s".to_string(),
+                owner: "zc-leader".to_string(),
+                registered_by: LEADER_APPROVER.to_string(),
+                default_until_days: 7,
+                rotation_days: 30,
+                paid: false,
+                reason: "locked".to_string(),
+                force: false,
+            },
+            now,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("locked by another operation"),
+            "unexpected error: {err}"
+        );
+        // The wait is bounded (10s) and actually waited, not instant.
+        assert!(start.elapsed() >= std::time::Duration::from_secs(9));
+        drop(held);
+    }
+
     #[test]
     fn rotation_keeps_old_value_through_grace_then_replaces_it() {
         let (_dir, store) = temp_store("rotate");
