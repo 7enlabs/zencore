@@ -563,7 +563,16 @@ impl LspConnection {
         let (action, current) = {
             let mut docs = lock_or_recover(&self.docs, "docs");
             match docs.get_mut(path) {
-                Some(doc) if doc.mtime == mtime => (Action::None, doc.text.clone()),
+                // mtime alone cannot prove the content is unchanged:
+                // a rewrite can land on the same mtime (coarse
+                // filesystem granularity, or a restored mtime), so
+                // compare the freshly read text too. Comparing the
+                // content we already read is free, and reusing the
+                // cache without it would silently serve stale text
+                // and never send `didChange` (#383).
+                Some(doc) if doc.mtime == mtime && doc.text == text => {
+                    (Action::None, doc.text.clone())
+                }
                 Some(doc) => {
                     doc.version += 1;
                     doc.mtime = mtime;
