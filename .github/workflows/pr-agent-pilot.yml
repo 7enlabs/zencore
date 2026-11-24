@@ -8,8 +8,15 @@
 # - auto-approval is OFF in .pr_agent.toml
 # - all models are :free with multi-provider fallback; fail-closed on exhaustion
 # - the repo must be checked out first: pr-agent determines the base repo
-#   from git, and without a checkout it fails at startup with
-#   "fatal: not a git repository" (seen on PR #317, run 45185222255).
+#   from git, and without a checkout it has no repo to review.
+# - the image entrypoint is `python pr_agent/cli.py` (relative) with image
+#   WORKDIR /app, but the runner forces --workdir /github/workspace, so the
+#   relative path never resolves: `python: can't open file
+#   '/github/workspace/pr_agent/cli.py'` (verified on runs 45185222255 and
+#   45308766004, with and without a checkout). The step below overrides the
+#   entrypoint to the absolute venv interpreter and passes the script by
+#   absolute path, so the code runs from /app while the repo stays at
+#   /github/workspace.
 name: PR Agent (pilot)
 
 on:
@@ -37,6 +44,9 @@ jobs:
           fetch-depth: 0
       - name: PR Agent action step
         uses: docker://pragent/pr-agent@sha256:8978ae8f025883159ccc6f5bec51e6553347c77d14dbc5ca4bf3bb4a8726eb43
+        with:
+          entrypoint: /app/.venv/bin/python
+          args: /app/pr_agent/cli.py
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
