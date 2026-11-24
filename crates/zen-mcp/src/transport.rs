@@ -38,12 +38,78 @@ pub(crate) struct Session {
     child_pid: Mutex<Option<u32>>,
 }
 
+/// Whether a failed session call means the session itself is dead.
+/// Only a transport failure evicts the cached session: a call the live
+/// server rejected (bad arguments, a tool that needs client-side input,
+/// ...) must not kill a healthy session. Timeouts count as transport
+/// failures: a peer that stops answering within its deadline is
+/// indistinguishable from a dead one, and reconnecting is the only
+/// self-healing path.
+#[derive(Debug)]
+enum SessionError {
+    Transport(anyhow::Error),
+    Call(anyhow::Error),
+}
+
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionError::Transport(e) | SessionError::Call(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for SessionError {}
+
 impl Session {
     fn deadline(&self) -> Duration {
         Duration::from_millis(self.timeout_ms.max(1))
     }
 
-    async fn list_all_tools(&self) -> anyhow::Result<Vec<Tool>> {
+    /// Cheap liveness probe: the rmcp service must still be held, and a
+    /// stdio child must still exist. A missing service means the session
+    /// was shut down; a reaped stdio child means the server is gone.
+    /// (A zombie child still answers kill(pid, 0), so a stale-but-zombie
+    /// session can slip past this probe; the transport-error eviction in
+    /// `Transport::list_all_tools_resilient` /
+    /// `Transport::call_tool_resilient` covers that case. HTTP sessions
+    /// have no child process, so for them only the service check applies
+    /// and healing comes from eviction on transport error.)
+    fn is_alive(&self) -> bool {
+        match self.service.lock() {
+            Ok(guard) => {
+                if guard.is_none() {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+        let pid = match self.child_pid.lock() {
+            Ok(guard) => *guard,
+            Err(_) => return false,
+        };
+        let Some(pid) = pid else { return true };
+        #[cfg(unix)]
+        {
+            // kill(pid, 0) delivers no signal: 0 means the process
+            // exists, EPERM means it exists but cannot be signalled,
+            // ESRCH means it is gone.
+            // SAFETY: kill(2) with signal 0 has no memory-safety
+            // preconditions; plain integers only.
+            let rc = unsafe { libc::kill(pid as i32, 0) };
+            if rc == 0 {
+                return true;
+            }
+            std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            true
+        }
+    }
+
+    async fn list_all_tools(&self) -> Result<Vec<Tool>, SessionError> {
         let mut all = Vec::new();
         let mut seen_cursors: HashSet<String> = HashSet::new();
         let mut cursor: Option<String> = None;
@@ -61,8 +127,13 @@ impl Session {
                 .map(|c| PaginatedRequestParams::default().with_cursor(Some(c)));
             let result = tokio::time::timeout(self.deadline(), self.peer.list_tools(params))
                 .await
-                .map_err(|_| anyhow!("tools/list timed out after {} ms", self.timeout_ms))?
-                .map_err(|e| anyhow!("tools/list failed: {e}"))?;
+                .map_err(|_| {
+                    SessionError::Transport(anyhow!(
+                        "tools/list timed out after {} ms",
+                        self.timeout_ms
+                    ))
+                })?
+                .map_err(|e| SessionError::Transport(anyhow!("tools/list failed: {e}")))?;
             all.extend(result.tools);
             if all.len() > MAX_LIST_TOOLS {
                 return Err(anyhow!(
@@ -86,11 +157,15 @@ impl Session {
         Ok(all)
     }
 
-    async fn call_tool(&self, name: &str, args: Value) -> anyhow::Result<Value> {
+    async fn call_tool(&self, name: &str, args: Value) -> Result<Value, SessionError> {
         let arguments = match args {
             Value::Null => None,
             Value::Object(map) => Some(map),
-            other => return Err(anyhow!("arguments must be a JSON object, got {other}")),
+            other => {
+                return Err(SessionError::Call(anyhow!(
+                    "arguments must be a JSON object, got {other}"
+                )));
+            }
         };
         let mut call = CallToolRequestParams::new(name.to_string());
         if let Some(map) = arguments {
@@ -98,8 +173,13 @@ impl Session {
         }
         let result = tokio::time::timeout(self.deadline(), self.peer.call_tool_once(call))
             .await
-            .map_err(|_| anyhow!("tools/call timed out after {} ms", self.timeout_ms))?
-            .map_err(|e| anyhow!("tools/call failed: {e}"))?;
+            .map_err(|_| {
+                SessionError::Transport(anyhow!(
+                    "tools/call timed out after {} ms",
+                    self.timeout_ms
+                ))
+            })?
+            .map_err(|e| SessionError::Transport(anyhow!("tools/call failed: {e}")))?;
         match result {
             CallToolResponse::Complete(done) => {
                 let parts: Vec<Value> = done.content.iter().map(content_block_to_value).collect();
@@ -112,12 +192,16 @@ impl Session {
                 }
                 Ok(out)
             }
-            CallToolResponse::InputRequired(_) => Err(anyhow!(
+            CallToolResponse::InputRequired(_) => Err(SessionError::Call(anyhow!(
                 "tool '{name}' requires client-side input, which this client does not provide"
-            )),
-            CallToolResponse::Task(_) => Err(anyhow!("tool '{name}' returned a task result")),
+            ))),
+            CallToolResponse::Task(_) => Err(SessionError::Call(anyhow!(
+                "tool '{name}' returned a task result"
+            ))),
             // `CallToolResponse` is #[non_exhaustive].
-            _ => Err(anyhow!("tool '{name}' returned an unsupported response")),
+            _ => Err(SessionError::Call(anyhow!(
+                "tool '{name}' returned an unsupported response"
+            ))),
         }
     }
 
@@ -339,7 +423,14 @@ impl Transport {
             } => {
                 let mut guard = session.lock().await;
                 if let Some(existing) = guard.as_ref() {
-                    return Ok(existing.clone());
+                    if existing.is_alive() {
+                        return Ok(existing.clone());
+                    }
+                    // Dead session: drop it (killing the child process
+                    // group, if any) so the fresh connect below starts a
+                    // new server instead of reusing the corpse.
+                    existing.shutdown();
+                    *guard = None;
                 }
                 let fresh = Arc::new(
                     connect_stdio(
@@ -364,7 +455,13 @@ impl Transport {
             } => {
                 let mut guard = session.lock().await;
                 if let Some(existing) = guard.as_ref() {
-                    return Ok(existing.clone());
+                    if existing.is_alive() {
+                        return Ok(existing.clone());
+                    }
+                    // Dead session: drop it so the fresh connect below
+                    // starts a new server instead of reusing the corpse.
+                    existing.shutdown();
+                    *guard = None;
                 }
                 let fresh = Arc::new(connect_http(name, url, headers, *timeout_ms).await?);
                 *guard = Some(fresh.clone());
@@ -373,11 +470,83 @@ impl Transport {
         }
     }
 
-    pub(crate) async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+    /// Drop the cached session, but only if it is still the session the
+    /// caller just failed on: another task may already have reconnected,
+    /// and its fresh session must not be evicted by a stale failure.
+    async fn evict(&self, dead: &Arc<Session>) {
+        let mut guard = match self {
+            Transport::Stdio { session, .. } | Transport::Http { session, .. } => {
+                session.lock().await
+            }
+        };
+        if let Some(existing) = guard.as_ref()
+            && Arc::ptr_eq(existing, dead)
+        {
+            existing.shutdown();
+            *guard = None;
+        }
+    }
+
+    /// `tools/list` with self-healing: a transport error evicts the dead
+    /// cached session and the call is retried once on a fresh connection.
+    /// A call error is returned as-is, and a reconnect (or retry) that
+    /// also fails is spelled out so the caller can tell a dead server
+    /// from a failed call.
+    async fn list_all_tools_resilient(&self) -> anyhow::Result<Vec<Tool>> {
         let session = self.session().await?;
+        match session.list_all_tools().await {
+            Ok(tools) => Ok(tools),
+            Err(SessionError::Call(e)) => Err(e),
+            Err(SessionError::Transport(first)) => {
+                let first = first.to_string();
+                self.evict(&session).await;
+                let fresh = self
+                    .session()
+                    .await
+                    .map_err(|e| anyhow!("MCP session died ({first}); reconnect failed: {e}"))?;
+                fresh.list_all_tools().await.map_err(|retry| match retry {
+                    SessionError::Call(e) => e,
+                    SessionError::Transport(e) => {
+                        anyhow!("MCP session died ({first}); reconnected session also failed: {e}")
+                    }
+                })
+            }
+        }
+    }
+
+    /// `tools/call` with the same self-healing as
+    /// `list_all_tools_resilient`: evict + reconnect once on a transport
+    /// error, return a call error untouched.
+    async fn call_tool_resilient(&self, name: &str, args: Value) -> anyhow::Result<Value> {
+        let session = self.session().await?;
+        let retry_args = args.clone();
+        match session.call_tool(name, args).await {
+            Ok(out) => Ok(out),
+            Err(SessionError::Call(e)) => Err(e),
+            Err(SessionError::Transport(first)) => {
+                let first = first.to_string();
+                self.evict(&session).await;
+                let fresh = self
+                    .session()
+                    .await
+                    .map_err(|e| anyhow!("MCP session died ({first}); reconnect failed: {e}"))?;
+                fresh
+                    .call_tool(name, retry_args)
+                    .await
+                    .map_err(|retry| match retry {
+                        SessionError::Call(e) => e,
+                        SessionError::Transport(e) => anyhow!(
+                            "MCP session died ({first}); reconnected session also failed: {e}"
+                        ),
+                    })
+            }
+        }
+    }
+
+    pub(crate) async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
         match method {
             "tools/list" => {
-                let tools = session.list_all_tools().await?;
+                let tools = self.list_all_tools_resilient().await?;
                 let encoded: Vec<Value> = tools.iter().map(tool_to_value).collect();
                 Ok(json!({ "tools": encoded }))
             }
@@ -388,7 +557,7 @@ impl Transport {
                     .ok_or_else(|| anyhow!("tools/call missing 'name'"))?
                     .to_string();
                 let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-                session.call_tool(&name, args).await
+                self.call_tool_resilient(&name, args).await
             }
             other => Err(anyhow!("unsupported MCP method '{other}'")),
         }
@@ -436,8 +605,9 @@ pub(crate) async fn handshake(transport: &Transport) -> anyhow::Result<Vec<Remot
 }
 
 pub(crate) async fn list_tools(transport: &Transport) -> anyhow::Result<Vec<RemoteTool>> {
-    let session = transport.session().await?;
-    let tools = session.list_all_tools().await?;
+    // Same self-healing path as Transport::request: a dead cached
+    // session is evicted and the list retried on a fresh connection.
+    let tools = transport.list_all_tools_resilient().await?;
     Ok(tools
         .iter()
         .filter_map(|tool| {

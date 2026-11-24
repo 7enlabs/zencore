@@ -2298,3 +2298,118 @@ for line in sys.stdin:
         .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn transport_stdio_dead_session_evicts_and_reconnects() {
+    // Regression for #375: a dead MCP session was cached forever and
+    // every later call failed until the process restarted. The mock
+    // answers one tools/list and then exits, so each request must heal:
+    // request 1 succeeds, requests 2 and 3 must reconnect (new child
+    // PID, new initialize handshake) instead of failing on the corpse.
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_dead");
+    let log = dir.join("methods.log");
+    let pid_file = dir.join("methods.log.pid");
+    let cfg = tcfg_stdio(&py, "die_after_first_call", &log, BTreeMap::new(), None);
+    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+
+    let read_pid = |pid_file: &Path| -> String {
+        std::fs::read_to_string(pid_file)
+            .map(|t| t.trim().to_string())
+            .unwrap_or_default()
+    };
+    let count_initializes = |log: &Path| -> usize {
+        std::fs::read_to_string(log)
+            .map(|t| t.lines().filter(|l| *l == "initialize").count())
+            .unwrap_or(0)
+    };
+
+    // Request 1: fresh server answers, then dies.
+    let out = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
+        .await
+        .unwrap()
+        .expect("first tools/list should succeed");
+    assert_eq!(out["tools"][0]["name"], "echo");
+    let pid1 = read_pid(&pid_file);
+    assert!(!pid1.is_empty(), "mock never wrote its pid");
+
+    // Request 2: the cached session is dead; the call must reconnect
+    // (new child process, new handshake) and succeed.
+    let out = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
+        .await
+        .unwrap()
+        .unwrap_or_else(|e| panic!("second tools/list should heal by reconnecting: {e}"));
+    assert_eq!(out["tools"][0]["name"], "echo");
+    let pid2 = read_pid(&pid_file);
+    assert_ne!(pid1, pid2, "second call reused the dead session's process");
+
+    // Request 3: the reconnected server died after its one call too,
+    // so healing must repeat, not work once.
+    let out = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
+        .await
+        .unwrap()
+        .unwrap_or_else(|e| panic!("third tools/list should heal again: {e}"));
+    assert_eq!(out["tools"][0]["name"], "echo");
+    let pid3 = read_pid(&pid_file);
+    assert_ne!(pid2, pid3, "third call reused a dead session's process");
+
+    // Three handshakes: one per spawned server.
+    assert_eq!(
+        count_initializes(&log),
+        3,
+        "expected one initialize per reconnect"
+    );
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn transport_stdio_call_error_does_not_evict_session() {
+    // Counterpart to the #375 regression test: a call the live server
+    // rejects (InputRequired here) is a failed call, not a dead
+    // session, so it must not evict the cached session or reconnect.
+    // The observable is the child PID and the initialize count: both
+    // must be unchanged after the failed call, and a later tools/list
+    // must still succeed on the same session.
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_callerr");
+    let log = dir.join("methods.log");
+    let pid_file = dir.join("methods.log.pid");
+    let cfg = tcfg_stdio(&py, "input_required", &log, BTreeMap::new(), None);
+    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+
+    let err = tokio::time::timeout(
+        TEST_TIMEOUT,
+        tr.request("tools/call", json!({"name": "echo", "arguments": {}})),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("requires client-side input"),
+        "got: {err}"
+    );
+    let pid1 = std::fs::read_to_string(&pid_file)
+        .map(|t| t.trim().to_string())
+        .unwrap_or_default();
+    assert!(!pid1.is_empty(), "mock never wrote its pid");
+
+    // Same session still alive: tools/list succeeds without reconnect.
+    let out = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
+        .await
+        .unwrap()
+        .expect("tools/list on the live session should succeed");
+    assert_eq!(out["tools"][0]["name"], "echo");
+    let pid2 = std::fs::read_to_string(&pid_file)
+        .map(|t| t.trim().to_string())
+        .unwrap_or_default();
+    assert_eq!(pid1, pid2, "a failed call evicted a live session");
+    let initializes = std::fs::read_to_string(&log)
+        .map(|t| t.lines().filter(|l| *l == "initialize").count())
+        .unwrap_or(0);
+    assert_eq!(initializes, 1, "a failed call triggered a reconnect");
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -25,6 +25,9 @@ Modes:
     exact_tools     - tools/list returns exactly 10,000 tools in one page (#377)
     hang            - tools/call sleeps 120s (in-flight request tests)
     spawn_worker    - tools/call spawns a long-lived grandchild, writes its PID
+    die_after_first_call - tools/list answers once, then the server exits
+                      (regression aid for zencore #375: the client must
+                      evict the dead cached session and reconnect)
 """
 
 import sys
@@ -221,6 +224,12 @@ for line in sys.stdin:
                 })
         else:
             send({"jsonrpc": "2.0", "id": mid, "result": {"tools": TOOLS}})
+            if mode == "die_after_first_call":
+                # Regression aid for zencore #375: answer one call, then
+                # die, so the client must evict the dead cached session
+                # and reconnect instead of failing forever.
+                sys.stdout.flush()
+                sys.exit(0)
     elif method == "tools/call":
         params = msg.get("params") or {}
         name = params.get("name")
