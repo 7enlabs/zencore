@@ -1,13 +1,15 @@
-# PR Agent pilot workflow (Route A: free-model PR review).
-# Pilot scope: this file exists only on the pilot branch. It is NOT merged
-# to main until the review run on the pilot PR itself is verified.
+# PR Agent workflow (Route A: free-model PR review).
+# Live on main: runs once per PR on opened / reopened / ready_for_review.
 # Safety gates for Route A:
 # - triggers only on opened / reopened / ready_for_review (no synchronize),
-#   so one pilot PR gets exactly one auto review comment
+#   so one PR gets exactly one auto review comment
 # - bot senders skipped
 # - runtime image pinned by digest, never a rolling tag
 # - auto-approval is OFF in .pr_agent.toml
 # - all models are :free with multi-provider fallback; fail-closed on exhaustion
+# - the repo must be checked out first: pr-agent determines the base repo
+#   from git, and without a checkout it fails at startup with
+#   "fatal: not a git repository" (seen on PR #317, run 45185222255).
 name: PR Agent (pilot)
 
 on:
@@ -29,6 +31,10 @@ jobs:
       cancel-in-progress: false
     name: Run PR Agent (free-model pilot)
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: PR Agent action step
         uses: docker://pragent/pr-agent@sha256:8978ae8f025883159ccc6f5bec51e6553347c77d14dbc5ca4bf3bb4a8726eb43
         env:
