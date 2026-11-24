@@ -1784,6 +1784,57 @@ mod tests {
     }
 
     #[test]
+    fn folder_trust_gates_sandbox_mode_off() {
+        // Issue #328: an untrusted project layer must not turn the
+        // sandbox off; the resolved mode falls back to the platform
+        // default instead.
+        let _env = env_lock();
+        let dir = std::env::temp_dir().join(format!("zen_cfg_sandbox_{}", std::process::id()));
+        let home = dir.join("home");
+        let proj = dir.join("proj");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(proj.join(".zen")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            proj.join(".zen/settings.json"),
+            r#"{"permissions":{"sandboxMode":"off"}}"#,
+        )
+        .unwrap();
+        let _env_guard = EnvGuard::remove(zen_ext::TRUST_ENV);
+
+        let cfg = resolve_config_with_home(&base_cli(), &proj, Some(&home)).unwrap();
+        assert!(!cfg.folder_trusted);
+        assert_eq!(cfg.sandbox_mode, SandboxMode::default_for_platform());
+        assert_eq!(
+            cfg.trust_skipped,
+            vec![".zen/settings.json: permissions.sandboxMode"]
+        );
+
+        // A stricter mode from the same untrusted layer still applies.
+        fs::write(
+            proj.join(".zen/settings.json"),
+            r#"{"permissions":{"sandboxMode":"read-only"}}"#,
+        )
+        .unwrap();
+        let cfg = resolve_config_with_home(&base_cli(), &proj, Some(&home)).unwrap();
+        assert_eq!(cfg.sandbox_mode, SandboxMode::ReadOnly);
+        assert!(cfg.trust_skipped.is_empty());
+
+        // Once trusted, "off" is honored.
+        zen_ext::trust_folder(&proj, Some(&home)).unwrap();
+        fs::write(
+            proj.join(".zen/settings.json"),
+            r#"{"permissions":{"sandboxMode":"off"}}"#,
+        )
+        .unwrap();
+        let cfg = resolve_config_with_home(&base_cli(), &proj, Some(&home)).unwrap();
+        assert!(cfg.folder_trusted);
+        assert_eq!(cfg.sandbox_mode, SandboxMode::Off);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn c3_1_disable_all_hooks_clears_hooks() {
         let _env = env_lock();
         let dir = std::env::temp_dir().join(format!("zen_cfg_nohooks_{}", std::process::id()));
