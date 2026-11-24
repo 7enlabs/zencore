@@ -61,7 +61,11 @@ pub fn build_system_prompt(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result
             parts.push(mem);
         }
 
-        let skills = zen_ext::discover_skills(cwd, home);
+        // Project skills and commands load only in a trusted folder
+        // (issue #330); the trust check is derived from the same inputs
+        // as ResolvedConfig.folder_trusted.
+        let trusted = crate::settings::folder_trusted(cli, cwd, home);
+        let skills = zen_ext::discover_skills(cwd, home, trusted);
         let skills_txt = crate::skills::skills_prompt_with_tiers(home, &skills);
         if !skills_txt.trim().is_empty() {
             parts.push(skills_txt);

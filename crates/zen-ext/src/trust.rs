@@ -221,6 +221,19 @@ pub fn gated_project_config(cwd: &Path) -> Vec<String> {
             }
         }
     }
+
+    // Issue #330: project skills and commands are gated content too
+    // (they load only in a trusted folder), so the trust prompt and
+    // `doctor` must surface them. An empty directory holds nothing.
+    for (rel, label) in [(".zen/skills", "skills"), (".zen/commands", "commands")] {
+        let p = cwd.join(rel);
+        let non_empty = std::fs::read_dir(&p)
+            .map(|mut entries| entries.any(|_| true))
+            .unwrap_or(false);
+        if non_empty {
+            out.push(format!("{}: {}", rel, label));
+        }
+    }
     out
 }
 
@@ -423,6 +436,46 @@ mod tests {
         assert_eq!(
             gated_project_config(proj),
             vec![".zen/settings.json: disableAllHooks".to_string()]
+        );
+    }
+
+    // Issue #330: project skills and commands are gated content, so
+    // the trust prompt and `doctor` must surface them.
+    #[test]
+    fn gated_detection_reports_project_skills_and_commands() {
+        let t = TempDir::new();
+        let proj = t.path();
+        assert!(gated_project_config(proj).is_empty());
+        fs::create_dir_all(proj.join(".zen/skills/some-skill")).unwrap();
+        fs::write(
+            proj.join(".zen/skills/some-skill/SKILL.md"),
+            "---\nname: some-skill\ndescription: S\n---\nbody\n",
+        )
+        .unwrap();
+        fs::create_dir_all(proj.join(".zen/commands")).unwrap();
+        fs::write(proj.join(".zen/commands/hi.md"), "Hi\n").unwrap();
+        let gated = gated_project_config(proj);
+        assert!(
+            gated.iter().any(|g| g.starts_with(".zen/skills")),
+            "skills dir not reported: {gated:?}"
+        );
+        assert!(
+            gated.iter().any(|g| g.starts_with(".zen/commands")),
+            "commands dir not reported: {gated:?}"
+        );
+    }
+
+    // Issue #330: an empty skills/commands dir holds nothing gated.
+    #[test]
+    fn gated_detection_ignores_empty_skills_and_commands_dirs() {
+        let t = TempDir::new();
+        let proj = t.path();
+        fs::create_dir_all(proj.join(".zen/skills")).unwrap();
+        fs::create_dir_all(proj.join(".zen/commands")).unwrap();
+        assert!(
+            gated_project_config(proj).is_empty(),
+            "{:?}",
+            gated_project_config(proj)
         );
     }
 }

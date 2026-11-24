@@ -1233,7 +1233,7 @@ pub async fn skill_command(
                     }
                 }
             } else if !cli.quiet {
-                cmd_list(&home, cwd)?;
+                cmd_list(cli, &home, cwd)?;
             }
             Ok(0)
         }
@@ -1395,9 +1395,15 @@ pub async fn skill_command(
     }
 }
 
-fn cmd_list(home: &Path, cwd: &Path) -> Result<()> {
+fn cmd_list(cli: &crate::cli::Cli, home: &Path, cwd: &Path) -> Result<()> {
     let registry = load_registry(home);
-    let discovered = zen_ext::discover_skills(cwd, Some(home));
+    // The discovered section mirrors what the model can load in this
+    // folder: project skills appear only when the folder is trusted.
+    let discovered = zen_ext::discover_skills(
+        cwd,
+        Some(home),
+        crate::settings::folder_trusted(cli, cwd, Some(home)),
+    );
     print!("{}", format_skill_list(&registry, &discovered));
     Ok(())
 }

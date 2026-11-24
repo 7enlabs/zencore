@@ -94,7 +94,7 @@ pub struct ConfigWatcher {
 }
 
 impl ConfigWatcher {
-    pub fn new(cwd: &Path, home: Option<&Path>) -> Self {
+    pub fn new(cwd: &Path, home: Option<&Path>, trusted: bool) -> Self {
         let mut sources: HashMap<PathBuf, &'static str> = HashMap::new();
         let mut add = |path: PathBuf, source: &'static str| {
             sources.insert(path, source);
@@ -110,7 +110,7 @@ impl ConfigWatcher {
             "local_settings",
         );
         add(cwd.join(".zen").join("hooks.local.json"), "local_settings");
-        for skill in zen_ext::discover_skills(cwd, home) {
+        for skill in zen_ext::discover_skills(cwd, home, trusted) {
             add(skill.path, "skills");
         }
         let paths: Vec<PathBuf> = sources.keys().cloned().collect();
@@ -287,7 +287,7 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, contents).unwrap();
         }
-        let mut w = ConfigWatcher::new(&cwd, Some(&home));
+        let mut w = ConfigWatcher::new(&cwd, Some(&home), true);
         assert!(w.poll().is_empty(), "snapshot is clean at start");
 
         // Each rewrite must advance the mtime (see
@@ -323,7 +323,7 @@ mod tests {
         let path = cwd.join(".zen").join("settings.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "one").unwrap();
-        let mut w = ConfigWatcher::new(&cwd, Some(&home));
+        let mut w = ConfigWatcher::new(&cwd, Some(&home), true);
         assert!(w.poll().is_empty(), "snapshot is clean at start");
 
         note_self_write(&path);
