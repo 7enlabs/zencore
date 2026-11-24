@@ -269,7 +269,7 @@ Status column is maintained in PLAN.md ("Parity status").
 
 ### C4 Memory (ZEN.md)
 - C4.1 P1 Load order: managed (/etc/zen/ZEN.md) → user (~/.zen/ZEN.md, ~/.zen/rules/*.md) → for each dir from filesystem root down to cwd: ZEN.md, .zen/ZEN.md, then ZEN.local.md last in that dir → project .zen/rules/*.md without `paths`.
-- C4.2 P1 `@path` imports: relative to the importing file, absolute and `~/` allowed, max depth 4 hops, backslash-escaped spaces, imports inside code spans/fenced blocks ignored, cycle-safe.
+- C4.2 P1 `@path` imports: relative to the importing file, absolute and `~/` allowed, max depth 4 hops, backslash-escaped spaces, imports inside code spans/fenced blocks ignored, cycle-safe; one import reads at most 4 MiB; in an untrusted folder an import from a project memory file must stay inside the project tree (absolute, `~/`, `../` and symlink escapes are rejected and left as literal text), while imports from the managed file and the user's own home files keep the old resolution.
 - C4.3 P1 Block-level HTML comments `<!-- ... -->` stripped (kept inside code blocks).
 - C4.4 P2 AGENTS.md fallback, decided per directory: for each directory from the filesystem root down to cwd that has none of ZEN.md / .zen/ZEN.md / ZEN.local.md, load AGENTS.md then .zen/AGENTS.md from that directory instead; a directory that has any ZEN file never also loads its AGENTS.md. At user level, ~/.zen/AGENTS.md is loaded only when ~/.zen/ZEN.md is absent.
 - C4.5 P2 Subdirectory ZEN.md below cwd and path-scoped rules (`paths:` frontmatter) load lazily when Read/Write/Edit touches a matching file (injected into the next tool result).

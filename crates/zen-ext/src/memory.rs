@@ -5,14 +5,25 @@ pub const MANAGED_MEMORY_PATH: &str = "/etc/zen/ZEN.md";
 
 pub const MAX_IMPORT_DEPTH: usize = 4;
 
+/// Maximum size of a single `@import`ed file. SPEC C4.6 skips memory
+/// files over 4 MiB; imports get the same bound (issue #331) so one
+/// `@` line can never pull an unbounded file into the system prompt.
+pub const MAX_IMPORT_BYTES: u64 = 4 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryFile {
     pub path: PathBuf,
     pub content: String,
 }
 
-pub fn memory_files(cwd: &Path, home: Option<&Path>) -> Vec<(PathBuf, String)> {
-    memory_files_with_managed(cwd, home, Some(Path::new(MANAGED_MEMORY_PATH)), None)
+pub fn memory_files(cwd: &Path, home: Option<&Path>, trusted: bool) -> Vec<(PathBuf, String)> {
+    memory_files_with_managed(
+        cwd,
+        home,
+        Some(Path::new(MANAGED_MEMORY_PATH)),
+        None,
+        trusted,
+    )
 }
 
 /// Load memory files, stopping the ancestor walk at `root` (inclusive).
@@ -24,8 +35,15 @@ pub fn memory_files_with_root(
     cwd: &Path,
     home: Option<&Path>,
     root: &Path,
+    trusted: bool,
 ) -> Vec<(PathBuf, String)> {
-    memory_files_with_managed(cwd, home, Some(Path::new(MANAGED_MEMORY_PATH)), Some(root))
+    memory_files_with_managed(
+        cwd,
+        home,
+        Some(Path::new(MANAGED_MEMORY_PATH)),
+        Some(root),
+        trusted,
+    )
 }
 
 pub fn memory_files_with_managed(
@@ -33,26 +51,33 @@ pub fn memory_files_with_managed(
     home: Option<&Path>,
     managed: Option<&Path>,
     root: Option<&Path>,
+    trusted: bool,
 ) -> Vec<(PathBuf, String)> {
     let home_dir = home.map(Path::to_path_buf).or_else(dirs::home_dir);
     let mut loader = Loader {
         home: home_dir.clone(),
+        // Issue #331: in an untrusted folder, @imports from project
+        // memory files stay inside the project tree. The root is
+        // canonicalised so a symlink cannot smuggle an outside file
+        // in through an import that looks relative.
+        trusted,
+        project_root: canonicalize(&abs_path(cwd)),
         seen: HashSet::new(),
         out: Vec::new(),
     };
 
     if let Some(m) = managed {
-        loader.push_file(m, false);
+        loader.push_file(m, false, true);
     }
     if let Some(home) = &home_dir {
         let user = home.join(".zen").join("ZEN.md");
         if user.is_file() {
-            loader.push_file(&user, false);
+            loader.push_file(&user, false, true);
         } else {
-            loader.push_file(&home.join(".zen").join("AGENTS.md"), false);
+            loader.push_file(&home.join(".zen").join("AGENTS.md"), false, true);
         }
         for rule in rule_files(&home.join(".zen").join("rules")) {
-            loader.push_file(&rule, true);
+            loader.push_file(&rule, true, true);
         }
     }
 
@@ -66,16 +91,16 @@ pub fn memory_files_with_managed(
         ];
         if zen_files.iter().any(|f| f.is_file()) {
             for f in &zen_files {
-                loader.push_file(f, false);
+                loader.push_file(f, false, false);
             }
         } else {
-            loader.push_file(&dir.join("AGENTS.md"), false);
-            loader.push_file(&dir.join(".zen").join("AGENTS.md"), false);
+            loader.push_file(&dir.join("AGENTS.md"), false, false);
+            loader.push_file(&dir.join(".zen").join("AGENTS.md"), false, false);
         }
     }
     for dir in &dirs {
         for rule in rule_files(&dir.join(".zen").join("rules")) {
-            loader.push_file(&rule, true);
+            loader.push_file(&rule, true, false);
         }
     }
     loader.out
@@ -84,12 +109,20 @@ pub fn memory_files_with_managed(
 struct Loader {
     home: Option<PathBuf>,
 
+    /// Whether the folder the session runs in is trusted. When false,
+    /// @imports from project memory files are confined to the
+    /// project tree (issue #331).
+    trusted: bool,
+    /// Canonicalised project root the confinement check is measured
+    /// against.
+    project_root: PathBuf,
+
     seen: HashSet<PathBuf>,
     out: Vec<(PathBuf, String)>,
 }
 
 impl Loader {
-    fn push_file(&mut self, path: &Path, is_rule: bool) {
+    fn push_file(&mut self, path: &Path, is_rule: bool, trusted_source: bool) {
         let path = normalize(path);
         if self.seen.contains(&path) || !path.is_file() {
             return;
@@ -106,11 +139,11 @@ impl Loader {
             raw
         };
         self.seen.insert(path.clone());
-        let expanded = self.expand(&body, &path, 0);
+        let expanded = self.expand(&body, &path, 0, trusted_source);
         self.out.push((path, expanded));
     }
 
-    fn expand(&mut self, content: &str, file: &Path, depth: usize) -> String {
+    fn expand(&mut self, content: &str, file: &Path, depth: usize, file_trusted: bool) -> String {
         let base_dir = file
             .parent()
             .unwrap_or_else(|| Path::new("."))
@@ -166,7 +199,7 @@ impl Loader {
             let tokens = import_tokens(line);
             let mut imported: Vec<String> = Vec::new();
             for tok in &tokens {
-                if let Some(text) = self.import(&base_dir, tok, depth) {
+                if let Some(text) = self.import(&base_dir, tok, depth, file_trusted) {
                     imported.push(text);
                 }
             }
@@ -193,7 +226,13 @@ impl Loader {
         out
     }
 
-    fn import(&mut self, base_dir: &Path, token: &str, depth: usize) -> Option<String> {
+    fn import(
+        &mut self,
+        base_dir: &Path,
+        token: &str,
+        depth: usize,
+        file_trusted: bool,
+    ) -> Option<String> {
         if depth >= MAX_IMPORT_DEPTH {
             return None;
         }
@@ -208,9 +247,26 @@ impl Loader {
         if self.seen.contains(&path) || !path.is_file() {
             return None;
         }
+        // Issue #331: an import never pulls more than 4 MiB into the
+        // system prompt, in a trusted folder or not.
+        if std::fs::metadata(&path)
+            .map(|m| m.len() > MAX_IMPORT_BYTES)
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        // Issue #331: in an untrusted folder, an import from a
+        // project memory file stays inside the project tree. Absolute
+        // paths, ~/ paths, ../ escapes and symlinks pointing outside
+        // are rejected and left as literal text. Imports from the
+        // managed file and the user's own home files are the user's
+        // own words, so they keep the old resolution.
+        if !self.trusted && !file_trusted && !canonicalize(&path).starts_with(&self.project_root) {
+            return None;
+        }
         let raw = std::fs::read_to_string(&path).ok()?;
         self.seen.insert(path.clone());
-        Some(self.expand(&raw, &path, depth + 1))
+        Some(self.expand(&raw, &path, depth + 1, file_trusted))
     }
 }
 
@@ -376,6 +432,12 @@ fn normalize(p: &Path) -> PathBuf {
     out
 }
 
+/// Canonical path for trust checks: resolves symlinks, falling back
+/// to the lexical form when the path cannot be canonicalised.
+fn canonicalize(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| normalize(p))
+}
+
 fn ancestors_root_first(dir: &Path, root: Option<&Path>) -> Vec<PathBuf> {
     let mut chain: Vec<PathBuf> = dir.ancestors().map(|p| p.to_path_buf()).collect();
     chain.reverse();
@@ -413,16 +475,32 @@ fn render_memory_section(path: &Path, content: &str) -> String {
     format!("# Memory: {}\n\n{}\n\n", path.display(), content.trim_end())
 }
 
-pub fn memory_prompt(cwd: &Path, home: Option<&Path>) -> String {
-    memory_prompt_with_root_impl(cwd, home, None)
+pub fn memory_prompt(cwd: &Path, home: Option<&Path>, trusted: bool) -> String {
+    memory_prompt_with_root_impl(cwd, home, None, trusted)
 }
 
-pub fn memory_prompt_with_root(cwd: &Path, home: Option<&Path>, root: &Path) -> String {
-    memory_prompt_with_root_impl(cwd, home, Some(root))
+pub fn memory_prompt_with_root(
+    cwd: &Path,
+    home: Option<&Path>,
+    root: &Path,
+    trusted: bool,
+) -> String {
+    memory_prompt_with_root_impl(cwd, home, Some(root), trusted)
 }
 
-fn memory_prompt_with_root_impl(cwd: &Path, home: Option<&Path>, root: Option<&Path>) -> String {
-    let files = memory_files_with_managed(cwd, home, Some(Path::new(MANAGED_MEMORY_PATH)), root);
+fn memory_prompt_with_root_impl(
+    cwd: &Path,
+    home: Option<&Path>,
+    root: Option<&Path>,
+    trusted: bool,
+) -> String {
+    let files = memory_files_with_managed(
+        cwd,
+        home,
+        Some(Path::new(MANAGED_MEMORY_PATH)),
+        root,
+        trusted,
+    );
     if files.is_empty() {
         return String::new();
     }
@@ -460,16 +538,32 @@ fn display_path(path: &Path, home: Option<&Path>) -> String {
     slash(path)
 }
 
-pub fn memories_report(cwd: &Path, home: Option<&Path>) -> String {
-    memories_report_with_root_impl(cwd, home, None)
+pub fn memories_report(cwd: &Path, home: Option<&Path>, trusted: bool) -> String {
+    memories_report_with_root_impl(cwd, home, None, trusted)
 }
 
-pub fn memories_report_with_root(cwd: &Path, home: Option<&Path>, root: &Path) -> String {
-    memories_report_with_root_impl(cwd, home, Some(root))
+pub fn memories_report_with_root(
+    cwd: &Path,
+    home: Option<&Path>,
+    root: &Path,
+    trusted: bool,
+) -> String {
+    memories_report_with_root_impl(cwd, home, Some(root), trusted)
 }
 
-fn memories_report_with_root_impl(cwd: &Path, home: Option<&Path>, root: Option<&Path>) -> String {
-    let files = memory_files_with_managed(cwd, home, Some(Path::new(MANAGED_MEMORY_PATH)), root);
+fn memories_report_with_root_impl(
+    cwd: &Path,
+    home: Option<&Path>,
+    root: Option<&Path>,
+    trusted: bool,
+) -> String {
+    let files = memory_files_with_managed(
+        cwd,
+        home,
+        Some(Path::new(MANAGED_MEMORY_PATH)),
+        root,
+        trusted,
+    );
     let mut sections: Vec<(PathBuf, String)> = Vec::new();
     for (path, content) in &files {
         if content.trim().is_empty() {
@@ -547,7 +641,7 @@ mod tests {
         fs::write(proj.join(".zen/ZEN.md"), "project dotzen memory").unwrap();
         fs::write(sub.join("ZEN.md"), "sub memory").unwrap();
 
-        let files = memory_files_with_root(&sub, Some(&home), tmp.path());
+        let files = memory_files_with_root(&sub, Some(&home), tmp.path(), true);
         let names: Vec<String> = files
             .iter()
             .map(|(p, _)| p.file_name().unwrap().to_string_lossy().to_string())
@@ -571,7 +665,7 @@ mod tests {
         fs::write(proj.join("ZEN.md"), "shared").unwrap();
         fs::write(proj.join("ZEN.local.md"), "personal").unwrap();
 
-        let files = memory_files_with_root(&proj, None, tmp.path());
+        let files = memory_files_with_root(&proj, None, tmp.path(), true);
         assert_eq!(files.last().unwrap().1.trim(), "personal");
     }
 
@@ -583,7 +677,7 @@ mod tests {
         fs::write(proj.join("ZEN.md"), "top\n@docs/extra.md\nbottom\n").unwrap();
         fs::write(proj.join("docs/extra.md"), "imported content").unwrap();
 
-        let files = memory_files_with_root(&proj, None, tmp.path());
+        let files = memory_files_with_root(&proj, None, tmp.path(), true);
         let top = files.iter().find(|(p, _)| p.ends_with("ZEN.md")).unwrap();
         assert!(top.1.contains("top"));
         assert!(top.1.contains("imported content"));
@@ -598,7 +692,7 @@ mod tests {
         fs::create_dir_all(&proj).unwrap();
         fs::write(proj.join("ZEN.md"), "before\n@does/not/exist.md\nafter\n").unwrap();
 
-        let files = memory_files_with_root(&proj, None, tmp.path());
+        let files = memory_files_with_root(&proj, None, tmp.path(), true);
         let top = &files[0].1;
         assert!(top.contains("before"));
         assert!(top.contains("after"));
@@ -612,7 +706,7 @@ mod tests {
         fs::write(proj.join("ZEN.md"), "root\n@b.md\n").unwrap();
         fs::write(proj.join("b.md"), "b\n@ZEN.md\n").unwrap();
 
-        let files = memory_files_with_root(&proj, None, tmp.path());
+        let files = memory_files_with_root(&proj, None, tmp.path(), true);
 
         let joined = files
             .iter()
@@ -635,7 +729,7 @@ mod tests {
         fs::write(proj.join("l5.md"), "l5\n@l6.md\n").unwrap();
         fs::write(proj.join("l6.md"), "l6-deepest").unwrap();
 
-        let files = memory_files_with_root(&proj, None, tmp.path());
+        let files = memory_files_with_root(&proj, None, tmp.path(), true);
         let joined = files
             .iter()
             .map(|(_, c)| c.clone())
@@ -654,7 +748,7 @@ mod tests {
         fs::create_dir_all(&proj).unwrap();
         fs::write(proj.join("ZEN.md"), "hello memory").unwrap();
 
-        let prompt = memory_prompt_with_root(&proj, None, tmp.path());
+        let prompt = memory_prompt_with_root(&proj, None, tmp.path(), true);
         assert!(prompt.contains("# Memory:"));
         assert!(prompt.contains("ZEN.md"));
         assert!(prompt.contains("hello memory"));
@@ -666,7 +760,8 @@ mod tests {
         let proj = tmp.path().join("proj");
         fs::create_dir_all(&proj).unwrap();
 
-        let prompt = memory_prompt_with_root(&proj, Some(&tmp.path().join("nohome")), tmp.path());
+        let prompt =
+            memory_prompt_with_root(&proj, Some(&tmp.path().join("nohome")), tmp.path(), true);
         assert_eq!(prompt, "");
     }
 
@@ -694,7 +789,11 @@ mod tests {
     }
 
     fn mem(proj: &Path, home: &Path, root: &Path) -> Vec<(PathBuf, String)> {
-        memory_files_with_managed(proj, Some(home), None, Some(root))
+        mem_t(proj, home, root, true)
+    }
+
+    fn mem_t(proj: &Path, home: &Path, root: &Path, trusted: bool) -> Vec<(PathBuf, String)> {
+        memory_files_with_managed(proj, Some(home), None, Some(root), trusted)
     }
 
     #[test]
@@ -773,7 +872,8 @@ mod tests {
         )
         .unwrap();
 
-        let files = memory_files_with_managed(&sub, Some(&home), Some(&managed), Some(tmp.path()));
+        let files =
+            memory_files_with_managed(&sub, Some(&home), Some(&managed), Some(tmp.path()), true);
         let contents: Vec<&str> = files.iter().map(|(_, c)| c.trim()).collect();
         assert_eq!(
             contents,
@@ -930,7 +1030,7 @@ mod tests {
         fs::write(home.join(".zen/ZEN.md"), "user rules here").unwrap();
         fs::write(proj.join("ZEN.md"), "project rules here").unwrap();
 
-        let report = memories_report_with_root(&proj, Some(&home), tmp.path());
+        let report = memories_report_with_root(&proj, Some(&home), tmp.path(), true);
         let lines: Vec<&str> = report.lines().collect();
 
         assert_eq!(lines.len(), 3, "report:\n{}", report);
@@ -972,7 +1072,8 @@ mod tests {
         let tmp = TempDir::new();
         let proj = tmp.path().join("proj");
         fs::create_dir_all(&proj).unwrap();
-        let report = memories_report_with_root(&proj, Some(&tmp.path().join("nohome")), tmp.path());
+        let report =
+            memories_report_with_root(&proj, Some(&tmp.path().join("nohome")), tmp.path(), true);
         assert_eq!(report, "(no memory files loaded)");
     }
 
@@ -1036,14 +1137,14 @@ mod tests {
         fs::write(proj.join("ZEN.md"), "inside-root").unwrap();
         let nohome = tmp.path().join("nohome");
 
-        let unbounded = memory_files(&sub, Some(&nohome));
+        let unbounded = memory_files(&sub, Some(&nohome), true);
         assert!(
             unbounded.iter().any(|(_, c)| c.contains("outside-root")),
             "unbounded load should still pick up the parent AGENTS.md: {:?}",
             unbounded.iter().map(|(p, _)| p).collect::<Vec<_>>()
         );
 
-        let bounded = memory_files_with_root(&sub, Some(&nohome), &proj);
+        let bounded = memory_files_with_root(&sub, Some(&nohome), &proj, true);
         assert!(
             !bounded.iter().any(|(_, c)| c.contains("outside-root")),
             "bounded load leaked the parent AGENTS.md"
@@ -1085,7 +1186,7 @@ mod tests {
         fs::write(proj.join("ZEN.md"), "inside-root").unwrap();
         let nohome = tmp.path().join("nohome");
 
-        let prompt = memory_prompt(&sub, Some(&nohome));
+        let prompt = memory_prompt(&sub, Some(&nohome), true);
         assert!(
             prompt.contains("inside-root"),
             "unbounded prompt should contain the fixture memory: {prompt}"
@@ -1101,10 +1202,207 @@ mod tests {
         fs::write(proj.join("ZEN.md"), "inside-root").unwrap();
         let nohome = tmp.path().join("nohome");
 
-        let report = memories_report(&sub, Some(&nohome));
+        let report = memories_report(&sub, Some(&nohome), true);
         assert!(
             report.contains("ZEN.md"),
             "unbounded report should list the fixture memory: {report}"
+        );
+    }
+
+    // Issue #331: in an untrusted folder a project memory file must
+    // not @import files outside the project tree: absolute paths,
+    // ~/ paths and ../ escapes are rejected and left as literal text,
+    // while relative imports inside the project still load.
+    #[test]
+    fn issue_331_untrusted_absolute_import_rejected() {
+        let tmp = TempDir::new();
+        let home = tmp.path().join("home");
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let outside = tmp.path().join("outside.md");
+        fs::write(&outside, "OUTSIDE-SECRET").unwrap();
+        fs::write(proj.join("ZEN.md"), format!("@{}\n", outside.display())).unwrap();
+
+        let untrusted = mem_t(&proj, &home, tmp.path(), false);
+        let top = untrusted
+            .iter()
+            .find(|(p, _)| p.ends_with("proj/ZEN.md"))
+            .unwrap();
+        assert!(
+            !top.1.contains("OUTSIDE-SECRET"),
+            "absolute import outside the project leaked into the prompt: {}",
+            top.1
+        );
+        assert!(
+            top.1.contains(&outside.display().to_string()),
+            "rejected import must stay as literal text: {}",
+            top.1
+        );
+
+        let trusted = mem_t(&proj, &home, tmp.path(), true);
+        let top = trusted
+            .iter()
+            .find(|(p, _)| p.ends_with("proj/ZEN.md"))
+            .unwrap();
+        assert!(
+            top.1.contains("OUTSIDE-SECRET"),
+            "absolute import still works in a trusted folder: {}",
+            top.1
+        );
+    }
+
+    #[test]
+    fn issue_331_untrusted_tilde_and_parent_imports_rejected() {
+        let tmp = TempDir::new();
+        let home = tmp.path().join("home");
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(home.join("notes")).unwrap();
+        fs::create_dir_all(home.join(".zen")).unwrap();
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(home.join("notes/secret.md"), "HOME-SECRET").unwrap();
+        fs::write(tmp.path().join("outside.md"), "PARENT-SECRET").unwrap();
+        fs::write(proj.join("ZEN.md"), "@~/notes/secret.md\n@../outside.md\n").unwrap();
+
+        let untrusted = mem_t(&proj, &home, tmp.path(), false);
+        let joined = untrusted
+            .iter()
+            .map(|(_, c)| c.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !joined.contains("HOME-SECRET"),
+            "tilde import leaked: {joined}"
+        );
+        assert!(
+            !joined.contains("PARENT-SECRET"),
+            "parent escape leaked: {joined}"
+        );
+
+        let trusted = mem_t(&proj, &home, tmp.path(), true);
+        let joined = trusted
+            .iter()
+            .map(|(_, c)| c.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("HOME-SECRET"),
+            "tilde import kept trusted: {joined}"
+        );
+        assert!(
+            joined.contains("PARENT-SECRET"),
+            "parent import kept trusted: {joined}"
+        );
+    }
+
+    #[test]
+    fn issue_331_untrusted_relative_import_inside_project_kept() {
+        let tmp = TempDir::new();
+        let home = tmp.path().join("home");
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(proj.join("docs")).unwrap();
+        fs::write(proj.join("docs/inside.md"), "INSIDE-CONTENT").unwrap();
+        fs::write(proj.join("ZEN.md"), "top\n@docs/inside.md\n").unwrap();
+
+        let untrusted = mem_t(&proj, &home, tmp.path(), false);
+        let top = untrusted
+            .iter()
+            .find(|(p, _)| p.ends_with("proj/ZEN.md"))
+            .unwrap();
+        assert!(
+            top.1.contains("INSIDE-CONTENT"),
+            "relative import inside the project must still load: {}",
+            top.1
+        );
+    }
+
+    // Issue #331: the trust distinction is about who controls the
+    // importing file. The user's own ~/.zen/ZEN.md keeps its imports
+    // even when the project folder is untrusted.
+    #[test]
+    fn issue_331_untrusted_home_file_import_kept() {
+        let tmp = TempDir::new();
+        let home = tmp.path().join("home");
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(home.join("notes")).unwrap();
+        fs::create_dir_all(home.join(".zen")).unwrap();
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(home.join("notes/prefs.md"), "HOME-PREFS").unwrap();
+        fs::write(home.join(".zen/ZEN.md"), "@~/notes/prefs.md\n").unwrap();
+        fs::write(proj.join("ZEN.md"), "proj memory").unwrap();
+
+        let untrusted = mem_t(&proj, &home, tmp.path(), false);
+        let joined = untrusted
+            .iter()
+            .map(|(_, c)| c.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("HOME-PREFS"),
+            "user memory import must survive an untrusted project: {joined}"
+        );
+    }
+
+    // Issue #331: an @import never pulls more than 4 MiB into the
+    // system prompt, trusted or not.
+    #[test]
+    fn issue_331_import_size_capped() {
+        let tmp = TempDir::new();
+        let home = tmp.path().join("home");
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let mut big = String::from("BIG-MARKER\n");
+        big.push_str(&"x".repeat(MAX_IMPORT_BYTES as usize));
+        fs::write(proj.join("big.md"), big).unwrap();
+        fs::write(proj.join("ZEN.md"), "@big.md\n").unwrap();
+
+        for trusted in [true, false] {
+            let files = mem_t(&proj, &home, tmp.path(), trusted);
+            let top = files
+                .iter()
+                .find(|(p, _)| p.ends_with("proj/ZEN.md"))
+                .unwrap();
+            assert!(
+                !top.1.contains("BIG-MARKER"),
+                "over-size import loaded (trusted={trusted}): {} bytes in prompt",
+                top.1.len()
+            );
+        }
+    }
+
+    // Issue #331: a symlink inside the project pointing outside it
+    // must not smuggle the outside file in through an import.
+    #[cfg(unix)]
+    #[test]
+    fn issue_331_untrusted_symlink_escape_rejected() {
+        let tmp = TempDir::new();
+        let home = tmp.path().join("home");
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let outside = tmp.path().join("outside.md");
+        fs::write(&outside, "OUTSIDE-SECRET").unwrap();
+        std::os::unix::fs::symlink(&outside, proj.join("link.md")).unwrap();
+        fs::write(proj.join("ZEN.md"), "@link.md\n").unwrap();
+
+        let untrusted = mem_t(&proj, &home, tmp.path(), false);
+        let top = untrusted
+            .iter()
+            .find(|(p, _)| p.ends_with("proj/ZEN.md"))
+            .unwrap();
+        assert!(
+            !top.1.contains("OUTSIDE-SECRET"),
+            "symlink escape leaked into the prompt: {}",
+            top.1
+        );
+
+        let trusted = mem_t(&proj, &home, tmp.path(), true);
+        let top = trusted
+            .iter()
+            .find(|(p, _)| p.ends_with("proj/ZEN.md"))
+            .unwrap();
+        assert!(
+            top.1.contains("OUTSIDE-SECRET"),
+            "symlinked import still works in a trusted folder: {}",
+            top.1
         );
     }
 }
