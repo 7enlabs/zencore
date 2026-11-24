@@ -407,6 +407,41 @@ mod tests {
     }
 
     #[test]
+    fn classify_429_with_only_exceeded_quota_phrase_is_quota_exhausted() {
+        // Issue #347: each quota phrase must count on its own - a 429
+        // whose body carries only "exceeded your current quota" (no
+        // "insufficient_quota" / "insufficient quota") is still quota
+        // exhaustion. Kills the mutant that turns the second `||` of
+        // explicit_quota into `&&`.
+        let c = classify_error(
+            Some(429),
+            r#"{"error": {"message": "You have exceeded your current quota."}}"#,
+        );
+        assert_eq!(c, ErrorClass::QuotaExhausted);
+        assert!(!c.is_retryable());
+    }
+
+    #[test]
+    fn classify_no_status_with_only_billing_word_is_quota_exhausted() {
+        // Issue #347: with no status to contradict the body, the word
+        // "billing" alone is a quota signal. Kills the mutant that
+        // turns the first `||` of billing_signal into `&&`.
+        let c = classify_error(None, "Billing issue, please check your account");
+        assert_eq!(c, ErrorClass::QuotaExhausted);
+        assert!(!c.is_retryable());
+    }
+
+    #[test]
+    fn classify_no_status_with_only_out_of_credit_is_quota_exhausted() {
+        // Issue #347: with no status to contradict the body, the phrase
+        // "out of credit" alone is a quota signal. Kills the mutant
+        // that turns the second `||` of billing_signal into `&&`.
+        let c = classify_error(None, "You are out of credit for this month");
+        assert_eq!(c, ErrorClass::QuotaExhausted);
+        assert!(!c.is_retryable());
+    }
+
+    #[test]
     fn classify_billing_body_is_quota_only_without_contradicting_status() {
         // The broad billing / out-of-credit signals still count where
         // no status contradicts them: 402 is a billing status, and
