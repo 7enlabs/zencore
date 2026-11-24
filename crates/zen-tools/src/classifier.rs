@@ -944,7 +944,12 @@ mod tests {
         // such dir exists on Linux); canonicalize_lenient falls back
         // to lexical normalization, so this runs on every OS.
         let cwd = PathBuf::from("/private/var/folders/xx/T/zen-classifier-test-wd");
-        let dirs = vec![cwd.clone()];
+        // The workdir must be canonicalized the same way resolve_target
+        // canonicalizes its targets: on Windows a rooted path gets the
+        // current drive attached (C:\private\var\...), so comparing the
+        // resolved target against the raw workdir would miss and the
+        // test would see danger instead of mutating.
+        let dirs = vec![canonicalize_lenient(&cwd)];
         let bash_in =
             |cmd: &str| classify("Bash", &serde_json::json!({ "command": cmd }), &cwd, &dirs);
         assert_eq!(bash_in("rm -rf ./build").reason_code, "mutating.default");
