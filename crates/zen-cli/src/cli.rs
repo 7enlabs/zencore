@@ -899,11 +899,11 @@ pub enum SecretSubcommand {
         #[arg(long = "by")]
         by: String,
 
-        /// Default lifetime of an issuance, in days (at least 1)
+        /// Default lifetime of an issuance, in days (1-36500, issue #318)
         #[arg(long = "default-until-days")]
         default_until_days: i64,
 
-        /// Rotation interval, in days (at least 1)
+        /// Rotation interval, in days (1-36500, issue #318)
         #[arg(long = "rotation-days")]
         rotation_days: i64,
 
