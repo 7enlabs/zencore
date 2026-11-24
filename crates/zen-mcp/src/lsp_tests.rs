@@ -544,6 +544,93 @@ async fn mock_server_sends_did_change_when_mtime_moves() {
 }
 
 #[tokio::test]
+async fn mock_server_sends_did_change_when_content_changes_but_mtime_does_not() {
+    // Issue #383: `ensure_open` keyed the sync decision on mtime only,
+    // so a rewrite that left the mtime unchanged (coarse filesystem
+    // granularity, or a restore of the old mtime) silently kept the
+    // stale cached text and never sent `didChange`. Restoring the old
+    // mtime after the rewrite forces the mtime-equal case.
+    let Some(setup) = mock_setup() else {
+        eprintln!("SKIP: python3 not found");
+        return;
+    };
+    let _ = setup
+        .manager
+        .goto_definition(&setup.main_rs, 1, 5)
+        .await
+        .unwrap();
+    let old_mtime = std::fs::metadata(&setup.main_rs)
+        .unwrap()
+        .modified()
+        .unwrap();
+
+    write_file(&setup.main_rs, "fn main() {\n    let y = 2;\n}\n");
+    std::fs::File::options()
+        .write(true)
+        .open(&setup.main_rs)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(old_mtime))
+        .unwrap();
+    let restored_mtime = std::fs::metadata(&setup.main_rs)
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_eq!(
+        restored_mtime, old_mtime,
+        "test setup failed: mtime moved despite the restore"
+    );
+
+    let _ = setup
+        .manager
+        .goto_definition(&setup.main_rs, 1, 5)
+        .await
+        .unwrap();
+    let methods = logged_methods(&setup.log);
+    assert_eq!(
+        count(&methods, "textDocument/didChange"),
+        1,
+        "expected one didChange after content changed at the same mtime: {methods:?}"
+    );
+    assert_eq!(count(&methods, "textDocument/didOpen"), 1);
+}
+
+#[tokio::test]
+async fn mock_server_reuses_cached_doc_when_nothing_changed() {
+    // Issue #383, mutant kill: `ensure_open` reuses the cached document
+    // only when BOTH the mtime and the freshly read text match
+    // (`doc.mtime == mtime && doc.text == text`). A second request with
+    // the file untouched must send neither `didOpen` nor `didChange`;
+    // replacing the guard with `false`, or flipping either `==` to
+    // `!=`, would send a spurious `didChange` instead.
+    let Some(setup) = mock_setup() else {
+        eprintln!("SKIP: python3 not found");
+        return;
+    };
+    let _ = setup
+        .manager
+        .goto_definition(&setup.main_rs, 1, 5)
+        .await
+        .unwrap();
+    let _ = setup
+        .manager
+        .goto_definition(&setup.main_rs, 1, 5)
+        .await
+        .unwrap();
+    let methods = logged_methods(&setup.log);
+    assert_eq!(
+        count(&methods, "textDocument/didOpen"),
+        1,
+        "second request must reuse the open document: {methods:?}"
+    );
+    assert_eq!(
+        count(&methods, "textDocument/didChange"),
+        0,
+        "nothing changed, so no didChange may be sent: {methods:?}"
+    );
+    assert_eq!(count(&methods, "textDocument/definition"), 2);
+}
+
+#[tokio::test]
 async fn mock_server_hover_and_references() {
     let Some(setup) = mock_setup() else {
         eprintln!("SKIP: python3 not found");
