@@ -60,8 +60,17 @@ pub struct RateGate {
     settings: RateGateSettings,
 
     store_path: Option<PathBuf>,
+}
 
-    io: Mutex<()>,
+/// Process-wide lock for the quota store. `gated_llm_client_for` builds a
+/// fresh `RateGate` per client, all sharing one store file, so a per-instance
+/// mutex cannot serialize reservations across instances; this lock does.
+/// Separate processes sharing the file can still race: closing that window
+/// needs an OS file lock, which is out of scope for this fix.
+static STORE_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_store() -> std::sync::MutexGuard<'static, ()> {
+    STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl RateGate {
@@ -76,7 +85,6 @@ impl RateGate {
             base_url,
             settings,
             store_path,
-            io: Mutex::new(()),
         }
     }
 
@@ -163,24 +171,27 @@ impl RateGate {
         state
     }
 
-    fn used_today(&self, provider: &str) -> u64 {
-        let _guard = self.io.lock().unwrap_or_else(|e| e.into_inner());
-        self.fresh_state()
-            .counts
-            .get(provider)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    fn record(&self, provider: &str) {
-        let _guard = self.io.lock().unwrap_or_else(|e| e.into_inner());
+    /// Reserve one request of quota atomically: the check, the increment and
+    /// the write happen under a single lock acquisition, before the network
+    /// call. Two concurrent chats can no longer both read the same count and
+    /// both send, and no reservation is lost to a stale re-read.
+    /// Returns the used count after the reservation, or the current used
+    /// count when the quota is already exhausted.
+    fn try_reserve(&self, provider: &str, limit: u64) -> Result<u64, u64> {
+        let _guard = lock_store();
         let mut state = self.fresh_state();
-        *state.counts.entry(provider.to_string()).or_insert(0) += 1;
+        let used = state.counts.get(provider).copied().unwrap_or(0);
+        if used >= limit {
+            return Err(used);
+        }
+        let used = used + 1;
+        state.counts.insert(provider.to_string(), used);
         self.write_store(&state);
+        Ok(used)
     }
 
     pub fn quota_status(&self) -> Vec<QuotaStatus> {
-        let _guard = self.io.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_store();
         let state = self.fresh_state();
         let mut out: Vec<QuotaStatus> = state
             .counts
@@ -418,17 +429,17 @@ impl LlmBackend for RateGate {
         let Some(limit) = self.gated_limit(&provider, &req.model) else {
             return self.inner.chat(req).await;
         };
-        let used = self.used_today(&provider);
-        if used >= limit {
+        // Reserve before the await: the quota is spent whether the call
+        // succeeds or fails, and the reservation is atomic, so concurrent
+        // chats cannot overshoot the limit or lose a count.
+        if let Err(used) = self.try_reserve(&provider, limit) {
             return Err(anyhow::anyhow!(
                 "rategate: daily quota exhausted for provider '{provider}' ({used}/{limit} requests used, UTC day); \
                  switch to a fallback model or wait until tomorrow"
             ));
         }
 
-        let res = self.inner.chat(req).await;
-        self.record(&provider);
-        res
+        self.inner.chat(req).await
     }
 }
 
@@ -564,6 +575,57 @@ mod tests {
         assert_eq!(civil_from_days(20743), (2026, 10, 17));
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(18628), (2021, 1, 1));
+    }
+
+    /// Backend that yields once mid-call so two concurrent `chat()` calls
+    /// interleave at the await, the way two live network calls would.
+    struct YieldingBackend {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmBackend for YieldingBackend {
+        async fn chat(&self, _req: ChatRequest) -> anyhow::Result<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            Ok(ChatResponse {
+                message: ChatMessage::assistant(Some("ok".into()), None),
+                usage: Default::default(),
+                finish_reason: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_reservations_do_not_exceed_quota_across_instances() {
+        // Regression test for #344: `gated_llm_client_for` builds a fresh
+        // RateGate per client, all sharing one store file, so the race was
+        // cross-instance, not just cross-task. With limit 1 and two gates
+        // on one store, exactly one of the two concurrent chats may send.
+        let store = tmp_store("race");
+        let inner = Arc::new(YieldingBackend {
+            calls: AtomicUsize::new(0),
+        });
+        let g1 = Arc::new(gate(
+            inner.clone(),
+            "https://openrouter.ai/api/v1",
+            1,
+            store.clone(),
+        ));
+        let g2 = Arc::new(gate(
+            inner.clone(),
+            "https://openrouter.ai/api/v1",
+            1,
+            store.clone(),
+        ));
+        let (r1, r2) = tokio::join!(g1.chat(req()), g2.chat(req()));
+        assert_ne!(
+            r1.is_ok(),
+            r2.is_ok(),
+            "exactly one chat may send; got {r1:?} and {r2:?}"
+        );
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(g1.quota_status()[0].used, 1);
     }
 
     #[tokio::test]
