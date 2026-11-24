@@ -1758,18 +1758,45 @@ fn tool_contents(msgs: &[ChatMessage]) -> Vec<String> {
 #[tokio::test]
 async fn r7_fifth_edit_turn_gets_exactly_one_guard_note() {
     // NOTE: args vary per call so the loop guard does not trip; the
-    // edit nudge under test keys on file_path only.
-    let mut script: Vec<ChatResponse> = (0..5)
-        .map(|i| {
-            resp_tool(
+    // edit nudge under test keys on file_path only. Five edits in ONE
+    // model turn nudge exactly once, at the fourth edit; the same file
+    // edited in the next model turn starts a fresh count (#345), so no
+    // second nudge fires there.
+    let llm = MockLlm::new(vec![
+        resp_multi_tool(vec![
+            (
                 "Edit",
-                &format!(r#"{{"file_path":"a.rs","old_string":"x{}"}}"#, i),
-                &format!("e{}", i),
-            )
-        })
-        .collect();
-    script.push(resp("done"));
-    let llm = MockLlm::new(script);
+                r#"{"file_path":"a.rs","old_string":"x0","new_string":"y"}"#,
+                "e0",
+            ),
+            (
+                "Edit",
+                r#"{"file_path":"a.rs","old_string":"x1","new_string":"y"}"#,
+                "e1",
+            ),
+            (
+                "Edit",
+                r#"{"file_path":"a.rs","old_string":"x2","new_string":"y"}"#,
+                "e2",
+            ),
+            (
+                "Edit",
+                r#"{"file_path":"a.rs","old_string":"x3","new_string":"y"}"#,
+                "e3",
+            ),
+            (
+                "Edit",
+                r#"{"file_path":"a.rs","old_string":"x4","new_string":"y"}"#,
+                "e4",
+            ),
+        ]),
+        resp_tool(
+            "Edit",
+            r#"{"file_path":"a.rs","old_string":"x5","new_string":"y"}"#,
+            "e5",
+        ),
+        resp("done"),
+    ]);
     let reg = registry_with(vec![fake("Edit", false, "edited")]);
     let (mut agent, _s, _h) = build_agent(llm, reg, allow(), base_cfg());
     agent.run_turn("go").await;
@@ -1805,17 +1832,22 @@ async fn r7_fifth_edit_turn_gets_exactly_one_guard_note() {
 
 #[tokio::test]
 async fn r7_two_identical_failures_nudge() {
+    // Two identical failures in ONE model turn nudge; the same failures
+    // spread over separate turns start a fresh count each turn (#345).
     let failing: Arc<dyn Tool> = Arc::new(FakeTool {
         name: "Bash",
         read_only: false,
         output: ToolOutput::err("exit 1"),
     });
-    let mut script: Vec<ChatResponse> = (0..3)
-        .map(|i| resp_tool("Bash", r#"{"command":"make"}"#, &format!("b{}", i)))
-        .collect();
-    script.push(resp("done"));
     let (mut agent, _s, _h) = build_agent(
-        MockLlm::new(script),
+        MockLlm::new(vec![
+            resp_multi_tool(vec![
+                ("Bash", r#"{"command":"make"}"#, "b0"),
+                ("Bash", r#"{"command":"make"}"#, "b1"),
+                ("Bash", r#"{"command":"make"}"#, "b2"),
+            ]),
+            resp("done"),
+        ]),
         registry_with(vec![failing]),
         allow(),
         base_cfg(),

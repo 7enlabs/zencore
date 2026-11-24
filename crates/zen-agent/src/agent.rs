@@ -856,6 +856,7 @@ impl Agent {
             self.prune_old_results();
 
             num_turns += 1;
+            turn_guard.reset_turn();
             if self.config.depth == 0 {
                 self.maybe_reinject_todos();
             }
