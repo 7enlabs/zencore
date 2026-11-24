@@ -363,7 +363,7 @@ fn classify_part(part: &Part, cwd: &Path, workdirs: &[PathBuf]) -> Classificatio
         ) {
             continue;
         }
-        if is_system_path(target, cwd) || is_authorized_keys(target) {
+        if is_system_write(target, cwd, workdirs) || is_authorized_keys(target) {
             return Classification::danger(
                 "danger.system-write",
                 format!("write into a protected path: {target}"),
@@ -377,7 +377,7 @@ fn classify_part(part: &Part, cwd: &Path, workdirs: &[PathBuf]) -> Classificatio
             *dest,
             "/dev/null" | "/dev/stdout" | "/dev/stderr" | "/dev/stdin"
         )
-        && (is_system_path(dest, cwd) || is_authorized_keys(dest))
+        && (is_system_write(dest, cwd, workdirs) || is_authorized_keys(dest))
     {
         return Classification::danger(
             "danger.system-write",
@@ -632,14 +632,43 @@ fn rm_target_verdict(target: &str, cwd: &Path, workdirs: &[PathBuf]) -> TargetVe
     {
         return TargetVerdict::Danger;
     }
-    if is_system_resolved(&resolved) {
+    // The workdir wins over the system prefix: on macOS the test
+    // tempdir canonicalizes under `/private/var`, so a recursive
+    // delete inside the workdir is the agent's own workspace, not a
+    // system path. Same for scratch space under the OS temp root.
+    if is_inside_workdirs(&resolved, workdirs) {
+        return TargetVerdict::Inside;
+    }
+    if is_system_resolved(&resolved) && !is_under_temp_dir(&resolved) {
         return TargetVerdict::Danger;
     }
-    if workdirs.iter().any(|d| resolved.starts_with(d)) {
-        TargetVerdict::Inside
-    } else {
-        TargetVerdict::Outside
+    TargetVerdict::Outside
+}
+
+/// A resolved path inside the caller's own workspace: under one of
+/// the canonical working directories, or under the OS temp root
+/// (macOS test tempdirs canonicalize under `/private/var`, `/dev/shm`
+/// on Linux CI). Scratch space is never a system path.
+fn is_inside_workdirs(resolved: &Path, workdirs: &[PathBuf]) -> bool {
+    workdirs.iter().any(|d| resolved.starts_with(d))
+}
+
+/// True when `p` sits under the OS temp root, canonicalized (`$TMPDIR`
+/// is a symlink on macOS: `/var/folders/...` becomes
+/// `/private/var/folders/...`). A pathological `$TMPDIR` that IS a
+/// system prefix (or `/`) disables the exemption instead of opening
+/// the guard to the whole prefix.
+fn is_under_temp_dir(p: &Path) -> bool {
+    let tmp = canonicalize_lenient(&std::env::temp_dir());
+    if tmp == Path::new("/") {
+        return false;
     }
+    let tmp_str = tmp.to_string_lossy().replace('\\', "/").to_lowercase();
+    let tmp_str = strip_drive(&tmp_str);
+    if SYSTEM_PREFIXES.contains(&tmp_str) {
+        return false;
+    }
+    p.starts_with(&tmp)
 }
 
 /// System prefixes on an already-resolved absolute path.
@@ -648,28 +677,29 @@ fn rm_target_verdict(target: &str, cwd: &Path, workdirs: &[PathBuf]) -> TargetVe
 /// `canonicalize_lenient` attaching the current drive to a rooted
 /// path), so the drive is stripped before matching: `c:/etc/hosts`
 /// must match `/etc` exactly like `/etc/hosts` does.
+const SYSTEM_PREFIXES: &[&str] = &[
+    "/etc",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/boot",
+    "/sys",
+    "/proc",
+    "/dev",
+    "/system",
+    "/library",
+    "/private/etc",
+    "/private/var",
+    "/windows",
+    "/program files",
+    "/program files (x86)",
+    "/programdata",
+];
+
 fn is_system_resolved(p: &Path) -> bool {
     let s = p.to_string_lossy().replace('\\', "/").to_lowercase();
     let s = strip_drive(&s);
-    const PREFIXES: &[&str] = &[
-        "/etc",
-        "/usr",
-        "/bin",
-        "/sbin",
-        "/boot",
-        "/sys",
-        "/proc",
-        "/dev",
-        "/system",
-        "/library",
-        "/private/etc",
-        "/private/var",
-        "/windows",
-        "/program files",
-        "/program files (x86)",
-        "/programdata",
-    ];
-    PREFIXES
+    SYSTEM_PREFIXES
         .iter()
         .any(|pre| s == *pre || s.starts_with(&format!("{pre}/")))
 }
@@ -698,9 +728,15 @@ fn is_drive_root(p: &Path) -> bool {
         && (b.len() == 2 || (b.len() == 3 && b[2] == b'/'))
 }
 
-/// System-path check for a not-yet-resolved write target.
-fn is_system_path(target: &str, cwd: &Path) -> bool {
-    is_system_resolved(&resolve_target(target, cwd))
+/// A write target is a system write only when it resolves under a
+/// system prefix AND outside the caller's working directories and the
+/// OS temp root: writes inside the workdir (macOS tempdirs live under
+/// `/private/var`) or into temp scratch space are plain mutations.
+fn is_system_write(target: &str, cwd: &Path, workdirs: &[PathBuf]) -> bool {
+    let resolved = resolve_target(target, cwd);
+    is_system_resolved(&resolved)
+        && !is_inside_workdirs(&resolved, workdirs)
+        && !is_under_temp_dir(&resolved)
 }
 
 fn is_authorized_keys(target: &str) -> bool {
@@ -896,6 +932,109 @@ mod tests {
     fn redirect_into_workdir_is_not_danger() {
         assert_eq!(code("echo x > out.txt"), "mutating.default");
         assert_eq!(code("echo x > /dev/null"), "mutating.default");
+    }
+
+    #[test]
+    fn workdir_under_system_prefix_is_not_system_write() {
+        // Regression (macOS aarch64 CI): the test tempdir
+        // canonicalizes under `/private/var`, so the workdir itself
+        // is a system prefix. Writes, redirects and recursive
+        // deletes inside it must stay plain mutating; genuine system
+        // paths outside it stay danger. The workdir is synthetic (no
+        // such dir exists on Linux); canonicalize_lenient falls back
+        // to lexical normalization, so this runs on every OS.
+        let cwd = PathBuf::from("/private/var/folders/xx/T/zen-classifier-test-wd");
+        // The workdir must be canonicalized the same way resolve_target
+        // canonicalizes its targets: on Windows a rooted path gets the
+        // current drive attached (C:\private\var\...), so comparing the
+        // resolved target against the raw workdir would miss and the
+        // test would see danger instead of mutating.
+        let dirs = vec![canonicalize_lenient(&cwd)];
+        let bash_in =
+            |cmd: &str| classify("Bash", &serde_json::json!({ "command": cmd }), &cwd, &dirs);
+        assert_eq!(bash_in("rm -rf ./build").reason_code, "mutating.default");
+        assert_eq!(
+            bash_in(&format!("rm -rf {}", cwd.join("build").display())).reason_code,
+            "mutating.default"
+        );
+        assert_eq!(bash_in("echo x > out.txt").reason_code, "mutating.default");
+        assert_eq!(
+            bash_in(&format!("echo x > {}", cwd.join("out.txt").display())).reason_code,
+            "mutating.default"
+        );
+        assert_eq!(bash_in("cp a build/out").reason_code, "mutating.default");
+        assert_eq!(bash_in("mv a build/out").reason_code, "mutating.default");
+        assert_eq!(
+            bash_in("chmod -R 755 ./src").reason_code,
+            "mutating.default"
+        );
+        assert_eq!(
+            bash_in("chown -R user ./src").reason_code,
+            "mutating.default"
+        );
+        // Control: system paths outside the workdir stay danger.
+        assert_eq!(
+            bash_in("rm -rf /private/var/other").reason_code,
+            "danger.rm-recursive-root"
+        );
+        assert_eq!(
+            bash_in("echo x > /etc/hosts").reason_code,
+            "danger.system-write"
+        );
+        assert_eq!(
+            bash_in("cp a /etc/hosts").reason_code,
+            "danger.system-write"
+        );
+        assert_eq!(
+            bash_in("chown -R user /usr").reason_code,
+            "danger.perm-recursive-root"
+        );
+    }
+
+    #[test]
+    fn temp_sibling_outside_workdir_is_not_system_write() {
+        // c2_11: `mv a ../outside` from a workdir under the OS temp
+        // root must not be danger.system-write: the sibling is scratch
+        // space, same as the `/tmp` warn-not-danger rule. Fails before
+        // the fix only when the temp root is itself a system prefix
+        // (macOS `/private/var`, Linux `/dev/shm`).
+        let (cwd, dirs) = ctx();
+        let c = classify(
+            "Bash",
+            &serde_json::json!({ "command": "mv a ../outside" }),
+            &cwd,
+            &dirs,
+        );
+        assert_eq!(c.reason_code, "mutating.default");
+        let c = classify(
+            "Bash",
+            &serde_json::json!({ "command": "echo x > ../outside.txt" }),
+            &cwd,
+            &dirs,
+        );
+        assert_eq!(c.reason_code, "mutating.default");
+    }
+
+    #[test]
+    fn rm_rf_outside_workdir_non_system_non_temp_is_warn_not_danger() {
+        // Kills the && -> || mutant in rm_target_verdict: a target
+        // that is neither a system path nor under the temp root must
+        // stay Outside (warn), not Danger. With ||, the
+        // `!is_under_temp_dir` arm alone would mark it danger.
+        assert_eq!(code("rm -rf /opt/zen-scratch"), "warn.rm-outside-workdir");
+    }
+
+    #[test]
+    fn is_under_temp_dir_matches_paths_under_the_os_temp_root() {
+        // Kills the whole-body -> false mutant and the == -> !=
+        // mutant on the "/" guard in is_under_temp_dir: a path under
+        // the real temp root must be recognised. With either mutant
+        // the function returns false here. The probe is canonicalized
+        // the same way the function canonicalizes the temp root, so
+        // the macOS /var -> /private/var symlink does not break it.
+        let probe = canonicalize_lenient(&std::env::temp_dir().join("zen-scratch"));
+        assert!(is_under_temp_dir(&probe));
+        assert!(!is_under_temp_dir(Path::new("/etc/hosts")));
     }
 
     #[test]
