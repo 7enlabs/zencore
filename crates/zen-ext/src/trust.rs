@@ -114,6 +114,16 @@ pub(crate) fn gated_keys(layer: &Value) -> Vec<&'static str> {
     {
         out.push("permissions.defaultMode");
     }
+    // Only the "off" value is gated: a project layer may pick any other
+    // sandbox mode, but it must never turn the sandbox off by itself
+    // (issue #328). Value-conditional, like defaultMode above.
+    if layer
+        .pointer("/permissions/sandboxMode")
+        .and_then(Value::as_str)
+        == Some("off")
+    {
+        out.push("permissions.sandboxMode");
+    }
     if non_empty(layer.get("env")) {
         out.push("env");
     }
@@ -150,6 +160,11 @@ pub(crate) fn strip_gated(layer: &mut Value) -> Vec<&'static str> {
             // mode from a project layer survives (issue #282).
             if p.get("defaultMode").and_then(Value::as_str) == Some("bypassPermissions") {
                 p.remove("defaultMode");
+            }
+            // Only the "off" value is stripped; any other sandbox mode
+            // from a project layer survives (issue #328).
+            if p.get("sandboxMode").and_then(Value::as_str) == Some("off") {
+                p.remove("sandboxMode");
             }
         }
     }
@@ -338,6 +353,37 @@ mod tests {
         assert_eq!(
             gated_project_config(proj),
             vec![".zen/settings.json: permissions.defaultMode".to_string()]
+        );
+    }
+
+    #[test]
+    fn gated_sandbox_mode_off_is_gated() {
+        // Issue #328: only the "off" value is gated - an untrusted
+        // project layer may pick any other sandbox mode, but it must
+        // never turn the sandbox off by itself.
+        let mut v = json!({"permissions": {"sandboxMode": "off", "deny": ["Write"]}});
+        let removed = strip_gated(&mut v);
+        assert_eq!(removed, vec!["permissions.sandboxMode"]);
+        assert_eq!(v, json!({"permissions": {"deny": ["Write"]}}));
+
+        for mode in ["workspace-write", "read-only"] {
+            let mut v = json!({"permissions": {"sandboxMode": mode}});
+            let removed = strip_gated(&mut v);
+            assert!(removed.is_empty(), "removed: {removed:?}");
+            assert_eq!(v, json!({"permissions": {"sandboxMode": mode}}));
+        }
+
+        let t = TempDir::new();
+        let proj = t.path();
+        fs::create_dir_all(proj.join(".zen")).unwrap();
+        fs::write(
+            proj.join(".zen/settings.json"),
+            r#"{"permissions":{"sandboxMode":"off"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            gated_project_config(proj),
+            vec![".zen/settings.json: permissions.sandboxMode".to_string()]
         );
     }
 }
