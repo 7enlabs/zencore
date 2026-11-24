@@ -9,8 +9,8 @@ use zen_core::{DiagnosticsProvider, Tool, ToolContext};
 use crate::lsp::LspClient;
 use crate::lsp::{
     LspConnection, LspLanguage, LspManager, col_to_utf16, detect_language, find_binary,
-    find_project_root, parse_locations, parse_publish_diagnostics, path_to_uri, render_hover,
-    server_spec, uri_to_path, utf16_to_col,
+    find_project_root, is_lsp_transport_error, parse_locations, parse_publish_diagnostics,
+    path_to_uri, render_hover, server_spec, uri_to_path, utf16_to_col,
 };
 use crate::lsp::{MAX_FRAME_BYTES, MAX_HEADER_BYTES, read_frame, write_frame};
 use crate::lsp_tools::{DiagnosticsTool, FindReferencesTool, GotoDefinitionTool, HoverTool};
@@ -214,6 +214,77 @@ import sys
 sys.exit(0)
 "##;
 
+/// Mock server that answers one `textDocument/definition` request and
+/// then exits (#387): the manager must notice the corpse, evict it,
+/// and serve the next call from a fresh server instead of failing
+/// every later call until the process restarts.
+const MOCK_SERVER_DIES_AFTER_ONE_DEFINITION: &str = r##"#!/usr/bin/env python3
+import sys, json
+
+log_path, target_uri = sys.argv[1], sys.argv[2]
+
+def log(method):
+    with open(log_path, "a") as f:
+        f.write(method + "\n")
+
+def read_msg():
+    headers = {}
+    while True:
+        raw = sys.stdin.buffer.readline()
+        if not raw:
+            return None
+        line = raw.decode("utf-8", "replace")
+        if line in ("\r\n", "\n", ""):
+            break
+        if ":" in line:
+            k, v = line.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+    n = int(headers.get("content-length", "0"))
+    if n <= 0:
+        return None
+    return json.loads(sys.stdin.buffer.read(n).decode("utf-8"))
+
+def send(obj):
+    data = json.dumps(obj).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(data) + data)
+    sys.stdout.buffer.flush()
+
+answered = 0
+while True:
+    msg = read_msg()
+    if msg is None:
+        break
+    method, mid = msg.get("method", ""), msg.get("id")
+    log(method)
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "capabilities": {"textDocumentSync": 2, "definitionProvider": True,
+                             "hoverProvider": True, "referencesProvider": True}}})
+    elif method == "textDocument/definition":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "uri": target_uri,
+            "range": {"start": {"line": 9, "character": 4},
+                      "end": {"line": 9, "character": 12}}}})
+        answered += 1
+        if answered >= 1:
+            sys.exit(0)
+    elif method == "shutdown":
+        send({"jsonrpc": "2.0", "id": mid, "result": None})
+    elif method == "exit":
+        break
+    # notifications (initialized / didOpen / didChange) and unknown methods: no reply
+"##;
+
+/// Mock server that logs one `started` line and exits at once (#387):
+/// every start dies immediately, so repeated calls must hit the
+/// respawn backoff instead of spawning forever.
+const MOCK_SERVER_DIES_AT_START: &str = r##"#!/usr/bin/env python3
+import sys
+with open(sys.argv[1], "a") as f:
+    f.write("started\n")
+sys.exit(0)
+"##;
+
 struct MockSetup {
     manager: LspManager,
     _tmp: PathBuf,
@@ -250,6 +321,72 @@ fn mock_setup() -> Option<MockSetup> {
             script.to_string_lossy().into_owned(),
             log.to_string_lossy().into_owned(),
             path_to_uri(&target_rs),
+        ],
+    );
+    Some(MockSetup {
+        manager,
+        _tmp: tmp,
+        main_rs,
+        target_rs,
+        log,
+    })
+}
+
+/// Same files and command override as `mock_setup`, but the server
+/// dies after answering one definition request (#387).
+fn dying_mock_setup() -> Option<MockSetup> {
+    let py = find_binary("python3")?;
+    let tmp = unique_tmpdir("mock-dying");
+    let main_rs = tmp.join("main.rs");
+    write_file(&main_rs, "fn main() {\n    let x = 1;\n}\n");
+    let target_rs = tmp.join("target.rs");
+    write_file(&target_rs, "pub fn target_fn() {}\n");
+    let script = tmp.join("mock_dying_lsp.py");
+    write_file(&script, MOCK_SERVER_DIES_AFTER_ONE_DEFINITION);
+    let log = tmp.join("methods.log");
+    write_file(&log, "");
+
+    let manager = LspManager::new();
+    manager.set_server_command(
+        LspLanguage::Rust,
+        py.to_string_lossy().into_owned(),
+        vec![
+            script.to_string_lossy().into_owned(),
+            log.to_string_lossy().into_owned(),
+            path_to_uri(&target_rs),
+        ],
+    );
+    Some(MockSetup {
+        manager,
+        _tmp: tmp,
+        main_rs,
+        target_rs,
+        log,
+    })
+}
+
+/// Same shape as `mock_setup`, but the server logs one `started` line
+/// and exits at once (#387). No target file is needed: the server
+/// never answers a request.
+fn dies_at_start_setup() -> Option<MockSetup> {
+    let py = find_binary("python3")?;
+    let tmp = unique_tmpdir("mock-dies-at-start");
+    let main_rs = tmp.join("main.rs");
+    write_file(&main_rs, "fn main() {\n    let x = 1;\n}\n");
+    let target_rs = tmp.join("target.rs");
+    write_file(&target_rs, "pub fn target_fn() {}\n");
+    let script = tmp.join("mock_dies_at_start.py");
+    write_file(&script, MOCK_SERVER_DIES_AT_START);
+    let log = tmp.join("methods.log");
+    write_file(&log, "");
+
+    let manager = LspManager::new();
+    manager.set_server_command(
+        LspLanguage::Rust,
+        py.to_string_lossy().into_owned(),
+        vec![
+            script.to_string_lossy().into_owned(),
+            log.to_string_lossy().into_owned(),
         ],
     );
     Some(MockSetup {
@@ -1934,4 +2071,144 @@ fn parse_publish_diagnostics_rejects_bad_shapes() {
             .expect("an empty diagnostics array is valid");
     assert_eq!(uri, "file:///a.rs");
     assert!(diags.is_empty());
+}
+
+#[tokio::test]
+async fn dead_server_is_evicted_and_next_call_respawns() {
+    // Issue #387: a dead LSP server used to stay cached forever, so
+    // every later call failed until the process restarted. The manager
+    // must evict the corpse (liveness probe, or the transport error
+    // from the call itself) and serve the next call from a fresh
+    // server.
+    let Some(setup) = dying_mock_setup() else {
+        eprintln!("SKIP: python3 not found");
+        return;
+    };
+    let locs = setup
+        .manager
+        .goto_definition(&setup.main_rs, 1, 5)
+        .await
+        .unwrap();
+    assert_eq!(locs.len(), 1, "first call must succeed: {locs:?}");
+
+    // The server exited after answering. The next call must NOT fail
+    // with the corpse's transport error: it respawns and answers.
+    let locs = setup
+        .manager
+        .goto_definition(&setup.main_rs, 1, 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        locs.len(),
+        1,
+        "second call must succeed on a fresh server: {locs:?}"
+    );
+
+    let methods = logged_methods(&setup.log);
+    assert_eq!(
+        count(&methods, "initialize"),
+        2,
+        "a fresh server must have been started after the death: {methods:?}"
+    );
+    assert_eq!(count(&methods, "textDocument/definition"), 2);
+}
+
+#[tokio::test]
+async fn cached_diagnostics_reports_no_server_after_death() {
+    // Issue #387: after the server dies, the read-only diagnostics
+    // query must report "no server" instead of serving an empty cache
+    // from the corpse. The child exits right after answering the
+    // first call, so poll until the probe sees it (a fixed wait would
+    // be racy on a loaded machine; on unfixed code this never turns
+    // None and the test fails).
+    let Some(setup) = dying_mock_setup() else {
+        eprintln!("SKIP: python3 not found");
+        return;
+    };
+    let _ = setup
+        .manager
+        .goto_definition(&setup.main_rs, 1, 5)
+        .await
+        .unwrap();
+    let start = Instant::now();
+    loop {
+        if setup.manager.cached_diagnostics(&setup.main_rs).is_none() {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "cached_diagnostics must report no server once the child has exited"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn dead_server_backoff_stops_respawn_loop() {
+    // Issue #387: a server that dies on every start must not be
+    // respawned in a tight loop. After MAX_CONSECUTIVE_DEAD_SERVERS
+    // failures the manager refuses to spawn again until the cooldown
+    // passes, and the refusal names the failure count.
+    let Some(setup) = dies_at_start_setup() else {
+        eprintln!("SKIP: python3 not found");
+        return;
+    };
+    for attempt in 1..=3 {
+        let err = setup
+            .manager
+            .goto_definition(&setup.main_rs, 1, 5)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("failed to start"),
+            "attempt {attempt} must fail at start, got: {err}"
+        );
+    }
+    let err = setup
+        .manager
+        .goto_definition(&setup.main_rs, 1, 5)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not respawning"),
+        "fourth call must hit the backoff, got: {err}"
+    );
+    let methods = logged_methods(&setup.log);
+    assert_eq!(
+        count(&methods, "started"),
+        3,
+        "no server must have been started on the backed-off call: {methods:?}"
+    );
+}
+
+#[test]
+fn transport_error_classifier_only_matches_dead_server_errors() {
+    // Issue #387, mutant killer: the eviction decision must split
+    // transport errors (dead server) from call errors (a live server
+    // rejecting the request) and timeouts (a live but slow server).
+    for msg in [
+        "write to LSP server failed: broken pipe",
+        "LSP server dropped the response",
+        "LSP error: {\"code\":-32000,\"message\":\"LSP server closed\"}",
+        "LSP notify 'textDocument/didOpen' failed: broken pipe",
+        "textDocument/didOpen failed: LSP notify 'textDocument/didOpen' failed: broken pipe",
+        "LSP initialize failed: LSP server closed",
+    ] {
+        assert!(
+            is_lsp_transport_error(&anyhow::anyhow!(msg)),
+            "must classify as transport: {msg}"
+        );
+    }
+    for msg in [
+        "LSP error: {\"code\":-32601,\"message\":\"Method not found\"}",
+        "LSP request 'textDocument/hover' timed out after 15s",
+        "cannot stat 'main.rs': No such file or directory",
+        "line 99 out of range (file has 10 lines)",
+        "unsupported file type '.txt'",
+    ] {
+        assert!(
+            !is_lsp_transport_error(&anyhow::anyhow!(msg)),
+            "must NOT classify as transport: {msg}"
+        );
+    }
 }

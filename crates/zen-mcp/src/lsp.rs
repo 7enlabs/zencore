@@ -50,6 +50,17 @@ pub(crate) const MAX_HEADER_BYTES: usize = 8 * 1024;
 /// header lines that stay under the total-byte cap.
 pub(crate) const MAX_HEADER_LINES: usize = 32;
 
+/// Maximum consecutive dead-server failures for one language/project
+/// before the manager stops respawning that server for
+/// `RESPAWN_COOLDOWN` (#387): a server binary that crashes on every
+/// start must not be respawned in a tight loop by repeated calls.
+const MAX_CONSECUTIVE_DEAD_SERVERS: u32 = 3;
+
+/// Cooldown after `MAX_CONSECUTIVE_DEAD_SERVERS` consecutive
+/// dead-server failures before a fresh server is attempted again
+/// (#387). A successful LSP call resets the counter.
+const RESPAWN_COOLDOWN: Duration = Duration::from_secs(30);
+
 type Pending = Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Value>>>>;
 
 /// Latest diagnostics per file URI, as published by the server.
@@ -499,6 +510,25 @@ impl LspClient {
         self.diagnostics_notify.clone()
     }
 
+    /// Cheap liveness probe: the child server process must still be
+    /// running. `try_wait` reaps a zombie child, so a dead-but-unreaped
+    /// server reads as dead, not alive (same idea as the
+    /// `waitpid(WNOHANG)` probe in `Session::is_alive`,
+    /// `transport.rs` #375; here the client owns the tokio `Child`
+    /// handle, so `try_wait` does the reaping directly). A missing
+    /// child handle (already killed) is dead, and a wait error is
+    /// treated as dead: a server that cannot even be waited on is not
+    /// one to keep serving.
+    pub(crate) fn is_alive(&self) -> bool {
+        let Ok(mut guard) = self.child.lock() else {
+            return false;
+        };
+        match guard.as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(None)),
+            None => false,
+        }
+    }
+
     pub(crate) async fn request(
         &self,
         method: &str,
@@ -563,7 +593,9 @@ impl LspClient {
         Ok(())
     }
 
-    #[allow(dead_code)] // floor-guard: item kept intentionally, unused for now
+    /// Kill the child server process (and its process group). Called
+    /// when the manager evicts a dead connection (#387) so no orphan
+    /// survives the cache removal.
     pub(crate) fn kill(&self) {
         let pid = self.child_pid.lock().ok().and_then(|mut g| g.take());
         if let Ok(mut guard) = self.child.lock()
@@ -623,6 +655,17 @@ impl LspConnection {
             language: lang,
             docs: Mutex::new(HashMap::new()),
         }))
+    }
+
+    /// Cheap liveness probe for the child server process (#387).
+    pub(crate) fn is_alive(&self) -> bool {
+        self.client.is_alive()
+    }
+
+    /// Kill the child server process (and its process group). Used
+    /// when the manager evicts this connection (#387).
+    pub(crate) fn kill(&self) {
+        self.client.kill();
     }
 
     async fn ensure_open(&self, path: &Path) -> anyhow::Result<String> {
@@ -992,6 +1035,49 @@ fn render_hover_part(v: &Value) -> Option<String> {
     }
 }
 
+/// Whether an LSP call error means the server itself is dead, so the
+/// cached connection must be evicted (#387; same Transport-vs-Call
+/// split as `SessionError` in `transport.rs` #375, but the LSP client
+/// reports `anyhow` errors, so the split is made on the message the
+/// client produces).
+///
+/// Transport errors (evict): a write to the server failed, the reader
+/// task ended and dropped the pending response, the reader task
+/// reported the server closed, or a notify write failed. Timeouts are
+/// NOT transport errors here, unlike #375: a live server can
+/// legitimately exceed the 15 s request timeout while indexing, and
+/// killing it would only force a slower re-initialize; a dead server
+/// always surfaces promptly as a closed pipe instead. Likewise a live
+/// server's own error response (`LSP error:` with any other message)
+/// and local failures (missing file, bad position) never evict.
+pub(crate) fn is_lsp_transport_error(e: &anyhow::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("write to LSP server failed")
+        || msg.contains("LSP server dropped the response")
+        || msg.contains("LSP server closed")
+        || msg.contains("LSP notify")
+}
+
+/// Cache key for the server covering `path`: its language plus the
+/// project root the server was started in.
+fn server_key(path: &Path) -> anyhow::Result<ServerKey> {
+    let lang = detect_language(path).ok_or_else(|| {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("(none)");
+        anyhow::anyhow!(
+            "unsupported file type '.{ext}' - LSP code intelligence covers \
+             Rust (.rs), Python (.py) and TypeScript/JavaScript \
+             (.ts, .tsx, .js, .jsx, .mjs, .cjs)"
+        )
+    })?;
+    Ok(ServerKey {
+        language: lang,
+        root: find_project_root(path, lang),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ServerKey {
     language: LspLanguage,
@@ -1014,6 +1100,13 @@ pub struct LspManager {
     overrides: Mutex<HashMap<LspLanguage, (String, Vec<String>)>>,
 
     timing: Mutex<DiagnosticsTiming>,
+
+    /// Consecutive dead-server failures per key, with the time of the
+    /// latest one (#387). A successful LSP call clears the entry; the
+    /// count only grows while the server keeps dying, and at
+    /// `MAX_CONSECUTIVE_DEAD_SERVERS` the manager refuses to respawn
+    /// until `RESPAWN_COOLDOWN` has passed.
+    failures: Mutex<HashMap<ServerKey, (u32, Instant)>>,
 }
 
 impl LspManager {
@@ -1025,6 +1118,7 @@ impl LspManager {
                 timeout: DIAGNOSTICS_TIMEOUT,
                 debounce: DIAGNOSTICS_DEBOUNCE,
             }),
+            failures: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1042,6 +1136,72 @@ impl LspManager {
     pub fn diagnostics_timing(&self) -> (Duration, Duration) {
         let timing = lock_or_recover(&self.timing, "diagnostics timing");
         (timing.timeout, timing.debounce)
+    }
+
+    /// Drop the cached connection for `key`, but only if it is still
+    /// the connection the caller just failed on: another task may
+    /// already have respawned, and its fresh server must not be
+    /// evicted by a stale failure (same guard as `Transport::evict`
+    /// in `transport.rs` #375). The evicted server's child process
+    /// is killed so no orphan survives the cache removal.
+    fn evict(&self, key: &ServerKey, dead: &Arc<LspConnection>) {
+        let removed = {
+            let mut servers = lock_or_recover(&self.servers, "servers");
+            match servers.get(key) {
+                Some(existing) if Arc::ptr_eq(existing, dead) => {
+                    servers.remove(key);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if removed {
+            dead.kill();
+        }
+    }
+
+    /// Record one dead-server observation for `key` (a failed
+    /// liveness probe, a transport-error eviction, or a failed start).
+    fn record_dead_server(&self, key: &ServerKey) {
+        let mut failures = lock_or_recover(&self.failures, "lsp failures");
+        let count = failures.get(key).map(|(n, _)| *n).unwrap_or(0);
+        failures.insert(key.clone(), (count + 1, Instant::now()));
+    }
+
+    /// A call through the server for `key` succeeded: the server is
+    /// alive, so any earlier failure streak is forgotten.
+    fn record_success(&self, key: &ServerKey) {
+        lock_or_recover(&self.failures, "lsp failures").remove(key);
+    }
+
+    /// Refuse to respawn a server that failed
+    /// `MAX_CONSECUTIVE_DEAD_SERVERS` times in a row within
+    /// `RESPAWN_COOLDOWN` (#387). The caller reports this instead of
+    /// spawning, so a crashing binary is not respawned in a tight
+    /// loop. The just-observed failure counts toward the streak, so
+    /// the refusal can trigger on the same call that records the
+    /// threshold failure; a later call retries once the cooldown has
+    /// passed.
+    fn check_respawn_backoff(&self, key: &ServerKey) -> anyhow::Result<()> {
+        let failures = lock_or_recover(&self.failures, "lsp failures");
+        let Some(&(count, last_failed_at)) = failures.get(key) else {
+            return Ok(());
+        };
+        if count < MAX_CONSECUTIVE_DEAD_SERVERS {
+            return Ok(());
+        }
+        match RESPAWN_COOLDOWN.checked_sub(last_failed_at.elapsed()) {
+            Some(remaining) if !remaining.is_zero() => {
+                anyhow::bail!(
+                    "language server for {:?} at '{}' failed {count} times in a row; \
+                     not respawning for {}s",
+                    key.language,
+                    key.root.display(),
+                    remaining.as_secs().max(1),
+                );
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Post-edit diagnostics for `path`: only the NEW diagnostics since
@@ -1069,12 +1229,32 @@ impl LspManager {
         timeout: Duration,
         debounce: Duration,
     ) -> Vec<LspDiagnostic> {
+        let key = server_key(path).ok();
         let Ok(conn) = self.connection_for(path).await else {
             return Vec::new();
         };
-        conn.diagnostics_after_edit(path, timeout, debounce)
-            .await
-            .unwrap_or_default()
+        match conn.diagnostics_after_edit(path, timeout, debounce).await {
+            Ok(diags) => {
+                if let Some(key) = &key {
+                    self.record_success(key);
+                }
+                diags
+            }
+            Err(e) => {
+                // Best effort as before, but a dead server must not
+                // stay cached: evict it so the next call respawns
+                // (#387). No retry here: the whole operation is
+                // already bounded by the diagnostics timeout cap, and
+                // the next call retries on a fresh server.
+                if is_lsp_transport_error(&e)
+                    && let Some(key) = &key
+                {
+                    self.evict(key, &conn);
+                    self.record_dead_server(key);
+                }
+                Vec::new()
+            }
+        }
     }
 
     /// Diagnostics currently cached for `path`, without spawning a
@@ -1084,13 +1264,16 @@ impl LspManager {
     /// language/project (the `diagnostics` tool reports that instead
     /// of starting a server for a read-only query).
     pub fn cached_diagnostics(&self, path: &Path) -> Option<Vec<LspDiagnostic>> {
-        let lang = detect_language(path)?;
-        let root = find_project_root(path, lang);
-        let key = ServerKey {
-            language: lang,
-            root,
-        };
+        let key = server_key(path).ok()?;
         let conn = self.servers.lock().ok()?.get(&key).cloned()?;
+        if !conn.is_alive() {
+            // A dead server's diagnostics were already cleared by its
+            // reader task; drop the corpse so the `diagnostics` tool
+            // reports "no server" instead of an empty cache (#387).
+            self.evict(&key, &conn);
+            self.record_dead_server(&key);
+            return None;
+        }
         let diags = conn.cached_diagnostics(path);
         Some(
             diags
@@ -1105,28 +1288,20 @@ impl LspManager {
     }
 
     pub(crate) async fn connection_for(&self, path: &Path) -> anyhow::Result<Arc<LspConnection>> {
-        let lang = detect_language(path).ok_or_else(|| {
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("(none)");
-            anyhow::anyhow!(
-                "unsupported file type '.{ext}' - LSP code intelligence covers \
-                 Rust (.rs), Python (.py) and TypeScript/JavaScript \
-                 (.ts, .tsx, .js, .jsx, .mjs, .cjs)"
-            )
-        })?;
-        let root = find_project_root(path, lang);
-        let key = ServerKey {
-            language: lang,
-            root: root.clone(),
-        };
+        let key = server_key(path)?;
         if let Some(conn) = lock_or_recover(&self.servers, "servers").get(&key).cloned() {
-            return Ok(conn);
+            if conn.is_alive() {
+                return Ok(conn);
+            }
+            // Dead server: evict it so the fresh start below replaces
+            // it instead of serving calls from the corpse (#387).
+            self.evict(&key, &conn);
+            self.record_dead_server(&key);
         }
-        let spec = server_spec(lang);
+        self.check_respawn_backoff(&key)?;
+        let spec = server_spec(key.language);
         let (command, args) = lock_or_recover(&self.overrides, "overrides")
-            .get(&lang)
+            .get(&key.language)
             .cloned()
             .unwrap_or((spec.command.clone(), spec.args.clone()));
         if find_binary(&command).is_none() {
@@ -1135,9 +1310,16 @@ impl LspManager {
                 spec.install_hint
             );
         }
-        let conn = LspConnection::start(lang, &command, &args, &root)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to start '{}': {e}", spec.command))?;
+        let conn = match LspConnection::start(key.language, &command, &args, &key.root).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                // A server that dies during its own start (crash,
+                // immediate exit) counts toward the respawn backoff,
+                // or a crashing binary would be respawned on every call.
+                self.record_dead_server(&key);
+                return Err(anyhow::anyhow!("failed to start '{}': {e}", spec.command));
+            }
+        };
         lock_or_recover(&self.servers, "servers").insert(key, conn.clone());
         Ok(conn)
     }
@@ -1148,13 +1330,81 @@ impl LspManager {
         line: usize,
         col: usize,
     ) -> anyhow::Result<Vec<LspLocation>> {
+        let key = server_key(path)?;
         let conn = self.connection_for(path).await?;
-        Ok(parse_locations(&conn.definition(path, line, col).await?))
+        match conn.definition(path, line, col).await {
+            Ok(value) => {
+                self.record_success(&key);
+                Ok(parse_locations(&value))
+            }
+            Err(e) if is_lsp_transport_error(&e) => {
+                // Dead server: evict it and retry once on a fresh one
+                // (#387; same shape as `Transport::call_tool_resilient`
+                // in `transport.rs` #375).
+                let first = e.to_string();
+                self.evict(&key, &conn);
+                self.record_dead_server(&key);
+                let fresh = self.connection_for(path).await.map_err(|e| {
+                    anyhow::anyhow!("LSP server died ({first}); restart failed: {e}")
+                })?;
+                fresh
+                    .definition(path, line, col)
+                    .await
+                    .map(|value| {
+                        self.record_success(&key);
+                        parse_locations(&value)
+                    })
+                    .map_err(|retry| {
+                        if is_lsp_transport_error(&retry) {
+                            anyhow::anyhow!(
+                                "LSP server died ({first}); restarted server also failed: {retry}"
+                            )
+                        } else {
+                            retry
+                        }
+                    })
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn hover(&self, path: &Path, line: usize, col: usize) -> anyhow::Result<String> {
+        let key = server_key(path)?;
         let conn = self.connection_for(path).await?;
-        Ok(render_hover(&conn.hover(path, line, col).await?))
+        match conn.hover(path, line, col).await {
+            Ok(value) => {
+                self.record_success(&key);
+                Ok(render_hover(&value))
+            }
+            Err(e) if is_lsp_transport_error(&e) => {
+                // Dead server: evict it and retry once on a fresh one
+                // (#387; same shape as `Transport::call_tool_resilient`
+                // in `transport.rs` #375).
+                let first = e.to_string();
+                self.evict(&key, &conn);
+                self.record_dead_server(&key);
+                let fresh = self.connection_for(path).await.map_err(|e| {
+                    anyhow::anyhow!("LSP server died ({first}); restart failed: {e}")
+                })?;
+                fresh
+                    .hover(path, line, col)
+                    .await
+                    .map(|value| {
+                        self.record_success(&key);
+                        render_hover(&value)
+                    })
+                    .map_err(|retry| {
+                        if is_lsp_transport_error(&retry) {
+                            anyhow::anyhow!(
+                                "LSP server died ({first}); restarted server also failed: {retry}"
+                            )
+                        } else {
+                            retry
+                        }
+                    })
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn find_references(
@@ -1164,12 +1414,42 @@ impl LspManager {
         col: usize,
         include_declaration: bool,
     ) -> anyhow::Result<Vec<LspLocation>> {
+        let key = server_key(path)?;
         let conn = self.connection_for(path).await?;
-        Ok(parse_locations(
-            &conn
-                .references(path, line, col, include_declaration)
-                .await?,
-        ))
+        match conn.references(path, line, col, include_declaration).await {
+            Ok(value) => {
+                self.record_success(&key);
+                Ok(parse_locations(&value))
+            }
+            Err(e) if is_lsp_transport_error(&e) => {
+                // Dead server: evict it and retry once on a fresh one
+                // (#387; same shape as `Transport::call_tool_resilient`
+                // in `transport.rs` #375).
+                let first = e.to_string();
+                self.evict(&key, &conn);
+                self.record_dead_server(&key);
+                let fresh = self.connection_for(path).await.map_err(|e| {
+                    anyhow::anyhow!("LSP server died ({first}); restart failed: {e}")
+                })?;
+                fresh
+                    .references(path, line, col, include_declaration)
+                    .await
+                    .map(|value| {
+                        self.record_success(&key);
+                        parse_locations(&value)
+                    })
+                    .map_err(|retry| {
+                        if is_lsp_transport_error(&retry) {
+                            anyhow::anyhow!(
+                                "LSP server died ({first}); restarted server also failed: {retry}"
+                            )
+                        } else {
+                            retry
+                        }
+                    })
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
