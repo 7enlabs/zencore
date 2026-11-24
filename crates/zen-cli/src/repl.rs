@@ -380,7 +380,7 @@ pub async fn run_repl(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result<()> 
     // `ConfigChange` / `FileChanged` hooks are driven by polling: the
     // watchers snapshot mtimes at session start and report each change
     // once per prompt iteration (see hook_watch.rs).
-    let mut config_watcher = crate::hook_watch::ConfigWatcher::new(cwd, home);
+    let mut config_watcher = crate::hook_watch::ConfigWatcher::new(cwd, home, cfg.folder_trusted);
     let mut file_watcher = crate::hook_watch::FileWatcher::new(cwd, &cfg.hooks);
 
     let mut interrupts = ReplInterrupts::install();
@@ -1594,7 +1594,7 @@ async fn handle_slash(
                 }
             }
 
-            let custom = zen_ext::discover_slash_commands(cwd, home);
+            let custom = zen_ext::discover_slash_commands(cwd, home, cfg.folder_trusted);
             if !custom.is_empty() {
                 println!("Custom commands and skills:");
                 for c in &custom {
@@ -2595,7 +2595,7 @@ async fn handle_slash(
             }
         }
         "/skills" => {
-            let skills = zen_ext::discover_skills(cwd, home);
+            let skills = zen_ext::discover_skills(cwd, home, cfg.folder_trusted);
             if skills.is_empty() {
                 println!("(no skills)");
             } else {
@@ -2673,7 +2673,7 @@ async fn handle_slash(
         other => {
             let name = other.trim_start_matches('/');
 
-            if zen_ext::find_slash_command(cwd, home, name).is_some() {
+            if zen_ext::find_slash_command(cwd, home, cfg.folder_trusted, name).is_some() {
                 let (expanded, slash_cmd) = crate::agent_run::expand_slash_prompt_cmd(
                     cli, cwd, home, line, cfg, session_id,
                 )?;
@@ -5850,6 +5850,9 @@ mod pr208_mutant_tests {
         let mut agent = test_agent_with_hooks(backend.clone(), hooks);
         let mut cfg = test_cfg();
         cfg.api_key = Some("test-openrouter-key".to_string());
+        // Issue #330: the probe is a project command, so it only
+        // loads (and its model pin only fires) in a trusted folder.
+        cfg.folder_trusted = true;
         let dir = temp_dir("zen_pr208_pin");
         write_probe_command(&dir, "nvidia/nemotron-3-ultra-550b-a55b:free");
         let cli = crate::cli::Cli::parse_from(["zen"]);
@@ -5906,6 +5909,9 @@ mod pr208_mutant_tests {
         });
         let mut agent = test_agent_with_hooks(backend.clone(), hooks);
         let mut cfg = test_cfg();
+        // Issue #330: the probe is a project command, so it only
+        // loads (and its model pin only fires) in a trusted folder.
+        cfg.folder_trusted = true;
         let dir = temp_dir("zen_pr208_pin_same");
         write_probe_command(&dir, "google/gemini-4-argon:free");
         let cli = crate::cli::Cli::parse_from(["zen"]);
@@ -5950,7 +5956,7 @@ mod pr208_mutant_tests {
         let home = temp_dir("zen_pr208_poll_home");
         let watched = dir.join("watched.txt");
         std::fs::write(&watched, "one").unwrap();
-        let mut config_watcher = crate::hook_watch::ConfigWatcher::new(&dir, Some(&home));
+        let mut config_watcher = crate::hook_watch::ConfigWatcher::new(&dir, Some(&home), true);
         let mut file_watcher = crate::hook_watch::FileWatcher::new(
             &dir,
             &serde_json::json!({"FileChanged": [{"matcher": "watched.txt", "hooks": []}]}),
@@ -6011,7 +6017,7 @@ mod pr208_mutant_tests {
         let mut agent = test_agent_with_hooks(backend, hooks);
         let watched = dir.join("watched.txt");
         std::fs::write(&watched, "one").unwrap();
-        let mut config_watcher = crate::hook_watch::ConfigWatcher::new(&dir, Some(&home));
+        let mut config_watcher = crate::hook_watch::ConfigWatcher::new(&dir, Some(&home), true);
         let mut file_watcher = crate::hook_watch::FileWatcher::new(
             &dir,
             &serde_json::json!({"FileChanged": [{"matcher": "watched.txt", "hooks": []}]}),

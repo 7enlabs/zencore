@@ -92,13 +92,22 @@ fn collect_md(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
     }
 }
 
-pub fn discover_custom_commands(cwd: &Path, home: Option<&Path>) -> Vec<SlashCommand> {
+pub fn discover_custom_commands(
+    cwd: &Path,
+    home: Option<&Path>,
+    trusted: bool,
+) -> Vec<SlashCommand> {
     let home_dir = home.map(Path::to_path_buf).or_else(dirs::home_dir);
     let mut roots = Vec::new();
     if let Some(h) = &home_dir {
         roots.push(h.join(".zen").join("commands"));
     }
-    roots.push(cwd.join(".zen").join("commands"));
+    // Issue #330: project commands load only in a trusted folder;
+    // a cloned repository must not smuggle prompt text in through
+    // its own slash commands.
+    if trusted {
+        roots.push(cwd.join(".zen").join("commands"));
+    }
     let mut out: Vec<SlashCommand> = Vec::new();
     for root in roots {
         let mut files = Vec::new();
@@ -122,9 +131,13 @@ pub fn discover_custom_commands(cwd: &Path, home: Option<&Path>) -> Vec<SlashCom
     out
 }
 
-pub fn discover_slash_commands(cwd: &Path, home: Option<&Path>) -> Vec<SlashCommand> {
-    let mut out = discover_custom_commands(cwd, home);
-    for (info, fm) in discover_skill_entries(cwd, home) {
+pub fn discover_slash_commands(
+    cwd: &Path,
+    home: Option<&Path>,
+    trusted: bool,
+) -> Vec<SlashCommand> {
+    let mut out = discover_custom_commands(cwd, home, trusted);
+    for (info, fm) in discover_skill_entries(cwd, home, trusted) {
         let user_invocable = fm
             .extra
             .get("user-invocable")
@@ -147,8 +160,13 @@ pub fn discover_slash_commands(cwd: &Path, home: Option<&Path>) -> Vec<SlashComm
     out
 }
 
-pub fn find_slash_command(cwd: &Path, home: Option<&Path>, name: &str) -> Option<SlashCommand> {
-    discover_slash_commands(cwd, home)
+pub fn find_slash_command(
+    cwd: &Path,
+    home: Option<&Path>,
+    trusted: bool,
+    name: &str,
+) -> Option<SlashCommand> {
+    discover_slash_commands(cwd, home, trusted)
         .into_iter()
         .find(|c| c.name == name)
 }
@@ -344,6 +362,7 @@ pub fn expand_slash_prompt(
     prompt: &str,
     cwd: &Path,
     home: Option<&Path>,
+    trusted: bool,
     ctx: &ExpandContext<'_>,
 ) -> Option<(SlashCommand, String)> {
     let trimmed = prompt.trim_start();
@@ -354,7 +373,7 @@ pub fn expand_slash_prompt(
         return None;
     }
     let args = it.next().unwrap_or("").trim();
-    let cmd = find_slash_command(cwd, home, name)?;
+    let cmd = find_slash_command(cwd, home, trusted, name)?;
     let text = expand_command(&cmd, args, ctx);
     Some((cmd, text))
 }
@@ -405,7 +424,7 @@ mod tests {
             "---\ndescription: Commit\nargument-hint: [msg]\nallowed-tools: Bash(git *), Read\nmodel: m-x\ndisable-model-invocation: true\n---\nCommit: $0\n",
         );
         write(&proj.join(".zen/commands/notes.txt"), "ignored");
-        let all = discover_slash_commands(&proj, Some(&home));
+        let all = discover_slash_commands(&proj, Some(&home), true);
         let names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["git:commit", "hello", "only-user"]);
         let hello = all.iter().find(|c| c.name == "hello").unwrap();
@@ -525,7 +544,7 @@ mod tests {
             &proj.join(".zen/skills/bg/SKILL.md"),
             "---\nname: bg\ndescription: Background knowledge\nuser-invocable: false\n---\nBG\n",
         );
-        let all = discover_slash_commands(&proj, Some(&home));
+        let all = discover_slash_commands(&proj, Some(&home), true);
         let deploy = all.iter().find(|c| c.name == "deploy").unwrap();
         assert_eq!(deploy.source, SlashSource::Skill);
         assert_eq!(deploy.argument_hint.as_deref(), Some("[env]"));
@@ -534,7 +553,7 @@ mod tests {
             "user-invocable:false skill hides /bg (and shadows the command)"
         );
         let c = ctx(&proj);
-        let (_, text) = expand_slash_prompt("/deploy prod", &proj, Some(&home), &c).unwrap();
+        let (_, text) = expand_slash_prompt("/deploy prod", &proj, Some(&home), true, &c).unwrap();
 
         let want = format!(
             "SKILL deploy prod from {}",
@@ -546,7 +565,7 @@ mod tests {
             &proj.join(".zen/skills/manual/SKILL.md"),
             "---\nname: manual\ndescription: M\ndisable-model-invocation: true\n---\nMANUAL\n",
         );
-        assert!(find_slash_command(&proj, Some(&home), "manual").is_some());
+        assert!(find_slash_command(&proj, Some(&home), true, "manual").is_some());
     }
 
     #[test]
@@ -557,11 +576,66 @@ mod tests {
         write(&proj.join(".zen/commands/greet.md"), "Hello $0 and $1!");
         let c = ctx(&proj);
         let (cmd, text) =
-            expand_slash_prompt("  /greet Alice Bob", &proj, Some(&home), &c).unwrap();
+            expand_slash_prompt("  /greet Alice Bob", &proj, Some(&home), true, &c).unwrap();
         assert_eq!(cmd.name, "greet");
         assert_eq!(text, "Hello Alice and Bob!");
-        assert!(expand_slash_prompt("/nope x", &proj, Some(&home), &c).is_none());
-        assert!(expand_slash_prompt("greet x", &proj, Some(&home), &c).is_none());
-        assert!(expand_slash_prompt("/", &proj, Some(&home), &c).is_none());
+        assert!(expand_slash_prompt("/nope x", &proj, Some(&home), true, &c).is_none());
+        assert!(expand_slash_prompt("greet x", &proj, Some(&home), true, &c).is_none());
+        assert!(expand_slash_prompt("/", &proj, Some(&home), true, &c).is_none());
+    }
+
+    // Issue #330: project commands (and skill-derived commands from
+    // project skills) load only in a trusted folder; user commands
+    // from ~/.zen/commands still load in an untrusted folder.
+    #[test]
+    fn issue_330_untrusted_folder_skips_project_commands() {
+        let tmp = TempDir::new();
+        let home = tmp.path().join("home");
+        let proj = tmp.path().join("proj");
+        write(&home.join(".zen/commands/mine.md"), "USER $ARGUMENTS");
+        write(&proj.join(".zen/commands/theirs.md"), "PROJECT $ARGUMENTS");
+        write(
+            &proj.join(".zen/skills/pskill/SKILL.md"),
+            "---\nname: pskill\ndescription: Project skill\n---\nPS\n",
+        );
+        write(
+            &home.join(".zen/skills/uskill/SKILL.md"),
+            "---\nname: uskill\ndescription: User skill\n---\nUS\n",
+        );
+
+        let untrusted = discover_slash_commands(&proj, Some(&home), false);
+        let names: Vec<&str> = untrusted.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["mine", "uskill"],
+            "project command and project-skill command must not load untrusted: {names:?}"
+        );
+
+        let trusted = discover_slash_commands(&proj, Some(&home), true);
+        let names: Vec<&str> = trusted.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["mine", "pskill", "theirs", "uskill"]);
+    }
+
+    // Issue #330: a project-only slash command does not expand in an
+    // untrusted folder.
+    #[test]
+    fn issue_330_untrusted_expand_slash_prompt_ignores_project_command() {
+        let tmp = TempDir::new();
+        let proj = tmp.path().join("proj");
+        let home = tmp.path().join("home");
+        write(&proj.join(".zen/commands/greet.md"), "Hello $0!");
+        write(&home.join(".zen/commands/hi.md"), "Hi $0!");
+        let c = ctx(&proj);
+
+        assert!(
+            expand_slash_prompt("/greet Bob", &proj, Some(&home), false, &c).is_none(),
+            "project command must not expand in an untrusted folder"
+        );
+        let (_, text) = expand_slash_prompt("/hi Bob", &proj, Some(&home), false, &c).unwrap();
+        assert_eq!(text, "Hi Bob!");
+        assert!(
+            expand_slash_prompt("/greet Bob", &proj, Some(&home), true, &c).is_some(),
+            "project command expands once the folder is trusted"
+        );
     }
 }

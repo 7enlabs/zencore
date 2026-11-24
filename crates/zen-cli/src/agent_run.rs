@@ -226,7 +226,8 @@ pub async fn assemble(
         cwd, cfg, cli,
     )));
     if !cli.bare {
-        let (found, skipped) = zen_ext::discover_skills_with_warnings(cwd, home);
+        let (found, skipped) =
+            zen_ext::discover_skills_with_warnings(cwd, home, cfg.folder_trusted);
         for s in &skipped {
             eprintln!("warning: {}", s.message());
         }
@@ -1824,7 +1825,7 @@ pub fn expand_slash_prompt_cmd(
         allow_shell: Some(&gate),
     };
     Ok(
-        match zen_ext::expand_slash_prompt(prompt, cwd, home, &ectx) {
+        match zen_ext::expand_slash_prompt(prompt, cwd, home, cfg.folder_trusted, &ectx) {
             Some((mut cmd, text)) => {
                 // In an untrusted folder, slash commands defined under
                 // .zen lose their tool allow-list: a cloned repository must

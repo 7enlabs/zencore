@@ -136,8 +136,8 @@ fn unquote(s: &str) -> String {
     t.trim().to_string()
 }
 
-pub fn discover_skills(cwd: &Path, home: Option<&Path>) -> Vec<SkillInfo> {
-    discover_skill_entries(cwd, home)
+pub fn discover_skills(cwd: &Path, home: Option<&Path>, trusted: bool) -> Vec<SkillInfo> {
+    discover_skill_entries(cwd, home, trusted)
         .into_iter()
         .filter(|(_, fm)| !fm.disable_model_invocation)
         .map(|(info, _)| info)
@@ -150,8 +150,9 @@ pub fn discover_skills(cwd: &Path, home: Option<&Path>) -> Vec<SkillInfo> {
 pub fn discover_skills_with_warnings(
     cwd: &Path,
     home: Option<&Path>,
+    trusted: bool,
 ) -> (Vec<SkillInfo>, Vec<SkippedSkill>) {
-    let (entries, skipped) = discover_skill_entries_with_warnings(cwd, home);
+    let (entries, skipped) = discover_skill_entries_with_warnings(cwd, home, trusted);
     (
         entries
             .into_iter()
@@ -162,17 +163,26 @@ pub fn discover_skills_with_warnings(
     )
 }
 
-pub fn discover_skill_entries(cwd: &Path, home: Option<&Path>) -> Vec<(SkillInfo, Frontmatter)> {
-    discover_skill_entries_with_warnings(cwd, home).0
+pub fn discover_skill_entries(
+    cwd: &Path,
+    home: Option<&Path>,
+    trusted: bool,
+) -> Vec<(SkillInfo, Frontmatter)> {
+    discover_skill_entries_with_warnings(cwd, home, trusted).0
 }
 
 /// Full discovery plus the skill directories that were dropped, with
 /// the reason each one was dropped. Project skills still override
 /// user skills of the same name (that override is intentional and
-/// stays silent); only genuine load failures are reported.
+/// stays silent); only genuine load failures are reported. In an
+/// untrusted folder (issue #330) the project root is skipped
+/// entirely: project skills do not load and do not shadow user
+/// skills, and each skipped project skill directory is reported with
+/// the trust reason instead.
 pub fn discover_skill_entries_with_warnings(
     cwd: &Path,
     home: Option<&Path>,
+    trusted: bool,
 ) -> (Vec<(SkillInfo, Frontmatter)>, Vec<SkippedSkill>) {
     let home_dir = home.map(|p| p.to_path_buf()).or_else(dirs::home_dir);
     let mut by_name: Vec<(SkillInfo, Frontmatter)> = Vec::new();
@@ -182,7 +192,30 @@ pub fn discover_skill_entries_with_warnings(
     if let Some(home) = &home_dir {
         roots.push(home.join(".zen").join("skills"));
     }
-    roots.push(cwd.join(".zen").join("skills"));
+    if trusted {
+        roots.push(cwd.join(".zen").join("skills"));
+    } else {
+        // Report the project skills that were skipped for trust, so
+        // the user sees why they are missing instead of wondering.
+        let project_root = cwd.join(".zen").join("skills");
+        if let Ok(entries) = std::fs::read_dir(&project_root) {
+            let mut dirs: Vec<String> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .filter_map(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
+                .collect();
+            dirs.sort();
+            for name in dirs {
+                skipped.push(SkippedSkill {
+                    name,
+                    reason: "project folder is not trusted \
+                        (project skills load only in a trusted folder)"
+                        .to_string(),
+                });
+            }
+        }
+    }
 
     for root in roots {
         let (entries, mut root_skipped) = scan_skill_dir_with_warnings(&root);
@@ -434,7 +467,7 @@ mod tests {
             "beta body",
         );
 
-        let found = discover_skills(&proj, Some(&tmp.path().join("nohome")));
+        let found = discover_skills(&proj, Some(&tmp.path().join("nohome")), true);
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].name, "alpha");
         assert_eq!(found[0].description, "Alpha skill");
@@ -452,7 +485,7 @@ mod tests {
             "name: withtools\ndescription: Has tools\nallowed-tools: Read, Write, Bash",
             "body",
         );
-        let found = discover_skills(&proj, Some(&tmp.path().join("nohome")));
+        let found = discover_skills(&proj, Some(&tmp.path().join("nohome")), true);
         assert_eq!(found[0].allowed_tools, vec!["Read", "Write", "Bash"]);
     }
 
@@ -463,7 +496,7 @@ mod tests {
         let skills = proj.join(".zen/skills");
         write_skill(&skills, "nodesc", "name: nodesc", "body");
         write_skill(&skills, "good", "name: good\ndescription: fine", "body");
-        let found = discover_skills(&proj, Some(&tmp.path().join("nohome")));
+        let found = discover_skills(&proj, Some(&tmp.path().join("nohome")), true);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name, "good");
     }
@@ -486,7 +519,7 @@ mod tests {
             "project body",
         );
 
-        let found = discover_skills(&proj, Some(&home));
+        let found = discover_skills(&proj, Some(&home), true);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].description, "from project");
     }
@@ -517,7 +550,7 @@ mod tests {
             "gamma instructions",
         );
 
-        let found = discover_skills(&proj, Some(&tmp.path().join("nohome")));
+        let found = discover_skills(&proj, Some(&tmp.path().join("nohome")), true);
         let tool = SkillTool::new(found);
         let ctx = ToolContext::new(proj.clone(), "s1");
         let out = tool.call(serde_json::json!({"name": "gamma"}), &ctx).await;
@@ -540,7 +573,7 @@ mod tests {
         );
         write_skill(&skills, "auto", "name: auto\ndescription: Auto", "body");
         let home = tmp.path().join("nohome");
-        let model_facing = discover_skills(&proj, Some(&home));
+        let model_facing = discover_skills(&proj, Some(&home), true);
         assert_eq!(
             model_facing
                 .iter()
@@ -549,7 +582,7 @@ mod tests {
             vec!["auto"]
         );
         assert!(!skills_prompt(&model_facing).contains("manual"));
-        let all = discover_skill_entries(&proj, Some(&home));
+        let all = discover_skill_entries(&proj, Some(&home), true);
         let (info, fm) = all.iter().find(|(i, _)| i.name == "manual").unwrap();
         assert_eq!(info.description, "Manual only");
         assert!(fm.disable_model_invocation);
@@ -570,7 +603,11 @@ mod tests {
             "name: s\ndescription: S",
             "run ${ZEN_SKILL_DIR}/x.sh",
         );
-        let tool = SkillTool::new(discover_skills(&proj, Some(&tmp.path().join("nohome"))));
+        let tool = SkillTool::new(discover_skills(
+            &proj,
+            Some(&tmp.path().join("nohome")),
+            true,
+        ));
         let ctx = ToolContext::new(proj.clone(), "s1");
         let out = tool.call(serde_json::json!({"name": "s"}), &ctx).await;
         let dir = proj.join(".zen/skills/s").display().to_string();
@@ -602,7 +639,7 @@ mod tests {
             "name: blocktools\ndescription: Block tools\nallowed-tools:\n  - Read\n  - Bash",
             "body",
         );
-        let found = discover_skills(&proj, Some(&tmp.path().join("nohome")));
+        let found = discover_skills(&proj, Some(&tmp.path().join("nohome")), true);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].allowed_tools, vec!["Read", "Bash"]);
     }
@@ -654,7 +691,7 @@ mod tests {
         .unwrap();
 
         let (found, skipped) =
-            discover_skills_with_warnings(&proj, Some(&tmp.path().join("nohome")));
+            discover_skills_with_warnings(&proj, Some(&tmp.path().join("nohome")), true);
         assert_eq!(
             found.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
             vec!["good"]
@@ -700,7 +737,7 @@ mod tests {
             "second body",
         );
         let (found, skipped) =
-            discover_skill_entries_with_warnings(&proj, Some(&tmp.path().join("nohome")));
+            discover_skill_entries_with_warnings(&proj, Some(&tmp.path().join("nohome")), true);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0.description, "second");
         assert_eq!(skipped.len(), 1);
@@ -729,7 +766,7 @@ mod tests {
             "name: dup\ndescription: from project",
             "project body",
         );
-        let (found, skipped) = discover_skill_entries_with_warnings(&proj, Some(&home));
+        let (found, skipped) = discover_skill_entries_with_warnings(&proj, Some(&home), true);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0.description, "from project");
         assert!(skipped.is_empty(), "{:?}", skipped);
@@ -768,11 +805,99 @@ mod tests {
         );
         write_skill(&skills, "auto", "name: auto\ndescription: Auto", "body");
         let (found, skipped) =
-            discover_skills_with_warnings(&proj, Some(&tmp.path().join("nohome")));
+            discover_skills_with_warnings(&proj, Some(&tmp.path().join("nohome")), true);
         assert_eq!(
             found.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
             vec!["auto"]
         );
         assert!(skipped.is_empty(), "{:?}", skipped);
+    }
+
+    // Issue #330: project skills load only in a trusted folder
+    // (SECURITY_MODEL.md). In an untrusted folder the project root is
+    // skipped entirely; user skills from ~/.zen/skills still load.
+    #[test]
+    fn issue_330_untrusted_folder_skips_project_skills() {
+        let tmp = TempDir::new();
+        let home = tmp.path().join("home");
+        let proj = tmp.path().join("proj");
+        write_skill(
+            &home.join(".zen/skills"),
+            "mine",
+            "name: mine\ndescription: from user",
+            "user body",
+        );
+        write_skill(
+            &proj.join(".zen/skills"),
+            "theirs",
+            "name: theirs\ndescription: from project",
+            "project body",
+        );
+
+        let untrusted = discover_skills(&proj, Some(&home), false);
+        assert_eq!(
+            untrusted
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mine"],
+            "project skill must not load in an untrusted folder"
+        );
+
+        let trusted = discover_skills(&proj, Some(&home), true);
+        assert_eq!(
+            trusted.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["mine", "theirs"]
+        );
+    }
+
+    // Issue #330: in an untrusted folder a project skill must not
+    // shadow a user skill of the same name.
+    #[test]
+    fn issue_330_untrusted_project_skill_does_not_shadow_user_skill() {
+        let tmp = TempDir::new();
+        let home = tmp.path().join("home");
+        let proj = tmp.path().join("proj");
+        write_skill(
+            &home.join(".zen/skills"),
+            "dup",
+            "name: dup\ndescription: from user",
+            "user body",
+        );
+        write_skill(
+            &proj.join(".zen/skills"),
+            "dup",
+            "name: dup\ndescription: from project",
+            "project body",
+        );
+
+        let found = discover_skills(&proj, Some(&home), false);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].description, "from user");
+    }
+
+    // Issue #330: skipped project skills are reported, with the trust
+    // reason, so the user can see why their project skills are missing.
+    #[test]
+    fn issue_330_untrusted_project_skills_reported_as_skipped() {
+        let tmp = TempDir::new();
+        let proj = tmp.path().join("proj");
+        write_skill(
+            &proj.join(".zen/skills"),
+            "theirs",
+            "name: theirs\ndescription: from project",
+            "project body",
+        );
+
+        let (found, skipped) =
+            discover_skills_with_warnings(&proj, Some(&tmp.path().join("nohome")), false);
+        assert!(found.is_empty(), "{found:?}");
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert_eq!(skipped[0].name, "theirs");
+        assert!(
+            skipped[0].reason.contains("not trusted"),
+            "reason: {}",
+            skipped[0].reason
+        );
     }
 }
