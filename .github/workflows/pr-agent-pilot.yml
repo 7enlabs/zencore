@@ -1,13 +1,22 @@
-# PR Agent pilot workflow (Route A: free-model PR review).
-# Pilot scope: this file exists only on the pilot branch. It is NOT merged
-# to main until the review run on the pilot PR itself is verified.
+# PR Agent workflow (Route A: free-model PR review).
+# Live on main: runs once per PR on opened / reopened / ready_for_review.
 # Safety gates for Route A:
 # - triggers only on opened / reopened / ready_for_review (no synchronize),
-#   so one pilot PR gets exactly one auto review comment
+#   so one PR gets exactly one auto review comment
 # - bot senders skipped
 # - runtime image pinned by digest, never a rolling tag
 # - auto-approval is OFF in .pr_agent.toml
 # - all models are :free with multi-provider fallback; fail-closed on exhaustion
+# - the repo must be checked out first: pr-agent determines the base repo
+#   from git, and without a checkout it has no repo to review.
+# - the image entrypoint is `python pr_agent/cli.py` (relative) with image
+#   WORKDIR /app, but the runner forces --workdir /github/workspace, so the
+#   relative path never resolves: `python: can't open file
+#   '/github/workspace/pr_agent/cli.py'` (verified on runs 45185222255 and
+#   45308766004, with and without a checkout). The step below overrides the
+#   entrypoint to the absolute venv interpreter and passes the script by
+#   absolute path, so the code runs from /app while the repo stays at
+#   /github/workspace.
 name: PR Agent (pilot)
 
 on:
@@ -29,8 +38,23 @@ jobs:
       cancel-in-progress: false
     name: Run PR Agent (free-model pilot)
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: PR Agent action step
         uses: docker://pragent/pr-agent@sha256:8978ae8f025883159ccc6f5bec51e6553347c77d14dbc5ca4bf3bb4a8726eb43
+        with:
+          # Run the official GitHub Action runner, not cli.py directly:
+          # cli.py does not map GITHUB_TOKEN to github.user_token, so
+          # the review fails with "GitHub token is required when using
+          # user deployment". The runner reads the event, sets the
+          # token from GITHUB_TOKEN, and derives the PR URL and the
+          # review command from the event (opened / reopened /
+          # ready_for_review, per github_action_config.pr_actions).
+          # No --pr_url or command argument is needed.
+          entrypoint: /app/.venv/bin/python
+          args: /app/pr_agent/servers/github_action_runner.py
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
