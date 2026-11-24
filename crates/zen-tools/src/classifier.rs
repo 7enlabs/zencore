@@ -1011,6 +1011,28 @@ mod tests {
     }
 
     #[test]
+    fn rm_rf_outside_workdir_non_system_non_temp_is_warn_not_danger() {
+        // Kills the && -> || mutant in rm_target_verdict: a target
+        // that is neither a system path nor under the temp root must
+        // stay Outside (warn), not Danger. With ||, the
+        // `!is_under_temp_dir` arm alone would mark it danger.
+        assert_eq!(code("rm -rf /opt/zen-scratch"), "warn.rm-outside-workdir");
+    }
+
+    #[test]
+    fn is_under_temp_dir_matches_paths_under_the_os_temp_root() {
+        // Kills the whole-body -> false mutant and the == -> !=
+        // mutant on the "/" guard in is_under_temp_dir: a path under
+        // the real temp root must be recognised. With either mutant
+        // the function returns false here. The probe is canonicalized
+        // the same way the function canonicalizes the temp root, so
+        // the macOS /var -> /private/var symlink does not break it.
+        let probe = canonicalize_lenient(&std::env::temp_dir().join("zen-scratch"));
+        assert!(is_under_temp_dir(&probe));
+        assert!(!is_under_temp_dir(Path::new("/etc/hosts")));
+    }
+
+    #[test]
     fn windows_drive_paths_are_system_paths() {
         // Regression (PR #274 windows-check): on Windows,
         // canonicalize_lenient turns "/etc/hosts" into "C:\etc\hosts";
