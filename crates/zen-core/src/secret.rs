@@ -3320,6 +3320,7 @@ mod tests {
         let held = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .open(&lock_path)
             .unwrap();
         held.lock_exclusive().unwrap();
