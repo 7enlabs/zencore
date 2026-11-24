@@ -120,8 +120,14 @@ async fn r7_verify_command_from_settings_feeds_failure_back() {
     assert_eq!(code, 0, "stderr: {}", stderr);
     assert_eq!(last_result(&stdout)["result"], "final answer");
     let reqs = server.finish().await;
-    assert_eq!(reqs.len(), 3);
-    let last = request_messages_text(&reqs[2]);
+    // Issue #353: a failed verify keeps the changes pending, so the
+    // finish attempt after the first feedback re-runs the check
+    // (round 2) and feeds the failure back a second time before the
+    // gate finishes with a note. That is one more request than the
+    // old bypass behaviour (3), and the last request still carries
+    // the verify failure.
+    assert_eq!(reqs.len(), 4);
+    let last = request_messages_text(&reqs[3]);
     assert!(
         last.contains("VERIFY-RAN-IN-") && last.contains("exit 1"),
         "{}",
