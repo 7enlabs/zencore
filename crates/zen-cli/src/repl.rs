@@ -2017,7 +2017,7 @@ async fn handle_slash(
             "{}",
             commands::context_report(
                 &agent.config.system_prompt,
-                &zen_ext::memory_prompt(cwd, home),
+                &zen_ext::memory_prompt(cwd, home, cfg.folder_trusted),
                 &agent.tools_for_request(),
                 agent.messages(),
                 agent.config.context_window,
@@ -2557,12 +2557,15 @@ async fn handle_slash(
             }
         }
         "/memory" => {
-            for (p, _) in zen_ext::memory_files(cwd, home) {
+            for (p, _) in zen_ext::memory_files(cwd, home, cfg.folder_trusted) {
                 println!("{}", p.display());
             }
         }
         "/memories" => {
-            println!("{}", zen_ext::memories_report(cwd, home));
+            println!(
+                "{}",
+                zen_ext::memories_report(cwd, home, cfg.folder_trusted)
+            );
         }
         "/todos" => {
             let todos = lock_or_recover(&agent.ctx.todos, "todos").clone();

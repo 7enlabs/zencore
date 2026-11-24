@@ -56,7 +56,8 @@ pub fn build_system_prompt(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result
             parts.push(map.text().to_string());
         }
 
-        let mem = zen_ext::memory_prompt(cwd, home);
+        let mem =
+            zen_ext::memory_prompt(cwd, home, crate::settings::folder_trusted(cli, cwd, home));
         if !mem.trim().is_empty() {
             parts.push(mem);
         }

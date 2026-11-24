@@ -45,7 +45,7 @@ or enforced; a control with no such pointer is listed under open questions, not 
 | Control | What it does | Where |
 | --- | --- | --- |
 | Permission modes and rules | allow, ask, deny per tool; plan mode refuses writes up front; project deny rules always apply | README (Plan mode, Folder trust), `crates/zen-tools` |
-| Folder trust | project hooks, `permissions.allow`, `additionalDirectories`, `env`, `verify`, provider `baseUrl` and `apiKeyEnv`, MCP servers, project `allowed-tools`, project skills and project commands load only in a trusted folder; headless never asks | README "Folder trust" |
+| Folder trust | project hooks, `permissions.allow`, `additionalDirectories`, `env`, `verify`, provider `baseUrl` and `apiKeyEnv`, MCP servers, project `allowed-tools`, project skills and project commands load only in a trusted folder; memory `@import`s from project files stay inside the project folder unless trusted; headless never asks | README "Folder trust" |
 | Skill trust tiers | verified (ed25519), community (hash-pinned, no auto-update), unverified (sandboxed); install shows the permission diff and needs `--yes` | README "Skills", `docs/skills.md`, `docs/skill-registry.md` |
 | Hooks | PreToolUse validation; PostToolUse can replace what the model sees | `docs/hooks.md` |
 | Export redaction | `zen export --redact` | SPEC.md, `docs/session-format.md` |
