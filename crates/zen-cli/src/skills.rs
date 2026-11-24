@@ -488,6 +488,19 @@ pub fn install_skill(home: &Path, source: &InstallSource, yes: bool) -> Result<R
         name = n;
     }
 
+    // The resolved name becomes a path component below
+    // (skills_root(name)), so it must be a single safe segment. A
+    // manifest name is already validated by load_manifest, but the
+    // SKILL.md frontmatter name and the source-derived fallback are not:
+    // a name such as "../../evil" would escape ~/.zen/skills and the
+    // remove_dir_all/copy_dir_all below would delete and overwrite an
+    // arbitrary directory tree (issue #371). Reject here, whatever the
+    // name's source, before the name is used as a path anywhere.
+    if let Err(e) = validate_skill_name(&name) {
+        std::fs::remove_dir_all(&staging).ok();
+        return Err(e);
+    }
+
     if !staging.join("SKILL.md").is_file() {
         std::fs::remove_dir_all(&staging).ok();
         return Err(anyhow!("skill {:?} has no SKILL.md", name));
@@ -2153,6 +2166,84 @@ mod tests {
         assert_eq!(entry.tier, TrustTier::Unverified);
 
         assert_eq!(entry.name, "nosig");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn install_rejects_frontmatter_name_traversal() {
+        // Issue #371: a SKILL.md frontmatter name was joined into
+        // skills_root unchecked, so install deleted and overwrote a
+        // directory outside ~/.zen/skills. The install must now fail
+        // with VALIDATION and leave the traversal target untouched.
+        let home = tmp_home("install-traversal");
+        // skills_root is home/.zen/skills, so "../../evil" lands on
+        // home/evil.
+        let victim = home.join("evil");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("keep.txt"), "do not delete").unwrap();
+        let abs_victim = home.join("abs-victim");
+        std::fs::create_dir_all(&abs_victim).unwrap();
+        std::fs::write(abs_victim.join("keep.txt"), "do not delete").unwrap();
+
+        let bad_names = vec![
+            "../../evil".to_string(),
+            "..".to_string(),
+            ".".to_string(),
+            "a/b".to_string(),
+            abs_victim.display().to_string(),
+        ];
+        for bad in &bad_names {
+            let src = home.join("src-skill");
+            if src.exists() {
+                std::fs::remove_dir_all(&src).ok();
+            }
+            write_skill_dir(
+                &src,
+                None,
+                &format!("---\nname: {bad}\ndescription: x\n---\nbody\n"),
+                "- CHECK frontmatter.name == \"x\"\n",
+            );
+            let err = install_skill(&home, &InstallSource::Local(src), true).unwrap_err();
+            assert_eq!(
+                crate::exit_code_for_error(&err),
+                crate::exit_code::VALIDATION,
+                "frontmatter name {bad:?} should be rejected with VALIDATION, got {err:?}"
+            );
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(victim.join("keep.txt")).unwrap(),
+            "do not delete"
+        );
+        assert_eq!(
+            std::fs::read_to_string(abs_victim.join("keep.txt")).unwrap(),
+            "do not delete"
+        );
+        assert!(!skills_root(&home).join("evil").exists());
+        assert!(load_registry(&home).skills.is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn install_accepts_valid_frontmatter_name() {
+        // The #371 gate must not reject ordinary names: letters, digits,
+        // '-' and '_' still install from frontmatter alone.
+        let home = tmp_home("install-valid-name");
+        let src = home.join("src-skill");
+        write_skill_dir(
+            &src,
+            None,
+            "---\nname: my-skill_2\ndescription: x\n---\nbody\n",
+            "- CHECK frontmatter.name == \"my-skill_2\"\n",
+        );
+        let entry = install_skill(&home, &InstallSource::Local(src), true).unwrap();
+        assert_eq!(entry.name, "my-skill_2");
+        assert!(
+            skills_root(&home)
+                .join("my-skill_2")
+                .join("SKILL.md")
+                .is_file()
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
