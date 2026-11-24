@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use serde_json::json;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use zen_core::*;
 
 use crate::agent::{Agent, AgentConfig};
@@ -23,6 +23,11 @@ pub struct SubAgentExecutor {
     pub max_depth: usize,
 
     pub skills: Vec<SkillInfo>,
+
+    /// Spend of finished children, in child-model dollars (issue #349):
+    /// `run_subagent` credits each child's final `RunResult` here and
+    /// the parent drains it through `SubAgentRunner::take_child_spend`.
+    child_spend: Mutex<ChildSpend>,
 }
 
 impl SubAgentExecutor {
@@ -45,11 +50,18 @@ impl SubAgentExecutor {
             base_config,
             max_depth: 1,
             skills: Vec::new(),
+            child_spend: Mutex::new(ChildSpend::default()),
         }
     }
 
     pub fn set_max_depth(&mut self, depth: usize) {
         self.max_depth = depth.max(1);
+    }
+
+    fn credit_child_spend(&self, result: &RunResult) {
+        if let Ok(mut guard) = self.child_spend.lock() {
+            guard.add(&result.usage, result.total_cost_usd);
+        }
     }
 
     fn skill_body(&self, name: &str) -> Option<String> {
@@ -94,6 +106,13 @@ fn strip_frontmatter(raw: &str) -> &str {
 impl SubAgentRunner for SubAgentExecutor {
     fn diagnostics_provider(&self) -> Option<Arc<dyn DiagnosticsProvider>> {
         self.base_config.diagnostics_provider.clone()
+    }
+
+    fn take_child_spend(&self) -> ChildSpend {
+        self.child_spend
+            .lock()
+            .map(|mut guard| std::mem::take(&mut *guard))
+            .unwrap_or_default()
     }
 
     async fn run_subagent(
@@ -264,6 +283,11 @@ impl SubAgentRunner for SubAgentExecutor {
             result = agent.run_turn(&feedback).await;
         }
 
+        // Issue #349: the child's final `RunResult` carries its whole
+        // run (usage is cumulative per child agent), so credit it once
+        // here - before the error bail, so a failed child still counts
+        // toward the parent's spend instead of vanishing.
+        self.credit_child_spend(&result);
         if result.is_error {
             anyhow::bail!(result.result);
         }

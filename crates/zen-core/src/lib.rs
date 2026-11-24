@@ -1248,6 +1248,35 @@ impl UsageStats {
     pub fn cache_hit_rate(&self) -> f64 {
         cache_hit_rate(self.cache_read_input_tokens, self.input_tokens)
     }
+
+    /// Add another run's tokens into this total (issue #349: the
+    /// parent folds finished sub-agents' tokens into its own total).
+    pub fn add_assign(&mut self, other: &Self) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_read_input_tokens += other.cache_read_input_tokens;
+    }
+}
+
+/// Spend of finished sub-agents, as reported by a `SubAgentRunner`
+/// (issue #349). Tokens and dollars are kept together because a child
+/// may run on a different model than its parent, so its dollars cannot
+/// be re-derived from its tokens at the parent's price.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ChildSpend {
+    pub usage: UsageStats,
+    pub total_cost_usd: f64,
+}
+
+impl ChildSpend {
+    pub fn is_empty(&self) -> bool {
+        self.usage == UsageStats::default() && self.total_cost_usd == 0.0
+    }
+
+    pub fn add(&mut self, usage: &UsageStats, total_cost_usd: f64) {
+        self.usage.add_assign(usage);
+        self.total_cost_usd += total_cost_usd;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1413,6 +1442,16 @@ pub trait SubAgentRunner: Send + Sync {
         parent_tool_use_id: &str,
         parent_depth: usize,
     ) -> anyhow::Result<String>;
+
+    /// Spend of children this runner has finished since the last drain
+    /// (issue #349): the parent takes it after each tool batch and folds
+    /// it into its own usage, so `/cost` and the budget check see child
+    /// spend. Taking empties the balance, so a child is never counted
+    /// twice. The default is empty: runners that never run a child
+    /// (e.g. the docs-only runner) report nothing and need no change.
+    fn take_child_spend(&self) -> ChildSpend {
+        ChildSpend::default()
+    }
 
     /// The post-edit LSP diagnostics provider spawned children inherit
     /// (`None` when the parent session has the feedback loop off).

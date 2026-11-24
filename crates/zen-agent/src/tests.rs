@@ -7,7 +7,7 @@ use zen_core::*;
 use crate::agent::combine_permission;
 use crate::subagent::subagent_mode;
 use crate::testutil::*;
-use crate::{AgentConfig, SubAgentExecutor};
+use crate::{AgentConfig, SubAgentExecutor, budget::BudgetPolicy};
 
 fn fake(name: &'static str, read_only: bool, out: &str) -> Arc<dyn Tool> {
     Arc::new(FakeTool {
@@ -3211,5 +3211,190 @@ async fn gate_events_for_hard_deny_and_headless_ask() {
             "classified:c1:Classifier:ask".to_string(),
             "resolved:DeniedNoPrompter".to_string(),
         ]
+    );
+}
+
+/// Fake `Task` tool that spawns through a real `SubAgentExecutor`
+/// (issue #349): the parent can only see child spend if the runner
+/// reports it and the parent drains it.
+struct SpawnTaskTool {
+    runner: Arc<dyn SubAgentRunner>,
+}
+
+#[async_trait::async_trait]
+impl Tool for SpawnTaskTool {
+    fn name(&self) -> &str {
+        "Task"
+    }
+
+    fn subagent_runner(&self) -> Option<&dyn SubAgentRunner> {
+        Some(&*self.runner)
+    }
+
+    fn description(&self) -> &str {
+        "test-only Task tool"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
+    async fn call(&self, args: Value, _ctx: &ToolContext) -> ToolOutput {
+        let prompt = args
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let def = AgentDefinition {
+            name: "general-purpose".into(),
+            description: "test child".into(),
+            ..Default::default()
+        };
+        match self.runner.run_subagent(&def, &prompt, "test-1", 0).await {
+            Ok(text) => ToolOutput::ok(text),
+            Err(e) => ToolOutput::err(e.to_string()),
+        }
+    }
+}
+
+fn spawn_runner(llm: Arc<MockLlm>, model: &str) -> Arc<dyn SubAgentRunner> {
+    let mut cfg = base_cfg();
+    cfg.model = model.into();
+    Arc::new(SubAgentExecutor::new(
+        llm,
+        ToolRegistry::new(),
+        allow(),
+        FakeHooks::new(),
+        Arc::new(CollectSink::default()),
+        temp_ctx(),
+        cfg,
+    ))
+}
+
+#[tokio::test]
+async fn c349_parent_usage_includes_subagent_spend() {
+    // Shared queue, in call order: parent tool call, child call,
+    // parent final call. gpt-4o ($2.50/$10 per 1M) so every token
+    // has a price on both sides.
+    let llm = MockLlm::new(vec![
+        resp_tool("Task", r#"{"prompt":"do it"}"#, "t1"),
+        resp("sub result"),
+        resp("done"),
+    ]);
+    let reg = registry_with(vec![Arc::new(SpawnTaskTool {
+        runner: spawn_runner(llm.clone(), "gpt-4o"),
+    })]);
+    let mut parent_cfg = base_cfg();
+    parent_cfg.model = "gpt-4o".into();
+    let (mut agent, _sink, _hooks) = build_agent(llm.clone(), reg, allow(), parent_cfg);
+    let result = agent.run_turn("go").await;
+    assert_eq!(result.subtype, "success");
+    assert_eq!(result.result, "done");
+    // Parent own: 20 in / 8 out (tool call) + 10 in / 5 out (final).
+    // Child: 10 in / 5 out. Without the fix the total is 30 / 13
+    // and the child's $0.000075 never appears.
+    assert_eq!(result.usage.input_tokens, 40);
+    assert_eq!(result.usage.output_tokens, 18);
+    assert_eq!(agent.subagent_usage.input_tokens, 10);
+    assert_eq!(agent.subagent_usage.output_tokens, 5);
+    // Own $0.000205 + child $0.000075 = $0.00028.
+    assert!(
+        (result.total_cost_usd - 0.00028).abs() < 1e-9,
+        "total_cost_usd: {}",
+        result.total_cost_usd
+    );
+    assert!(
+        (agent.subagent_cost_usd - 0.000075).abs() < 1e-9,
+        "subagent_cost_usd: {}",
+        agent.subagent_cost_usd
+    );
+    assert_eq!(llm.requests().len(), 3, "parent, child, parent");
+}
+
+#[tokio::test]
+async fn c349_spawn_refused_when_parent_already_over_budget() {
+    // The spawn gate is the only enforcement that can fire here, so
+    // the parent model must be unpriced ("mock-model": the loop-top
+    // budget check is skipped when the estimate is `None`, while the
+    // gate deliberately has no free-model skip). A priced parent can
+    // never reach the gate with `MockLlm` fixed usage: the loop-top
+    // check blocks the first call whenever `spent + est_next` (4096
+    // output tokens) exceeds the cap, and one call can never cost more
+    // than that estimate - the existing
+    // `budget_cap_blocks_before_first_call_when_tiny` test pins the
+    // loop-top behaviour, so a cap of $0.0001 on gpt-4o would make
+    // zero model calls and never exercise the gate.
+    let llm = MockLlm::new(vec![
+        resp_tool("Task", r#"{"prompt":"do it"}"#, "t1"),
+        resp("sub result"),
+        resp("done"),
+        resp_tool("Task", r#"{"prompt":"again"}"#, "t2"),
+        resp("done"),
+    ]);
+    let reg = registry_with(vec![Arc::new(SpawnTaskTool {
+        runner: spawn_runner(llm.clone(), "gpt-4o"),
+    })]);
+    // Turn 1, no budget: the child runs and its $0.000075 is drained
+    // into the parent (parent model unpriced, so its own cost is $0).
+    let (mut agent, _sink, _hooks) = build_agent(llm.clone(), reg, allow(), base_cfg());
+    let r1 = agent.run_turn("go").await;
+    assert_eq!(r1.subtype, "success");
+    assert_eq!(agent.subagent_usage.input_tokens, 10);
+    assert_eq!(agent.subagent_usage.output_tokens, 5);
+    assert!(
+        (agent.subagent_cost_usd - 0.000075).abs() < 1e-9,
+        "subagent_cost_usd: {}",
+        agent.subagent_cost_usd
+    );
+    // Now install a cap below what the child already spent. The next
+    // spawn must be refused at `prepare_call`, before any child runs.
+    agent.config.budget = Some(BudgetPolicy {
+        max_budget_usd: 0.00005,
+        warn_at: 0.8,
+    });
+    let r2 = agent.run_turn("again").await;
+    assert_eq!(r2.subtype, "success");
+    assert!(
+        agent
+            .messages()
+            .iter()
+            .any(|m| m.role == "tool" && m.text().contains("refusing to spawn")),
+        "spawn refusal must reach the model as a tool result: {:?}",
+        agent.messages()
+    );
+    // Parent, child, parent, parent, parent - the second child never ran.
+    assert_eq!(llm.requests().len(), 5);
+    assert_eq!(agent.subagent_usage.input_tokens, 10);
+    assert_eq!(agent.subagent_usage.output_tokens, 5);
+    assert!(
+        (agent.subagent_cost_usd - 0.000075).abs() < 1e-9,
+        "subagent_cost_usd: {}",
+        agent.subagent_cost_usd
+    );
+}
+
+#[tokio::test]
+async fn c349_executor_reports_child_spend_once() {
+    let llm = MockLlm::new(vec![resp("sub result")]);
+    let (ex, _sink) = executor(llm.clone(), ToolRegistry::new(), FakeHooks::new());
+    let def = AgentDefinition {
+        name: "w".into(),
+        description: "d".into(),
+        ..Default::default()
+    };
+    let out = ex.run_subagent(&def, "do", "t", 0).await.unwrap();
+    assert_eq!(out, "sub result");
+    let spend = ex.take_child_spend();
+    assert_eq!(spend.usage.input_tokens, 10);
+    assert_eq!(spend.usage.output_tokens, 5);
+    // mock-model is unpriced, so the child costs $0 by the estimator.
+    assert!((spend.total_cost_usd - 0.0).abs() < 1e-9);
+    assert!(
+        ex.take_child_spend().is_empty(),
+        "drain takes the balance exactly once"
     );
 }

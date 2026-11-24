@@ -308,6 +308,15 @@ pub struct Agent {
 
     pub usage: UsageStats,
 
+    /// Tokens spent by finished sub-agents, drained from their runners
+    /// (issue #349). Kept apart from `usage` so the child's own model
+    /// price survives: `total_cost_usd` adds `subagent_cost_usd`
+    /// (child-model dollars) to the parent-model price of `usage`.
+    pub subagent_usage: UsageStats,
+
+    /// Child-model dollars behind `subagent_usage`.
+    pub subagent_cost_usd: f64,
+
     pub denials: Vec<PermissionDenial>,
 
     pub parent_tool_use_id: Option<String>,
@@ -371,6 +380,8 @@ impl Agent {
             config,
             messages: vec![],
             usage: UsageStats::default(),
+            subagent_usage: UsageStats::default(),
+            subagent_cost_usd: 0.0,
             denials: vec![],
             parent_tool_use_id: None,
             last_prompt_tokens: 0,
@@ -478,16 +489,56 @@ impl Agent {
             result,
             session_id: self.ctx.session_id.clone(),
 
-            total_cost_usd: crate::budget::estimate_cost_usd(
-                &self.config.model,
-                self.usage.input_tokens,
-                self.usage.output_tokens,
-            )
-            .unwrap_or(0.0),
-            usage: self.usage.clone(),
+            total_cost_usd: self.total_cost_usd(),
+            usage: self.total_usage(),
             model: self.config.model.clone(),
             permission_denials: self.denials.clone(),
             schema_error: None,
+        }
+    }
+
+    /// Combined token usage: this agent's own calls plus every finished
+    /// sub-agent's (issue #349). What `/cost` and `RunResult` report.
+    pub fn total_usage(&self) -> UsageStats {
+        let mut total = self.usage.clone();
+        total.add_assign(&self.subagent_usage);
+        total
+    }
+
+    /// Combined spend in dollars: this agent's own usage priced at its
+    /// own model, plus finished sub-agents priced at theirs (issue
+    /// #349). What the budget check enforces.
+    pub fn total_cost_usd(&self) -> f64 {
+        crate::budget::estimate_cost_usd(
+            &self.config.model,
+            self.usage.input_tokens,
+            self.usage.output_tokens,
+        )
+        .unwrap_or(0.0)
+            + self.subagent_cost_usd
+    }
+
+    /// Drain finished-child spend out of every sub-agent runner this
+    /// agent's tools hold (issue #349) and fold it into
+    /// `subagent_usage` / `subagent_cost_usd`. Called once per tool
+    /// batch, after every call resolved and before the next model call,
+    /// so the budget check at the top of the loop already sees it.
+    /// Draining is exact: `take_child_spend` empties each runner, so
+    /// a child is never counted twice.
+    fn credit_child_spend(&mut self) {
+        for name in self.tools.names() {
+            let Some(tool) = self.tools.get(&name) else {
+                continue;
+            };
+            let Some(runner) = tool.subagent_runner() else {
+                continue;
+            };
+            let spend = runner.take_child_spend();
+            if spend.is_empty() {
+                continue;
+            }
+            self.subagent_usage.add_assign(&spend.usage);
+            self.subagent_cost_usd += spend.total_cost_usd;
         }
     }
 
@@ -866,11 +917,10 @@ impl Agent {
             if let Some(policy) = self.config.budget.clone() {
                 let model = self.config.model.clone();
                 if !crate::budget::is_free_model(&model) {
-                    let spent = crate::budget::estimate_cost_usd(
-                        &model,
-                        self.usage.input_tokens,
-                        self.usage.output_tokens,
-                    );
+                    // Issue #349: spend is the combined total (own calls
+                    // plus finished sub-agents), not just the parent's
+                    // own usage.
+                    let spent = Some(self.total_cost_usd());
                     let est_next = crate::budget::estimate_cost_usd(
                         &model,
                         crate::compaction::context_tokens(self),
@@ -1653,6 +1703,41 @@ impl Agent {
             );
             return Slot::Done(tool_use_id, veto, true);
         }
+        // Issue #349: never spawn a sub-agent once the combined
+        // (parent + already-drained child) spend has breached the cap:
+        // the child would otherwise get a fresh full budget. The gate
+        // deliberately has no free-model skip: a free parent model can
+        // still have paid-child spend behind it. Estimated cost is 0
+        // because a child's spend is unknowable before it runs; the
+        // gate only refuses spawning when already over the cap.
+        if tool.subagent_runner().is_some()
+            && let Some(policy) = self.config.budget.clone()
+        {
+            let spent_usd = self.total_cost_usd();
+            match crate::budget::check_budget(&policy, spent_usd, 0.0, self.budget_warned) {
+                BudgetVerdict::Allow => {}
+                BudgetVerdict::Warn { spent_usd, cap_usd } => {
+                    self.budget_warned = true;
+                    self.sink.emit(AgentEvent::SystemMessage {
+                        event: "budget".to_string(),
+                        text: crate::budget::warn_message(spent_usd, cap_usd),
+                    });
+                }
+                BudgetVerdict::Block {
+                    spent_usd, cap_usd, ..
+                } => {
+                    return Slot::Done(
+                        tool_use_id,
+                        format!(
+                            "Budget exceeded: spent ${:.2} of ${:.2} cap; refusing to spawn a sub-agent. \
+                             Raise the cap with --max-budget-usd or ZEN_MAX_BUDGET_USD to continue.",
+                            spent_usd, cap_usd
+                        ),
+                        true,
+                    );
+                }
+            }
+        }
         let parallel = read_only && is_parallel_safe(&tool_name);
         Slot::Run(PendingCall {
             tool_use_id,
@@ -1789,6 +1874,9 @@ impl Agent {
                 }
             }
         }
+        // Issue #349: fold finished-child spend into this agent before
+        // the next model call (and its budget check).
+        self.credit_child_spend();
     }
 
     async fn finish_call(
