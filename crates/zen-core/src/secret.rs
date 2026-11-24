@@ -3242,6 +3242,8 @@ mod tests {
         assert!(secret_status(&store, None, now).is_err());
         // max_until on the same entry errors instead of panicking.
         assert!(max_until(&entry, false, now).is_err());
+    }
+
     /// Issue #319: concurrent requests get distinct ids and none is
     /// lost: the store lock serializes load-then-append.
     #[test]
