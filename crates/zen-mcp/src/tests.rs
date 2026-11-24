@@ -306,6 +306,10 @@ for line in sys.stdin:
             send({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"alpha","description":"first tool","inputSchema":{"type":"object","properties":{"x":{"type":"string"}}}}],"nextCursor":"page2"}})
         elif mode == "paged":
             send({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"beta","description":"second tool","inputSchema":{"type":"object"}}]}})
+        elif mode in ("mark-a", "mark-b"):
+            send({"jsonrpc":"2.0","id":mid,"result":{"tools":[
+                {"name":"thing","description":"marked tool","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}
+            ]}})
         else:
             send({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"echo","description":"echoes input","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}},{"name":"boom","description":"fails","inputSchema":{"type":"object"}}]}})
     elif method == "tools/call":
@@ -329,6 +333,8 @@ for line in sys.stdin:
             send({"jsonrpc":"2.0","id":mid,"result":{"resultType":"input_required","requestState":"st"}})
         elif name == "tasky":
             send({"jsonrpc":"2.0","id":mid,"result":{"resultType":"task","taskId":"t1","status":"working","createdAt":"2026-11-15T00:00:00Z","lastUpdatedAt":"2026-11-15T00:00:00Z"}})
+        elif name == "thing":
+            send({"jsonrpc":"2.0","id":mid,"result":{"content":[{"type":"text","text":mode + ": " + str(args.get("text"))}]}})
         else:
             send({"jsonrpc":"2.0","id":mid,"error":{"code":-32601,"message":"no such tool"}})
     else:
@@ -399,6 +405,83 @@ async fn mcp_stdio_handshake_list_and_call() {
         .unwrap();
     assert!(out.is_error);
     assert_eq!(out.content, "boom happened");
+
+    tokio::time::timeout(TEST_TIMEOUT, mgr.shutdown())
+        .await
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #372: `my.server` and `my_server` both sanitise to `my_server`, so a
+/// tool `thing` from each collides on `mcp__my_server__thing`. The manager
+/// must register it once (first server wins, deterministically) and report
+/// the second as a skip naming both sources - never silently register two
+/// tools under one name and route calls to the wrong server.
+#[tokio::test]
+async fn mcp_tool_name_collision_is_skipped_and_reported() {
+    let py = match python_exe() {
+        Some(p) => p,
+        None => return,
+    };
+    let dir = tmpdir("collision");
+    let script = write_fake_server(&dir);
+
+    let mut configs = BTreeMap::new();
+    configs.insert(
+        "my.server".to_string(),
+        stdio_config(&py, &script, "mark-a"),
+    );
+    configs.insert(
+        "my_server".to_string(),
+        stdio_config(&py, &script, "mark-b"),
+    );
+
+    let mgr = tokio::time::timeout(TEST_TIMEOUT, McpManager::start(configs, 10_000))
+        .await
+        .expect("start did not time out");
+
+    assert_eq!(
+        mgr.status(),
+        vec![
+            ("my.server".to_string(), "connected".to_string()),
+            ("my_server".to_string(), "connected".to_string()),
+        ]
+    );
+
+    let tools = mgr.tools();
+    let names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
+    assert_eq!(names, vec!["mcp__my_server__thing".to_string()]);
+
+    // The surviving tool must route to the first server, not the second.
+    let ctx = ToolContext::new(dir.clone(), "sess");
+    let out = tokio::time::timeout(TEST_TIMEOUT, tools[0].call(json!({"text": "hi"}), &ctx))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "got {:?}", out);
+    assert_eq!(out.content, "mark-a: hi");
+
+    let errors = mgr.errors();
+    assert_eq!(
+        errors.len(),
+        1,
+        "one collision skip expected, got {errors:?}"
+    );
+    assert_eq!(errors[0].server_name, "my_server");
+    assert!(
+        errors[0].reason.contains("tool_name_collision"),
+        "reason must name the collision, got: {}",
+        errors[0].reason
+    );
+    assert!(
+        errors[0].reason.contains("mcp__my_server__thing"),
+        "reason must name the colliding tool, got: {}",
+        errors[0].reason
+    );
+    assert!(
+        errors[0].reason.contains("my.server"),
+        "reason must name the first owner, got: {}",
+        errors[0].reason
+    );
 
     tokio::time::timeout(TEST_TIMEOUT, mgr.shutdown())
         .await
