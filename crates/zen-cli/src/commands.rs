@@ -928,7 +928,12 @@ pub async fn mcp_command(
             }
             Err(anyhow!("no MCP server named {:?}", name))
         }
-        McpSubcommand::AddJson { scope, name, json } => {
+        McpSubcommand::AddJson {
+            scope,
+            name,
+            json,
+            force,
+        } => {
             let path = mcp_scope_path(scope, cwd, home)?;
             let mut root = read_mcp_file(&path);
             let cfg: Value = serde_json::from_str(json)?;
@@ -937,10 +942,31 @@ pub async fn mcp_command(
             }
             serde_json::from_value::<zen_mcp::McpServerConfig>(cfg.clone())
                 .map_err(|e| anyhow!("invalid MCP server JSON: {}", e))?;
+            // Issue #315: a taken name must not be replaced silently
+            // (same as #285 for `mcp add`). Refuse with a conflict
+            // (exit 7, like `secret register`) unless --force was given.
+            let existing = root["mcpServers"].get(name).cloned();
+            if let Some(old) = &existing
+                && !force
+            {
+                return Err(crate::coded_error(
+                    crate::exit_code::CONFLICT,
+                    format!(
+                        "MCP server {:?} already exists in {} ({}); pass --force to replace it",
+                        name,
+                        path.display(),
+                        describe_mcp_server(old),
+                    ),
+                ));
+            }
             root["mcpServers"][name] = cfg;
             write_mcp_file(&path, &root)?;
             if !cli.quiet {
-                println!("added MCP server {:?} to {}", name, path.display());
+                if existing.is_some() {
+                    println!("replaced MCP server {:?} in {}", name, path.display());
+                } else {
+                    println!("added MCP server {:?} to {}", name, path.display());
+                }
             }
             Ok(())
         }

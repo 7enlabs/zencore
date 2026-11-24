@@ -768,3 +768,68 @@ async fn mcp_add_duplicate_refuses_without_force() {
         err
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_add_json_duplicate_refuses_without_force() {
+    // Issue #315: `mcp add-json` on an existing server name must fail
+    // with exit 7 instead of silently replacing it; --force replaces
+    // (same as #285 for `mcp add`).
+    let home = TempDir::new("mcp_add_json_dup_home");
+    let cwd = TempDir::new("mcp_add_json_dup_cwd");
+    let run = |args: Vec<String>| {
+        ZenRun::new("mcp_add_json_dup", &home, &cwd)
+            .args(args)
+            .run_output()
+    };
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let mcp_path = cwd.path().join(".zen/mcp.json");
+    let read_command = || {
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&mcp_path).unwrap()).unwrap();
+        doc["mcpServers"]["probe"]["command"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let (out, err, code) = run(s(&[
+        "mcp",
+        "add-json",
+        "probe",
+        r#"{"type":"stdio","command":"echo"}"#,
+    ]));
+    assert_eq!(code, 0, "{}", err);
+    assert!(out.contains("added"), "stdout: {}", out);
+    assert_eq!(read_command(), "echo");
+
+    let (_, err, code) = run(s(&[
+        "mcp",
+        "add-json",
+        "probe",
+        r#"{"type":"stdio","command":"cat"}"#,
+    ]));
+    assert_eq!(
+        code, 7,
+        "duplicate without --force must be a conflict: {}",
+        err
+    );
+    assert!(err.contains("already exists"), "stderr: {}", err);
+    // The conflict names the existing server, so the old command must show.
+    assert!(
+        err.contains("command echo"),
+        "stderr should name the existing server: {}",
+        err
+    );
+    assert_eq!(read_command(), "echo");
+
+    let (out, err, code) = run(s(&[
+        "mcp",
+        "add-json",
+        "--force",
+        "probe",
+        r#"{"type":"stdio","command":"cat"}"#,
+    ]));
+    assert_eq!(code, 0, "{}", err);
+    assert!(out.contains("replaced"), "stdout: {}", out);
+    assert_eq!(read_command(), "cat");
+}
