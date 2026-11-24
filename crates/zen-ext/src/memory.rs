@@ -1370,19 +1370,22 @@ mod tests {
     }
 
     // Issue #331: the cap is a strict upper bound - a file of exactly
-    // MAX_IMPORT_BYTES is still imported. This pins the boundary so the
-    // `>` (not `>=`) and the `4 * 1024 * 1024` value itself are both
-    // mutant-killing: any smaller cap or `>=` rejects this file.
+    // 4 MiB is still imported. The size is hardcoded (not built from
+    // MAX_IMPORT_BYTES) so a mutant that shrinks the constant cannot
+    // shrink the test file with it; the literal assertion pins the
+    // constant's value, and the boundary file pins the `>` (not `>=`).
     #[test]
     fn issue_331_import_size_boundary_kept() {
+        assert_eq!(MAX_IMPORT_BYTES, 4_194_304);
+        const EDGE_BYTES: usize = 4_194_304;
         let tmp = TempDir::new();
         let home = tmp.path().join("home");
         let proj = tmp.path().join("proj");
         fs::create_dir_all(&proj).unwrap();
         let marker = "EDGE-MARKER\n";
         let mut edge = String::from(marker);
-        edge.push_str(&"x".repeat(MAX_IMPORT_BYTES as usize - marker.len()));
-        assert_eq!(edge.len() as u64, MAX_IMPORT_BYTES);
+        edge.push_str(&"x".repeat(EDGE_BYTES - marker.len()));
+        assert_eq!(edge.len(), EDGE_BYTES);
         fs::write(proj.join("edge.md"), edge).unwrap();
         fs::write(proj.join("ZEN.md"), "@edge.md\n").unwrap();
 
