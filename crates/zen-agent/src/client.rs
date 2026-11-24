@@ -2528,6 +2528,11 @@ mod anthropic_tests {
         assert!(is_anthropic_url("https://api.moonshot.ai/anthropic"));
         assert!(is_anthropic_url("https://api.deepseek.com/anthropic"));
         assert!(is_anthropic_url("https://api.deepseek.com/anthropic/"));
+        // Any subdomain of anthropic.com routes to AnthropicClient,
+        // not just the exact api host: this kills the || -> && mutant
+        // on the host check (issue #335).
+        assert!(is_anthropic_url("https://api.anthropic.com/v1"));
+        assert!(is_anthropic_url("https://eu.anthropic.com/v1"));
     }
 
     #[test]
