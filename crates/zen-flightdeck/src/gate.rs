@@ -134,6 +134,39 @@ impl AsyncPrompter for FlightdeckPrompter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// Await a spawned ask, failing fast instead of hanging the test
+    /// binary when the ask never returns. A mutant that breaks the
+    /// answer path (for example `answer` returning without delivering)
+    /// leaves the ask waiting forever; without the timeout the whole
+    /// test binary hangs and the mutant is reported as a timeout
+    /// instead of a kill. Aborting on timeout lets the runtime shut
+    /// down so the failure is observed.
+    async fn await_ask(handle: &mut tokio::task::JoinHandle<PromptAnswer>) -> PromptAnswer {
+        match tokio::time::timeout(Duration::from_secs(5), &mut *handle).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(err)) => panic!("ask task failed: {err}"),
+            Err(_) => {
+                handle.abort();
+                panic!("ask_permission did not return within 5s");
+            }
+        }
+    }
+
+    /// Deliver an answer, aborting the waiting ask first when the
+    /// delivery fails so a failed assertion does not leave a task
+    /// that blocks the runtime shutdown.
+    fn deliver(
+        bridge: &GateBridge,
+        answer: GateAnswer,
+        handle: &mut tokio::task::JoinHandle<PromptAnswer>,
+    ) {
+        if !bridge.answer(answer) {
+            handle.abort();
+            panic!("bridge.answer did not deliver");
+        }
+    }
 
     fn prompter(bridge: &Arc<GateBridge>) -> FlightdeckPrompter {
         bridge.set_viewer_open(true);
@@ -147,9 +180,12 @@ mod tests {
     async fn closed_viewer_denies_immediately() {
         let bridge = Arc::new(GateBridge::new());
         let p = FlightdeckPrompter::new(bridge, Arc::new(|_, _| vec![]));
-        let a = p
-            .ask_permission("Bash", &serde_json::json!({}), "c1", false)
-            .await;
+        let a = tokio::time::timeout(
+            Duration::from_secs(5),
+            p.ask_permission("Bash", &serde_json::json!({}), "c1", false),
+        )
+        .await
+        .expect("ask_permission did not return within 5s");
         assert_eq!(a, PromptAnswer::No);
     }
 
@@ -158,14 +194,14 @@ mod tests {
         let bridge = Arc::new(GateBridge::new());
         let p = prompter(&bridge);
         let b = bridge.clone();
-        let handle = tokio::spawn(async move {
+        let mut handle = tokio::spawn(async move {
             p.ask_permission("Bash", &serde_json::json!({}), "c1", false)
                 .await
         });
         // Let the ask register, then answer from the "viewer".
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(bridge.answer(GateAnswer::Once));
-        assert_eq!(handle.await.unwrap(), PromptAnswer::Yes);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        deliver(&bridge, GateAnswer::Once, &mut handle);
+        assert_eq!(await_ask(&mut handle).await, PromptAnswer::Yes);
         let _ = b;
     }
 
@@ -173,14 +209,14 @@ mod tests {
     async fn answer_always_uses_the_suggester() {
         let bridge = Arc::new(GateBridge::new());
         let p = prompter(&bridge);
-        let handle = tokio::spawn(async move {
+        let mut handle = tokio::spawn(async move {
             p.ask_permission("Bash", &serde_json::json!({}), "c1", false)
                 .await
         });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(bridge.answer(GateAnswer::Always));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        deliver(&bridge, GateAnswer::Always, &mut handle);
         assert_eq!(
-            handle.await.unwrap(),
+            await_ask(&mut handle).await,
             PromptAnswer::Always("Bash(suggested)".to_string())
         );
     }
@@ -189,30 +225,30 @@ mod tests {
     async fn viewer_close_denies_the_waiting_call() {
         let bridge = Arc::new(GateBridge::new());
         let p = prompter(&bridge);
-        let handle = tokio::spawn(async move {
+        let mut handle = tokio::spawn(async move {
             p.ask_permission("Bash", &serde_json::json!({}), "c1", false)
                 .await
         });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
         bridge.deny_pending();
-        assert_eq!(handle.await.unwrap(), PromptAnswer::No);
+        assert_eq!(await_ask(&mut handle).await, PromptAnswer::No);
     }
 
     #[tokio::test]
     async fn second_concurrent_ask_is_refused() {
         let bridge = Arc::new(GateBridge::new());
         let p = prompter(&bridge);
-        let first = tokio::spawn(async move {
+        let mut first = tokio::spawn(async move {
             p.ask_permission("Bash", &serde_json::json!({}), "c1", false)
                 .await
         });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
         let p2 = prompter(&bridge);
         let a2 = p2
             .ask_permission("Bash", &serde_json::json!({}), "c2", false)
             .await;
         assert_eq!(a2, PromptAnswer::No);
         bridge.deny_pending();
-        assert_eq!(first.await.unwrap(), PromptAnswer::No);
+        assert_eq!(await_ask(&mut first).await, PromptAnswer::No);
     }
 }

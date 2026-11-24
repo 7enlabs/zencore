@@ -143,23 +143,25 @@ fn tokenize(part: &str) -> Part<'_> {
         .collect();
     let mut sudo = false;
     // Strip leading `sudo` and `VAR=value` env assignments to reach
-    // the real program.
-    let mut start = 0;
-    while start < tokens.len() {
-        let t = &tokens[start];
-        if t == "sudo" {
-            sudo = true;
-            start += 1;
-        } else if let Some((name, _)) = t.split_once('=')
-            && !t.starts_with('-')
-            && is_env_name(name)
-        {
-            start += 1;
-        } else {
-            break;
+    // the real program. Slice-based: the loop only ever drops a
+    // leading token, so no mutant on the advance can stall it.
+    let mut rest = tokens.as_slice();
+    loop {
+        match rest.first() {
+            Some(t) if t == "sudo" => {
+                sudo = true;
+                rest = &rest[1..];
+            }
+            Some(t)
+                if t.split_once('=')
+                    .is_some_and(|(name, _)| !t.starts_with('-') && is_env_name(name)) =>
+            {
+                rest = &rest[1..];
+            }
+            _ => break,
         }
     }
-    tokens.drain(..start);
+    tokens.drain(..tokens.len() - rest.len());
     let program = tokens
         .first()
         .map(|t| t.rsplit(['/', '\\']).next().unwrap_or(t).to_lowercase())
@@ -438,19 +440,31 @@ fn classify_part(part: &Part, cwd: &Path, workdirs: &[PathBuf]) -> Classificatio
     Classification::new(RiskClass::Mutating, "mutating.default", "shell command")
 }
 
-fn classify_git(part: &Part) -> Option<Classification> {
-    let args = &part.args;
-    // Skip git's global flags to find the subcommand.
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-C" | "-c" => i += 2,
-            s if s.starts_with('-') => i += 1,
+/// Skip git's global flags (`-C <dir>`, `-c <kv>`, other `-x`) to
+/// reach the subcommand. Returns the args from the subcommand on.
+///
+/// Slice-based (no index arithmetic) so a mutant on the skip cannot
+/// stall the scan: the loop only ever drops a leading element, and
+/// every mutant on the arms changes which args are dropped, which
+/// the subcommand tests observe.
+fn skip_git_global_flags(args: &[String]) -> &[String] {
+    let mut rest = args;
+    loop {
+        match rest.first().map(|s| s.as_str()) {
+            Some("-C") | Some("-c") => rest = rest.get(2..).unwrap_or(&[]),
+            Some(s) if s.starts_with('-') => rest = &rest[1..],
             _ => break,
         }
     }
-    let sub = args.get(i).map(|s| s.as_str())?;
-    let rest = &args[i + 1..];
+    rest
+}
+
+fn classify_git(part: &Part) -> Option<Classification> {
+    let args = &part.args;
+    // Skip git's global flags to find the subcommand.
+    let rest_all = skip_git_global_flags(args);
+    let sub = rest_all.first().map(|s| s.as_str())?;
+    let rest = &rest_all[1..];
     match sub {
         "push" => {
             let force = rest.iter().any(|a| {
@@ -541,32 +555,25 @@ fn is_safe_part(part: &Part) -> bool {
             )
         }),
         "git" => {
-            let mut i = 0;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "-C" | "-c" => i += 2,
-                    s if s.starts_with('-') => i += 1,
-                    _ => break,
-                }
-            }
-            match args.get(i).map(|s| s.as_str()) {
+            let rest = skip_git_global_flags(args);
+            match rest.first().map(|s| s.as_str()) {
                 Some(
                     "status" | "diff" | "log" | "show" | "ls-files" | "rev-parse" | "blame"
                     | "describe",
                 ) => true,
-                Some("branch") => !args[i + 1..].iter().any(|a| {
+                Some("branch") => !rest[1..].iter().any(|a| {
                     matches!(
                         a.as_str(),
                         "-d" | "-D" | "-m" | "-M" | "--delete" | "--move"
                     )
                 }),
                 Some("remote") => {
-                    let rest = &args[i + 1..];
-                    rest.is_empty() || rest.iter().all(|a| a == "-v" || a == "--verbose")
+                    let r = &rest[1..];
+                    r.is_empty() || r.iter().all(|a| a == "-v" || a == "--verbose")
                 }
                 Some("stash") => {
-                    let rest = &args[i + 1..];
-                    rest.first().is_some_and(|a| a == "list" || a == "show")
+                    let r = &rest[1..];
+                    r.first().is_some_and(|a| a == "list" || a == "show")
                 }
                 _ => false,
             }
@@ -721,36 +728,49 @@ fn non_flag_args(args: &[String]) -> Vec<&str> {
 }
 
 /// Targets of `>` / `>>` redirections inside one part's raw text.
+///
+/// Slice-based scan: the outer loop only ever drops the leading byte
+/// of the remaining input, and the inner skips are bounded
+/// `take_while` counts, so no mutant on an advance can stall the
+/// scan into an infinite loop (the `+=` mutants on the old index
+/// loops timed out instead of being killed).
 fn redirect_targets(raw: &str) -> impl Iterator<Item = &str> {
     let mut out = Vec::new();
     let bytes = raw.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'>' {
-            let mut j = i + 1;
-            if j < bytes.len() && bytes[j] == b'>' {
-                j += 1;
-            }
-            // Skip fd duplication (>&2, >&-) and /dev/null style sinks
-            // are handled by the caller's path check.
-            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
-                j += 1;
-            }
-            if j < bytes.len() && bytes[j] == b'&' {
-                i = j + 1;
-                continue;
-            }
-            let start = j;
-            while j < bytes.len() && !matches!(bytes[j], b' ' | b'\t' | b';' | b'|' | b'&') {
-                j += 1;
-            }
-            if start < j {
-                out.push(raw[start..j].trim_matches(|c| c == '"' || c == '\''));
-            }
-            i = j;
-        } else {
-            i += 1;
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        if rest[0] != b'>' {
+            rest = &rest[1..];
+            continue;
         }
+        // rest[0] == b'>': parse the redirect.
+        let mut j = 1;
+        if rest.get(j) == Some(&b'>') {
+            j += 1;
+        }
+        // Skip spaces/tabs after the operator.
+        j += rest[j..]
+            .iter()
+            .take_while(|&&b| b == b' ' || b == b'\t')
+            .count();
+        if rest.get(j) == Some(&b'&') {
+            // Fd duplication (>&2): no file target; resume after '&'.
+            // Two slice drops (no arithmetic) so the advance cannot
+            // be stalled by a mutant.
+            rest = &rest[j..];
+            rest = &rest[1..];
+            continue;
+        }
+        let start = j;
+        j += rest[j..]
+            .iter()
+            .take_while(|&&b| !matches!(b, b' ' | b'\t' | b';' | b'|' | b'&'))
+            .count();
+        if start < j {
+            let base = raw.len() - rest.len();
+            out.push(raw[base + start..base + j].trim_matches(|c| c == '"' || c == '\''));
+        }
+        rest = &rest[j..];
     }
     out.into_iter()
 }
