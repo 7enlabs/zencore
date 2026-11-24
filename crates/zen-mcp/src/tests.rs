@@ -2311,7 +2311,7 @@ async fn transport_stdio_dead_session_evicts_and_reconnects() {
     let log = dir.join("methods.log");
     let pid_file = dir.join("methods.log.pid");
     let cfg = tcfg_stdio(&py, "die_after_first_call", &log, BTreeMap::new(), None);
-    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+    let tr = Transport::from_config("fake", &cfg, 10_000, None).unwrap();
 
     let read_pid = |pid_file: &Path| -> String {
         std::fs::read_to_string(pid_file)
@@ -2377,7 +2377,7 @@ async fn transport_stdio_call_error_does_not_evict_session() {
     let log = dir.join("methods.log");
     let pid_file = dir.join("methods.log.pid");
     let cfg = tcfg_stdio(&py, "input_required", &log, BTreeMap::new(), None);
-    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+    let tr = Transport::from_config("fake", &cfg, 10_000, None).unwrap();
 
     let err = tokio::time::timeout(
         TEST_TIMEOUT,
@@ -2457,7 +2457,7 @@ async fn transport_stdio_probe_detects_dead_session_before_retry() {
         BTreeMap::new(),
         None,
     );
-    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+    let tr = Transport::from_config("fake", &cfg, 10_000, None).unwrap();
 
     let read_pid = |pid_file: &Path| -> String {
         std::fs::read_to_string(pid_file)
@@ -2523,7 +2523,7 @@ async fn transport_stdio_retry_exactly_once_on_transport_errors() {
         BTreeMap::new(),
         None,
     );
-    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+    let tr = Transport::from_config("fake", &cfg, 10_000, None).unwrap();
 
     let count_initializes = |log: &Path| -> usize {
         std::fs::read_to_string(log)
@@ -2579,7 +2579,7 @@ async fn transport_stdio_reconnect_failure_reports_dead_session() {
         BTreeMap::new(),
         None,
     );
-    let tr = Transport::from_config(&cfg, 1_000).unwrap();
+    let tr = Transport::from_config("fake", &cfg, 1_000, None).unwrap();
 
     let count_initializes = |log: &Path| -> usize {
         std::fs::read_to_string(log)
@@ -2618,7 +2618,7 @@ async fn transport_stdio_hung_list_evicts_and_reconnects() {
     let dir = tmpdir("t_hanglist");
     let log = dir.join("methods.log");
     let cfg = tcfg_stdio(&py, "hang_first_list", &log, BTreeMap::new(), None);
-    let tr = Transport::from_config(&cfg, 1_000).unwrap();
+    let tr = Transport::from_config("fake", &cfg, 1_000, None).unwrap();
 
     let count_initializes = |log: &Path| -> usize {
         std::fs::read_to_string(log)
@@ -2653,7 +2653,7 @@ async fn transport_stdio_hung_call_evicts_and_reconnects() {
     let dir = tmpdir("t_hangcall");
     let log = dir.join("methods.log");
     let cfg = tcfg_stdio(&py, "hang_first_call", &log, BTreeMap::new(), None);
-    let tr = Transport::from_config(&cfg, 1_000).unwrap();
+    let tr = Transport::from_config("fake", &cfg, 1_000, None).unwrap();
 
     let count_initializes = |log: &Path| -> usize {
         std::fs::read_to_string(log)
@@ -2694,7 +2694,7 @@ async fn transport_stdio_dead_session_call_heals_and_keeps_arguments() {
     let log = dir.join("methods.log");
     let pid_file = dir.join("methods.log.pid");
     let cfg = tcfg_stdio(&py, "die_after_first_call", &log, BTreeMap::new(), None);
-    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+    let tr = Transport::from_config("fake", &cfg, 10_000, None).unwrap();
 
     let read_pid = |pid_file: &Path| -> String {
         std::fs::read_to_string(pid_file)
@@ -2756,7 +2756,7 @@ async fn transport_stdio_task_result_does_not_evict_session() {
     let log = dir.join("methods.log");
     let pid_file = dir.join("methods.log.pid");
     let cfg = tcfg_stdio(&py, "task", &log, BTreeMap::new(), None);
-    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+    let tr = Transport::from_config("fake", &cfg, 10_000, None).unwrap();
 
     let read_pid = |pid_file: &Path| -> String {
         std::fs::read_to_string(pid_file)
@@ -2808,7 +2808,7 @@ async fn transport_stdio_bad_arguments_do_not_evict_session() {
     let log = dir.join("methods.log");
     let pid_file = dir.join("methods.log.pid");
     let cfg = tcfg_stdio(&py, "ok", &log, BTreeMap::new(), None);
-    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+    let tr = Transport::from_config("fake", &cfg, 10_000, None).unwrap();
 
     let read_pid = |pid_file: &Path| -> String {
         std::fs::read_to_string(pid_file)
@@ -2858,7 +2858,7 @@ async fn transport_stdio_live_session_is_reused() {
     let log = dir.join("methods.log");
     let pid_file = dir.join("methods.log.pid");
     let cfg = tcfg_stdio(&py, "ok", &log, BTreeMap::new(), None);
-    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+    let tr = Transport::from_config("fake", &cfg, 10_000, None).unwrap();
 
     let read_pid = |pid_file: &Path| -> String {
         std::fs::read_to_string(pid_file)
@@ -2897,7 +2897,7 @@ async fn transport_list_tools_heals_dead_session() {
     let dir = tmpdir("t_listtools");
     let log = dir.join("methods.log");
     let cfg = tcfg_stdio(&py, "die_after_first_call", &log, BTreeMap::new(), None);
-    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+    let tr = Transport::from_config("fake", &cfg, 10_000, None).unwrap();
 
     let count_initializes = |log: &Path| -> usize {
         std::fs::read_to_string(log)
@@ -2952,7 +2952,7 @@ async fn transport_stdio_concurrent_failures_keep_fresh_session() {
         BTreeMap::new(),
         None,
     );
-    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+    let tr = Transport::from_config("fake", &cfg, 10_000, None).unwrap();
 
     let count_initializes = |log: &Path| -> usize {
         std::fs::read_to_string(log)

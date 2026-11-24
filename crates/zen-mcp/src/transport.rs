@@ -130,10 +130,10 @@ impl Session {
         loop {
             pages += 1;
             if pages > MAX_LIST_PAGES {
-                return Err(anyhow!(
+                return Err(SessionError::Call(anyhow!(
                     "MCP server '{}': tools/list exceeded {MAX_LIST_PAGES} pages; refusing to page further",
                     self.name
-                ));
+                )));
             }
             let params = cursor
                 .clone()
@@ -149,18 +149,18 @@ impl Session {
                 .map_err(|e| SessionError::Transport(anyhow!("tools/list failed: {e}")))?;
             all.extend(result.tools);
             if all.len() > MAX_LIST_TOOLS {
-                return Err(anyhow!(
+                return Err(SessionError::Call(anyhow!(
                     "MCP server '{}': tools/list exceeded {MAX_LIST_TOOLS} tools; refusing to collect further",
                     self.name
-                ));
+                )));
             }
             match result.next_cursor {
                 Some(next) => {
                     if !seen_cursors.insert(next.clone()) {
-                        return Err(anyhow!(
+                        return Err(SessionError::Call(anyhow!(
                             "MCP server '{}': tools/list cursor '{next}' repeated; refusing to page further",
                             self.name
-                        ));
+                        )));
                     }
                     cursor = Some(next);
                 }
