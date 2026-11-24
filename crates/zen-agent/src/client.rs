@@ -2083,6 +2083,63 @@ pub(crate) fn anthropic_system_blocks(system_text: &str) -> Vec<Value> {
     blocks
 }
 
+/// Append plain user text to the in-progress message list,
+/// merging into the trailing user message when there is one so
+/// roles strictly alternate (issue #333).
+fn push_user_text(messages: &mut Vec<Value>, text: String) {
+    if let Some(last) = messages.last_mut()
+        && last.get("role").and_then(Value::as_str) == Some("user")
+        && let Some(content) = last.get_mut("content")
+    {
+        match content {
+            Value::String(s) => {
+                if !text.is_empty() {
+                    if !s.is_empty() {
+                        s.push_str("\n\n");
+                    }
+                    s.push_str(&text);
+                }
+                return;
+            }
+            Value::Array(blocks) => {
+                if !text.is_empty() {
+                    blocks.push(serde_json::json!({"type": "text", "text": text}));
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+    messages.push(serde_json::json!({"role": "user", "content": text}));
+}
+
+/// Append a tool_result block to the in-progress message list,
+/// merging into the trailing user message when there is one so
+/// several tool results share one user message (issue #333).
+fn push_tool_result(messages: &mut Vec<Value>, block: Value) {
+    if let Some(last) = messages.last_mut()
+        && last.get("role").and_then(Value::as_str) == Some("user")
+        && let Some(content) = last.get_mut("content")
+    {
+        match content {
+            Value::Array(blocks) => {
+                blocks.push(block);
+                return;
+            }
+            Value::String(s) => {
+                let text = std::mem::take(s);
+                *content = Value::Array(vec![
+                    serde_json::json!({"type": "text", "text": text}),
+                    block,
+                ]);
+                return;
+            }
+            _ => {}
+        }
+    }
+    messages.push(serde_json::json!({"role": "user", "content": [block]}));
+}
+
 pub(crate) fn anthropic_request_body(req: &ChatRequest) -> Value {
     let mut system_parts: Vec<String> = Vec::new();
     let mut messages: Vec<Value> = Vec::new();
@@ -2094,15 +2151,16 @@ pub(crate) fn anthropic_request_body(req: &ChatRequest) -> Value {
                     system_parts.push(text);
                 }
             }
+            // The Messages API requires roles to alternate and the
+            // first message to be from the user, so consecutive
+            // same-role turns merge into one message (issue #333).
             "tool" => {
-                messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": m.tool_call_id.as_deref().unwrap_or(""),
-                        "content": m.text(),
-                    }],
-                }));
+                let block = serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": m.tool_call_id.as_deref().unwrap_or(""),
+                    "content": m.text(),
+                });
+                push_tool_result(&mut messages, block);
             }
             "assistant" => {
                 let mut blocks: Vec<Value> = Vec::new();
@@ -2120,13 +2178,27 @@ pub(crate) fn anthropic_request_body(req: &ChatRequest) -> Value {
                         "input": input,
                     }));
                 }
+                // An assistant turn with no blocks would emit
+                // "content": [], which the API rejects; drop it.
+                if blocks.is_empty() {
+                    continue;
+                }
+                if let Some(last) = messages.last_mut()
+                    && last.get("role").and_then(Value::as_str) == Some("assistant")
+                    && let Some(content) = last.get_mut("content").and_then(Value::as_array_mut)
+                {
+                    content.extend(blocks);
+                    continue;
+                }
+                // A leading assistant turn has no preceding user turn
+                // to answer; drop it so messages start with the user.
+                if messages.is_empty() {
+                    continue;
+                }
                 messages.push(serde_json::json!({"role": "assistant", "content": blocks}));
             }
             _ => {
-                messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": m.text(),
-                }));
+                push_user_text(&mut messages, m.text());
             }
         }
     }
@@ -2649,6 +2721,144 @@ mod anthropic_tests {
         let a = serde_json::to_string(&anthropic_request_body(&r)).unwrap();
         let b = serde_json::to_string(&anthropic_request_body(&r)).unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn request_body_merges_consecutive_tool_results() {
+        // Issue #333: one user message per tool result breaks the
+        // Messages API alternation rule (400: roles must alternate).
+        let mut r = req();
+        r.messages.push(ChatMessage::assistant(
+            Some("checking".to_string()),
+            Some(vec![
+                ToolCall {
+                    id: "toolu_1".to_string(),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "Read".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                },
+                ToolCall {
+                    id: "toolu_2".to_string(),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "Bash".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                },
+            ]),
+        ));
+        r.messages
+            .push(ChatMessage::tool("toolu_1", "first result"));
+        r.messages
+            .push(ChatMessage::tool("toolu_2", "second result"));
+        let body = anthropic_request_body(&r);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[2]["role"], "user");
+        let blocks = msgs[2]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[0]["tool_use_id"], "toolu_1");
+        assert_eq!(blocks[1]["type"], "tool_result");
+        assert_eq!(blocks[1]["tool_use_id"], "toolu_2");
+    }
+
+    #[test]
+    fn request_body_drops_empty_and_leading_assistant_turns() {
+        // Issue #333: an assistant turn with no blocks emits
+        // "content": [], and a leading assistant turn breaks the
+        // must-start-with-user rule.
+        let mut r = req();
+        r.messages
+            .insert(1, ChatMessage::assistant(Some("orphan".to_string()), None));
+        r.messages.push(ChatMessage::assistant(None, None));
+        r.messages
+            .push(ChatMessage::assistant(Some(String::new()), None));
+        let body = anthropic_request_body(&r);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "hi");
+    }
+
+    #[test]
+    fn request_body_merges_consecutive_same_role_turns() {
+        // Issue #333: consecutive user (or assistant) turns must
+        // merge into one message so roles strictly alternate.
+        let mut r = req();
+        r.messages.push(ChatMessage::user("again"));
+        r.messages
+            .push(ChatMessage::assistant(Some("first".to_string()), None));
+        r.messages
+            .push(ChatMessage::assistant(Some("second".to_string()), None));
+        let body = anthropic_request_body(&r);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "hi\n\nagain");
+        assert_eq!(msgs[1]["role"], "assistant");
+        let blocks = msgs[1]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["text"], "first");
+        assert_eq!(blocks[1]["text"], "second");
+    }
+
+    #[test]
+    fn request_body_merges_tool_result_into_plain_user_text() {
+        // Issue #333: a tool result arriving after a plain user turn
+        // (String content) must convert that message to blocks
+        // [text, tool_result] instead of starting a second user
+        // message, or roles stop alternating. Kills the mutant that
+        // deletes the Value::String arm of push_tool_result.
+        let mut r = req();
+        r.messages.push(ChatMessage::tool("toolu_1", "result text"));
+        let body = anthropic_request_body(&r);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        let blocks = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "hi");
+        assert_eq!(blocks[1]["type"], "tool_result");
+        assert_eq!(blocks[1]["tool_use_id"], "toolu_1");
+    }
+
+    #[test]
+    fn request_body_appends_user_text_after_tool_results() {
+        // Issue #333: user text after tool results must append as a
+        // text block to the same user message (Array content), not
+        // start a new user message. Kills the mutants that delete
+        // the Value::Array arm of push_user_text and that flip its
+        // !text.is_empty() guard.
+        let mut r = req();
+        r.messages.push(ChatMessage::assistant(
+            Some("checking".to_string()),
+            Some(vec![ToolCall {
+                id: "toolu_1".to_string(),
+                call_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "Read".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+        ));
+        r.messages
+            .push(ChatMessage::tool("toolu_1", "first result"));
+        r.messages.push(ChatMessage::user("follow-up"));
+        let body = anthropic_request_body(&r);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[2]["role"], "user");
+        let blocks = msgs[2]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[0]["tool_use_id"], "toolu_1");
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], "follow-up");
     }
 
     #[test]
