@@ -235,6 +235,69 @@ fn load_configs_bare_map_and_bad_json() {
 }
 
 #[test]
+fn one_bad_mcp_config_file_does_not_drop_other_servers() {
+    // Regression test for #374: one bad file (bad JSON in the project
+    // `.mcp.json`, plus a `~/.zen.json` whose top-level keys are not
+    // server objects) must not abort the whole load. On the original code
+    // this test fails: `merge_file(...)?` propagates the first error and
+    // the `unwrap()` below panics on `Err`.
+    let cwd = tmpdir("cfg_badfile_cwd");
+    let home = tmpdir("cfg_badfile_home");
+    std::fs::write(cwd.join(".mcp.json"), "{not json").unwrap();
+    std::fs::create_dir_all(cwd.join(".zen")).unwrap();
+    std::fs::write(
+        cwd.join(".zen").join("mcp.json"),
+        r#"{"mcpServers":{"local":{"command":"echo"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(home.join(".zen.json"), r#"{"version": 1}"#).unwrap();
+    std::fs::create_dir_all(home.join(".zen")).unwrap();
+    std::fs::write(
+        home.join(".zen").join("mcp.json"),
+        r#"{"mcpServers":{"user":{"command":"cat"}}}"#,
+    )
+    .unwrap();
+    let cli = vec![r#"{"mcpServers":{"cli":{"command":"cat"}}}"#.to_string()];
+
+    let cfg = crate::load_mcp_configs_scoped(&cwd, Some(&home), &cli, false, true).unwrap();
+    assert_eq!(
+        cfg.keys().cloned().collect::<Vec<_>>(),
+        vec!["cli", "local", "user"]
+    );
+    assert_eq!(cfg["local"].command.as_deref(), Some("echo"));
+    assert_eq!(cfg["user"].command.as_deref(), Some("cat"));
+    assert_eq!(cfg["cli"].command.as_deref(), Some("cat"));
+
+    let _ = std::fs::remove_dir_all(&cwd);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn bad_cli_entry_does_not_drop_file_servers_unless_strict() {
+    // Same #374 rule for `--mcp-config` entries in non-strict mode: a bad
+    // entry is skipped and the remaining entries and file servers load.
+    // In strict mode the bad explicit entry is still a hard error (kept
+    // behaviour, see `load_configs_bare_map_and_bad_json`).
+    let cwd = tmpdir("cfg_badcli_cwd");
+    let home = tmpdir("cfg_badcli_home");
+    std::fs::write(
+        cwd.join(".mcp.json"),
+        r#"{"mcpServers":{"proj":{"command":"echo"}}}"#,
+    )
+    .unwrap();
+    let good = r#"{"mcpServers":{"cli":{"command":"cat"}}}"#.to_string();
+    let cli = vec!["{not json".to_string(), good];
+
+    let cfg = load_mcp_configs(&cwd, Some(&home), &cli, false).unwrap();
+    assert_eq!(cfg.keys().cloned().collect::<Vec<_>>(), vec!["cli", "proj"]);
+
+    assert!(load_mcp_configs(&cwd, Some(&home), &cli, true).is_err());
+
+    let _ = std::fs::remove_dir_all(&cwd);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn tool_name_sanitization() {
     assert_eq!(
         crate::manager::mcp_tool_name("my server", "do.thing"),

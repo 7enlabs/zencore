@@ -400,6 +400,19 @@ pub fn load_mcp_configs(
     load_mcp_configs_scoped(cwd, home, cli_configs, strict, true)
 }
 
+/// Load MCP server configs from the config files and `--mcp-config` entries.
+///
+/// In non-strict mode a single unreadable or malformed config file (or CLI
+/// entry) is skipped with a `warning:` on stderr and loading continues with
+/// the remaining files and entries, so one bad file cannot drop the valid
+/// servers (see #374). A missing file is not an error and is skipped
+/// silently, as before.
+///
+/// In strict mode (`--strict-mcp-config`, "only use servers given via
+/// `--mcp-config`") config files are not loaded at all, and a malformed
+/// `--mcp-config` entry is still a hard error: strict means "only the
+/// explicitly given CLI servers", so a bad explicit entry fails the load
+/// instead of silently running with fewer servers than requested.
 pub fn load_mcp_configs_scoped(
     cwd: &Path,
     home: Option<&Path>,
@@ -411,13 +424,26 @@ pub fn load_mcp_configs_scoped(
     if !strict {
         let project = [cwd.join(".mcp.json"), cwd.join(".zen").join("mcp.json")];
         for f in config_files(cwd, home) {
-            if include_project || !project.contains(&f) {
-                merge_file(&mut out, &f)?;
+            if (include_project || !project.contains(&f))
+                && let Err(e) = merge_file(&mut out, &f)
+            {
+                eprintln!("warning: skipping MCP config file '{}': {}", f.display(), e);
             }
         }
     }
     for entry in cli_configs {
-        load_cli_entry(&mut out, entry)?;
+        if strict {
+            load_cli_entry(&mut out, entry)?;
+        } else if let Err(e) = load_cli_entry(&mut out, entry) {
+            // Do not dump a whole inline JSON blob into the warning; the
+            // entry itself is the identifier when it is a file path.
+            let label = if entry.trim_start().starts_with('{') {
+                "inline JSON".to_string()
+            } else {
+                format!("'{}'", entry.trim())
+            };
+            eprintln!("warning: skipping MCP config entry {label}: {e}");
+        }
     }
     Ok(out)
 }
