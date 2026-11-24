@@ -908,7 +908,14 @@ impl Tool for BashTool {
                     if !new_pwd.is_empty() {
                         let p = native_shell_path(new_pwd);
                         if p.is_dir() {
-                            *lock_or_recover(&ctx.cwd, "cwd") = canonicalize_lenient(&p);
+                            // Issue #321: the persistent shell cwd must
+                            // never leave the workspace root, or the
+                            // Landlock write set would follow it outside.
+                            let canon = canonicalize_lenient(&p);
+                            let root = canonicalize_lenient(&ctx.workspace_root());
+                            if canon == root || canon.starts_with(&root) {
+                                *lock_or_recover(&ctx.cwd, "cwd") = canon;
+                            }
                         }
                     }
                     combined = format!("{}{}", &combined[..pos], rest);
@@ -2448,6 +2455,28 @@ mod tests {
         .await
         .expect("no hang");
         assert!(second.content.contains("deeper"), "{}", second.content);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bash_cd_outside_workspace_does_not_persist() {
+        // Issue #321: a persistent `cd` outside the workspace must not
+        // move the session cwd, or the Landlock write set would follow.
+        if zen_core::resolve_shell("bash").kind != zen_core::ShellKind::Posix {
+            return;
+        }
+        let dir = tmpdir("bash-cd-outside");
+        let ctx = ctx_for(&dir);
+        let before = ctx.cwd();
+
+        let out = tokio::time::timeout(
+            Duration::from_secs(10),
+            BashTool.call(json!({"command": "cd /tmp"}), &ctx),
+        )
+        .await
+        .expect("no hang");
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(ctx.cwd(), before, "cwd escaped the workspace root");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

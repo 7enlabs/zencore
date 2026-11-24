@@ -483,6 +483,12 @@ pub struct ToolContext {
     /// `SubAgentRunner::run_subagent`.
     pub agent_depth: usize,
 
+    /// The directory the session started in: the workspace root. The
+    /// persistent shell cwd (updated by the Bash tool) must never leave
+    /// this directory (issue #321); the sandbox write set is anchored
+    /// here. Set once at construction, never mutated.
+    pub workspace_root: PathBuf,
+
     pub extra_dirs: Vec<PathBuf>,
 
     /// OS-level sandbox mode applied to child processes spawned by the
@@ -628,6 +634,7 @@ impl std::fmt::Debug for dyn DiagnosticsProvider {
 impl ToolContext {
     pub fn new(cwd: PathBuf, session_id: impl Into<String>) -> Self {
         Self {
+            workspace_root: cwd.clone(),
             cwd: Arc::new(Mutex::new(cwd)),
             agent_depth: 0,
             extra_dirs: vec![],
@@ -646,6 +653,11 @@ impl ToolContext {
     }
     pub fn cwd(&self) -> PathBuf {
         lock_recovery::lock_or_recover(&self.cwd, "cwd").clone()
+    }
+
+    /// The workspace root this session started in (issue #321).
+    pub fn workspace_root(&self) -> PathBuf {
+        self.workspace_root.clone()
     }
 
     pub fn scratch_dir(&self) -> PathBuf {
