@@ -65,10 +65,25 @@ impl SandboxConfig {
     pub fn from_tool_context(ctx: &zen_core::ToolContext) -> Self {
         Self::new(
             ctx.sandbox_mode,
-            ctx.cwd(),
+            Self::contained_cwd(ctx),
             ctx.extra_dirs.clone(),
             ctx.scratch_dir(),
         )
+    }
+
+    /// The cwd the sandbox may grant writes in: the session cwd, clamped
+    /// to the workspace root (issue #321). A cwd outside the root can
+    /// only come from a writer that bypassed the Bash persistence check,
+    /// so the write set falls back to the root instead of following it.
+    fn contained_cwd(ctx: &zen_core::ToolContext) -> PathBuf {
+        let cwd = ctx.cwd();
+        let canon_cwd = crate::canonicalize_lenient(&cwd);
+        let canon_root = crate::canonicalize_lenient(&ctx.workspace_root());
+        if canon_cwd == canon_root || canon_cwd.starts_with(&canon_root) {
+            cwd
+        } else {
+            ctx.workspace_root()
+        }
     }
 }
 
@@ -739,6 +754,19 @@ mod tests {
         }
     }
 
+    // Issue #321: a cwd inside the workspace root (but not equal to
+    // it) is kept, not clamped to the root. This pins the `||` in
+    // contained_cwd: an `&&` mutant would clamp every subdirectory
+    // back to the root and fail this test.
+    #[test]
+    fn contained_cwd_keeps_subdirectory_inside_workspace() {
+        let root = PathBuf::from("/work/repo");
+        let ctx = zen_core::ToolContext::new(root.clone(), "test-session");
+        let sub = root.join("sub");
+        *ctx.cwd.lock().unwrap() = sub.clone();
+        assert_eq!(SandboxConfig::contained_cwd(&ctx), sub);
+    }
+
     #[test]
     fn write_paths_workspace_write_covers_cwd_scratch_tmp_and_extra() {
         let cwd = PathBuf::from("/work/repo");
@@ -767,6 +795,19 @@ mod tests {
         let scratch = PathBuf::from("/work/repo/.zen/scratch");
         assert!(write_allowed_paths(SandboxMode::ReadOnly, &cwd, &[], &scratch).is_empty());
         assert!(write_allowed_paths(SandboxMode::Off, &cwd, &[], &scratch).is_empty());
+    }
+
+    #[test]
+    fn from_tool_context_clamps_cwd_outside_workspace_root() {
+        // Issue #321: a session cwd outside the workspace root must not
+        // move the sandbox write set; it falls back to the root.
+        let root = std::env::temp_dir().join("zen-321-root");
+        let _ = std::fs::create_dir_all(&root);
+        let ctx = zen_core::ToolContext::new(root.clone(), "s321");
+        *ctx.cwd.lock().unwrap() = std::env::temp_dir();
+        let cfg = SandboxConfig::from_tool_context(&ctx);
+        assert_eq!(cfg.cwd, root);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
