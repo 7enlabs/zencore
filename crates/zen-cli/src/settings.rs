@@ -769,7 +769,12 @@ pub fn resolve_config_with_home(
     // the paid Google API. Check the catalog first; only non-catalog
     // ids take the direct path.
     let is_catalog_id = crate::models::catalog_entry(&raw_model).is_some();
-    let spec = zen_agent::providers::ModelSpec::parse(&raw_model, DEFAULT_BASE_URL, false);
+    // A known provider whose endpoint cannot resolve is a hard error
+    // (issue #346): falling back to the default gateway would silently
+    // discard the provider, model and key env. Catalog ids are checked
+    // first above, so they never reach this parse.
+    let spec = zen_agent::providers::ModelSpec::parse(&raw_model, DEFAULT_BASE_URL, false)
+        .map_err(anyhow::Error::msg)?;
     let provider_key = spec
         .api_key_env
         .as_deref()
