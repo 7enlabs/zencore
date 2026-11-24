@@ -2414,7 +2414,30 @@ async fn transport_stdio_call_error_does_not_evict_session() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(unix)]
+fn wait_child_dead(pid: u32) {
+    // The mock exits asynchronously after answering, so the test must
+    // wait until the child is actually dead before the next request:
+    // otherwise the probe can sample it still-running and the retry is
+    // wasted on the corpse. waitpid reaps it; that is safe here (the
+    // child is ours, and tokio's orphan queue drops an already-reaped
+    // child cleanly on ECHILD), and it makes the probe deterministic:
+    // the next is_alive sees waitpid return -1 and reports dead.
+    for _ in 0..1000 {
+        let mut status = 0;
+        let ret = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+        if ret == pid as i32 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("mock child {pid} did not exit within 5s");
+}
+
 #[tokio::test]
+#[cfg(unix)] // probe relies on the waitpid liveness check; on
+// Windows is_alive cannot see a dead stdio child, so these
+// tests only run on Unix.
 async fn transport_stdio_probe_detects_dead_session_before_retry() {
     // Mutant killer for the liveness probe in `Transport::session`:
     // removing the `is_alive` check must fail this test. The mock's
@@ -2455,6 +2478,7 @@ async fn transport_stdio_probe_detects_dead_session_before_retry() {
     assert_eq!(out["tools"][0]["name"], "echo");
     let pid1 = read_pid(&pid_file);
     assert!(!pid1.is_empty(), "mock never wrote its pid");
+    wait_child_dead(pid1.parse().expect("mock pid must be numeric"));
 
     // Request 2: probe -> second spawn (list errors) -> retry -> third
     // spawn answers. Success with exactly three handshakes proves the
@@ -2477,6 +2501,9 @@ async fn transport_stdio_probe_detects_dead_session_before_retry() {
 }
 
 #[tokio::test]
+#[cfg(unix)] // probe relies on the waitpid liveness check; on
+// Windows is_alive cannot see a dead stdio child, so these
+// tests only run on Unix.
 async fn transport_stdio_retry_exactly_once_on_transport_errors() {
     // Mutant killer for the "retry once" bound in the resilient helpers:
     // the second *and* third spawns fail `tools/list`, so the request
@@ -2488,6 +2515,7 @@ async fn transport_stdio_retry_exactly_once_on_transport_errors() {
     let Some(py) = python_exe() else { return };
     let dir = tmpdir("t_retry1");
     let log = dir.join("methods.log");
+    let pid_file = dir.join("methods.log.pid");
     let cfg = tcfg_stdio(
         &py,
         "die_after_first_call_then_list_error_twice",
@@ -2508,6 +2536,11 @@ async fn transport_stdio_retry_exactly_once_on_transport_errors() {
         .unwrap()
         .expect("first tools/list should succeed");
     assert_eq!(out["tools"][0]["name"], "echo");
+    let pid1 = std::fs::read_to_string(&pid_file)
+        .map(|t| t.trim().to_string())
+        .unwrap_or_default();
+    assert!(!pid1.is_empty(), "mock never wrote its pid");
+    wait_child_dead(pid1.parse().expect("mock pid must be numeric"));
 
     let err = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
         .await
@@ -2673,28 +2706,30 @@ async fn transport_stdio_dead_session_call_heals_and_keeps_arguments() {
             .map(|t| t.lines().filter(|l| *l == "initialize").count())
             .unwrap_or(0)
     };
-    let call_echo = |tr: &Transport| {
-        tokio::time::timeout(
-            TEST_TIMEOUT,
-            tr.request(
-                "tools/call",
-                json!({"name": "echo", "arguments": {"text": "hello"}}),
-            ),
-        )
-    };
-
-    let out = call_echo(&tr)
-        .await
-        .unwrap()
-        .expect("first tools/call should succeed");
+    let out = tokio::time::timeout(
+        TEST_TIMEOUT,
+        tr.request(
+            "tools/call",
+            json!({"name": "echo", "arguments": {"text": "hello"}}),
+        ),
+    )
+    .await
+    .unwrap()
+    .expect("first tools/call should succeed");
     assert_eq!(out["content"][0]["text"], "echo: hello");
     let pid1 = read_pid(&pid_file);
     assert!(!pid1.is_empty(), "mock never wrote its pid");
 
-    let out = call_echo(&tr)
-        .await
-        .unwrap()
-        .unwrap_or_else(|e| panic!("second tools/call should heal by reconnecting: {e}"));
+    let out = tokio::time::timeout(
+        TEST_TIMEOUT,
+        tr.request(
+            "tools/call",
+            json!({"name": "echo", "arguments": {"text": "hello"}}),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap_or_else(|e| panic!("second tools/call should heal by reconnecting: {e}"));
     assert_eq!(out["content"][0]["text"], "echo: hello");
     let pid2 = read_pid(&pid_file);
     assert_ne!(pid1, pid2, "second call reused the dead session's process");

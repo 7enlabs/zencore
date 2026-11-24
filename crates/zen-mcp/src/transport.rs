@@ -67,14 +67,19 @@ impl Session {
     }
 
     /// Cheap liveness probe: the rmcp service must still be held, and a
-    /// stdio child must still exist. A missing service means the session
-    /// was shut down; a reaped stdio child means the server is gone.
-    /// (A zombie child still answers kill(pid, 0), so a stale-but-zombie
-    /// session can slip past this probe; the transport-error eviction in
+    /// stdio child must still be alive. A missing service means the
+    /// session was shut down; an exited stdio child means the server is
+    /// gone. (On Unix the child is checked with waitpid(WNOHANG), which
+    /// reaps a zombie: kill(pid, 0) cannot see zombies, so the old probe
+    /// called a dead-but-unreaped child alive and the single retry was
+    /// wasted on the corpse. A child already reaped elsewhere reports
+    /// dead too (waitpid returns -1), so the session is reconnected
+    /// instead of retried on the corpse; the transport-error eviction in
     /// `Transport::list_all_tools_resilient` /
-    /// `Transport::call_tool_resilient` covers that case. HTTP sessions
-    /// have no child process, so for them only the service check applies
-    /// and healing comes from eviction on transport error.)
+    /// `Transport::call_tool_resilient` covers any case the probe still
+    /// misses. HTTP sessions have no child process, so for them only the
+    /// service check applies and healing comes from eviction on
+    /// transport error.)
     fn is_alive(&self) -> bool {
         match self.service.lock() {
             Ok(guard) => {
@@ -91,16 +96,24 @@ impl Session {
         let Some(pid) = pid else { return true };
         #[cfg(unix)]
         {
-            // kill(pid, 0) delivers no signal: 0 means the process
-            // exists, EPERM means it exists but cannot be signalled,
-            // ESRCH means it is gone.
-            // SAFETY: kill(2) with signal 0 has no memory-safety
-            // preconditions; plain integers only.
-            let rc = unsafe { libc::kill(pid as i32, 0) };
-            if rc == 0 {
-                return true;
-            }
-            std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+            // waitpid(WNOHANG) reaps a zombie child, which kill(pid, 0)
+            // cannot see: a dead stdio server that has exited but not
+            // been waited on yet still answers kill(pid, 0), so the old
+            // probe called it alive and the single retry was wasted on
+            // the corpse. The child is ours (spawned in
+            // `connect_stdio`), and reaping it here is safe: tokio's
+            // orphan queue drops an already-reaped child cleanly on
+            // ECHILD. A return of 0 means the child is still running;
+            // any other outcome (the pid: it exited; -1: already reaped
+            // elsewhere, or an error) means the session is dead and must
+            // be reconnected. waitpid subsumes the old kill(pid, 0)
+            // check: for our own child a return of 0 already proves it
+            // is running.
+            // SAFETY: waitpid(2) with WNOHANG on our own child; plain
+            // integers only, no memory-safety preconditions.
+            let mut status = 0;
+            let ret = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+            ret == 0
         }
         #[cfg(not(unix))]
         {
@@ -630,4 +643,22 @@ pub(crate) struct RemoteTool {
     pub name: String,
     pub description: String,
     pub schema: Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_error_display_forwards_inner_message() {
+        // Mutant killer for the Display impl: the resilient helpers
+        // return the inner anyhow error, so Display is only reached
+        // when a SessionError itself is formatted; pin that it
+        // forwards the inner message for both variants.
+        assert_eq!(SessionError::Transport(anyhow!("boom")).to_string(), "boom");
+        assert_eq!(
+            SessionError::Call(anyhow!("bad args")).to_string(),
+            "bad args"
+        );
+    }
 }
