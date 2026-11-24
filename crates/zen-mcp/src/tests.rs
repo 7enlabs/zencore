@@ -2413,3 +2413,536 @@ async fn transport_stdio_call_error_does_not_evict_session() {
     tr.kill();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn transport_stdio_probe_detects_dead_session_before_retry() {
+    // Mutant killer for the liveness probe in `Transport::session`:
+    // removing the `is_alive` check must fail this test. The mock's
+    // second spawn always fails `tools/list`, so the single retry is
+    // only enough if the probe spots the dead first spawn *before* any
+    // list attempt and spends the retry on the third spawn. Without the
+    // probe the first attempt dies on the corpse, the retry dies on the
+    // second spawn, and the request fails.
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_probe");
+    let log = dir.join("methods.log");
+    let pid_file = dir.join("methods.log.pid");
+    let cfg = tcfg_stdio(
+        &py,
+        "die_after_first_call_then_list_error_once",
+        &log,
+        BTreeMap::new(),
+        None,
+    );
+    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+
+    let read_pid = |pid_file: &Path| -> String {
+        std::fs::read_to_string(pid_file)
+            .map(|t| t.trim().to_string())
+            .unwrap_or_default()
+    };
+    let count_initializes = |log: &Path| -> usize {
+        std::fs::read_to_string(log)
+            .map(|t| t.lines().filter(|l| *l == "initialize").count())
+            .unwrap_or(0)
+    };
+
+    // Request 1: the first server answers, then dies.
+    let out = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
+        .await
+        .unwrap()
+        .expect("first tools/list should succeed");
+    assert_eq!(out["tools"][0]["name"], "echo");
+    let pid1 = read_pid(&pid_file);
+    assert!(!pid1.is_empty(), "mock never wrote its pid");
+
+    // Request 2: probe -> second spawn (list errors) -> retry -> third
+    // spawn answers. Success with exactly three handshakes proves the
+    // probe ran; without it this request errors out.
+    let out = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
+        .await
+        .unwrap()
+        .unwrap_or_else(|e| panic!("second tools/list should heal via probe + retry: {e}"));
+    assert_eq!(out["tools"][0]["name"], "echo");
+    let pid2 = read_pid(&pid_file);
+    assert_ne!(pid1, pid2, "second call reused a dead session's process");
+    assert_eq!(
+        count_initializes(&log),
+        3,
+        "expected one initialize per spawn (dead, list-error, healthy)"
+    );
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn transport_stdio_retry_exactly_once_on_transport_errors() {
+    // Mutant killer for the "retry once" bound in the resilient helpers:
+    // the second *and* third spawns fail `tools/list`, so the request
+    // must surface "reconnected session also failed" after exactly one
+    // retry (three handshakes total). A retry-twice mutant would reach
+    // the healthy fourth spawn and succeed; a no-retry mutant would stop
+    // after two handshakes; a no-probe mutant would also stop after two
+    // (first attempt wasted on the corpse).
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_retry1");
+    let log = dir.join("methods.log");
+    let cfg = tcfg_stdio(
+        &py,
+        "die_after_first_call_then_list_error_twice",
+        &log,
+        BTreeMap::new(),
+        None,
+    );
+    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+
+    let count_initializes = |log: &Path| -> usize {
+        std::fs::read_to_string(log)
+            .map(|t| t.lines().filter(|l| *l == "initialize").count())
+            .unwrap_or(0)
+    };
+
+    let out = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
+        .await
+        .unwrap()
+        .expect("first tools/list should succeed");
+    assert_eq!(out["tools"][0]["name"], "echo");
+
+    let err = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("reconnected session also failed"),
+        "got: {err}"
+    );
+    assert_eq!(
+        count_initializes(&log),
+        3,
+        "a second retry would have spawned a fourth server"
+    );
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn transport_stdio_reconnect_failure_reports_dead_session() {
+    // Mutant killer for the "reconnect failed" message in the resilient
+    // helpers: the first list hangs (timeout = transport error), then
+    // the reconnect target itself refuses to start, so the error must
+    // say the session died *and* that the reconnect failed, instead of
+    // returning the raw timeout or hanging. The first spawn's child is
+    // still alive when it hangs, so the probe cannot heal this case;
+    // only evict + retry reaches the failing reconnect.
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_reconnfail");
+    let log = dir.join("methods.log");
+    let cfg = tcfg_stdio(
+        &py,
+        "hang_first_list_then_refuse",
+        &log,
+        BTreeMap::new(),
+        None,
+    );
+    let tr = Transport::from_config(&cfg, 1_000).unwrap();
+
+    let count_initializes = |log: &Path| -> usize {
+        std::fs::read_to_string(log)
+            .map(|t| t.lines().filter(|l| *l == "initialize").count())
+            .unwrap_or(0)
+    };
+
+    let err = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
+        .await
+        .unwrap()
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("MCP session died"), "got: {msg}");
+    assert!(msg.contains("reconnect failed"), "got: {msg}");
+    assert!(msg.contains("timed out"), "got: {msg}");
+    assert_eq!(
+        count_initializes(&log),
+        1,
+        "the refusing reconnect must never complete a handshake"
+    );
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn transport_stdio_hung_list_evicts_and_reconnects() {
+    // Mutant killer for evict-on-transport-error on the list path, in
+    // the case the probe cannot help: the first server hangs but its
+    // child is still alive, so `is_alive` passes and only `evict()`
+    // can move the retry onto a fresh server. An evict no-op mutant
+    // retries on the same hanging session and fails with "reconnected
+    // session also failed"; a mutant classifying timeouts as call
+    // errors returns the timeout with no retry at all.
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_hanglist");
+    let log = dir.join("methods.log");
+    let cfg = tcfg_stdio(&py, "hang_first_list", &log, BTreeMap::new(), None);
+    let tr = Transport::from_config(&cfg, 1_000).unwrap();
+
+    let count_initializes = |log: &Path| -> usize {
+        std::fs::read_to_string(log)
+            .map(|t| t.lines().filter(|l| *l == "initialize").count())
+            .unwrap_or(0)
+    };
+
+    let out = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
+        .await
+        .unwrap()
+        .unwrap_or_else(|e| panic!("hung tools/list should heal by evict + reconnect: {e}"));
+    assert_eq!(out["tools"][0]["name"], "echo");
+    assert_eq!(
+        count_initializes(&log),
+        2,
+        "expected exactly one reconnect after the hang"
+    );
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn transport_stdio_hung_call_evicts_and_reconnects() {
+    // Same evict isolation as the hung-list test, on the call path:
+    // the first `tools/call` hangs (child alive, probe passes), so
+    // only evict + one retry on a fresh server can succeed. The
+    // retried call must carry the original arguments: a mutant that
+    // retries with dropped arguments gets "echo: " instead of
+    // "echo: hello".
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_hangcall");
+    let log = dir.join("methods.log");
+    let cfg = tcfg_stdio(&py, "hang_first_call", &log, BTreeMap::new(), None);
+    let tr = Transport::from_config(&cfg, 1_000).unwrap();
+
+    let count_initializes = |log: &Path| -> usize {
+        std::fs::read_to_string(log)
+            .map(|t| t.lines().filter(|l| *l == "initialize").count())
+            .unwrap_or(0)
+    };
+
+    let out = tokio::time::timeout(
+        TEST_TIMEOUT,
+        tr.request(
+            "tools/call",
+            json!({"name": "echo", "arguments": {"text": "hello"}}),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap_or_else(|e| panic!("hung tools/call should heal by evict + reconnect: {e}"));
+    assert_eq!(out["content"][0]["text"], "echo: hello");
+    assert_eq!(
+        count_initializes(&log),
+        2,
+        "expected exactly one reconnect after the hang"
+    );
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn transport_stdio_dead_session_call_heals_and_keeps_arguments() {
+    // Mutant killer for the call path of the resilient helpers: the
+    // server answers one `tools/call` and then dies, so the next call
+    // must evict + reconnect and retry with the *same* arguments. A
+    // no-retry mutant fails the second call; a retry-drops-arguments
+    // mutant answers "echo: " instead of "echo: hello".
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_callheal");
+    let log = dir.join("methods.log");
+    let pid_file = dir.join("methods.log.pid");
+    let cfg = tcfg_stdio(&py, "die_after_first_call", &log, BTreeMap::new(), None);
+    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+
+    let read_pid = |pid_file: &Path| -> String {
+        std::fs::read_to_string(pid_file)
+            .map(|t| t.trim().to_string())
+            .unwrap_or_default()
+    };
+    let count_initializes = |log: &Path| -> usize {
+        std::fs::read_to_string(log)
+            .map(|t| t.lines().filter(|l| *l == "initialize").count())
+            .unwrap_or(0)
+    };
+    let call_echo = |tr: &Transport| {
+        tokio::time::timeout(
+            TEST_TIMEOUT,
+            tr.request(
+                "tools/call",
+                json!({"name": "echo", "arguments": {"text": "hello"}}),
+            ),
+        )
+    };
+
+    let out = call_echo(&tr)
+        .await
+        .unwrap()
+        .expect("first tools/call should succeed");
+    assert_eq!(out["content"][0]["text"], "echo: hello");
+    let pid1 = read_pid(&pid_file);
+    assert!(!pid1.is_empty(), "mock never wrote its pid");
+
+    let out = call_echo(&tr)
+        .await
+        .unwrap()
+        .unwrap_or_else(|e| panic!("second tools/call should heal by reconnecting: {e}"));
+    assert_eq!(out["content"][0]["text"], "echo: hello");
+    let pid2 = read_pid(&pid_file);
+    assert_ne!(pid1, pid2, "second call reused the dead session's process");
+    assert_eq!(
+        count_initializes(&log),
+        2,
+        "expected one initialize per spawned server"
+    );
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn transport_stdio_task_result_does_not_evict_session() {
+    // Mutant killer for the Call/Transport classification: a `task`
+    // result is a call the live server answered, not a dead session.
+    // A mutant classifying it as Transport evicts the healthy session
+    // and reconnects (new PID, second initialize) before returning the
+    // same error; the correct code returns the error on the same
+    // session, which the following list proves is still alive.
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_tasknoev");
+    let log = dir.join("methods.log");
+    let pid_file = dir.join("methods.log.pid");
+    let cfg = tcfg_stdio(&py, "task", &log, BTreeMap::new(), None);
+    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+
+    let read_pid = |pid_file: &Path| -> String {
+        std::fs::read_to_string(pid_file)
+            .map(|t| t.trim().to_string())
+            .unwrap_or_default()
+    };
+
+    let err = tokio::time::timeout(
+        TEST_TIMEOUT,
+        tr.request("tools/call", json!({"name": "echo", "arguments": {}})),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("returned a task result"),
+        "got: {err}"
+    );
+    let pid1 = read_pid(&pid_file);
+    assert!(!pid1.is_empty(), "mock never wrote its pid");
+
+    let out = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
+        .await
+        .unwrap()
+        .expect("tools/list on the live session should succeed");
+    assert_eq!(out["tools"][0]["name"], "echo");
+    let pid2 = read_pid(&pid_file);
+    assert_eq!(pid1, pid2, "a task result evicted a live session");
+    let initializes = std::fs::read_to_string(&log)
+        .map(|t| t.lines().filter(|l| *l == "initialize").count())
+        .unwrap_or(0);
+    assert_eq!(initializes, 1, "a task result triggered a reconnect");
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn transport_stdio_bad_arguments_do_not_evict_session() {
+    // Mutant killer for the Call/Transport classification at the
+    // argument check: non-object arguments fail before the peer is
+    // even contacted, so there is no dead session to evict. A mutant
+    // classifying this as Transport evicts the healthy session and
+    // reconnects (new PID, second initialize) before failing again
+    // with the same message; the error text alone cannot tell them
+    // apart, the PID and handshake count can.
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_badargs");
+    let log = dir.join("methods.log");
+    let pid_file = dir.join("methods.log.pid");
+    let cfg = tcfg_stdio(&py, "ok", &log, BTreeMap::new(), None);
+    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+
+    let read_pid = |pid_file: &Path| -> String {
+        std::fs::read_to_string(pid_file)
+            .map(|t| t.trim().to_string())
+            .unwrap_or_default()
+    };
+
+    let err = tokio::time::timeout(
+        TEST_TIMEOUT,
+        tr.request("tools/call", json!({"name": "echo", "arguments": [1, 2]})),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("arguments must be a JSON object"),
+        "got: {err}"
+    );
+    let pid1 = read_pid(&pid_file);
+    assert!(!pid1.is_empty(), "mock never wrote its pid");
+
+    let out = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
+        .await
+        .unwrap()
+        .expect("tools/list on the live session should succeed");
+    assert_eq!(out["tools"][0]["name"], "echo");
+    let pid2 = read_pid(&pid_file);
+    assert_eq!(pid1, pid2, "bad arguments evicted a live session");
+    let initializes = std::fs::read_to_string(&log)
+        .map(|t| t.lines().filter(|l| *l == "initialize").count())
+        .unwrap_or(0);
+    assert_eq!(initializes, 1, "bad arguments triggered a reconnect");
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn transport_stdio_live_session_is_reused() {
+    // Mutant killer for the probe's live branch: a probe that always
+    // reports dead (or a `session()` that always reconnects) still
+    // passes every healing test above, because they all expect a
+    // reconnect. Two plain lists on a healthy server must cost exactly
+    // one spawn and one handshake.
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_reuse");
+    let log = dir.join("methods.log");
+    let pid_file = dir.join("methods.log.pid");
+    let cfg = tcfg_stdio(&py, "ok", &log, BTreeMap::new(), None);
+    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+
+    let read_pid = |pid_file: &Path| -> String {
+        std::fs::read_to_string(pid_file)
+            .map(|t| t.trim().to_string())
+            .unwrap_or_default()
+    };
+
+    for n in 1..=2 {
+        let out = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
+            .await
+            .unwrap()
+            .unwrap_or_else(|e| panic!("tools/list {n} on a live session should succeed: {e}"));
+        assert_eq!(out["tools"][0]["name"], "echo");
+    }
+    let pid1 = read_pid(&pid_file);
+    assert!(!pid1.is_empty(), "mock never wrote its pid");
+    let initializes = std::fs::read_to_string(&log)
+        .map(|t| t.lines().filter(|l| *l == "initialize").count())
+        .unwrap_or(0);
+    assert_eq!(
+        initializes, 1,
+        "a live session was reconnected for no reason"
+    );
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn transport_list_tools_heals_dead_session() {
+    // Mutant killer for the `list_tools` / `handshake` path: it must go
+    // through the same resilient helper as `Transport::request`. A
+    // mutant that calls the bare `Session::list_all_tools` here fails
+    // the second listing on the dead cached session instead of healing.
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_listtools");
+    let log = dir.join("methods.log");
+    let cfg = tcfg_stdio(&py, "die_after_first_call", &log, BTreeMap::new(), None);
+    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+
+    let count_initializes = |log: &Path| -> usize {
+        std::fs::read_to_string(log)
+            .map(|t| t.lines().filter(|l| *l == "initialize").count())
+            .unwrap_or(0)
+    };
+
+    for n in 1..=2 {
+        let tools = tokio::time::timeout(TEST_TIMEOUT, crate::transport::list_tools(&tr))
+            .await
+            .unwrap()
+            .unwrap_or_else(|e| panic!("list_tools call {n} should succeed: {e}"));
+        assert!(
+            tools.iter().any(|t| t.name == "echo"),
+            "call {n}: expected an echo tool, got {:?}",
+            tools.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(
+        count_initializes(&log),
+        2,
+        "expected one initialize per spawned server"
+    );
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn transport_stdio_concurrent_failures_keep_fresh_session() {
+    // Mutant killer for the `Arc::ptr_eq` guard in `Transport::evict`:
+    // when several tasks fail on the same dead session, only the task
+    // that still sees the dead session in the cache may clear it. A
+    // mutant that evicts unconditionally can clear (and shut down) the
+    // fresh session another task just reconnected, so that task's retry
+    // fails instead of succeeding. Only the first spawn dies here, so
+    // every retry lands on the same healthy second spawn and all four
+    // requests must succeed with exactly two handshakes.
+    //
+    // This kill is opportunistic, not deterministic: it fires only if
+    // a stale evict lands between another task's reconnect and its
+    // retry. (A plain `die_after_first_call` concurrent test would be
+    // wrong here: each server answers once, so the second wave of
+    // retries would exhaust its one retry and fail on correct code.)
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_concptr");
+    let log = dir.join("methods.log");
+    let cfg = tcfg_stdio(
+        &py,
+        "die_first_spawn_after_first_list",
+        &log,
+        BTreeMap::new(),
+        None,
+    );
+    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+
+    let count_initializes = |log: &Path| -> usize {
+        std::fs::read_to_string(log)
+            .map(|t| t.lines().filter(|l| *l == "initialize").count())
+            .unwrap_or(0)
+    };
+
+    let (r1, r2, r3, r4) = tokio::join!(
+        tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({}))),
+        tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({}))),
+        tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({}))),
+        tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({}))),
+    );
+    for (n, r) in [r1, r2, r3, r4].into_iter().enumerate() {
+        let out = r
+            .unwrap()
+            .unwrap_or_else(|e| panic!("concurrent tools/list {} should heal: {e}", n + 1));
+        assert_eq!(out["tools"][0]["name"], "echo");
+    }
+    assert_eq!(
+        count_initializes(&log),
+        2,
+        "expected one dead spawn plus one healthy reconnect"
+    );
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
