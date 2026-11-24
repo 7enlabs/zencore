@@ -118,6 +118,11 @@ pub const REGISTRY_FILE: &str = "secrets-registry.jsonl";
 pub const REQUESTS_FILE: &str = "secret-requests.jsonl";
 pub const AUDIT_FILE: &str = "secret-audit.jsonl";
 
+/// The file an exclusive store lock is held on (issue #319). It is
+/// never renamed or read as data, so a `flock` on it stays valid
+/// across registry rewrites.
+pub const LOCK_FILE: &str = "secret.lock";
+
 /// D1: the Leader approves seat secrets.
 pub const LEADER_APPROVER: &str = "zc-leader";
 /// D1: Zen approves user/Zen broker grants and paid-use secrets.
@@ -459,6 +464,69 @@ impl SecretStore {
 
     pub fn audit_path(&self) -> PathBuf {
         self.dir.join(AUDIT_FILE)
+    }
+}
+
+/// An exclusive lock on the secret store (issue #319), held across a
+/// load-modify-append / load-modify-rewrite sequence. The lock is an
+/// `flock` on a dedicated file that is never renamed, so it stays valid
+/// across registry rewrites; it is released when the guard drops, and a
+/// crashed holder releases it with the process, so it can never stick.
+struct StoreLock {
+    _file: std::fs::File,
+}
+
+/// Acquire the store lock, waiting a bounded time. One CLI invocation
+/// holds it only for a single short operation, so 10 seconds is ample;
+/// waiting forever would hang the CLI behind a stuck peer.
+fn lock_store(store: &SecretStore) -> SecretResult<StoreLock> {
+    use fs2::FileExt;
+    let lock_path = store.dir.join(LOCK_FILE);
+    std::fs::create_dir_all(&store.dir).map_err(|e| {
+        SecretError::new(
+            exit_code::GENERAL,
+            format!("cannot create {}: {e}", store.dir.display()),
+        )
+    })?;
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        // The file only carries the flock; its content is never read
+        // or written, so it must not be truncated on open.
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| {
+            SecretError::new(
+                exit_code::GENERAL,
+                format!("cannot open {}: {e}", lock_path.display()),
+            )
+        })?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(StoreLock { _file: file }),
+            // Contention means retry until the deadline: Unix reports
+            // it as WouldBlock, Windows as ERROR_LOCK_VIOLATION
+            // (raw OS error 33), which std maps to ErrorKind::Other
+            // instead of WouldBlock (issue #319).
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(33) =>
+            {
+                if std::time::Instant::now() >= deadline {
+                    return Err(SecretError::new(
+                        exit_code::GENERAL,
+                        "secret store is locked by another operation; try again",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => {
+                return Err(SecretError::new(
+                    exit_code::GENERAL,
+                    format!("cannot lock {}: {e}", lock_path.display()),
+                ));
+            }
+        }
     }
 }
 
@@ -895,6 +963,7 @@ pub fn register_secret(
     input: RegisterInput,
     now: DateTime<Utc>,
 ) -> SecretResult<RegistryEntry> {
+    let _lock = lock_store(store)?;
     validate_register_input(store, &input)?;
     let entry = build_registry_entry(&input, now);
     // --force replaces the live card in place, so the file keeps
@@ -949,6 +1018,7 @@ pub fn deregister_secret(
     reason: &str,
     now: DateTime<Utc>,
 ) -> SecretResult<RegistryEntry> {
+    let _lock = lock_store(store)?;
     let registry = load_registry(store)?;
     let Some(entry) = registry.iter().find(|e| e.name == name).cloned() else {
         return Err(SecretError::not_found(format!(
@@ -1059,6 +1129,7 @@ pub fn request_secret(
     input: RequestInput,
     now: DateTime<Utc>,
 ) -> SecretResult<SecretRequest> {
+    let _lock = lock_store(store)?;
     if !valid_secret_name(&input.name) {
         return Err(SecretError::validation(format!(
             "invalid secret name '{}': use upper snake case, starting with a letter",
@@ -1253,6 +1324,7 @@ pub fn approve_secret(
     evidence: &str,
     now: DateTime<Utc>,
 ) -> SecretResult<SecretRequest> {
+    let _lock = lock_store(store)?;
     let mut req = validate_approve(store, request_id, by, evidence, now)?;
     req.state = RequestState::Approved;
     req.decided_by = Some(by.to_string());
@@ -1293,6 +1365,7 @@ pub fn deny_secret(
     reason: &str,
     now: DateTime<Utc>,
 ) -> SecretResult<SecretRequest> {
+    let _lock = lock_store(store)?;
     let mut req = load_request(store, request_id)?;
     if req.state != RequestState::Requested {
         return Err(SecretError::conflict(format!(
@@ -1336,6 +1409,7 @@ pub fn withdraw_secret(
     reason: &str,
     now: DateTime<Utc>,
 ) -> SecretResult<SecretRequest> {
+    let _lock = lock_store(store)?;
     let mut req = load_request(store, request_id)?;
     if req.state != RequestState::Requested {
         return Err(SecretError::conflict(format!(
@@ -1416,6 +1490,7 @@ pub fn issue_secret(
     by: &str,
     now: DateTime<Utc>,
 ) -> SecretResult<SecretRequest> {
+    let _lock = lock_store(store)?;
     let mut req = load_request(store, request_id)?;
     if by != LEADER_APPROVER && by != OPERATOR_ISSUER {
         return Err(SecretError::forbidden(format!(
@@ -1467,6 +1542,7 @@ pub fn revoke_secret(
     reason: &str,
     now: DateTime<Utc>,
 ) -> SecretResult<SecretRequest> {
+    let _lock = lock_store(store)?;
     let mut req = load_request(store, request_id)?;
     if !matches!(req.state, RequestState::Issued | RequestState::Active) {
         return Err(SecretError::conflict(format!(
@@ -1512,6 +1588,7 @@ pub fn rotate_secret(
     reason: &str,
     now: DateTime<Utc>,
 ) -> SecretResult<SecretRequest> {
+    let _lock = lock_store(store)?;
     let registry = load_registry(store)?;
     let Some(entry) = registry.iter().find(|e| e.name == name).cloned() else {
         return Err(SecretError::not_found(format!(
@@ -1678,12 +1755,19 @@ pub fn check_use(
 /// calls this. The first use moves `issued` to `active`; a one-shot
 /// issuance is consumed by this use and then revoked, so a second use
 /// is a `DENY` (criterion 7).
+/// Holds the store lock across the check and the append, so two
+/// concurrent uses cannot both consume a one-shot issuance.
 pub fn record_use(
     store: &SecretStore,
     request_id: &str,
     seat: &str,
     now: DateTime<Utc>,
 ) -> SecretResult<UseOutcome> {
+    // The lock makes check-then-append atomic (issue #319): every
+    // writer holds it, so the state checked here cannot change before
+    // the append below lands. A revoke or a first use of a one-shot
+    // landing in between is now seen, not ignored.
+    let _lock = lock_store(store)?;
     let check = check_use(store, request_id, seat, now)?;
     if !check.allowed {
         return Err(SecretError::forbidden(format!(
@@ -3158,6 +3242,121 @@ mod tests {
         assert!(secret_status(&store, None, now).is_err());
         // max_until on the same entry errors instead of panicking.
         assert!(max_until(&entry, false, now).is_err());
+    }
+
+    /// Issue #319: concurrent requests get distinct ids and none is
+    /// lost: the store lock serializes load-then-append.
+    #[test]
+    fn concurrent_requests_keep_distinct_ids() {
+        let (_dir, store) = temp_store("lock-ids");
+        let now = fixed_now();
+        register_model_key(&store, now);
+        let threads = 8;
+        let mut ids: Vec<String> = std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for _ in 0..threads {
+                let store = store.clone();
+                handles.push(s.spawn(move || {
+                    request_secret(
+                        &store,
+                        RequestInput {
+                            name: "MODEL_API_KEY".to_string(),
+                            seat: "zc-developer".to_string(),
+                            task_id: None,
+                            purpose: "concurrent id check".to_string(),
+                            scope: "task:DS-7".to_string(),
+                            until: rfc3339(now + Duration::days(1)),
+                            one_shot: false,
+                            broker_action: None,
+                        },
+                        now,
+                    )
+                    .unwrap()
+                    .request_id
+                }));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), threads);
+        // No append lost to the latest-wins fold either.
+        assert_eq!(load_requests(&store).unwrap().len(), threads);
+    }
+
+    /// Issue #319: two concurrent uses of one one-shot issuance
+    /// consume it exactly once; the second is a DENY.
+    #[test]
+    fn concurrent_one_shot_use_consumes_once() {
+        let (_dir, store) = temp_store("lock-oneshot");
+        let now = fixed_now();
+        register_model_key(&store, now);
+        let req = request_model_key(&store, "zc-developer", now + Duration::hours(1), true);
+        approve_secret(&store, &req.request_id, LEADER_APPROVER, "tin 8071", now).unwrap();
+        issue_secret(&store, &req.request_id, OPERATOR_ISSUER, now).unwrap();
+        let id = req.request_id.clone();
+        let (first, second) = std::thread::scope(|s| {
+            let a = s.spawn(|| record_use(&store, &id, "zc-developer", now));
+            let b = s.spawn(|| record_use(&store, &id, "zc-developer", now));
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        let oks = [first.is_ok(), second.is_ok()]
+            .iter()
+            .filter(|o| **o)
+            .count();
+        assert_eq!(oks, 1, "exactly one concurrent use consumes the one-shot");
+        let ok = if first.is_ok() { first } else { second }.unwrap();
+        assert!(ok.consumed);
+        // The loser sees the consumption: a second use is a DENY.
+        let denied = check_use(&store, &id, "zc-developer", now).unwrap();
+        assert!(!denied.allowed);
+    }
+
+    /// Issue #319: a store locked by another process fails closed
+    /// with the locked message after the bounded wait, instead of
+    /// hanging or writing through the other holder.
+    #[test]
+    fn locked_store_fails_closed_after_bounded_wait() {
+        use fs2::FileExt;
+        let (_dir, store) = temp_store("lock-held");
+        let now = fixed_now();
+        register_model_key(&store, now);
+        // Hold the lock from outside the store API, as another CLI
+        // invocation would.
+        let lock_path = store.dir.join(LOCK_FILE);
+        std::fs::create_dir_all(&store.dir).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        held.lock_exclusive().unwrap();
+        let start = std::time::Instant::now();
+        let err = register_secret(
+            &store,
+            RegisterInput {
+                name: "OTHER_KEY".to_string(),
+                class: SecretClass::Seat,
+                service: "s".to_string(),
+                owner: "zc-leader".to_string(),
+                registered_by: LEADER_APPROVER.to_string(),
+                default_until_days: 7,
+                rotation_days: 30,
+                paid: false,
+                reason: "locked".to_string(),
+                force: false,
+            },
+            now,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("locked by another operation"),
+            "unexpected error: {err}"
+        );
+        // The wait is bounded (10s) and actually waited, not instant.
+        assert!(start.elapsed() >= std::time::Duration::from_secs(9));
+        drop(held);
     }
 
     #[test]
