@@ -847,6 +847,49 @@ pub(crate) fn transient_completion(body: &str) -> Option<String> {
     (!has_text && !has_calls).then(|| "model returned an empty message".into())
 }
 
+/// Anthropic mirror of `transient_completion` (issue #336): a 200 whose
+/// content carries no text and no `tool_use` block is not a successful
+/// turn, and neither is a response the provider itself ended with
+/// `stop_reason: "error"`. Returns the reason to retry with, or `None`
+/// when the response carries usable content. A response carrying an
+/// `error` object is left to `parse_anthropic_response`, which bails
+/// on it (unchanged behaviour).
+pub(crate) fn transient_anthropic_completion(body: &str) -> Option<String> {
+    let v: Value = first_json_value(body)?;
+    if v.get("error").is_some_and(|e| !e.is_null()) {
+        return None;
+    }
+    if v.get("stop_reason")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s == "error")
+    {
+        return Some("model returned stop_reason \"error\"".into());
+    }
+    let mut has_text = false;
+    let mut has_calls = false;
+    for block in v
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| !t.trim().is_empty())
+                {
+                    has_text = true;
+                }
+            }
+            Some("tool_use") => has_calls = true,
+            _ => {}
+        }
+    }
+    (!has_text && !has_calls).then(|| "model returned an empty message".into())
+}
+
 pub(crate) fn parse_completion(body: &str) -> anyhow::Result<ChatResponse> {
     // A service may append trailing content after the completion JSON
     // (observed 2026-11-10: leading blank lines + one completion JSON for
@@ -2267,14 +2310,31 @@ impl LlmBackend for AnthropicClient {
                             with_request_id(format!("HTTP {}: {}", code, msg), rid.as_deref()),
                         )
                     } else if (200..300).contains(&code) {
-                        match parse_anthropic_response(&resp_body) {
-                            Ok(parsed) => return Ok(parsed),
-                            Err(e) => (
-                                false,
+                        // Mirror the OpenAI path (issue #336): an empty
+                        // 200 with no tool call, or a provider-reported
+                        // `stop_reason: "error"`, is transient, not a
+                        // successful empty turn. The loop tail below caps
+                        // retries at MAX_ATTEMPTS and applies the retry
+                        // budgets, as for any other retryable failure.
+                        match transient_anthropic_completion(&resp_body) {
+                            Some(why) => (
+                                true,
                                 false,
                                 Some(code),
-                                with_request_id(format!("bad anthropic body: {e}"), rid.as_deref()),
+                                with_request_id(why, rid.as_deref()),
                             ),
+                            None => match parse_anthropic_response(&resp_body) {
+                                Ok(parsed) => return Ok(parsed),
+                                Err(e) => (
+                                    false,
+                                    false,
+                                    Some(code),
+                                    with_request_id(
+                                        format!("bad anthropic body: {e}"),
+                                        rid.as_deref(),
+                                    ),
+                                ),
+                            },
                         }
                     } else {
                         let retryable = matches!(code, 429 | 500 | 502 | 503 | 504 | 529);
@@ -2708,6 +2768,63 @@ mod anthropic_tests {
         let blank_trailing = format!("{body}\n\ntrailing text\n");
         let resp = parse_anthropic_response(&blank_trailing).unwrap();
         assert_eq!(resp.message.text_ref(), Some("done"));
+    }
+
+    #[test]
+    fn transient_anthropic_completion_classifies_empty_and_error_stop() {
+        // Issue #336: an empty 200 and a provider `stop_reason:
+        // "error"` are transient, not a successful empty turn.
+        let empty = r#"{
+            "content": [], "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 0}
+        }"#;
+        assert_eq!(
+            transient_anthropic_completion(empty).as_deref(),
+            Some("model returned an empty message")
+        );
+        let whitespace = r#"{
+            "content": [{"type": "text", "text": "   "}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 1}
+        }"#;
+        assert!(transient_anthropic_completion(whitespace).is_some());
+        let error_stop = r#"{
+            "content": [{"type": "text", "text": "partial"}],
+            "stop_reason": "error",
+            "usage": {"input_tokens": 10, "output_tokens": 1}
+        }"#;
+        assert_eq!(
+            transient_anthropic_completion(error_stop).as_deref(),
+            Some("model returned stop_reason \"error\"")
+        );
+        let text = r#"{
+            "content": [{"type": "text", "text": "done"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }"#;
+        assert!(transient_anthropic_completion(text).is_none());
+        let call = r#"{
+            "content": [{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}}],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }"#;
+        assert!(transient_anthropic_completion(call).is_none());
+        assert!(transient_anthropic_completion("not json").is_none());
+        // A body carrying a real `error` object is left to
+        // `parse_anthropic_response`, even when its content is empty:
+        // the error branch must check `!is_null`, not `is_null`.
+        let error_obj = r#"{
+            "content": [], "stop_reason": "end_turn",
+            "error": {"type": "overloaded_error", "message": "Overloaded"},
+            "usage": {"input_tokens": 10, "output_tokens": 0}
+        }"#;
+        assert!(transient_anthropic_completion(error_obj).is_none());
+        let null_error = r#"{
+            "content": [], "stop_reason": "end_turn",
+            "error": null,
+            "usage": {"input_tokens": 10, "output_tokens": 0}
+        }"#;
+        assert!(transient_anthropic_completion(null_error).is_some());
     }
 
     #[tokio::test]
