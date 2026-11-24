@@ -2350,6 +2350,40 @@ async fn plan_mode_rejects_read_only_but_denied_tools() {
     assert_paired(agent.messages());
 }
 
+/// #355 (mutant kill): `prepare_call` gates plan mode on
+/// `!read_only || plan_mode_hides(...)`, so a plain read-only tool that
+/// is not denied must still run in plan mode — plan mode is for
+/// researching with read-only tools. Dropping the `!` would reject
+/// every read-only tool, including `Read`.
+#[tokio::test]
+async fn plan_mode_still_runs_plain_read_only_tools() {
+    let llm = MockLlm::new(vec![
+        resp_tool("Read", r#"{"path":"src/lib.rs"}"#, "c1"),
+        resp("plan done"),
+    ]);
+    let reg = registry_with(vec![fake("Read", true, "READ_RAN")]);
+    let cfg = AgentConfig {
+        permission_mode: PermissionMode::Plan,
+        ..base_cfg()
+    };
+    let (mut agent, _s, _h) = build_agent(llm, reg, allow(), cfg);
+    let r = agent.run_turn("go").await;
+    let tool_contents: Vec<&str> = agent
+        .messages()
+        .iter()
+        .filter(|m| m.role == "tool")
+        .filter_map(|m| m.text_ref())
+        .collect();
+    assert_eq!(tool_contents.len(), 1, "one tool result expected");
+    assert!(
+        tool_contents[0].contains("READ_RAN"),
+        "plain read-only Read must execute in plan mode, got: {}",
+        tool_contents[0]
+    );
+    assert_eq!(r.result, "plan done");
+    assert_paired(agent.messages());
+}
+
 use std::sync::atomic::Ordering;
 
 #[tokio::test]
