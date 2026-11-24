@@ -756,4 +756,30 @@ mod tests {
         let names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["shallow"]);
     }
+
+    /// Issue #388 follow-up (Leader): the depth cap is `depth > MAX`,
+    /// so a file exactly at depth 16 is collected and one at depth 17
+    /// is not. The deep-tree test above cannot tell `>` from `>=` or
+    /// `==` (both missed mutants at commands.rs:95), because it only
+    /// places files at depth 0 and depth 20; this test pins the exact
+    /// boundary. Kills: `>` -> `==` and `>` -> `>=` in collect_md_inner.
+    #[test]
+    fn issue_388_depth_cap_boundary_is_exact() {
+        let tmp = TempDir::new();
+        let proj = tmp.path().join("proj");
+        let mut dir = proj.join(".zen/commands");
+        for i in 0..16 {
+            dir = dir.join(format!("d{i}"));
+        }
+        write(&dir.join("at_cap.md"), "at cap");
+        write(&dir.join("d16").join("past_cap.md"), "past cap");
+        let all = discover_custom_commands(&proj, Some(&tmp.path().join("home")), true);
+        let names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
+        let expected = (0..16)
+            .map(|i| format!("d{i}"))
+            .chain(std::iter::once("at_cap".to_string()))
+            .collect::<Vec<_>>()
+            .join(":");
+        assert_eq!(names, vec![expected.as_str()]);
+    }
 }
