@@ -45,6 +45,13 @@ use zen_core::ToolOutput;
 /// Default value of `K`: how many repeats, or identical turns, trip the guard.
 pub const DEFAULT_LOOP_STUCK_K: usize = 3;
 
+/// Floor for `loopStuckK` when it comes from a settings file (issue
+/// #389): the guard must never be disabled through settings, so a file
+/// value below this is clamped up. An explicit `--loop-stuck-k 0` on
+/// the command line still disables the guard, and `AgentConfig` may
+/// still carry `loop_stuck_k: 0` directly.
+pub const MIN_LOOP_STUCK_K: usize = 1;
+
 /// User-facing suggestion attached to every `loop_stuck` stop.
 pub const LOOP_STUCK_SUGGESTION: &str = "Suggestion: rephrase the prompt, narrow the scope, or break the task into a smaller step instead of repeating the same call.";
 
@@ -481,6 +488,7 @@ mod tests {
     #[test]
     fn default_k_is_three() {
         assert_eq!(DEFAULT_LOOP_STUCK_K, 3);
+        assert_eq!(MIN_LOOP_STUCK_K, 1);
     }
 
     #[test]

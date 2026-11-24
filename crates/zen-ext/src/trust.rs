@@ -147,6 +147,20 @@ pub(crate) fn gated_keys(layer: &Value) -> Vec<&'static str> {
     if layer.get("allowPrivateNetwork").and_then(Value::as_bool) == Some(true) {
         out.push("allowPrivateNetwork");
     }
+    // Issue #389: the rate gate, the loop-guard threshold and the
+    // spend cap are cost/loop guards. An untrusted project layer may
+    // not change any of them: rateGate off (or its limits raised),
+    // loopStuckK 0 (disables the guard), maxBudgetUsd raised (lifts
+    // the spend cap). Any value is gated, not just the disabling one.
+    if non_empty(layer.get("rateGate")) {
+        out.push("rateGate");
+    }
+    if layer.get("loopStuckK").is_some_and(|v| !v.is_null()) {
+        out.push("loopStuckK");
+    }
+    if layer.get("maxBudgetUsd").is_some_and(|v| !v.is_null()) {
+        out.push("maxBudgetUsd");
+    }
     out
 }
 
@@ -164,6 +178,11 @@ pub(crate) fn strip_gated(layer: &mut Value) -> Vec<&'static str> {
         m.remove("baseUrl");
         m.remove("apiKeyEnv");
         m.remove("allowPrivateNetwork");
+        // Issue #389: fully gated, like hooks/env/baseUrl above - any
+        // value from an untrusted project layer is dropped.
+        m.remove("rateGate");
+        m.remove("loopStuckK");
+        m.remove("maxBudgetUsd");
         if let Some(Value::Object(p)) = m.get_mut("permissions") {
             p.remove("allow");
             p.remove("additionalDirectories");
@@ -441,6 +460,39 @@ mod tests {
 
     // Issue #330: project skills and commands are gated content, so
     // the trust prompt and `doctor` must surface them.
+    #[test]
+    fn gated_rate_gate_loop_stuck_k_and_max_budget_are_gated() {
+        // Issue #389: an untrusted project must not disable the rate
+        // gate, switch the loop guard off with loopStuckK 0, or lift
+        // the spend cap - any value of these keys is gated, not just
+        // the disabling one.
+        let mut v = json!({"rateGate": {"enabled": false}, "loopStuckK": 0,
+            "maxBudgetUsd": 9999.0, "model": "m"});
+        let removed = strip_gated(&mut v);
+        assert_eq!(removed, vec!["rateGate", "loopStuckK", "maxBudgetUsd"]);
+        assert_eq!(v, json!({"model": "m"}));
+
+        // A non-zero loopStuckK and a raised daily limit are gated too:
+        // the project may not change these knobs at all.
+        let mut v = json!({"rateGate": {"dailyLimit": 100000}, "loopStuckK": 5});
+        let removed = strip_gated(&mut v);
+        assert_eq!(removed, vec!["rateGate", "loopStuckK"]);
+        assert_eq!(v, json!({}));
+
+        let t = TempDir::new();
+        let proj = t.path();
+        fs::create_dir_all(proj.join(".zen")).unwrap();
+        fs::write(
+            proj.join(".zen/settings.json"),
+            r#"{"rateGate":{"enabled":false},"loopStuckK":0,"maxBudgetUsd":9999.0}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            gated_project_config(proj),
+            vec![".zen/settings.json: rateGate, loopStuckK, maxBudgetUsd".to_string()]
+        );
+    }
+
     #[test]
     fn gated_detection_reports_project_skills_and_commands() {
         let t = TempDir::new();
