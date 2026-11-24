@@ -592,8 +592,14 @@ impl LspConnection {
         let mtime = std::fs::metadata(path)
             .and_then(|m| m.modified())
             .map_err(|e| anyhow::anyhow!("cannot stat '{}': {e}", path.display()))?;
-        let text = std::fs::read_to_string(path)
+        // LSP text is UTF-8 by spec, but a source file on disk need
+        // not be: `read_to_string` failed every LSP operation on a
+        // file with invalid UTF-8. Decode lossily instead so the
+        // operation still runs; the unreadable bytes become U+FFFD
+        // in the text sent to the server (#384).
+        let bytes = std::fs::read(path)
             .map_err(|e| anyhow::anyhow!("cannot read '{}': {e}", path.display()))?;
+        let text = String::from_utf8_lossy(&bytes).into_owned();
         let uri = path_to_uri(path);
         let lang_id = language_id_for(path, self.language);
 

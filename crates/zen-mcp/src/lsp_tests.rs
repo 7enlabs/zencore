@@ -747,6 +747,36 @@ async fn mock_server_reuses_cached_doc_when_nothing_changed() {
 }
 
 #[tokio::test]
+async fn mock_server_non_utf8_file_still_answers() {
+    // Issue #384: `ensure_open` used `read_to_string`, so a source
+    // file containing invalid UTF-8 failed every LSP operation with
+    // "stream did not contain valid UTF-8" before the server was ever
+    // contacted. LSP text is UTF-8 by spec, so the unreadable bytes
+    // are lossy-decoded instead of failing the whole operation.
+    let Some(setup) = mock_setup() else {
+        eprintln!("SKIP: python3 not found");
+        return;
+    };
+    std::fs::write(
+        &setup.main_rs,
+        b"fn main() {\n    let s = \"caf\xff\xfe\";\n}\n",
+    )
+    .unwrap();
+    let locs = setup
+        .manager
+        .goto_definition(&setup.main_rs, 1, 5)
+        .await
+        .unwrap();
+    assert_eq!(locs.len(), 1, "expected one definition, got {locs:?}");
+    let methods = logged_methods(&setup.log);
+    assert_eq!(
+        count(&methods, "textDocument/didOpen"),
+        1,
+        "expected didOpen for the non-UTF-8 file: {methods:?}"
+    );
+}
+
+#[tokio::test]
 async fn mock_server_hover_and_references() {
     let Some(setup) = mock_setup() else {
         eprintln!("SKIP: python3 not found");
