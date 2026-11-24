@@ -952,11 +952,15 @@ pub fn resolve_config_with_home(
         .or(merged.max_turns)
         .unwrap_or(DEFAULT_MAX_TURNS);
 
-    // K = 0 disables the guard, so the resolved value is used as-is
-    // (no .max(1) clamp like max_turns).
+    // Issue #389: a settings file must never disable the loop guard
+    // (K = 0), so the file value is floored at MIN_LOOP_STUCK_K. An
+    // explicit --loop-stuck-k flag is the user's own per-invocation
+    // choice - its documented "0 disables the guard" still applies.
     let loop_stuck_k = cli
         .loop_stuck_k
-        .or(merged.loop_stuck_k)
+        .or(merged
+            .loop_stuck_k
+            .map(|k| k.max(zen_agent::loop_guard::MIN_LOOP_STUCK_K)))
         .unwrap_or(zen_agent::loop_guard::DEFAULT_LOOP_STUCK_K);
 
     Ok(ResolvedConfig {
@@ -1466,6 +1470,66 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&home);
         assert_eq!(cfg.loop_stuck_k, 7);
+    }
+
+    #[test]
+    fn config_untrusted_project_cannot_touch_rate_gate_or_loop_guard() {
+        // Issue #389: in an untrusted folder the project layer's
+        // rateGate / loopStuckK / maxBudgetUsd are stripped, so the
+        // user/default guards apply and the strip is reported.
+        let _env = env_lock();
+        let _env_guards = EnvGuard::remove_many(&["ZEN_MODEL", "ZEN_BASE_URL", "ZEN_TRUST_FOLDER"]);
+        let dir = std::env::temp_dir().join(format!("zen_cfg_test_389_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".zen")).unwrap();
+        fs::write(
+            dir.join(".zen/settings.json"),
+            r#"{"loopStuckK":0,"rateGate":{"enabled":false,"dailyLimit":100000},"maxBudgetUsd":9999.0}"#,
+        )
+        .unwrap();
+        let home =
+            std::env::temp_dir().join(format!("zen_cfg_test_389_home_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+        let cli = Cli::parse_from(["zen", "--setting-sources", "project"]);
+        let cfg = resolve_config_with_home(&cli, &dir, Some(&home)).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&home);
+        assert_eq!(
+            cfg.loop_stuck_k,
+            zen_agent::loop_guard::DEFAULT_LOOP_STUCK_K
+        );
+        assert!(cfg.rate_gate.enabled);
+        assert_eq!(cfg.rate_gate.daily_limit, zen_agent::DEFAULT_DAILY_LIMIT);
+        assert_eq!(cfg.max_budget_usd, None);
+        assert!(
+            cfg.trust_skipped.iter().any(|s| s.contains("loopStuckK")
+                && s.contains("rateGate")
+                && s.contains("maxBudgetUsd")),
+            "trust_skipped: {:?}",
+            cfg.trust_skipped
+        );
+    }
+
+    #[test]
+    fn config_file_loop_stuck_k_zero_is_clamped_to_one() {
+        // Issue #389: even a trusted settings file must never disable
+        // the loop guard - loopStuckK 0 resolves to MIN_LOOP_STUCK_K.
+        let _env = env_lock();
+        let _env_guards = EnvGuard::remove_many(&["ZEN_MODEL", "ZEN_BASE_URL", "ZEN_TRUST_FOLDER"]);
+        let dir = std::env::temp_dir().join(format!("zen_cfg_test_389b_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".zen")).unwrap();
+        fs::write(dir.join(".zen/settings.json"), r#"{"loopStuckK":0}"#).unwrap();
+        let home =
+            std::env::temp_dir().join(format!("zen_cfg_test_389b_home_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+        let cli = Cli::parse_from(["zen", "--setting-sources", "project", "--trust-folder"]);
+        let cfg = resolve_config_with_home(&cli, &dir, Some(&home)).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&home);
+        assert_eq!(cfg.loop_stuck_k, zen_agent::loop_guard::MIN_LOOP_STUCK_K);
     }
 
     #[test]
