@@ -423,4 +423,37 @@ exclude_re = [
   # with a test that overfills the gate rows and checks which rows
   # survive.
   "state\\.rs:554:55: replace - with / in FlightdeckState::apply",
+  # PR #274, classifier.rs redirect_targets (line 739, col 18):
+  # replace < with > in the scan guard.
+  # EQUIVALENT (waived by ZC Leader, 2026-11-24; proof verified by
+  # reading redirect_targets and running the whole classifier module
+  # under this mutant, all tests PASS): the branch only runs when
+  # `j < len && bytes[j] == '&'`. With `>` the condition can never
+  # hold (j starts at i+1 <= len and only grows while j < len). When
+  # the branch is skipped, start = j; the target scan loop stops at
+  # once because bytes[j] == '&' is in the terminator set, so no
+  # target is pushed; i = j; the next iteration sees bytes[j] == '&',
+  # not '>', so i += 1, giving i = j+1 - exactly what the original
+  # branch assigns. Both paths converge to the same state, so no
+  # input can distinguish them and no test can kill this mutant.
+  # EXPIRY: if the target scan loop stops treating '&' as a
+  # terminator, or the 739 branch changes its condition, this mutant
+  # stops being equivalent: remove this exclusion and kill it with a
+  # test where redirect_targets("echo x >&2") returns empty.
+  "classifier\\.rs:739:18: replace < with > in redirect_targets",
+  # PR #274, classifier.rs redirect_targets (line 740, col 23):
+  # replace + with * in `i = j + 1`.
+  # EQUIVALENT (waived by ZC Leader, 2026-11-24; proof verified by
+  # reading redirect_targets and running the test
+  # redirect_targets_fd_duplication_and_bare_redirect under this
+  # mutant, which PASSES): `i = j * 1` is j. The branch only runs
+  # when bytes[j] == '&', and '&' is not '>', so the next loop
+  # iteration does i += 1, giving i = j+1 - exactly what the
+  # original assigns. No input can distinguish them and no test can
+  # kill this mutant.
+  # EXPIRY: if the expression stops being `j * 1` (for example
+  # `j * 2`), or the character at j can be '>' on entry to the
+  # branch, this mutant stops being equivalent: remove this
+  # exclusion and kill it with a similar test.
+  "classifier\\.rs:740:23: replace \\+ with \\* in redirect_targets",
 ]
