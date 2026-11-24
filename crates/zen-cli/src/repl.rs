@@ -312,6 +312,9 @@ pub async fn run_repl(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result<()> 
             config.permission_mode,
             flightdeck_autocompact_label(&config),
         )));
+    // Flightdeck (Phase 2): the approval bridge. The agent's gate
+    // prompter waits on it; the viewer answers through it while open.
+    let flightdeck_gate = std::sync::Arc::new(zen_flightdeck::GateBridge::new());
     let flightdeck_sink = zen_flightdeck::FlightdeckSink::new(flightdeck_state.clone());
     let flightdeck_agent_sink: Arc<dyn EventSink> =
         std::sync::Arc::new(zen_flightdeck::FanoutSink::new(vec![
@@ -362,6 +365,11 @@ pub async fn run_repl(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result<()> 
         .recorder
         .clone()
         .map(|r| r as Arc<dyn zen_core::ToolJournal>);
+    // Flightdeck (Phase 2): approval questions route to the viewer
+    // while it is open, to the terminal otherwise (D4).
+    agent.set_async_prompter(Arc::new(crate::agent_run::GatePrompter::new(
+        flightdeck_gate.clone(),
+    )));
 
     if agent.config.permission_mode == zen_core::PermissionMode::Plan {
         println!("Plan mode is ON (read-only). Research, then present a plan. /plan toggles it.");
@@ -399,6 +407,7 @@ pub async fn run_repl(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result<()> 
         checkpoints,
         progress: progress_sink.clone(),
         flightdeck: flightdeck_state.clone(),
+        flightdeck_gate: flightdeck_gate.clone(),
         model_rows: Vec::new(),
     };
 
@@ -649,6 +658,11 @@ struct ReplState<'a> {
     // Flightdeck (Phase 1): dashboard state shared with the viewer
     // (`/flightdeck`) and fed by the fan-out sink below.
     flightdeck: std::sync::Arc<std::sync::Mutex<zen_flightdeck::FlightdeckState>>,
+
+    // Flightdeck (Phase 2): approval bridge shared by the viewer
+    // (which answers with y/a/n while open) and the agent's gate
+    // prompter (which waits for the answer).
+    flightdeck_gate: std::sync::Arc<zen_flightdeck::GateBridge>,
 
     // Model rows for /model Tab completion (B2): (short, provider,
     // id), refreshed whenever /model lists them.
@@ -1820,7 +1834,11 @@ async fn handle_slash(
             // The viewer owns the terminal while it runs; run it on a
             // blocking thread so the REPL's runtime keeps working.
             let state = repl.flightdeck.clone();
-            match tokio::task::spawn_blocking(move || zen_flightdeck::run_viewer(state, None)).await
+            let gate = repl.flightdeck_gate.clone();
+            match tokio::task::spawn_blocking(move || {
+                zen_flightdeck::run_viewer(state, Some(gate), None)
+            })
+            .await
             {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => eprintln!("flightdeck error: {e:#}"),
@@ -3656,6 +3674,7 @@ mod model_picker_tests {
                     "auto",
                 ),
             )),
+            flightdeck_gate: std::sync::Arc::new(zen_flightdeck::GateBridge::new()),
             model_rows: Vec::new(),
         };
         assert_eq!(agent.config.model, "google/gemini-4-argon:free");
@@ -4111,6 +4130,7 @@ mod model_picker_tests {
                     "auto",
                 ),
             )),
+            flightdeck_gate: std::sync::Arc::new(zen_flightdeck::GateBridge::new()),
             model_rows: Vec::new(),
         };
         // The env lock stays held across the await: the switch
@@ -4849,6 +4869,7 @@ mod pr208_mutant_tests {
                     "auto",
                 ),
             )),
+            flightdeck_gate: std::sync::Arc::new(zen_flightdeck::GateBridge::new()),
             model_rows: Vec::new(),
         }
     }

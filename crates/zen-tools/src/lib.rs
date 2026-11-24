@@ -1,6 +1,7 @@
 pub mod atomic;
 pub mod builtin;
 pub mod checkpoint;
+pub mod classifier;
 pub mod edit_match;
 pub mod gitignore;
 pub mod jobs;

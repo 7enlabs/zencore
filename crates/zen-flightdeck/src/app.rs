@@ -21,6 +21,7 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 
+use crate::gate::{GateAnswer, GateBridge};
 use crate::render::draw;
 use crate::state::{FlightdeckState, Focus};
 
@@ -67,6 +68,9 @@ struct KeyHandler {
     /// Filter in force before the current edit, so `Esc` can restore
     /// it (the draft previews live in the state while editing).
     saved_filter: String,
+    /// Approval bridge (Phase 2): set when the viewer can answer a
+    /// pending per-command approval with `y` / `a` / `n`.
+    gate: Option<Arc<GateBridge>>,
 }
 
 impl KeyHandler {
@@ -99,13 +103,35 @@ impl KeyHandler {
             }
             return false;
         }
+        // Phase 2: while a command waits for approval, `y` / `a` /
+        // `n` answer it and mean nothing else.
+        if let Some(bridge) = &self.gate
+            && lock_state(state).pending_gate.is_some()
+        {
+            match key.code {
+                KeyCode::Char('y') => {
+                    bridge.answer(GateAnswer::Once);
+                    return false;
+                }
+                KeyCode::Char('a') => {
+                    bridge.answer(GateAnswer::Always);
+                    return false;
+                }
+                KeyCode::Char('n') => {
+                    bridge.answer(GateAnswer::Deny);
+                    return false;
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Char('q') => true,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
             KeyCode::Tab => {
                 let mut s = lock_state(state);
                 s.focus = match s.focus {
-                    Focus::Agents => Focus::Log,
+                    Focus::Agents => Focus::Gate,
+                    Focus::Gate => Focus::Log,
                     Focus::Log => Focus::Agents,
                 };
                 false
@@ -130,15 +156,39 @@ fn is_press(key: event::KeyEvent) -> bool {
 
 /// Run the viewer over shared state until `q` (or Ctrl-C) is pressed.
 /// When `exit_when` is set, the viewer also exits once that flag is
-/// set (used by the scripted demo for unattended runs).
+/// set (used by the scripted demo for unattended runs). While the
+/// viewer is open it owns per-command approvals through `gate`
+/// (Phase 2); closing the viewer denies any command still waiting
+/// (D5).
 pub fn run_viewer(
     state: Arc<Mutex<FlightdeckState>>,
+    gate: Option<Arc<GateBridge>>,
     exit_when: Option<Arc<AtomicBool>>,
 ) -> io::Result<()> {
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.clear()?;
-    let mut keys = KeyHandler::default();
+    if let Some(bridge) = &gate {
+        bridge.set_viewer_open(true);
+    }
+    let mut keys = KeyHandler {
+        gate: gate.clone(),
+        ..Default::default()
+    };
+    let result = viewer_loop(&mut terminal, &state, &mut keys, &exit_when);
+    if let Some(bridge) = &gate {
+        bridge.set_viewer_open(false);
+        bridge.deny_pending();
+    }
+    result
+}
+
+fn viewer_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    state: &Arc<Mutex<FlightdeckState>>,
+    keys: &mut KeyHandler,
+    exit_when: &Option<Arc<AtomicBool>>,
+) -> io::Result<()> {
     loop {
         if let Some(done) = &exit_when
             && done.load(Ordering::SeqCst)
@@ -146,7 +196,7 @@ pub fn run_viewer(
             break;
         }
         {
-            let snapshot = lock_state(&state).clone();
+            let snapshot = lock_state(state).clone();
             terminal.draw(|frame| draw(frame, &snapshot))?;
         }
         if !event::poll(Duration::from_millis(100))? {
@@ -158,7 +208,7 @@ pub fn run_viewer(
         if !is_press(key) {
             continue;
         }
-        if keys.handle(&state, key) {
+        if keys.handle(state, key) {
             break;
         }
     }
@@ -168,8 +218,9 @@ pub fn run_viewer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gate::FlightdeckPrompter;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use zen_core::PermissionMode;
+    use zen_core::{AsyncPrompter, PermissionMode, PromptAnswer};
 
     fn state() -> Arc<Mutex<FlightdeckState>> {
         Arc::new(Mutex::new(FlightdeckState::new(
@@ -210,9 +261,94 @@ mod tests {
         let mut h = KeyHandler::default();
         assert_eq!(lock_state(&s).focus, Focus::Agents);
         assert!(!h.handle(&s, key(KeyCode::Tab)));
+        assert_eq!(lock_state(&s).focus, Focus::Gate);
+        assert!(!h.handle(&s, key(KeyCode::Tab)));
         assert_eq!(lock_state(&s).focus, Focus::Log);
         assert!(!h.handle(&s, key(KeyCode::Tab)));
         assert_eq!(lock_state(&s).focus, Focus::Agents);
+    }
+
+    #[test]
+    fn gate_keys_answer_a_pending_approval() {
+        use crate::state::PendingGate;
+        let s = state();
+        lock_state(&s).pending_gate = Some(PendingGate {
+            tool_use_id: "c1".to_string(),
+            tool_name: "Bash".to_string(),
+            summary: "git reset --hard".to_string(),
+            reason_code: "warn.git-destructive".to_string(),
+        });
+        let bridge = Arc::new(GateBridge::new());
+        let mut h = KeyHandler {
+            gate: Some(bridge.clone()),
+            ..Default::default()
+        };
+        // 'n' answers Deny through the bridge (nobody waits here, so
+        // the bridge reports false, but the key is consumed as an
+        // answer, not as anything else).
+        assert!(!h.handle(&s, key(KeyCode::Char('n'))));
+        // With no pending approval, 'y' falls through and does nothing.
+        lock_state(&s).pending_gate = None;
+        assert!(!h.handle(&s, key(KeyCode::Char('y'))));
+    }
+
+    async fn pending_gate_key_answer(code: KeyCode, expected: PromptAnswer) -> PromptAnswer {
+        use crate::state::PendingGate;
+        let s = state();
+        lock_state(&s).pending_gate = Some(PendingGate {
+            tool_use_id: "c1".to_string(),
+            tool_name: "Bash".to_string(),
+            summary: "git reset --hard".to_string(),
+            reason_code: "warn.git-destructive".to_string(),
+        });
+        let bridge = Arc::new(GateBridge::new());
+        bridge.set_viewer_open(true);
+        let p = FlightdeckPrompter::new(
+            bridge.clone(),
+            Arc::new(|tool: &str, _input: &serde_json::Value| vec![format!("{tool}(suggested)")]),
+        );
+        let handle = tokio::spawn(async move {
+            p.ask_permission("Bash", &serde_json::json!({}), "c1", false)
+                .await
+        });
+        // Give the ask task time to register its waiter with the
+        // bridge before the key is pressed.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut h = KeyHandler {
+            gate: Some(bridge.clone()),
+            ..Default::default()
+        };
+        assert!(!h.handle(&s, key(code)));
+        let answered = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        let answer = answered
+            .expect("gate key did not answer the pending approval")
+            .expect("ask task panicked");
+        assert_eq!(answer, expected);
+        answer
+    }
+
+    #[tokio::test]
+    async fn gate_key_y_answers_once() {
+        // Kills the deleted Char('y') arm in KeyHandler::handle: without
+        // the arm the key falls through and the waiting approval is
+        // never answered (the timeout fails instead of hanging).
+        pending_gate_key_answer(KeyCode::Char('y'), PromptAnswer::Yes).await;
+    }
+
+    #[tokio::test]
+    async fn gate_key_a_answers_always() {
+        // Kills the deleted Char('a') arm in KeyHandler::handle.
+        pending_gate_key_answer(
+            KeyCode::Char('a'),
+            PromptAnswer::Always("Bash(suggested)".to_string()),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn gate_key_n_answers_deny() {
+        // Kills the deleted Char('n') arm in KeyHandler::handle.
+        pending_gate_key_answer(KeyCode::Char('n'), PromptAnswer::No).await;
     }
 
     #[test]
@@ -278,7 +414,59 @@ mod tests {
         }
         let s = state();
         let done = Arc::new(AtomicBool::new(false));
-        run_viewer(s, Some(done)).expect("viewer failed under pty");
+        run_viewer(s, None, Some(done)).expect("viewer failed under pty");
+    }
+
+    /// Gate variant of the pty helper: a pending approval waits on
+    /// the bridge while the viewer runs, so a 'y' key must reach it
+    /// through the KeyHandler's gate field. The answer is printed
+    /// after the viewer exits, where the parent test can read it.
+    #[test]
+    fn viewer_pty_gate_helper() {
+        if std::env::var_os("FLIGHTDECK_PTY_GATE_HELPER").is_none() {
+            return;
+        }
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            return;
+        }
+        use crate::state::PendingGate;
+        let s = state();
+        lock_state(&s).pending_gate = Some(PendingGate {
+            tool_use_id: "c1".to_string(),
+            tool_name: "Bash".to_string(),
+            summary: "git reset --hard".to_string(),
+            reason_code: "warn.git-destructive".to_string(),
+        });
+        let bridge = Arc::new(GateBridge::new());
+        bridge.set_viewer_open(true);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = FlightdeckPrompter::new(
+            bridge.clone(),
+            Arc::new(|tool: &str, _input: &serde_json::Value| vec![format!("{tool}(suggested)")]),
+        );
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("gate helper runtime");
+            let answer = rt.block_on(p.ask_permission("Bash", &serde_json::json!({}), "c1", false));
+            let _ = tx.send(answer);
+        });
+        // Give the ask task time to register its waiter with the
+        // bridge before the viewer starts reading keys.
+        std::thread::sleep(Duration::from_millis(200));
+        run_viewer(s, Some(bridge), None).expect("viewer failed under pty");
+        // The viewer exited on 'q': the pending approval was answered
+        // by 'y' or denied when the viewer closed.
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(PromptAnswer::Yes) => println!("GATE_ANSWER: Yes"),
+            Ok(PromptAnswer::Always(rule)) => {
+                println!("GATE_ANSWER: Always({rule})")
+            }
+            Ok(PromptAnswer::No) => println!("GATE_ANSWER: No"),
+            Err(_) => println!("GATE_ANSWER: TIMEOUT"),
+        }
     }
 
     /// The viewer draws a frame and restores the terminal on exit, run
@@ -407,6 +595,114 @@ mod tests {
             raw.contains("\u{1b}[?1049l"),
             "terminal not restored (no LeaveAlternateScreen): {raw}"
         );
+    }
+
+    /// Pressing 'y' in the viewer answers a pending approval through
+    /// the bridge. Kills the deleted `gate: gate.clone()` mutant in
+    /// run_viewer: without the bridge the key never reaches the
+    /// waiting approval and the helper reports No instead of Yes.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn viewer_gate_key_y_answers_pending_approval() {
+        use std::io::{Read, Write};
+        use std::process::{Command, Stdio};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        let exe = std::env::current_exe().expect("current test exe");
+        let mut child = Command::new("script")
+            .arg("-qec")
+            .arg(format!(
+                "stty rows 24 cols 100; exec {} viewer_pty_gate_helper --nocapture",
+                exe.display()
+            ))
+            .arg("/dev/null")
+            .env("FLIGHTDECK_PTY_GATE_HELPER", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn `script` (util-linux) for the pty gate test");
+        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("pty stdin")));
+        let mut stdout = child.stdout.take().expect("pty stdout");
+        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let reader_out = Arc::clone(&output);
+        let reader_stdin = Arc::clone(&stdin);
+        let reader = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut answered = 0usize;
+            loop {
+                match stdout.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let queries = {
+                            let mut out = reader_out.lock().expect("output lock");
+                            out.extend_from_slice(&buf[..n]);
+                            out.windows(4).filter(|w| *w == b"\x1b[6n").count()
+                        };
+                        while answered < queries {
+                            answered += 1;
+                            if let Ok(mut s) = reader_stdin.lock() {
+                                let _ = s.write_all(b"\x1b[1;1R");
+                                let _ = s.flush();
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        // Send 'y' then 'q' again and again: 'y' answers the pending
+        // approval, 'q' exits the viewer. Keep stdin open until the
+        // child exits.
+        let stop_sending = Arc::new(AtomicBool::new(false));
+        let sender_stop = Arc::clone(&stop_sending);
+        let sender_stdin = Arc::clone(&stdin);
+        let sender = std::thread::spawn(move || {
+            while !sender_stop.load(Ordering::SeqCst) {
+                if let Ok(mut s) = sender_stdin.lock() {
+                    let _ = s.write_all(b"yq");
+                    let _ = s.flush();
+                }
+                std::thread::sleep(Duration::from_millis(40));
+            }
+        });
+        struct StopSender {
+            stop: Arc<AtomicBool>,
+            handle: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for StopSender {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::SeqCst);
+                if let Some(handle) = self.handle.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
+        let _sender_guard = StopSender {
+            stop: stop_sending,
+            handle: Some(sender),
+        };
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {
+                    if Instant::now() > deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("pty gate viewer did not exit within 15s");
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => panic!("try_wait: {e}"),
+            }
+        };
+        let _ = reader.join();
+        drop(stdin);
+        assert!(status.success(), "pty gate viewer failed, status {status}");
+        let guard = output.lock().expect("output lock");
+        let out = String::from_utf8_lossy(&guard);
+        assert!(out.contains("GATE_ANSWER: Yes"), "{out}");
     }
     /// Strip ANSI escape sequences (CSI, ending at a letter, and two-byte
     /// escapes) so frame text can be asserted on without the cursor moves

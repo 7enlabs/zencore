@@ -10,11 +10,13 @@
 
 pub mod app;
 pub mod demo;
+pub mod gate;
 pub mod render;
 pub mod sink;
 pub mod state;
 
 pub use app::run_viewer;
 pub use demo::run_demo;
+pub use gate::{FlightdeckPrompter, GateAnswer, GateBridge, RuleSuggester};
 pub use sink::{FanoutSink, FlightdeckSink};
-pub use state::{AgentRow, AgentStatus, FlightdeckState, Focus};
+pub use state::{AgentRow, AgentStatus, FlightdeckState, Focus, GateRow, PendingGate};

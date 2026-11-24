@@ -91,6 +91,55 @@ impl Prompter for ReplPrompter {
     }
 }
 
+/// Flightdeck Phase 2 composite prompter: while the flightdeck
+/// viewer is open it owns the approval question (D4); otherwise the
+/// question goes to the terminal exactly as before.
+pub struct GatePrompter {
+    flightdeck: Arc<zen_flightdeck::FlightdeckPrompter>,
+    bridge: Arc<zen_flightdeck::GateBridge>,
+}
+
+impl GatePrompter {
+    pub fn new(bridge: Arc<zen_flightdeck::GateBridge>) -> Self {
+        let suggester: zen_flightdeck::RuleSuggester =
+            Arc::new(|tool_name: &str, input: &serde_json::Value| {
+                zen_tools::suggested_rules(tool_name, input)
+            });
+        Self {
+            flightdeck: Arc::new(zen_flightdeck::FlightdeckPrompter::new(
+                bridge.clone(),
+                suggester,
+            )),
+            bridge,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl zen_core::AsyncPrompter for GatePrompter {
+    async fn ask_permission(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+        tool_call_id: &str,
+        read_only: bool,
+    ) -> zen_core::PromptAnswer {
+        if self.bridge.viewer_open() {
+            return self
+                .flightdeck
+                .ask_permission(tool_name, input, tool_call_id, read_only)
+                .await;
+        }
+        // Terminal fallback: the sync REPL prompter, run off the
+        // async runtime so its stdin read cannot stall other tasks.
+        let tool_name = tool_name.to_string();
+        let input = input.clone();
+        tokio::task::spawn_blocking(move || ReplPrompter.ask_permission(&tool_name, &input))
+            .await
+            .unwrap_or(zen_core::PromptAnswer::No)
+    }
+}
+
 pub fn select_builtin_tools(
     spec: Option<&str>,
     all: Vec<Arc<dyn Tool>>,

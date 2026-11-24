@@ -372,6 +372,10 @@ async fn run_subcommand(cli: &Cli, cwd: &Path, home: Option<&Path>, sub: &Comman
                         },
                         "ollama": cfg.ollama,
                         "permission_mode": cfg.permission_mode.to_string(),
+                        "permission_classifier": {
+                            "enabled": cfg.permissions.classifier.enabled,
+                            "safe_auto_allow": cfg.permissions.classifier.safe_auto_allow,
+                        },
                         "folder_trusted": cfg.folder_trusted,
                         "trust_skipped": cfg.trust_skipped,
                         "quota": quota.lines().collect::<Vec<_>>(),
@@ -402,6 +406,19 @@ async fn run_subcommand(cli: &Cli, cwd: &Path, home: Option<&Path>, sub: &Comman
                         }
                     );
                     println!("  permission_mode: {}", cfg.permission_mode);
+                    println!(
+                        "  permission_classifier: {} (safe_auto_allow: {})",
+                        if cfg.permissions.classifier.enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        },
+                        if cfg.permissions.classifier.safe_auto_allow {
+                            "on"
+                        } else {
+                            "off"
+                        },
+                    );
                     println!("  sandbox_mode: {}", cfg.sandbox_mode.as_str());
                     println!("  folder_trusted: {}", cfg.folder_trusted);
                     for s in &cfg.trust_skipped {

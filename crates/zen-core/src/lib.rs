@@ -748,6 +748,85 @@ pub enum PermissionDecision {
     Ask,
 }
 
+/// Which GATE bucket a tool call landed in (Flightdeck Phase 2,
+/// permissions classifier): the call runs at once, waits for a
+/// per-command approval, or is blocked with a reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GateBucket {
+    Allowed,
+    Classifier,
+    Denied,
+}
+
+/// How a per-command approval (bucket `Classifier`) was resolved.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GateOutcome {
+    ApprovedOnce,
+    /// The user approved and a rule was recorded (the rule text).
+    ApprovedAlways(String),
+    DeniedByUser,
+    /// No prompter could answer (headless run, or the UI closed
+    /// while the command waited): the call is denied.
+    DeniedNoPrompter,
+}
+
+/// The gate verdict for one tool call: the decision plus the bucket
+/// and a stable machine-readable reason code, so UIs (flightdeck)
+/// can show *why* a call ran, waited, or was blocked.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GateInfo {
+    pub bucket: GateBucket,
+    pub reason_code: String,
+}
+
+impl GateInfo {
+    /// Derive the coarsest honest info from a bare decision, for
+    /// checkers that do not track their own reason codes.
+    pub fn from_decision(decision: &PermissionDecision) -> Self {
+        let (bucket, reason_code) = match decision {
+            PermissionDecision::Allow => (GateBucket::Allowed, "allow"),
+            PermissionDecision::Deny(_) => (GateBucket::Denied, "deny"),
+            PermissionDecision::Ask => (GateBucket::Classifier, "ask"),
+        };
+        Self {
+            bucket,
+            reason_code: reason_code.to_string(),
+        }
+    }
+}
+
+/// One-line summary of a tool call for gate displays: the command
+/// for Bash, the path for file tools, the URL for WebFetch, else
+/// just the tool name. Truncated to 80 chars.
+pub fn summarize_tool_call(tool_name: &str, input: &Value) -> String {
+    let raw = match tool_name {
+        "Bash" => input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "WebFetch" | "WebSearch" => input
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or(tool_name)
+            .to_string(),
+        _ => input
+            .get("file_path")
+            .or_else(|| input.get("path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(tool_name)
+            .to_string(),
+    };
+    let one_line = raw.replace(['\n', '\r'], " ");
+    if one_line.chars().count() > 80 {
+        let cut: String = one_line.chars().take(79).collect();
+        format!("{cut}…")
+    } else {
+        one_line
+    }
+}
+
 pub trait PermissionChecker: Send + Sync {
     fn check(
         &self,
@@ -756,6 +835,21 @@ pub trait PermissionChecker: Send + Sync {
         read_only: bool,
         ctx: &ToolContext,
     ) -> PermissionDecision;
+
+    /// The decision plus its GATE bucket and reason code (Flightdeck
+    /// Phase 2). The default derives the info from `check`; checkers
+    /// with a classifier override it to report the precise code.
+    fn gate_decision(
+        &self,
+        tool_name: &str,
+        input: &Value,
+        read_only: bool,
+        ctx: &ToolContext,
+    ) -> (PermissionDecision, GateInfo) {
+        let decision = self.check(tool_name, input, read_only, ctx);
+        let info = GateInfo::from_decision(&decision);
+        (decision, info)
+    }
 
     fn add_allow_rule(&self, _rule: &str) {}
 
@@ -1074,6 +1168,24 @@ pub enum AgentEvent {
     },
     PermissionDenied(PermissionDenial),
 
+    /// A tool call passed the permission gate (Flightdeck Phase 2):
+    /// emitted once per call with its final bucket and reason code,
+    /// after hooks have had their say, before any prompt is shown.
+    PermissionClassified {
+        tool_use_id: String,
+        tool_name: String,
+        bucket: GateBucket,
+        reason_code: String,
+        summary: String,
+        parent_tool_use_id: Option<String>,
+    },
+
+    /// A per-command approval (bucket `Classifier`) was resolved.
+    PermissionResolved {
+        tool_use_id: String,
+        outcome: GateOutcome,
+    },
+
     SystemMessage {
         event: String,
         text: String,
@@ -1211,6 +1323,39 @@ pub struct PermissionSettings {
     /// (Phase 2 #12). `None` means "use the platform default".
     #[serde(default)]
     pub sandbox_mode: Option<String>,
+    /// Permissions classifier gate (Flightdeck Phase 2), JSON key
+    /// `classifier`. Absent means the defaults below.
+    #[serde(default)]
+    pub classifier: ClassifierSettings,
+}
+
+/// Permissions classifier settings (Flightdeck Phase 2). The
+/// classifier sorts every tool call into a GATE bucket; dangerous
+/// commands are hard-denied with a reason code.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassifierSettings {
+    /// Master switch for the classifier's hard deny of dangerous
+    /// commands. Default on.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Auto-allow commands the classifier rates Safe in modes that
+    /// would otherwise ask (D3). Default off: ship measuring first.
+    #[serde(default)]
+    pub safe_auto_allow: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for ClassifierSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            safe_auto_allow: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2236,5 +2381,61 @@ mod glob_tests {
     fn c3_tool_context_cwd_returns_constructed_cwd() {
         let ctx = ToolContext::new(PathBuf::from("/work/dir"), "sess-1");
         assert_eq!(ctx.cwd(), PathBuf::from("/work/dir"));
+    }
+
+    #[test]
+    fn summarize_tool_call_uses_command_url_or_path() {
+        // Kills the whole-body replacements and the deleted "Bash"
+        // and "WebFetch" | "WebSearch" arms in summarize_tool_call.
+        let bash = serde_json::json!({ "command": "ls -la" });
+        assert_eq!(summarize_tool_call("Bash", &bash), "ls -la");
+        let web = serde_json::json!({ "url": "https://example.com/x" });
+        assert_eq!(
+            summarize_tool_call("WebFetch", &web),
+            "https://example.com/x"
+        );
+        assert_eq!(
+            summarize_tool_call("WebSearch", &web),
+            "https://example.com/x"
+        );
+        let read = serde_json::json!({ "file_path": "src/main.rs" });
+        assert_eq!(summarize_tool_call("Read", &read), "src/main.rs");
+        let path = serde_json::json!({ "path": "other.txt" });
+        assert_eq!(summarize_tool_call("Edit", &path), "other.txt");
+        // No usable field: the tool name itself, except Bash which
+        // has its own empty fallback.
+        let empty = serde_json::json!({});
+        assert_eq!(summarize_tool_call("Bash", &empty), "");
+        assert_eq!(summarize_tool_call("Read", &empty), "Read");
+        assert_eq!(summarize_tool_call("WebFetch", &empty), "WebFetch");
+    }
+
+    #[test]
+    fn summarize_tool_call_truncates_only_past_80_chars() {
+        // Kills the > mutants in summarize_tool_call: exactly 80
+        // chars stay whole, 81 chars truncate to 79 plus an ellipsis,
+        // and a short string is never truncated.
+        let exact = "x".repeat(80);
+        let cmd = serde_json::json!({ "command": exact });
+        assert_eq!(summarize_tool_call("Bash", &cmd), exact);
+        let over = "y".repeat(81);
+        let cmd = serde_json::json!({ "command": over });
+        let got = summarize_tool_call("Bash", &cmd);
+        assert_eq!(got.chars().count(), 80);
+        assert!(got.ends_with('…'));
+        assert_eq!(&got[..79], &"y".repeat(79));
+        let short = serde_json::json!({ "command": "ls" });
+        assert_eq!(summarize_tool_call("Bash", &short), "ls");
+    }
+
+    #[test]
+    fn classifier_settings_enabled_defaults_to_true() {
+        // Kills the default_true -> false mutant: omitting "enabled"
+        // must leave the classifier on.
+        let s: ClassifierSettings = serde_json::from_str("{}").unwrap();
+        assert!(s.enabled);
+        assert!(!s.safe_auto_allow);
+        let s: ClassifierSettings = serde_json::from_str(r#"{"enabled": false}"#).unwrap();
+        assert!(!s.enabled);
     }
 }
