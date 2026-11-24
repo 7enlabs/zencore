@@ -362,7 +362,7 @@ async fn run_one(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    for name in zen_core::api_key_env_names(api_key_env) {
+    for name in zen_core::all_api_key_env_names(api_key_env) {
         cmd.env_remove(name);
     }
 
@@ -1852,5 +1852,48 @@ mod tests {
             let out = interpret_json_stdout(&json_obj(obj.clone()), *event);
             assert_eq!(out.allow_retry, *expected, "event: {event:?}, obj: {obj}");
         }
+    }
+
+    #[tokio::test]
+    async fn test_hook_child_does_not_inherit_provider_routed_keys() {
+        // Issue #390: on the provider-routed path ResolvedConfig.api_key_env
+        // stays None, so the hook child must still not see provider keys.
+        // The keys arrive here through the explicit env map (the same
+        // env_remove applies to keys inherited from the parent process).
+        let tmp = TempDir::new();
+        let hooks = hooks_with(
+            "UserPromptSubmit",
+            None,
+            "printenv GROQ_API_KEY; printenv ANTHROPIC_API_KEY; printenv DEEPSEEK_API_KEY; printenv CLOUDFLARE_API_TOKEN; printenv ZEN_HOOK_MARKER",
+            10,
+        );
+        let mut env = HashMap::new();
+        env.insert("GROQ_API_KEY".to_string(), "sk-live-groq".to_string());
+        env.insert(
+            "ANTHROPIC_API_KEY".to_string(),
+            "sk-live-anthropic".to_string(),
+        );
+        env.insert(
+            "DEEPSEEK_API_KEY".to_string(),
+            "sk-live-deepseek".to_string(),
+        );
+        env.insert(
+            "CLOUDFLARE_API_TOKEN".to_string(),
+            "sk-live-cloudflare".to_string(),
+        );
+        env.insert("ZEN_HOOK_MARKER".to_string(), "visible".to_string());
+        // api_key_env stays None: the provider-routed case from #390.
+        let r = runner(hooks, tmp.path()).with_env(env);
+        let out = run_ev(&r, HookEvent::UserPromptSubmit, "", json!({"prompt": "hi"})).await;
+        assert!(!out.blocked);
+        let feedback = out.feedback.as_deref().unwrap_or("");
+        assert!(
+            !feedback.contains("sk-live-"),
+            "hook child saw a provider key: {feedback}"
+        );
+        assert!(
+            feedback.contains("visible"),
+            "hook child lost its normal env: {feedback}"
+        );
     }
 }
