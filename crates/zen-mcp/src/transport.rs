@@ -7,15 +7,28 @@ use rmcp::service::{Peer, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::config::McpServerConfig;
 
+/// Bounds for `tools/list` pagination in `Session::list_all_tools` (#377).
+/// A server returning cursors forever (or a never-ending stream of them)
+/// used to hang session startup and grow memory without bound. Each page
+/// still has its own per-request timeout, and the manager wraps the whole
+/// handshake in `timeout_ms`, so total time at startup was already bounded
+/// there; these caps close the remaining holes (infinite pages, unbounded
+/// memory) inside the listing itself.
+pub(crate) const MAX_LIST_PAGES: usize = 100;
+pub(crate) const MAX_LIST_TOOLS: usize = 10_000;
+
 /// One live rmcp client session. rmcp performs the
 /// `initialize` / `notifications/initialized` handshake inside `serve_client`.
 pub(crate) struct Session {
+    /// Server name, for error messages (#377: a pagination-cap error must
+    /// name the server so it can be told apart in the manager's failed list).
+    name: String,
     /// Kept alive for the session's lifetime. Dropping it cancels the service,
     /// and rmcp's DropGuard kills the stdio child process.
     service: Mutex<Option<RunningService<RoleClient, ()>>>,
@@ -32,8 +45,17 @@ impl Session {
 
     async fn list_all_tools(&self) -> anyhow::Result<Vec<Tool>> {
         let mut all = Vec::new();
+        let mut seen_cursors: HashSet<String> = HashSet::new();
         let mut cursor: Option<String> = None;
+        let mut pages = 0;
         loop {
+            pages += 1;
+            if pages > MAX_LIST_PAGES {
+                return Err(anyhow!(
+                    "MCP server '{}': tools/list exceeded {MAX_LIST_PAGES} pages; refusing to page further",
+                    self.name
+                ));
+            }
             let params = cursor
                 .clone()
                 .map(|c| PaginatedRequestParams::default().with_cursor(Some(c)));
@@ -42,8 +64,22 @@ impl Session {
                 .map_err(|_| anyhow!("tools/list timed out after {} ms", self.timeout_ms))?
                 .map_err(|e| anyhow!("tools/list failed: {e}"))?;
             all.extend(result.tools);
+            if all.len() > MAX_LIST_TOOLS {
+                return Err(anyhow!(
+                    "MCP server '{}': tools/list exceeded {MAX_LIST_TOOLS} tools; refusing to collect further",
+                    self.name
+                ));
+            }
             match result.next_cursor {
-                Some(next) => cursor = Some(next),
+                Some(next) => {
+                    if !seen_cursors.insert(next.clone()) {
+                        return Err(anyhow!(
+                            "MCP server '{}': tools/list cursor '{next}' repeated; refusing to page further",
+                            self.name
+                        ));
+                    }
+                    cursor = Some(next);
+                }
                 None => break,
             }
         }
@@ -143,6 +179,7 @@ pub(crate) fn content_block_to_value(block: &ContentBlock) -> Value {
 }
 
 async fn connect_stdio(
+    name: &str,
     command: &str,
     args: &[String],
     env: &BTreeMap<String, String>,
@@ -179,6 +216,7 @@ async fn connect_stdio(
     .map_err(|e| anyhow!("MCP stdio handshake failed: {e}"))?;
     let peer = service.peer().clone();
     Ok(Session {
+        name: name.to_string(),
         service: Mutex::new(Some(service)),
         peer,
         timeout_ms,
@@ -187,6 +225,7 @@ async fn connect_stdio(
 }
 
 async fn connect_http(
+    name: &str,
     url: &str,
     headers: &BTreeMap<String, String>,
     timeout_ms: u64,
@@ -215,6 +254,7 @@ async fn connect_http(
     .map_err(|e| anyhow!("MCP HTTP handshake failed: {e}"))?;
     let peer = service.peer().clone();
     Ok(Session {
+        name: name.to_string(),
         service: Mutex::new(Some(service)),
         peer,
         timeout_ms,
@@ -227,6 +267,7 @@ async fn connect_http(
 /// can wrap the handshake in its own timeout.
 pub(crate) enum Transport {
     Stdio {
+        name: String,
         command: String,
         args: Vec<String>,
         env: BTreeMap<String, String>,
@@ -234,6 +275,7 @@ pub(crate) enum Transport {
         session: tokio::sync::Mutex<Option<Arc<Session>>>,
     },
     Http {
+        name: String,
         url: String,
         headers: BTreeMap<String, String>,
         timeout_ms: u64,
@@ -242,7 +284,11 @@ pub(crate) enum Transport {
 }
 
 impl Transport {
-    pub(crate) fn from_config(cfg: &McpServerConfig, timeout_ms: u64) -> anyhow::Result<Self> {
+    pub(crate) fn from_config(
+        name: &str,
+        cfg: &McpServerConfig,
+        timeout_ms: u64,
+    ) -> anyhow::Result<Self> {
         let timeout_ms = if timeout_ms == 0 { 30_000 } else { timeout_ms };
         if cfg.is_http() {
             let url = cfg
@@ -250,6 +296,7 @@ impl Transport {
                 .clone()
                 .ok_or_else(|| anyhow!("http server has no url"))?;
             Ok(Transport::Http {
+                name: name.to_string(),
                 url,
                 headers: cfg.headers.clone(),
                 timeout_ms,
@@ -261,6 +308,7 @@ impl Transport {
                 .clone()
                 .ok_or_else(|| anyhow!("stdio server has no command"))?;
             Ok(Transport::Stdio {
+                name: name.to_string(),
                 command,
                 args: cfg.args.clone(),
                 env: cfg.env.clone(),
@@ -273,6 +321,7 @@ impl Transport {
     async fn session(&self) -> anyhow::Result<Arc<Session>> {
         match self {
             Transport::Stdio {
+                name,
                 command,
                 args,
                 env,
@@ -283,11 +332,12 @@ impl Transport {
                 if let Some(existing) = guard.as_ref() {
                     return Ok(existing.clone());
                 }
-                let fresh = Arc::new(connect_stdio(command, args, env, *timeout_ms).await?);
+                let fresh = Arc::new(connect_stdio(name, command, args, env, *timeout_ms).await?);
                 *guard = Some(fresh.clone());
                 Ok(fresh)
             }
             Transport::Http {
+                name,
                 url,
                 headers,
                 timeout_ms,
@@ -297,7 +347,7 @@ impl Transport {
                 if let Some(existing) = guard.as_ref() {
                     return Ok(existing.clone());
                 }
-                let fresh = Arc::new(connect_http(url, headers, *timeout_ms).await?);
+                let fresh = Arc::new(connect_http(name, url, headers, *timeout_ms).await?);
                 *guard = Some(fresh.clone());
                 Ok(fresh)
             }
