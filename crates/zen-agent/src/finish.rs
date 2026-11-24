@@ -64,10 +64,15 @@ impl FinishGate {
                 ));
             }
             self.verify_rounds += 1;
-            self.changed_since_verify.clear();
-            self.changed_since_command.clear();
             let (passed, status, tail) = run_command(cmd, cwd, env, timeout).await;
             if passed {
+                // Only a passing run clears the pending changes: on failure
+                // the changes stay pending, so a later finish attempt with
+                // no intervening edit re-runs the check instead of
+                // slipping through the `changed_since_verify.is_empty()`
+                // shortcut above (issue #353).
+                self.changed_since_verify.clear();
+                self.changed_since_command.clear();
                 return Decision::Finish;
             }
             return Decision::Continue(format!(
@@ -203,11 +208,41 @@ mod tests {
             d => panic!("{:?}", d),
         }
 
-        assert_eq!(decide(&mut g, true, Some("exit 3")).await, Decision::Finish);
-        g.observe("Edit", Some("a.rs"), false);
+        // A failed check stays pending: finishing again with no
+        // intervening edit must re-run the check (round 2), not finish.
+        // (Regression for issue #353: this used to return `Finish` here,
+        // letting a known-failing check be bypassed.)
         assert!(
             matches!(decide(&mut g, true, Some("exit 3")).await, Decision::Continue(t) if t.contains("check 2 of 2"))
         );
+        // After the cap is exhausted the gate finishes with a note that
+        // the check never passed; it never reports a clean finish.
+        assert!(matches!(
+            decide(&mut g, true, Some("exit 3")).await,
+            Decision::FinishWithNote(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_verify_cannot_be_bypassed_by_finishing_without_another_edit() {
+        let mut g = FinishGate::default();
+        g.observe("Edit", Some("a.rs"), false);
+        assert!(matches!(
+            decide(&mut g, true, Some("exit 3")).await,
+            Decision::Continue(t) if t.contains("check 1 of 2")
+        ));
+        // No edit, no fix, model just tries to finish again: the gate
+        // must force a second check round, never a bare `Finish`.
+        assert!(matches!(
+            decide(&mut g, true, Some("exit 3")).await,
+            Decision::Continue(t) if t.contains("check 2 of 2")
+        ));
+        // Still no edit and rounds exhausted: FinishWithNote, not Finish.
+        assert!(matches!(
+            decide(&mut g, true, Some("exit 3")).await,
+            Decision::FinishWithNote(t) if t.contains("not re-run")
+        ));
+        // A later edit after the cap does not reset the cap either.
         g.observe("Edit", Some("a.rs"), false);
         assert!(matches!(
             decide(&mut g, true, Some("exit 3")).await,
@@ -220,5 +255,9 @@ mod tests {
         let mut g = FinishGate::default();
         g.observe("Edit", Some("a.rs"), false);
         assert_eq!(decide(&mut g, true, Some("true")).await, Decision::Finish);
+        // A passing run clears the pending changes: a later finish
+        // attempt must not re-run the check, even if the command would
+        // now fail. (Kills the mutant that drops the clear on pass.)
+        assert_eq!(decide(&mut g, true, Some("exit 3")).await, Decision::Finish);
     }
 }
