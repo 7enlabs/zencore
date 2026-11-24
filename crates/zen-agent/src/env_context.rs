@@ -530,6 +530,34 @@ mod tests {
     }
 
     #[test]
+    fn commit_ignores_already_committed_turn() {
+        // #351: commit is idempotent - re-committing an old delta must
+        // not move the turn counter backwards. (Kills the `<` -> `>`
+        // mutant in DeltaStore::commit: with `>`, re-committing turn 0
+        // after turn 1 would reset next_turn to 1 and revert the
+        // recorded hashes, so the next diff would re-send turn 1.)
+        let mut store = DeltaStore::new();
+        let s0 = snap();
+        let d0 = store.diff(&s0);
+        store.commit(&d0, &s0);
+        let mut s1 = snap();
+        s1.git = Some(GitInfo {
+            branch: Some("main".to_string()),
+            sha: Some("def456".to_string()),
+            dirty: true,
+        });
+        let d1 = store.diff(&s1);
+        assert_eq!(d1.turn, 1);
+        store.commit(&d1, &s1);
+        // Re-commit the old turn-0 delta: must be a no-op.
+        store.commit(&d0, &s0);
+        let d2 = store.diff(&s1);
+        assert_eq!(d2.turn, 2);
+        assert!(d2.partial);
+        assert!(d2.snapshot.as_object().unwrap().is_empty());
+    }
+
+    #[test]
     fn unchanged_turn_sends_empty_delta() {
         let mut store = DeltaStore::new();
         let s0 = snap();
@@ -767,6 +795,9 @@ mod tests {
         assert!(!r1.is_error);
         // Env changes after turn 0 was delivered: cwd moves.
         let dir2 = std::env::temp_dir().join(format!("zen-envctx-{}", uuid::Uuid::new_v4()));
+        // The delta renders the path as JSON, so on Windows the
+        // backslashes are doubled - assert the escaped form.
+        let dir2_json = dir2.to_str().unwrap().replace('\\', "\\\\");
         std::fs::create_dir_all(&dir2).unwrap();
         *agent.ctx.cwd.lock().unwrap() = dir2.clone();
         let r2 = agent.run_turn("again").await;
@@ -782,14 +813,14 @@ mod tests {
             "{}",
             sys(1)
         );
-        assert!(sys(1).contains(dir2.to_str().unwrap()), "{}", sys(1));
+        assert!(sys(1).contains(&dir2_json), "{}", sys(1));
         // ... and the next request re-sends the very same delta.
         assert!(
             sys(2).contains("Env context (turn 1, delta since turn 0)"),
             "{}",
             sys(2)
         );
-        assert!(sys(2).contains(dir2.to_str().unwrap()), "{}", sys(2));
+        assert!(sys(2).contains(&dir2_json), "{}", sys(2));
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
@@ -816,6 +847,9 @@ mod tests {
         let r1 = agent.run_turn("hi").await;
         assert!(!r1.is_error);
         let dir2 = std::env::temp_dir().join(format!("zen-envctx-{}", uuid::Uuid::new_v4()));
+        // The delta renders the path as JSON, so on Windows the
+        // backslashes are doubled - assert the escaped form.
+        let dir2_json = dir2.to_str().unwrap().replace('\\', "\\\\");
         std::fs::create_dir_all(&dir2).unwrap();
         *agent.ctx.cwd.lock().unwrap() = dir2.clone();
         let r2 = agent.run_turn("again").await;
@@ -833,7 +867,7 @@ mod tests {
             "{}",
             sys(2)
         );
-        assert!(sys(2).contains(dir2.to_str().unwrap()), "{}", sys(2));
+        assert!(sys(2).contains(&dir2_json), "{}", sys(2));
         let _ = std::fs::remove_dir_all(&dir2);
     }
 }
