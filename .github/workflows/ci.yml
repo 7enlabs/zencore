@@ -59,6 +59,8 @@ jobs:
         run: python3 -m unittest scripts/test_arch_lint.py
       - name: Self-test the install hash checker
         run: python3 -m unittest scripts/test_check_install_hash.py
+      - name: Self-test the bench harness
+        run: bash tools/test_bench.sh
       - run: cargo test --workspace
   install-hash:
     # Provenance gate for install.ps1 (bug hunt P1-2): the SHA-256 pinned
