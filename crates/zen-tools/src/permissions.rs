@@ -629,7 +629,23 @@ impl RulePermissions {
             .all(|part| {
                 part.split_whitespace()
                     .skip(1)
-                    .filter(|a| !a.starts_with('-'))
+                    // A `--opt=value` argument hides a path after the
+                    // `=` (issue #322): `cp --target-directory=/etc`
+                    // must not slip past as a plain flag. The value
+                    // after the first `=` is checked as a path; a bare
+                    // flag (`--verbose`, `-p`) carries no path.
+                    .filter_map(|a| {
+                        if let Some(rest) = a.strip_prefix('-')
+                            && let Some(eq) = rest.find('=')
+                        {
+                            Some(&rest[eq + 1..])
+                        } else if a.starts_with('-') {
+                            None
+                        } else {
+                            Some(a)
+                        }
+                    })
+                    .filter(|a| !a.is_empty())
                     .all(|arg| {
                         let arg = arg.trim_matches(|c| c == '"' || c == '\'');
 
@@ -1578,6 +1594,28 @@ mod permission_tests {
             false,
             &ctx
         )));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #322: `--opt=value` must not smuggle a path outside
+    /// the workdir past the AcceptEdits auto-allow.
+    #[test]
+    fn accept_edits_rejects_target_directory_equals_escape() {
+        let dir = tmpdir("accept-target-dir");
+        let ctx = ctx_for(&dir);
+        let p = perms(PermissionMode::AcceptEdits, &[], &[], &[], None);
+        let bash = |cmd: &str| p.check("Bash", &json!({"command": cmd}), false, &ctx);
+        // The `=` form escapes the old flag filter: /etc/cron.d is
+        // outside the workdir, so this must ask, not auto-allow.
+        assert!(is_ask(&bash("cp --target-directory=/etc/cron.d payload")));
+        assert!(is_ask(&bash("mv --target-directory=/etc/cron.d payload")));
+        // The space-separated form was already caught.
+        assert!(is_ask(&bash("cp -t /etc/cron.d payload")));
+        // An in-workdir target still auto-allows.
+        assert!(is_allow(&bash("cp --target-directory=dest payload")));
+        assert!(is_allow(&bash("cp --target-directory=sub/dir payload")));
+        // A non-path `--opt=value` flag stays auto-allowed.
+        assert!(is_allow(&bash("cp --color=always a b")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
