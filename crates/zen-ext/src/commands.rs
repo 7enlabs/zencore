@@ -77,11 +77,16 @@ const COLLECT_MD_MAX_DEPTH: usize = 16;
 
 fn collect_md(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
     let mut visited = HashSet::new();
-    collect_md_inner(root, dir, out, &mut visited, 0);
+    // Canonical root: the walk must never escape it through a symlink
+    // (issue #388 follow-up: `loop -> ..` used to let `.zen/*.md` leak
+    // in as commands named `loop/<name>`).
+    let root_key = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    collect_md_inner(root, &root_key, dir, out, &mut visited, 0);
 }
 
 fn collect_md_inner(
     root: &Path,
+    root_key: &Path,
     dir: &Path,
     out: &mut Vec<(String, PathBuf)>,
     visited: &mut HashSet<PathBuf>,
@@ -97,6 +102,11 @@ fn collect_md_inner(
     // Fall back to the raw path when canonicalization fails; `read_dir`
     // below then fails the same way it did before this change.
     let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    // Never walk outside the commands tree: a symlink to a parent (or
+    // anywhere else) is skipped, so sibling files cannot leak in.
+    if !key.starts_with(root_key) {
+        return;
+    }
     if !visited.insert(key) {
         return;
     }
@@ -107,7 +117,7 @@ fn collect_md_inner(
     paths.sort();
     for p in paths {
         if p.is_dir() {
-            collect_md_inner(root, &p, out, visited, depth + 1);
+            collect_md_inner(root, root_key, &p, out, visited, depth + 1);
         } else if p.extension().is_some_and(|x| x == "md") {
             let rel = p.strip_prefix(root).unwrap_or(&p).with_extension("");
             let name = rel
@@ -683,6 +693,22 @@ mod tests {
         let tmp = TempDir::new();
         let proj = tmp.path().join("proj");
         write(&proj.join(".zen/commands/real.md"), "real");
+        symlink(Path::new(".."), &proj.join(".zen/commands/loop"));
+        let all = discover_custom_commands(&proj, Some(&tmp.path().join("home")), true);
+        let names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["real"]);
+    }
+
+    /// Issue #388 follow-up (Leader): the same `loop -> ..` cycle must
+    /// not let a sibling `.md` under `.zen` leak in as a command
+    /// (before the root-escape guard it was collected as `loop/<name>`).
+    #[test]
+    #[cfg(unix)]
+    fn issue_388_symlink_cycle_to_parent_does_not_leak_sibling_md() {
+        let tmp = TempDir::new();
+        let proj = tmp.path().join("proj");
+        write(&proj.join(".zen/commands/real.md"), "real");
+        write(&proj.join(".zen/extra.md"), "extra");
         symlink(Path::new(".."), &proj.join(".zen/commands/loop"));
         let all = discover_custom_commands(&proj, Some(&tmp.path().join("home")), true);
         let names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
