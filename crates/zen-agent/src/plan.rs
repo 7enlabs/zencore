@@ -20,6 +20,10 @@ const PLAN_MODE_DENIED_TOOLS: &[&str] = &[
     "WebFetch",
     "WebSearch",
     "Task",
+    // `delegate` spawns sub-agents like `Task` does; it reports
+    // `is_read_only() == true`, so it must be listed here explicitly or
+    // the execution-time plan-mode gate would let it run (#355).
+    "delegate",
 ];
 
 pub fn plan_mode_hides(tool_name: &str) -> bool {
@@ -365,6 +369,11 @@ mod tests {
         assert!(plan_mode_hides("Edit"));
         assert!(plan_mode_hides("Bash"));
         assert!(plan_mode_hides("Task"));
+        // #355: read-only-but-denied tools must be hidden too.
+        assert!(plan_mode_hides("delegate"));
+        assert!(plan_mode_hides("JobOutput"));
+        assert!(plan_mode_hides("WebFetch"));
+        assert!(plan_mode_hides("WebSearch"));
         assert!(plan_mode_hides("mcp__server__tool"));
         assert!(!plan_mode_hides("Read"));
         assert!(!plan_mode_hides("Grep"));

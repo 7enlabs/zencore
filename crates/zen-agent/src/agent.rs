@@ -1584,7 +1584,7 @@ impl Agent {
         }
         let read_only = tool.is_read_only();
 
-        if plan_mode && !read_only {
+        if plan_mode && (!read_only || plan::plan_mode_hides(&tool_name)) {
             let content = format!("Tool '{}' is not available in plan mode", tool_name);
             loop_guard.observe_rejected(&tool_name, &args, loop_guard::rejection_reason::PLAN_MODE);
             return Slot::Done(tool_use_id, content, true);
