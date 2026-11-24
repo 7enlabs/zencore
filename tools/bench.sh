@@ -37,7 +37,7 @@ if [ "${BENCH_SUMMARY:-}" = 1 ]; then
 fi
 
 TASKS=("$@")
-[ ${
+[ "${#TASKS[@]}" -eq 0 ] && TASKS=("${ALL_TASKS[@]}")
 
 setup_fix_failing_test() {
   cat > calc.py <<'EOF'
