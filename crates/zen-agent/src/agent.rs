@@ -472,7 +472,7 @@ impl Agent {
             // #351: `diff` is speculative - the delta is only committed
             // (see `commit_env_delta`) after the model call carrying it
             // succeeds, so an undelivered request loses nothing.
-            let cwd = self.ctx.cwd.lock().unwrap().clone();
+            let cwd = lock_or_recover(&self.ctx.cwd, "ctx.cwd").clone();
             let snap = env_context::EnvSnapshot::collect(&cwd);
             let delta = self.env_deltas.diff(&snap);
             self.pending_env_delta = Some((snap, delta.clone()));
@@ -2531,5 +2531,51 @@ mod tests {
             AgentConfig::default().model,
             "nvidia/nemotron-3-ultra-550b-a55b:free"
         );
+    }
+
+    #[test]
+    fn request_messages_recovers_from_poisoned_cwd_lock() {
+        // #354 (missed C3 site): request_messages() read ctx.cwd with
+        // `.lock().unwrap()`, so one poisoned cwd lock panicked on every
+        // model turn. With the fix it recovers the last cwd through
+        // lock_or_recover and still assembles the env snapshot.
+        let mut cfg = base_cfg();
+        cfg.env_context_deltas = true;
+        let (mut agent, _sink, _hooks) = build_agent(
+            MockLlm::new(vec![]),
+            registry_with(vec![]),
+            FakePerms::new(PermissionDecision::Allow),
+            cfg,
+        );
+        let expected_cwd = agent.ctx.cwd.lock().unwrap().clone();
+        // Poison ctx.cwd the way the lock_recovery tests do: lock it in
+        // a thread that panics while holding the guard.
+        let cwd_mutex = agent.ctx.cwd.clone();
+        let handle = std::thread::spawn(move || {
+            let _guard = cwd_mutex.lock().unwrap();
+            panic!("deliberate poison for the #354 regression test");
+        });
+        let _ = handle.join();
+        assert!(agent.ctx.cwd.is_poisoned());
+        // Must not panic: the pre-fix `.lock().unwrap()` panicked here.
+        let msgs = agent.request_messages();
+        assert!(!msgs.is_empty(), "request_messages should return messages");
+        let sys = msgs[0].text();
+        assert!(
+            sys.contains("Env context (turn 0, full snapshot)"),
+            "first request should carry the full snapshot: {sys}"
+        );
+        // The delta renders the path as JSON, so on Windows the
+        // backslashes are doubled - assert the escaped form.
+        let cwd_json = expected_cwd.to_str().unwrap().replace('\\', "\\\\");
+        assert!(
+            sys.contains(&cwd_json),
+            "snapshot should carry the recovered cwd: {sys}"
+        );
+        assert!(
+            agent.pending_env_delta.is_some(),
+            "the env delta should be assembled from the recovered cwd"
+        );
+        assert!(zen_core::lock_recovery::is_degraded());
     }
 }
