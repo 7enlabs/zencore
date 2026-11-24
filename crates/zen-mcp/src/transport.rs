@@ -183,6 +183,7 @@ async fn connect_stdio(
     command: &str,
     args: &[String],
     env: &BTreeMap<String, String>,
+    api_key_env: Option<&str>,
     timeout_ms: u64,
 ) -> anyhow::Result<Session> {
     let mut cmd = tokio::process::Command::new(command);
@@ -190,8 +191,10 @@ async fn connect_stdio(
     if !env.is_empty() {
         cmd.envs(env);
     }
-    // Never inherit provider credentials from the parent process.
-    for name in zen_core::api_key_env_names(None) {
+    // Never inherit provider credentials from the parent process: strip
+    // the two defaults, the configured key env, and every known provider
+    // key env, so a third-party MCP server cannot see any of them (#378).
+    for name in zen_core::all_api_key_env_names(api_key_env) {
         cmd.env_remove(name);
     }
     cmd.stdin(std::process::Stdio::piped());
@@ -271,6 +274,9 @@ pub(crate) enum Transport {
         command: String,
         args: Vec<String>,
         env: BTreeMap<String, String>,
+        /// Configured provider key env name (model's `apiKeyEnv`), stripped
+        /// from the child environment in `connect_stdio` (#378).
+        api_key_env: Option<String>,
         timeout_ms: u64,
         session: tokio::sync::Mutex<Option<Arc<Session>>>,
     },
@@ -288,6 +294,7 @@ impl Transport {
         name: &str,
         cfg: &McpServerConfig,
         timeout_ms: u64,
+        api_key_env: Option<&str>,
     ) -> anyhow::Result<Self> {
         let timeout_ms = if timeout_ms == 0 { 30_000 } else { timeout_ms };
         if cfg.is_http() {
@@ -312,6 +319,7 @@ impl Transport {
                 command,
                 args: cfg.args.clone(),
                 env: cfg.env.clone(),
+                api_key_env: api_key_env.map(str::to_string),
                 timeout_ms,
                 session: tokio::sync::Mutex::new(None),
             })
@@ -325,6 +333,7 @@ impl Transport {
                 command,
                 args,
                 env,
+                api_key_env,
                 timeout_ms,
                 session,
             } => {
@@ -332,7 +341,17 @@ impl Transport {
                 if let Some(existing) = guard.as_ref() {
                     return Ok(existing.clone());
                 }
-                let fresh = Arc::new(connect_stdio(name, command, args, env, *timeout_ms).await?);
+                let fresh = Arc::new(
+                    connect_stdio(
+                        name,
+                        command,
+                        args,
+                        env,
+                        api_key_env.as_deref(),
+                        *timeout_ms,
+                    )
+                    .await?,
+                );
                 *guard = Some(fresh.clone());
                 Ok(fresh)
             }

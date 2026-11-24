@@ -145,7 +145,11 @@ pub struct McpManager {
 }
 
 impl McpManager {
-    pub async fn start(configs: BTreeMap<String, McpServerConfig>, timeout_ms: u64) -> Self {
+    pub async fn start(
+        configs: BTreeMap<String, McpServerConfig>,
+        timeout_ms: u64,
+        api_key_env: Option<&str>,
+    ) -> Self {
         let timeout_ms = if timeout_ms == 0 { 30_000 } else { timeout_ms };
 
         let mut join = Vec::new();
@@ -176,8 +180,11 @@ impl McpManager {
         }
 
         for (name, cfg) in valid_configs {
+            // Owned per task: tokio::spawn needs 'static, and the borrow
+            // cannot be shared across the spawned tasks.
+            let api_key_env = api_key_env.map(str::to_string);
             join.push(tokio::spawn(async move {
-                let result = start_one(&name, &cfg, timeout_ms).await;
+                let result = start_one(&name, &cfg, timeout_ms, api_key_env.as_deref()).await;
                 (name, result)
             }));
         }
@@ -273,8 +280,9 @@ async fn start_one(
     name: &str,
     cfg: &McpServerConfig,
     timeout_ms: u64,
+    api_key_env: Option<&str>,
 ) -> anyhow::Result<(Arc<Transport>, Vec<RemoteTool>)> {
-    let transport = Arc::new(Transport::from_config(name, cfg, timeout_ms)?);
+    let transport = Arc::new(Transport::from_config(name, cfg, timeout_ms, api_key_env)?);
     let handshake_transport = transport.clone();
     let result = tokio::time::timeout(
         std::time::Duration::from_millis(timeout_ms),
