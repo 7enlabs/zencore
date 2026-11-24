@@ -48,25 +48,39 @@ impl ErrorClass {
     }
 }
 
+/// Classify an HTTP error for retry decisions (issue #347).
+///
+/// The status decides first: a 429 is a rate limit and stays retryable
+/// unless the body carries an explicit quota code (`insufficient_quota`
+/// / `exceeded your current quota`). The old body-first scan matched
+/// the broad substrings `billing` / `out of credit` on any status, so
+/// a 429 saying "Rate limit exceeded. See billing to upgrade your plan"
+/// was misclassified as non-retryable quota exhaustion and the run
+/// failed instead of backing off. Those broad signals only count when
+/// no status contradicts them (402, or no status at all).
 pub fn classify_error(status: Option<u16>, body: &str) -> ErrorClass {
     let lower = body.to_ascii_lowercase();
-    if lower.contains("insufficient_quota")
+    let explicit_quota = lower.contains("insufficient_quota")
         || lower.contains("insufficient quota")
-        || lower.contains("billing")
-        || lower.contains("out of credit")
-        || lower.contains("exceeded your current quota")
-    {
-        return ErrorClass::QuotaExhausted;
-    }
+        || lower.contains("exceeded your current quota");
+    let billing_signal =
+        explicit_quota || lower.contains("billing") || lower.contains("out of credit");
 
     match status {
         Some(529) => ErrorClass::Overloaded,
+        Some(429) if explicit_quota => ErrorClass::QuotaExhausted,
         Some(429) => ErrorClass::RateLimit,
         Some(402) => ErrorClass::QuotaExhausted,
         Some(code) if (400..500).contains(&code) => ErrorClass::Fatal,
         Some(code) if (500..600).contains(&code) => ErrorClass::Transient,
 
-        None => ErrorClass::Transient,
+        None => {
+            if billing_signal {
+                ErrorClass::QuotaExhausted
+            } else {
+                ErrorClass::Transient
+            }
+        }
         _ => ErrorClass::Fatal,
     }
 }
@@ -357,7 +371,6 @@ mod tests {
         let bodies = [
             r#"{"error":{"type":"insufficient_quota","message":"You exceeded your current quota"}}"#,
             r#"{"error":{"code":"insufficient_quota"}}"#,
-            r#"{"error": {"message": "Billing issue: out of credit"}}"#,
         ];
         for b in bodies {
             let c = classify_error(Some(429), b);
@@ -366,6 +379,54 @@ mod tests {
         }
 
         assert_eq!(classify_error(Some(402), "{}"), ErrorClass::QuotaExhausted);
+    }
+
+    #[test]
+    fn classify_429_mentioning_billing_is_retryable_rate_limit() {
+        // Issue #347: a 429 whose body mentions billing is a rate
+        // limit, not quota exhaustion - the old body-first scan
+        // classified it QuotaExhausted and the run failed instead of
+        // backing off and retrying.
+        let c = classify_error(
+            Some(429),
+            "Rate limit exceeded. See billing to upgrade your plan",
+        );
+        assert_eq!(c, ErrorClass::RateLimit);
+        assert!(c.is_retryable());
+
+        let c = classify_error(
+            Some(429),
+            r#"{"error": {"message": "Billing issue: out of credit"}}"#,
+        );
+        assert_eq!(
+            c,
+            ErrorClass::RateLimit,
+            "broad billing words must not beat a 429"
+        );
+        assert!(c.is_retryable());
+    }
+
+    #[test]
+    fn classify_billing_body_is_quota_only_without_contradicting_status() {
+        // The broad billing / out-of-credit signals still count where
+        // no status contradicts them: 402 is a billing status, and
+        // with no status there is nothing to contradict the body.
+        assert_eq!(
+            classify_error(
+                Some(402),
+                r#"{"error": {"message": "Billing issue: out of credit"}}"#
+            ),
+            ErrorClass::QuotaExhausted
+        );
+        assert_eq!(
+            classify_error(None, "Billing issue: out of credit"),
+            ErrorClass::QuotaExhausted
+        );
+        assert_eq!(
+            classify_error(Some(500), "Billing issue: out of credit"),
+            ErrorClass::Transient,
+            "a 5xx keeps its status-based class"
+        );
     }
 
     #[test]
