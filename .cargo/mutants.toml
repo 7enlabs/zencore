@@ -457,7 +457,7 @@ exclude_re = [
   # exclusion and kill it with a similar test.
   "classifier\\.rs:740:23: replace \\+ with \\* in redirect_targets",
   # PR #319 (issue #319, secret file locking), secret.rs lock_store
-  # (line 507): the contention guard
+  # (line 513): the contention guard
   # e.kind() == WouldBlock || e.raw_os_error() == Some(33).
   # Two mutants, both EQUIVALENT (waived by ZC Leader, 2026-11-24;
   # verified by running cargo mutants --in-diff on this branch:
@@ -488,6 +488,6 @@ exclude_re = [
   # different message for them), or the lock file moves to a
   # non-local filesystem, these mutants stop being equivalent:
   # remove these exclusions and kill them with tests.
-  "secret\\.rs:507:20: replace match guard e\\.kind\\(\\) == std::io::ErrorKind::WouldBlock \\|\\| e\\.raw_os_error\\(\\) == Some\\(33\\) with true in lock_store",
-  "secret\\.rs:507:83: replace == with != in lock_store",
+  "secret\\.rs:513:20: replace match guard e\\.kind\\(\\) == std::io::ErrorKind::WouldBlock \\|\\| e\\.raw_os_error\\(\\) == Some\\(33\\) with true in lock_store",
+  "secret\\.rs:513:83: replace == with != in lock_store",
 ]
