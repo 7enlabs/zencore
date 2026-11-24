@@ -831,7 +831,7 @@ async fn request_timeout_is_surfaced_not_hung() {
 /// missing answer is logged as `{"timeout": true}` and the mock moves
 /// on, so the test fails on its assertions instead of hanging.
 const MOCK_SERVER_386: &str = r##"#!/usr/bin/env python3
-import sys, json, select
+import sys, json, threading, queue
 
 log_path = sys.argv[1]
 
@@ -839,7 +839,7 @@ def log(obj):
     with open(log_path, "a") as f:
         f.write(json.dumps(obj) + "\n")
 
-def read_msg():
+def _read_msg_raw():
     headers = {}
     while True:
         raw = sys.stdin.buffer.readline()
@@ -856,11 +856,30 @@ def read_msg():
         return None
     return json.loads(sys.stdin.buffer.read(n).decode("utf-8"))
 
+# One reader thread feeds every read: `select` on stdin does not work on
+# Windows (sockets only), so the mock crashed there as soon as it waited
+# for the client's answer and the server looked closed during
+# initialize. A single thread also means a timed-out wait can never
+# steal bytes from a later read.
+_msg_queue = queue.Queue()
+
+def _reader():
+    while True:
+        msg = _read_msg_raw()
+        _msg_queue.put(msg)
+        if msg is None:
+            return
+
+threading.Thread(target=_reader, daemon=True).start()
+
+def read_msg():
+    return _msg_queue.get()
+
 def read_msg_timeout(seconds):
-    r, _, _ = select.select([sys.stdin], [], [], seconds)
-    if not r:
+    try:
+        return _msg_queue.get(timeout=seconds)
+    except queue.Empty:
         return {"timeout": True}
-    return read_msg()
 
 def send(obj):
     data = json.dumps(obj).encode("utf-8")
