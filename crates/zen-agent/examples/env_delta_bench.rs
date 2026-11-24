@@ -83,7 +83,7 @@ fn main() {
 
     let mut off_per_turn: Vec<u64> = Vec::new();
     for snap in &turns {
-        let mut fresh = DeltaStore::new();
+        let fresh = DeltaStore::new();
         let rendered = render_delta(&fresh.diff(snap));
         off_per_turn.push(est_tokens(&rendered));
     }
@@ -91,7 +91,11 @@ fn main() {
     let mut store = DeltaStore::new();
     let mut on_per_turn: Vec<u64> = Vec::new();
     for snap in &turns {
-        let rendered = render_delta(&store.diff(snap));
+        // #351: `diff` no longer commits - the bench models delivered
+        // requests, so each diff is committed right away.
+        let delta = store.diff(snap);
+        store.commit(&delta, snap);
+        let rendered = render_delta(&delta);
         on_per_turn.push(est_tokens(&rendered));
     }
 

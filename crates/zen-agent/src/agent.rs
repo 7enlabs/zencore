@@ -328,6 +328,15 @@ pub struct Agent {
     /// Per-session env-context delta state (Viec 5).
     pub env_deltas: env_context::DeltaStore,
 
+    /// Env delta assembled for the request in flight (Viec 5, #351):
+    /// the snapshot + delta pair that [`Agent::request_messages`]
+    /// last appended to the system message. Committed into
+    /// [`Agent::env_deltas`] only after the model call carrying it
+    /// succeeds; a request that never reaches the model (budget block,
+    /// API error, unparsed-reply requery) leaves it pending, so the
+    /// next request re-sends the same fields instead of losing them.
+    pending_env_delta: Option<(env_context::EnvSnapshot, env_context::EnvDelta)>,
+
     /// LSP feedback rounds already appended per file in this run
     /// (path string -> count), enforcing `MAX_LSP_FEEDBACK_PER_FILE`.
     pub lsp_feedback_counts: HashMap<String, usize>,
@@ -381,6 +390,7 @@ impl Agent {
             prune_turn_starts: vec![0],
             prune_stats: PruneStats::default(),
             env_deltas: env_context::DeltaStore::new(),
+            pending_env_delta: None,
             lsp_feedback_counts: HashMap::new(),
             pending_hook_context: vec![],
             dynamic_watch_paths: vec![],
@@ -392,6 +402,7 @@ impl Agent {
         // A resumed/reset session restarts env-context deltas from a full
         // snapshot (Viec 5).
         self.env_deltas.reset();
+        self.pending_env_delta = None;
 
         self.last_prompt_tokens = 0;
 
@@ -447,9 +458,13 @@ impl Agent {
             // Viec 5: append this request's env payload (full snapshot on
             // the first request, changed fields only afterwards) after the
             // stable prompt text, i.e. inside the cache-volatile tail.
+            // #351: `diff` is speculative - the delta is only committed
+            // (see `commit_env_delta`) after the model call carrying it
+            // succeeds, so an undelivered request loses nothing.
             let cwd = self.ctx.cwd.lock().unwrap().clone();
             let snap = env_context::EnvSnapshot::collect(&cwd);
             let delta = self.env_deltas.diff(&snap);
+            self.pending_env_delta = Some((snap, delta.clone()));
             prompt.push_str(&env_context::render_delta(&delta));
         }
         if !prompt.is_empty() {
@@ -457,6 +472,18 @@ impl Agent {
         }
         msgs.extend(self.messages.iter().cloned());
         crate::plan::ensure_tool_responses(msgs)
+    }
+
+    /// Commit the pending env delta (#351). Call only after the model
+    /// call that carried it returned `Ok`. A request that never reached
+    /// the model - budget `Block` return, API error, or an unparsed-reply
+    /// requery that `continue`s to a fresh `request_messages()` - skips
+    /// this, so the next request re-diffs from the last delivered
+    /// snapshot and re-sends the same changed fields.
+    fn commit_env_delta(&mut self) {
+        if let Some((snap, delta)) = self.pending_env_delta.take() {
+            self.env_deltas.commit(&delta, &snap);
+        }
     }
 
     fn run_result(
@@ -958,6 +985,11 @@ impl Agent {
                     );
                 }
             };
+            // #351: the model call succeeded, so the delta it carried is
+            // delivered - commit it. Every path above that skips this
+            // line (budget Block, API error, unparsed-reply `continue`)
+            // leaves the delta uncommitted for the next request.
+            self.commit_env_delta();
             duration_api_ms += api_ms;
 
             self.usage.input_tokens += resp.usage.prompt_tokens;
@@ -1341,6 +1373,9 @@ impl Agent {
             Ok(v) => v,
             Err(_) => return (stop_text.to_string(), 0),
         };
+        // #351: same commit-on-success rule as the main loop - a failed
+        // summary call leaves its delta uncommitted for the next request.
+        self.commit_env_delta();
         self.usage.input_tokens += resp.usage.prompt_tokens;
         self.usage.output_tokens += resp.usage.completion_tokens;
         self.usage.cache_read_input_tokens += resp.usage.cache_read_input_tokens;
