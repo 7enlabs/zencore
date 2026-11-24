@@ -34,6 +34,22 @@ const DIAGNOSTICS_DEBOUNCE: Duration = Duration::from_millis(150);
 /// set) are low megabytes.
 pub(crate) const MAX_FRAME_BYTES: usize = 10 * 1024 * 1024;
 
+/// Maximum total size of one LSP frame's headers.
+///
+/// `read_frame` used to read header lines with no limit, so a
+/// misbehaving or compromised server could force an unbounded
+/// allocation with one huge header line, or keep the reader looping
+/// forever on endless short lines, before the body cap ever applied
+/// (issue #385). 8 KiB is generous: real frames carry one or two
+/// short headers (`Content-Length`, maybe `Content-Type`), totalling
+/// well under 200 bytes.
+pub(crate) const MAX_HEADER_BYTES: usize = 8 * 1024;
+
+/// Maximum number of header lines in one LSP frame (issue #385).
+/// Stops a server from stalling the reader with endless short
+/// header lines that stay under the total-byte cap.
+pub(crate) const MAX_HEADER_LINES: usize = 32;
+
 type Pending = Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Value>>>>;
 
 /// Latest diagnostics per file URI, as published by the server.
@@ -268,10 +284,36 @@ where
     R: AsyncBufReadExt + Unpin,
 {
     let mut content_length: Option<usize> = None;
+    let mut header_bytes = 0usize;
+    let mut header_lines = 0usize;
     loop {
+        header_lines += 1;
+        if header_lines > MAX_HEADER_LINES {
+            anyhow::bail!("LSP frame has more than {MAX_HEADER_LINES} header lines");
+        }
         let mut line = String::new();
-        let n = r.read_line(&mut line).await?;
+        // Read through `take` so one huge header line cannot grow
+        // `line` without bound: the read stops at the remaining
+        // header budget, and a line cut short by the cap is rejected
+        // below instead of being buffered in full (#385).
+        let n = r
+            .take((MAX_HEADER_BYTES - header_bytes) as u64)
+            .read_line(&mut line)
+            .await?;
         if n == 0 {
+            if header_bytes >= MAX_HEADER_BYTES {
+                anyhow::bail!("LSP frame headers exceed the {MAX_HEADER_BYTES} byte limit");
+            }
+            anyhow::bail!("LSP server closed the connection");
+        }
+        header_bytes += n;
+        if !line.ends_with('\n') {
+            // No newline: either the line ran past the header cap
+            // (`take` stopped mid-line, which always fills the cap
+            // exactly) or the stream ended mid-line.
+            if header_bytes >= MAX_HEADER_BYTES {
+                anyhow::bail!("LSP frame headers exceed the {MAX_HEADER_BYTES} byte limit");
+            }
             anyhow::bail!("LSP server closed the connection");
         }
         let line = line.trim();

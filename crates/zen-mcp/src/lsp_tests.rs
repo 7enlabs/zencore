@@ -12,7 +12,7 @@ use crate::lsp::{
     find_project_root, parse_locations, parse_publish_diagnostics, path_to_uri, render_hover,
     server_spec, uri_to_path, utf16_to_col,
 };
-use crate::lsp::{MAX_FRAME_BYTES, read_frame, write_frame};
+use crate::lsp::{MAX_FRAME_BYTES, MAX_HEADER_BYTES, read_frame, write_frame};
 use crate::lsp_tools::{DiagnosticsTool, FindReferencesTool, GotoDefinitionTool, HoverTool};
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -454,6 +454,61 @@ async fn read_frame_rejects_one_byte_over_ten_mib_written_literally() {
         err.to_string().contains("exceeds the 10485760 byte limit"),
         "got: {err}"
     );
+}
+
+#[tokio::test]
+async fn read_frame_rejects_endless_header_lines() {
+    // Issue #385: the header loop read lines with no limit, so a
+    // server sending endless short header lines kept the reader
+    // looping (and allocating) forever instead of returning an error.
+    let (mut a, mut b) = tokio::io::duplex(65536);
+    tokio::spawn(async move {
+        for _ in 0..100 {
+            a.write_all(b"X-Pad: x\r\n").await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    });
+    let err = read_frame(&mut BufReader::new(&mut b)).await.unwrap_err();
+    assert!(err.to_string().contains("32 header lines"), "got: {err}");
+}
+
+#[tokio::test]
+async fn read_frame_rejects_oversize_header_line() {
+    // Issue #385: a single header line had no length limit, so a
+    // server could force an unbounded allocation with one huge line
+    // before the body cap ever applied. The line here (64 KiB) is
+    // far over the 8192-byte header cap.
+    let (mut a, mut b) = tokio::io::duplex(65536);
+    tokio::spawn(async move {
+        let line = format!("X-Pad: {}\r\n", "x".repeat(65536));
+        a.write_all(line.as_bytes()).await.unwrap();
+        a.write_all(b"\r\n{}").await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    });
+    let err = read_frame(&mut BufReader::new(&mut b)).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("headers exceed the 8192 byte limit"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn read_frame_accepts_large_but_capped_headers() {
+    // Boundary: headers well under the cap must still read fine, so
+    // the cap does not reject legitimate frames with long extra
+    // headers (e.g. a long Content-Type value).
+    let (mut a, mut b) = tokio::io::duplex(65536);
+    let body = br#"{"ok":true}"#;
+    let raw = format!(
+        "Content-Length: {}\r\nContent-Type: application/vscode-jsonrpc; charset=utf-8; {}\r\n\r\n",
+        body.len(),
+        "x".repeat(MAX_HEADER_BYTES / 2)
+    );
+    a.write_all(raw.as_bytes()).await.unwrap();
+    a.write_all(body).await.unwrap();
+    let got = read_frame(&mut BufReader::new(&mut b)).await.unwrap();
+    assert_eq!(got, json!({"ok": true}));
 }
 
 #[tokio::test]
