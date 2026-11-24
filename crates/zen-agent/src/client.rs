@@ -2103,13 +2103,27 @@ pub(crate) fn anthropic_request_body(req: &ChatRequest) -> Value {
 }
 
 pub(crate) fn parse_anthropic_response(body: &str) -> anyhow::Result<ChatResponse> {
-    let v: Value = serde_json::from_str(body).map_err(|e| {
-        anyhow::anyhow!(
-            "invalid anthropic response: {} (body: {})",
-            e,
-            first_chars(body, ERROR_BODY_CHARS)
-        )
-    })?;
+    // Parse only the first JSON value and ignore whatever follows it,
+    // stripping a leading BOM first, as `parse_completion` does
+    // (issue #338; BOM strip and trailing tolerance come from bug
+    // hunt B P2-1 on the OpenAI path, observed 2026-11-10).
+    let mut values = serde_json::Deserializer::from_str(strip_bom(body)).into_iter::<Value>();
+    let v: Value = match values.next() {
+        Some(Ok(v)) => v,
+        Some(Err(e)) => {
+            return Err(anyhow::anyhow!(
+                "invalid anthropic response: {} (body: {})",
+                e,
+                first_chars(body, ERROR_BODY_CHARS)
+            ));
+        }
+        None => {
+            return Err(anyhow::anyhow!(
+                "invalid anthropic response: empty body (body: {})",
+                first_chars(body, ERROR_BODY_CHARS)
+            ));
+        }
+    };
     if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
         let msg = err
             .get("message")
@@ -2675,6 +2689,25 @@ mod anthropic_tests {
         }"#;
         let resp = parse_anthropic_response(body).unwrap();
         assert_eq!(resp.usage.total_tokens, u64::MAX);
+    }
+
+    #[test]
+    fn parse_response_tolerates_bom_and_trailing_content() {
+        // Issue #338: same BOM/trailing tolerance as `parse_completion`
+        // (bug hunt B P2-1; trailing second JSON observed 2026-11-10).
+        let body = r#"{
+            "content": [{"type": "text", "text": "done"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }"#;
+        let resp = parse_anthropic_response(&format!("\u{feff}{body}")).unwrap();
+        assert_eq!(resp.message.text_ref(), Some("done"));
+        let trailing = format!("{body} {{\"second\": \"json\"}}");
+        let resp = parse_anthropic_response(&trailing).unwrap();
+        assert_eq!(resp.message.text_ref(), Some("done"));
+        let blank_trailing = format!("{body}\n\ntrailing text\n");
+        let resp = parse_anthropic_response(&blank_trailing).unwrap();
+        assert_eq!(resp.message.text_ref(), Some("done"));
     }
 
     #[tokio::test]
