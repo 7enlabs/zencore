@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::sync::Arc;
 
 use zen_core::{Tool, ToolContext, ToolOutput};
@@ -100,6 +101,35 @@ pub(crate) fn render_result(result: Value, ctx: &ToolContext) -> ToolOutput {
     }
 }
 
+/// Register one MCP tool, guarding against sanitised-name collisions
+/// (#372). The first tool to claim an exposed name wins; a later tool
+/// with the same name is skipped and reported with both sources, so the
+/// model never sees one tool that routes to another server.
+fn register_tool(
+    tools: &mut Vec<Arc<dyn Tool>>,
+    seen: &mut BTreeMap<String, (String, String)>,
+    skipped: &mut Vec<SkipReason>,
+    tool: McpTool,
+) {
+    match seen.entry(tool.full_name.clone()) {
+        Entry::Vacant(entry) => {
+            entry.insert((tool.server.clone(), tool.remote_name.clone()));
+            tools.push(Arc::new(tool));
+        }
+        Entry::Occupied(entry) => {
+            let (first_server, first_remote) = entry.get();
+            skipped.push(SkipReason {
+                server_name: tool.server.clone(),
+                reason: format!(
+                    "tool_name_collision: '{}' already provided by server '{}' tool '{}'; \
+                     tool '{}' from server '{}' was skipped",
+                    tool.full_name, first_server, first_remote, tool.remote_name, tool.server
+                ),
+            });
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkipReason {
     pub server_name: String,
@@ -156,19 +186,29 @@ impl McpManager {
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
         let mut transports: Vec<Arc<Transport>> = Vec::new();
         let mut failed = Vec::new();
+        // Exposed names are sanitised (#372): distinct servers/tools can
+        // map to the same `mcp__...` name. Keep the first tool per name
+        // and report the rest as skips so a call is never silently
+        // routed to the wrong server.
+        let mut seen: BTreeMap<String, (String, String)> = BTreeMap::new();
 
         for handle in join {
             match handle.await {
                 Ok((name, Ok((transport, remote_tools)))) => {
                     for rt in remote_tools {
-                        tools.push(Arc::new(McpTool {
-                            server: name.clone(),
-                            remote_name: rt.name.clone(),
-                            full_name: mcp_tool_name(&name, &rt.name),
-                            description: rt.description.clone(),
-                            schema: rt.schema.clone(),
-                            transport: transport.clone(),
-                        }));
+                        register_tool(
+                            &mut tools,
+                            &mut seen,
+                            &mut skipped,
+                            McpTool {
+                                server: name.clone(),
+                                remote_name: rt.name.clone(),
+                                full_name: mcp_tool_name(&name, &rt.name),
+                                description: rt.description.clone(),
+                                schema: rt.schema.clone(),
+                                transport: transport.clone(),
+                            },
+                        );
                     }
                     transports.push(transport);
                     statuses.push((name, "connected".to_string()));
