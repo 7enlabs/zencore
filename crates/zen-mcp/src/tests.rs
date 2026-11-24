@@ -148,6 +148,77 @@ fn c7_scope_paths_match_spec_and_are_loaded() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// #373: an unreadable/invalid config file and an invalid `--mcp-config`
+/// entry must be reported as skips, not silently discarded with `let _`.
+#[test]
+fn load_mcp_configs_ex_reports_file_and_cli_errors() {
+    let cwd = tmpdir("ex_err_cwd");
+    let home = tmpdir("ex_err_home");
+
+    let broken_user_file = home.join(".zen").join("mcp.json");
+    std::fs::create_dir_all(home.join(".zen")).unwrap();
+    std::fs::write(&broken_user_file, "{invalid json").unwrap();
+    std::fs::write(
+        cwd.join(".mcp.json"),
+        r#"{"mcpServers":{"proj":{"command":"echo"}}}"#,
+    )
+    .unwrap();
+
+    let missing_cli = cwd.join("no-such-mcp.json");
+    let missing_cli_str = missing_cli.to_string_lossy().to_string();
+    let cli = vec!["{not json".to_string(), missing_cli_str.clone()];
+    let (validated, skipped) = load_mcp_configs_ex(&cwd, Some(&home), &cli, false);
+
+    // The valid server still loads.
+    assert_eq!(validated.len(), 1);
+    assert_eq!(validated["proj"].command.as_deref(), Some("echo"));
+
+    // One skip per bad source: the broken user file + two bad CLI entries.
+    assert_eq!(skipped.len(), 3, "got {skipped:?}");
+    let broken_file_str = broken_user_file.to_string_lossy().to_string();
+    let file_skip = skipped
+        .iter()
+        .find(|s| s.server_name == broken_file_str)
+        .expect("broken user file must be reported");
+    assert!(
+        file_skip.reason.starts_with("invalid_config_file:"),
+        "got: {}",
+        file_skip.reason
+    );
+    let cli_json_skip = skipped
+        .iter()
+        .find(|s| s.server_name == "cli")
+        .expect("bad inline CLI JSON must be reported");
+    assert!(
+        cli_json_skip.reason.starts_with("invalid_cli_config:"),
+        "got: {}",
+        cli_json_skip.reason
+    );
+    let cli_file_skip = skipped
+        .iter()
+        .find(|s| s.server_name == missing_cli_str)
+        .expect("missing CLI config file must be reported");
+    assert!(
+        cli_file_skip.reason.starts_with("invalid_cli_config:"),
+        "got: {}",
+        cli_file_skip.reason
+    );
+
+    // Strict mode reads no files, so the broken file is not reported -
+    // but bad CLI entries still are.
+    let (_, strict_skipped) = load_mcp_configs_ex(&cwd, Some(&home), &cli, true);
+    assert_eq!(strict_skipped.len(), 2, "got {strict_skipped:?}");
+    assert!(
+        strict_skipped
+            .iter()
+            .all(|s| s.reason.starts_with("invalid_cli_config:")),
+        "got: {strict_skipped:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&cwd);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 fn empty_cfg() -> McpServerConfig {
     McpServerConfig {
         kind: None,

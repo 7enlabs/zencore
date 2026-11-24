@@ -237,41 +237,78 @@ pub fn mcp_list(scope_path: &Path) -> Vec<(String, McpServerConfig)> {
 fn merge_file_with_skips(
     into: &mut BTreeMap<String, McpServerConfig>,
     path: PathBuf,
-    _skipped: &mut [SkipReason],
-) -> anyhow::Result<()> {
+    skipped: &mut Vec<SkipReason>,
+) {
     if !path.exists() {
-        return Ok(());
+        return;
     }
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| anyhow::anyhow!("failed to read config '{}': {}", path.display(), e))?;
-    let servers = parse_servers(&text)
-        .map_err(|e| anyhow::anyhow!("invalid MCP config '{}': {}", path.display(), e))?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) => {
+            skipped.push(SkipReason {
+                server_name: path.display().to_string(),
+                reason: format!("invalid_config_file: failed to read config: {e}"),
+            });
+            return;
+        }
+    };
+    let servers = match parse_servers(&text) {
+        Ok(servers) => servers,
+        Err(e) => {
+            skipped.push(SkipReason {
+                server_name: path.display().to_string(),
+                reason: format!("invalid_config_file: {e}"),
+            });
+            return;
+        }
+    };
     for (name, cfg) in servers {
         into.insert(name, cfg);
     }
-    Ok(())
 }
 
 fn load_cli_entry_with_skips(
     into: &mut BTreeMap<String, McpServerConfig>,
     entry: &str,
-) -> anyhow::Result<()> {
+    skipped: &mut Vec<SkipReason>,
+) {
     let trimmed = entry.trim();
     if trimmed.is_empty() {
-        return Ok(());
+        return;
     }
+    // Inline JSON entries have no path to name the skip after.
+    let source = if trimmed.starts_with('{') {
+        "cli".to_string()
+    } else {
+        trimmed.to_string()
+    };
     let text = if trimmed.starts_with('{') {
         trimmed.to_string()
     } else {
-        std::fs::read_to_string(PathBuf::from(trimmed))
-            .map_err(|e| anyhow::anyhow!("failed to read CLI config '{}': {}", trimmed, e))?
+        match std::fs::read_to_string(PathBuf::from(trimmed)) {
+            Ok(text) => text,
+            Err(e) => {
+                skipped.push(SkipReason {
+                    server_name: source,
+                    reason: format!("invalid_cli_config: failed to read config: {e}"),
+                });
+                return;
+            }
+        }
     };
-    let servers = parse_servers(&text)
-        .map_err(|e| anyhow::anyhow!("invalid CLI config '{}': {}", trimmed, e))?;
+    let servers = match parse_servers(&text) {
+        Ok(servers) => servers,
+        Err(e) => {
+            skipped.push(SkipReason {
+                server_name: source,
+                reason: format!("invalid_cli_config: {e}"),
+            });
+            return;
+        }
+    };
     for (name, cfg) in servers {
         into.insert(name, cfg);
     }
-    Ok(())
 }
 
 pub fn scope_path(scope: &str, cwd: &Path, home: Option<&Path>) -> anyhow::Result<PathBuf> {
@@ -345,15 +382,17 @@ pub fn load_mcp_configs_ex(
 
     if !strict {
         for f in config_files(cwd, home) {
-            let _ = merge_file_with_skips(&mut out, f, &mut skipped);
+            merge_file_with_skips(&mut out, f, &mut skipped);
         }
     }
 
     for entry in cli_configs {
-        let _ = load_cli_entry_with_skips(&mut out, entry);
+        load_cli_entry_with_skips(&mut out, entry, &mut skipped);
     }
 
-    let mut final_skipped = Vec::new();
+    // File/CLI-level skips first (in source order), then per-server
+    // validation skips.
+    let mut final_skipped = skipped;
     let mut validated = BTreeMap::new();
     for (name, cfg) in out {
         let mut missing = Vec::new();
