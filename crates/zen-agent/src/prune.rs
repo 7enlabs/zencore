@@ -238,10 +238,27 @@ pub fn prune_messages(
     }
 
     for (i, label, identifier, tokens, age) in candidates {
+        // The "referenced later" scan must see everything a later
+        // message can reference with: plain text, the text parts of a
+        // multipart message, and each tool call's function name and
+        // arguments (issue #348). The old scan used `text_ref()`, which
+        // returns None for parts content and for an assistant message
+        // that is purely a tool call, so a later Edit targeting the
+        // same file as an earlier Read contributed nothing and the
+        // Read result was pruned with a false "not referenced" claim.
         let later_text: String = messages
             .iter()
             .skip(i + 1)
-            .filter_map(|m| m.text_ref())
+            .flat_map(|m| {
+                let mut parts = vec![m.text()];
+                if let Some(calls) = &m.tool_calls {
+                    for c in calls {
+                        parts.push(c.function.name.clone());
+                        parts.push(c.function.arguments.clone());
+                    }
+                }
+                parts
+            })
             .collect::<Vec<_>>()
             .join("\n");
         if should_prune(
@@ -490,6 +507,68 @@ mod tests {
         assert!(
             !messages[2].text().starts_with(PRUNE_MARKER),
             "turn 1 is referenced later, must not be pruned"
+        );
+    }
+
+    #[test]
+    fn prune_messages_keeps_result_referenced_by_later_tool_call_args() {
+        // Issue #348: turn 1 Read returns a large result; the later
+        // assistant message is purely a tool call (no text) editing
+        // the same file. The old text_ref() scan saw nothing from it,
+        // so the Read result was pruned with a false "not referenced"
+        // claim while the evidence the edit was based on vanished.
+        let body = format!("// auth contents\n{}", "x".repeat(20_000));
+        let mut messages = vec![
+            ChatMessage::user("do the thing"),
+            assistant_with_call("call-1", "Read", r#"{"file_path": "src/auth.rs"}"#),
+            tool_msg("call-1", &body),
+            ChatMessage::assistant(Some("done with step 1".into()), None),
+            assistant_with_call(
+                "call-2",
+                "Edit",
+                r#"{"file_path": "src/auth.rs", "old": "a", "new": "b"}"#,
+            ),
+            ChatMessage::user("next step"),
+        ];
+        let turn_starts = vec![0usize, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        let current_turn = turn_starts.len() - 1;
+        let stats = prune_messages(&mut messages, &turn_starts, current_turn, &cfg(), "");
+        assert_eq!(stats.pruned, 0, "stats: {:?}", stats);
+        assert!(
+            !messages[2].text().starts_with(PRUNE_MARKER),
+            "turn 1 is referenced by a later tool call, must not be pruned"
+        );
+    }
+
+    #[test]
+    fn prune_messages_keeps_result_referenced_by_later_multipart_text() {
+        // Issue #348: the identifier appears only in the text part of
+        // a later multipart user message. text_ref() returns None for
+        // parts content, so the old scan pruned the result.
+        let body = format!("// auth contents\n{}", "x".repeat(20_000));
+        let multipart = ChatMessage {
+            role: "user".into(),
+            content: Some(zen_core::MessageContent::Parts(vec![
+                zen_core::ContentPart::Text {
+                    text: "now update src/auth.rs please".into(),
+                },
+            ])),
+            ..Default::default()
+        };
+        let mut messages = vec![
+            ChatMessage::user("do the thing"),
+            assistant_with_call("call-1", "Read", r#"{"file_path": "src/auth.rs"}"#),
+            tool_msg("call-1", &body),
+            ChatMessage::assistant(Some("done with step 1".into()), None),
+            multipart,
+        ];
+        let turn_starts = vec![0usize, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        let current_turn = turn_starts.len() - 1;
+        let stats = prune_messages(&mut messages, &turn_starts, current_turn, &cfg(), "");
+        assert_eq!(stats.pruned, 0, "stats: {:?}", stats);
+        assert!(
+            !messages[2].text().starts_with(PRUNE_MARKER),
+            "turn 1 is referenced by a later multipart message, must not be pruned"
         );
     }
 
