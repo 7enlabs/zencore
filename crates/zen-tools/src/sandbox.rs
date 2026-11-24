@@ -754,6 +754,19 @@ mod tests {
         }
     }
 
+    // Issue #321: a cwd inside the workspace root (but not equal to
+    // it) is kept, not clamped to the root. This pins the `||` in
+    // contained_cwd: an `&&` mutant would clamp every subdirectory
+    // back to the root and fail this test.
+    #[test]
+    fn contained_cwd_keeps_subdirectory_inside_workspace() {
+        let root = PathBuf::from("/work/repo");
+        let ctx = zen_core::ToolContext::new(root.clone(), "test-session");
+        let sub = root.join("sub");
+        *ctx.cwd.lock().unwrap() = sub.clone();
+        assert_eq!(SandboxConfig::contained_cwd(&ctx), sub);
+    }
+
     #[test]
     fn write_paths_workspace_write_covers_cwd_scratch_tmp_and_extra() {
         let cwd = PathBuf::from("/work/repo");

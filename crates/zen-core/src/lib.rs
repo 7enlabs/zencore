@@ -2404,6 +2404,15 @@ mod glob_tests {
         assert_eq!(ctx.cwd(), PathBuf::from("/work/dir"));
     }
 
+    // Issue #321: the workspace root is the directory the session
+    // started in. This pins the accessor so a mutant that returns an
+    // empty path instead is caught.
+    #[test]
+    fn c3_tool_context_workspace_root_returns_constructed_root() {
+        let ctx = ToolContext::new(PathBuf::from("/work/dir"), "sess-1");
+        assert_eq!(ctx.workspace_root(), PathBuf::from("/work/dir"));
+    }
+
     #[test]
     fn summarize_tool_call_uses_command_url_or_path() {
         // Kills the whole-body replacements and the deleted "Bash"
