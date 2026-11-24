@@ -2236,6 +2236,21 @@ pub(crate) fn anthropic_request_body(req: &ChatRequest) -> Value {
     body
 }
 
+/// Whether a response body is a structured Anthropic error
+/// payload: a JSON object whose top-level `type` is `"error"` with
+/// a non-null `error` field. A raw substring match is wrong here:
+/// a successful completion can mention `"type":"error"` inside a
+/// tool_use input (or any nested object), which must not turn the
+/// completion into an error (issue #334).
+fn is_anthropic_error_payload(body: &str) -> bool {
+    serde_json::from_str::<Value>(body)
+        .map(|v| {
+            v.get("type").and_then(Value::as_str) == Some("error")
+                && v.get("error").map(|e| !e.is_null()).unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
 pub(crate) fn parse_anthropic_response(body: &str) -> anyhow::Result<ChatResponse> {
     // Parse only the first JSON value and ignore whatever follows it,
     // stripping a leading BOM first, as `parse_completion` does
@@ -2386,9 +2401,7 @@ impl LlmBackend for AnthropicClient {
                         .and_then(|v| v.to_str().ok())
                         .map(str::to_string);
                     server_hint_ms = server_retry_hint_ms(retry_after.as_deref(), &resp_body);
-                    if resp_body.contains("\"type\":\"error\"")
-                        || resp_body.contains("\"type\": \"error\"")
-                    {
+                    if is_anthropic_error_payload(&resp_body) {
                         let msg = parse_anthropic_response(&resp_body)
                             .err()
                             .map(|e| e.to_string())
@@ -2971,6 +2984,25 @@ mod anthropic_tests {
     }
 
     #[test]
+    fn is_anthropic_error_payload_matches_structured_errors_only() {
+        // Issue #334: only a top-level type/error pair counts.
+        assert!(is_anthropic_error_payload(
+            r#"{"type":"error","error":{"type":"authentication_error","message":"bad key"}}"#
+        ));
+        assert!(is_anthropic_error_payload(
+            r#"{"type": "error", "error": {"type": "rate_limit_error", "message": "slow"}}"#
+        ));
+        // A success whose nested object mentions "type":"error".
+        assert!(!is_anthropic_error_payload(
+            r#"{"type":"message","content":[{"type":"tool_use","id":"toolu_1","name":"Explain","input":{"type":"error"}}]}"#
+        ));
+        // type "error" without an error object is not an error payload.
+        assert!(!is_anthropic_error_payload(r#"{"type":"error"}"#));
+        assert!(!is_anthropic_error_payload(r#"{"type":"message"}"#));
+        assert!(!is_anthropic_error_payload("not json"));
+    }
+
+    #[test]
     fn parse_response_error_object_fails() {
         let body =
             r#"{"type": "error", "error": {"type": "authentication_error", "message": "bad key"}}"#;
@@ -3161,6 +3193,66 @@ mod anthropic_tests {
         assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[tokio::test]
+    async fn anthropic_success_mentioning_error_payload_is_not_an_error() {
+        // Issue #334: the old raw substring match on the response
+        // body turned a successful completion whose text mentions
+        // an error payload into "HTTP 200: <first 300 chars>".
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // The tool_use input {"type": "error"} puts the literal
+        // substring "type":"error" in the raw body even though the
+        // response is a successful completion, not an error payload.
+        let resp_body = r#"{"content":[{"type":"tool_use","id":"toolu_1","name":"Explain","input":{"type":"error"}}],"stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":5}}"#;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 65536];
+            let mut got = Vec::new();
+            loop {
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+                let txt = String::from_utf8_lossy(&got);
+                if let Some(h) = txt.find("\r\n\r\n") {
+                    let len = txt[..h]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if got.len() >= h + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+        });
+
+        let sink: Arc<dyn EventSink> = Arc::new(NullSink);
+        let mut c = AnthropicClient::new(format!("http://{addr}"), None, sink);
+        c.base_retry_delay_ms = 1;
+        let r = c.chat(req()).await.unwrap();
+        let calls = r.message.tool_calls.expect("tool call survives");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "toolu_1");
+        assert!(
+            calls[0].function.arguments.contains("\"type\":\"error\""),
+            "tool input: {}",
+            calls[0].function.arguments
+        );
     }
 
     /// Stub that always answers 429 to POST /messages, counting
