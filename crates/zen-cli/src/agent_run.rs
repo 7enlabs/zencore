@@ -446,6 +446,7 @@ impl zen_core::SubAgentRunner for DocsRunner {
         _def: &zen_core::AgentDefinition,
         _prompt: &str,
         _parent_tool_use_id: &str,
+        _parent_depth: usize,
     ) -> anyhow::Result<String> {
         anyhow::bail!("DocsRunner cannot run sub-agents; it only documents the Task/delegate tools")
     }
@@ -2706,7 +2707,7 @@ mod lsp_provider_tests {
     async fn docs_runner_never_runs() {
         let runner = DocsRunner;
         let def = zen_core::AgentDefinition::default();
-        let err = zen_core::SubAgentRunner::run_subagent(&runner, &def, "hi", "parent-1")
+        let err = zen_core::SubAgentRunner::run_subagent(&runner, &def, "hi", "parent-1", 0)
             .await
             .expect_err("DocsRunner must refuse to run sub-agents");
         assert!(

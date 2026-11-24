@@ -411,13 +411,15 @@ impl DelegateTool {
         task: &DelegateTask,
         top_timeout: Option<u64>,
         parent_id: &str,
+        parent_depth: usize,
     ) -> Result<HandoffEnvelope, String> {
         let def = self.resolve(task)?;
         let timeout_secs = self.timeout_for(task, top_timeout)?;
         let prompt = format!("{}{}", task.task, ENVELOPE_INSTRUCTION);
         match tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
-            self.runner.run_subagent(&def, &prompt, parent_id),
+            self.runner
+                .run_subagent(&def, &prompt, parent_id, parent_depth),
         )
         .await
         {
@@ -561,6 +563,9 @@ impl Tool for DelegateTool {
             .clone()
             .unwrap_or_else(|| "delegate".to_string());
 
+        // Issue #327: the spawning agent's true depth, for the runner.
+        let parent_depth = ctx.agent_depth;
+
         if has_single {
             let task = match parse_task(&args, "single task") {
                 Ok(t) => t,
@@ -574,7 +579,10 @@ impl Tool for DelegateTool {
                 },
                 _ => task,
             };
-            return match self.run_one(&task, top_timeout, &parent_id).await {
+            return match self
+                .run_one(&task, top_timeout, &parent_id, parent_depth)
+                .await
+            {
                 Ok(env) => {
                     ToolOutput::ok(serde_json::to_string(&env).unwrap_or_else(|_| "{}".to_string()))
                 }
@@ -603,7 +611,10 @@ impl Tool for DelegateTool {
             let futs = futures::stream::iter(tasks.into_iter().map(|task| {
                 let parent_id = parent_id.clone();
                 async move {
-                    match self.run_one(&task, top_timeout, &parent_id).await {
+                    match self
+                        .run_one(&task, top_timeout, &parent_id, parent_depth)
+                        .await
+                    {
                         Ok(env) => env,
                         Err(e) => failed_envelope(&task.agent, e),
                     }
@@ -644,7 +655,10 @@ impl Tool for DelegateTool {
                 },
                 None => step,
             };
-            match self.run_one(&task, top_timeout, &parent_id).await {
+            match self
+                .run_one(&task, top_timeout, &parent_id, parent_depth)
+                .await
+            {
                 Ok(env) => {
                     let done = env.status == HandoffStatus::Done;
                     previous = Some(env.summary.clone());
@@ -736,6 +750,7 @@ mod tests {
             def: &AgentDefinition,
             prompt: &str,
             _parent_tool_use_id: &str,
+            _parent_depth: usize,
         ) -> anyhow::Result<String> {
             self.prompts
                 .lock()

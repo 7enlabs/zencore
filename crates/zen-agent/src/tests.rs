@@ -1231,7 +1231,7 @@ async fn c6_subagent_fresh_context_tool_filter_and_parent_id() {
         max_turns: Some(5),
         ..Default::default()
     };
-    let out = ex.run_subagent(&def, "find it", "task-1").await.unwrap();
+    let out = ex.run_subagent(&def, "find it", "task-1", 0).await.unwrap();
     assert_eq!(out, "sub result");
     let req = &llm.requests()[0];
     let names: Vec<String> = req.tools.iter().map(|t| t.function.name.clone()).collect();
@@ -1286,7 +1286,7 @@ async fn c6_subagent_stop_block_continues_subagent() {
         description: "d".into(),
         ..Default::default()
     };
-    let out = ex.run_subagent(&def, "do", "t").await.unwrap();
+    let out = ex.run_subagent(&def, "do", "t", 0).await.unwrap();
     assert_eq!(out, "final");
     assert_eq!(
         llm.requests()[1].messages.last().unwrap().text_ref(),
@@ -1299,10 +1299,10 @@ async fn c6_depth_limit_refuses_nested_spawn() {
     let llm = MockLlm::new(vec![]);
     let hooks = FakeHooks::new();
     let sink = Arc::new(CollectSink::default());
-    let cfg = AgentConfig {
-        depth: 1,
-        ..base_cfg()
-    };
+    // The depth decision uses the depth passed to run_subagent (the
+    // spawning agent's depth), not this snapshot: keep the base config
+    // at depth 0 and pass the spawner depth explicitly.
+    let cfg = base_cfg();
     let ex = SubAgentExecutor::new(
         llm,
         ToolRegistry::new(),
@@ -1318,11 +1318,58 @@ async fn c6_depth_limit_refuses_nested_spawn() {
         ..Default::default()
     };
     let err = ex
-        .run_subagent(&def, "x", "t")
+        .run_subagent(&def, "x", "t", 1)
         .await
         .unwrap_err()
         .to_string();
     assert!(err.contains("depth limit"));
+}
+
+#[tokio::test]
+async fn c6_depth_limit_enforced_across_reused_executor() {
+    // Issue #327: spawning through the SAME executor must enforce the
+    // depth limit from the spawning agent's actual depth, not from the
+    // executor's depth-0 snapshot (which used to recompute depth 1 for
+    // every nested spawn, nesting without limit).
+    let llm = MockLlm::new(vec![resp("done"), resp("done")]);
+    let reg = registry_with(vec![
+        fake("Read", true, "r"),
+        fake("Task", true, "t"),
+        fake("delegate", true, "d"),
+    ]);
+    let (mut ex, _sink) = executor(llm.clone(), reg, FakeHooks::new());
+    ex.set_max_depth(2);
+    let def = AgentDefinition {
+        name: "w".into(),
+        description: "d".into(),
+        ..Default::default()
+    };
+    let tool_names = |req: usize| {
+        llm.requests()[req]
+            .tools
+            .iter()
+            .map(|t| t.function.name.clone())
+            .collect::<Vec<String>>()
+    };
+    // Depth-0 spawner: child is depth 1, keeps Task/delegate.
+    let out = ex.run_subagent(&def, "go", "t", 0).await.unwrap();
+    assert_eq!(out, "done");
+    let names = tool_names(0);
+    assert!(names.contains(&"Task".to_string()), "{names:?}");
+    assert!(names.contains(&"delegate".to_string()), "{names:?}");
+    // Depth-1 spawner: child is depth 2, Task/delegate are stripped.
+    let out = ex.run_subagent(&def, "go", "t", 1).await.unwrap();
+    assert_eq!(out, "done");
+    let names = tool_names(1);
+    assert!(!names.contains(&"Task".to_string()), "{names:?}");
+    assert!(!names.contains(&"delegate".to_string()), "{names:?}");
+    // Depth-2 spawner: a third level is refused.
+    let err = ex
+        .run_subagent(&def, "go", "t", 2)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("depth limit"), "{err}");
 }
 
 #[tokio::test]
@@ -1351,7 +1398,7 @@ async fn c6_1_preloads_skills_into_subagent_system_prompt() {
         skills: vec!["style".into(), "known".into(), "ghost".into()],
         ..Default::default()
     };
-    assert_eq!(ex.run_subagent(&def, "go", "t").await.unwrap(), "done");
+    assert_eq!(ex.run_subagent(&def, "go", "t", 0).await.unwrap(), "done");
     let sys = llm.requests()[0].messages[0].text();
     assert!(sys.starts_with("Base."));
 
@@ -1383,7 +1430,7 @@ async fn c6_3_builtin_read_only_agent_and_no_nested_task_by_default() {
         ..Default::default()
     };
     let out = ex
-        .run_subagent(&def, "investigate", "task-9")
+        .run_subagent(&def, "investigate", "task-9", 0)
         .await
         .unwrap();
     assert_eq!(
@@ -1407,7 +1454,7 @@ async fn c6_3_builtin_read_only_agent_and_no_nested_task_by_default() {
         description: "d".into(),
         ..Default::default()
     };
-    ex2.run_subagent(&gp, "x", "t").await.unwrap();
+    ex2.run_subagent(&gp, "x", "t", 0).await.unwrap();
     let names2: Vec<String> = llm2.requests()[0]
         .tools
         .iter()

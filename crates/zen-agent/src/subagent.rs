@@ -101,8 +101,13 @@ impl SubAgentRunner for SubAgentExecutor {
         def: &AgentDefinition,
         prompt: &str,
         parent_tool_use_id: &str,
+        parent_depth: usize,
     ) -> anyhow::Result<String> {
-        let depth = self.base_config.depth + 1;
+        // Issue #327: the child's depth comes from the agent that is
+        // actually spawning, not from this executor's immutable snapshot
+        // (which is depth 0 in production, so every nested spawn used
+        // to recompute depth 1 and nest without limit).
+        let depth = parent_depth + 1;
         if depth > self.max_depth {
             anyhow::bail!(
                 "sub-agent depth limit reached (max_depth = {}): refusing to spawn '{}'",

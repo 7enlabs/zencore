@@ -352,9 +352,13 @@ impl Agent {
         prompter: Option<Arc<dyn Prompter>>,
         hooks: Arc<dyn HookRunner>,
         sink: Arc<dyn EventSink>,
-        ctx: ToolContext,
+        mut ctx: ToolContext,
         config: AgentConfig,
     ) -> Self {
+        // Issue #327: stamp this agent's depth into its own context so
+        // the tools it calls (Task/delegate) can pass the spawning
+        // agent's true depth to the sub-agent runner.
+        ctx.agent_depth = config.depth;
         Self {
             llm,
             tools,

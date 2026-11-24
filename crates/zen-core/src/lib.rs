@@ -476,6 +476,13 @@ impl ToolOutput {
 pub struct ToolContext {
     pub cwd: Arc<Mutex<PathBuf>>,
 
+    /// Depth of the agent whose tool call this context belongs to
+    /// (issue #327): 0 for the root agent and for non-agent callers.
+    /// `Agent::new` stamps the agent's own `config.depth` here so
+    /// `Task`/`delegate` can pass the spawning agent's true depth to
+    /// `SubAgentRunner::run_subagent`.
+    pub agent_depth: usize,
+
     pub extra_dirs: Vec<PathBuf>,
 
     /// OS-level sandbox mode applied to child processes spawned by the
@@ -622,6 +629,7 @@ impl ToolContext {
     pub fn new(cwd: PathBuf, session_id: impl Into<String>) -> Self {
         Self {
             cwd: Arc::new(Mutex::new(cwd)),
+            agent_depth: 0,
             extra_dirs: vec![],
             sandbox_mode: SandboxMode::Off,
             env: HashMap::new(),
@@ -1391,6 +1399,7 @@ pub trait SubAgentRunner: Send + Sync {
         def: &AgentDefinition,
         prompt: &str,
         parent_tool_use_id: &str,
+        parent_depth: usize,
     ) -> anyhow::Result<String>;
 
     /// The post-edit LSP diagnostics provider spawned children inherit
