@@ -49,8 +49,45 @@ pub fn tool_phase(name: &str) -> Option<ToolPhase> {
         "Read" | "Glob" | "Grep" | "WebFetch" | "WebSearch" => Some(ToolPhase::Read),
         "Write" | "Edit" | "MultiEdit" => Some(ToolPhase::Write),
         "Bash" | "JobOutput" | "JobKill" => Some(ToolPhase::Exec),
+        // Sub-agent tools spawn children that can do anything the child
+        // role allows, so they are Exec even though they report
+        // `is_read_only() == true` (delegation itself mutates nothing;
+        // the child does). A `core` bundle must not expose them.
+        "Task" | "delegate" => Some(ToolPhase::Exec),
+        // Loads skill instructions as text only.
+        "Skill" => Some(ToolPhase::Read),
+        // LSP navigation tools are genuinely read-only.
+        "goto_definition" | "hover" | "find_references" | "diagnostics" => Some(ToolPhase::Read),
+        // MCP tools have no per-tool read-only flag visible here:
+        // `McpTool::is_read_only()` is always `false` and `RemoteTool`
+        // carries no read-only annotation, so every `mcp__*` tool is
+        // conservatively Exec (full only in `all`/`exec` bundles).
+        // Plumbing the server's own read-only annotation through is a
+        // separate `zen-mcp` change; see issue #350.
+        _ if name.starts_with("mcp__") => Some(ToolPhase::Exec),
         _ => None,
     }
+}
+
+/// Registry-aware phase: the name table first, then a fail-closed
+/// fallback for any tool nobody classified yet — read-only tools map
+/// to `Read`, everything else to `Exec` — so no registered tool ever
+/// keeps its full schema in every bundle (issue #350). The name table
+/// must win over the fallback: `Task`/`delegate` report
+/// `is_read_only() == true` but spawn sub-agents, while `WebFetch` /
+/// `WebSearch` report `false` but are read-phase tools, so
+/// `is_read_only` alone cannot classify a tool.
+pub fn tool_phase_for(registry: &ToolRegistry, name: &str) -> Option<ToolPhase> {
+    if let Some(phase) = tool_phase(name) {
+        return Some(phase);
+    }
+    registry.get(name).map(|tool| {
+        if tool.is_read_only() {
+            ToolPhase::Read
+        } else {
+            ToolPhase::Exec
+        }
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -134,7 +171,7 @@ pub fn definitions_for_bundle(registry: &ToolRegistry, bundle: ToolBundle) -> Ve
             let name = d.function.name.as_str();
             let full = match bundle.full_phases() {
                 None => true,
-                Some(phases) => match tool_phase(name) {
+                Some(phases) => match tool_phase_for(registry, name) {
                     None => true,
                     Some(p) => phases.contains(&p),
                 },
@@ -152,7 +189,7 @@ pub fn is_deferred(registry: &ToolRegistry, bundle: ToolBundle, name: &str) -> b
     }
     match bundle.full_phases() {
         None => false,
-        Some(phases) => match tool_phase(name) {
+        Some(phases) => match tool_phase_for(registry, name) {
             None => false,
             Some(p) => !phases.contains(&p),
         },
@@ -169,6 +206,7 @@ mod tests {
     struct FakeTool {
         name: &'static str,
         description: &'static str,
+        read_only: bool,
     }
 
     #[async_trait::async_trait]
@@ -191,7 +229,7 @@ mod tests {
             })
         }
         fn is_read_only(&self) -> bool {
-            true
+            self.read_only
         }
         async fn call(&self, _args: Value, _ctx: &ToolContext) -> ToolOutput {
             ToolOutput::ok("ok")
@@ -201,33 +239,56 @@ mod tests {
     fn registry() -> ToolRegistry {
         let mut r = ToolRegistry::new();
 
-        for (name, desc) in [
+        for (name, desc, read_only) in [
             (
                 "Write",
                 "Create a file or overwrite it completely. Parent directories are created. \
                  If the file already exists it must have been read earlier in this session, \
                  otherwise the call is rejected to prevent accidental overwrites of unseen content.",
+                false,
             ),
             (
                 "Bash",
                 "Run a shell command with bash -c in the session working directory. The directory \
                  is persistent across calls. Long output is cut to head and tail with the full text \
                  saved to a file whose path is reported, along with the exit code.",
+                false,
             ),
             (
                 "Read",
                 "Read a text file from disk and return its lines with 1-based line numbers. Use \
                  offset and limit to page through large files without loading them fully.",
+                true,
             ),
-            ("TodoWrite", "Replace the session task list with a new one."),
             (
+                "TodoWrite",
+                "Replace the session task list with a new one.",
+                true,
+            ),
+            (
+                // Read-only here on purpose: the name table must override
+                // the fallback and classify these as Exec anyway.
+                "Task",
+                "Delegate a self-contained task to a sub-agent.",
+                true,
+            ),
+            (
+                "delegate",
+                "Delegate work to sub-agents (Scout/Worker/Reviewer) in one session.",
+                true,
+            ),
+            (
+                // Read-only here on purpose: the `mcp__` prefix rule must
+                // override the fallback and classify this as Exec anyway.
                 "mcp__srv__ext",
                 "External MCP tool with a longer description for realism, plus extra detail.",
+                true,
             ),
         ] {
             r.register(Arc::new(FakeTool {
                 name,
                 description: desc,
+                read_only,
             }));
         }
         r
@@ -247,6 +308,18 @@ mod tests {
         assert_eq!(tool_phase("Bash"), Some(ToolPhase::Exec));
         assert_eq!(tool_phase("JobOutput"), Some(ToolPhase::Exec));
         assert_eq!(tool_phase("JobKill"), Some(ToolPhase::Exec));
+        assert_eq!(tool_phase("Task"), Some(ToolPhase::Exec));
+        assert_eq!(tool_phase("delegate"), Some(ToolPhase::Exec));
+        assert_eq!(tool_phase("mcp__srv__ext"), Some(ToolPhase::Exec));
+        assert_eq!(tool_phase("mcp__fs__read"), Some(ToolPhase::Exec));
+        assert_eq!(tool_phase("Skill"), Some(ToolPhase::Read));
+        assert_eq!(tool_phase("goto_definition"), Some(ToolPhase::Read));
+        assert_eq!(tool_phase("hover"), Some(ToolPhase::Read));
+        assert_eq!(tool_phase("find_references"), Some(ToolPhase::Read));
+        assert_eq!(tool_phase("diagnostics"), Some(ToolPhase::Read));
+        // The bare name table is intentionally partial: an unknown name
+        // stays `None` here and only the registry-aware `tool_phase_for`
+        // can classify it (via the `is_read_only` fallback).
         assert_eq!(tool_phase("Nope"), None);
     }
 
@@ -318,27 +391,89 @@ mod tests {
         assert!(estimate_schema_tokens(&stub) < 60);
     }
 
+    // Regression test for issue #350. This replaces the old
+    // `unclassified_tools_keep_full_schema`, which pinned the bug: it
+    // asserted that an unclassified tool keeps its full schema in every
+    // bundle, so `--tool-bundle read` still sent the full schema of an
+    // MCP filesystem/shell tool and a `core` bundle still exposed
+    // sub-agent spawning, while `Write` in the same bundle was stubbed
+    // and rejected. That was inconsistent with the bundle's documented
+    // purpose ("Restrict the run to a named tool bundle",
+    // `zen-cli/src/cli.rs`) and with the `is_deferred` rejection in
+    // `agent.rs`, so the old test was wrong, not the fix. Unclassified
+    // is no longer a free pass: known names are classified above and
+    // anything else registered falls back to `is_read_only`.
     #[test]
-    fn unclassified_tools_keep_full_schema() {
+    fn unclassified_tools_are_gated() {
         let r = registry();
-        for bundle in [
-            ToolBundle::Core,
-            ToolBundle::Read,
-            ToolBundle::Write,
-            ToolBundle::Exec,
-        ] {
+        for bundle in [ToolBundle::Core, ToolBundle::Read, ToolBundle::Write] {
             let defs = definitions_for_bundle(&r, bundle);
-            let mcp = defs
-                .iter()
-                .find(|d| d.function.name == "mcp__srv__ext")
-                .expect("mcp tool missing");
-            assert!(
-                !mcp.function.description.contains("[deferred]"),
-                "unclassified tool stubbed in {:?}",
-                bundle
-            );
-            assert!(!is_deferred(&r, bundle, "mcp__srv__ext"));
+            for name in ["mcp__srv__ext", "Task", "delegate"] {
+                let def = defs
+                    .iter()
+                    .find(|d| d.function.name == name)
+                    .unwrap_or_else(|| panic!("{name} missing in {bundle:?}"));
+                assert!(
+                    def.function.description.contains("[deferred]"),
+                    "{name} should be stubbed in {bundle:?}"
+                );
+                assert!(
+                    is_deferred(&r, bundle, name),
+                    "{name} should be deferred in {bundle:?}"
+                );
+            }
         }
+        // Exec is the permissive non-`all` bundle: the tools are full
+        // there (and in `all`), exactly like `Bash`.
+        for bundle in [ToolBundle::Exec, ToolBundle::All] {
+            let defs = definitions_for_bundle(&r, bundle);
+            for name in ["mcp__srv__ext", "Task", "delegate"] {
+                let def = defs
+                    .iter()
+                    .find(|d| d.function.name == name)
+                    .unwrap_or_else(|| panic!("{name} missing in {bundle:?}"));
+                assert!(
+                    !def.function.description.contains("[deferred]"),
+                    "{name} should be full in {bundle:?}"
+                );
+                assert!(!is_deferred(&r, bundle, name));
+            }
+        }
+    }
+
+    #[test]
+    fn registry_fallback_gates_unknown_tools() {
+        let mut r = ToolRegistry::new();
+        for (name, read_only) in [("MysteryRead", true), ("MysteryMut", false)] {
+            r.register(Arc::new(FakeTool {
+                name,
+                description: "A tool no name table entry covers.",
+                read_only,
+            }));
+        }
+        // A read-only unknown tool behaves like a read-phase tool.
+        assert_eq!(tool_phase_for(&r, "MysteryRead"), Some(ToolPhase::Read));
+        assert!(!is_deferred(&r, ToolBundle::Read, "MysteryRead"));
+        assert!(is_deferred(&r, ToolBundle::Write, "MysteryRead"));
+        assert!(is_deferred(&r, ToolBundle::Exec, "MysteryRead"));
+        assert!(is_deferred(&r, ToolBundle::Core, "MysteryRead"));
+        // A mutating unknown tool behaves like an exec-phase tool.
+        assert_eq!(tool_phase_for(&r, "MysteryMut"), Some(ToolPhase::Exec));
+        assert!(!is_deferred(&r, ToolBundle::Exec, "MysteryMut"));
+        assert!(is_deferred(&r, ToolBundle::Read, "MysteryMut"));
+        assert!(is_deferred(&r, ToolBundle::Write, "MysteryMut"));
+        assert!(is_deferred(&r, ToolBundle::Core, "MysteryMut"));
+        // Neither keeps its full schema in a bundle that excludes it.
+        let read_defs = definitions_for_bundle(&r, ToolBundle::Read);
+        let mut_def = read_defs
+            .iter()
+            .find(|d| d.function.name == "MysteryMut")
+            .expect("MysteryMut missing");
+        assert!(mut_def.function.description.contains("[deferred]"));
+        // `tool_phase` alone still returns `None` for unknown names;
+        // only the registry-aware lookup classifies them.
+        assert_eq!(tool_phase("MysteryRead"), None);
+        assert_eq!(tool_phase("MysteryMut"), None);
     }
 
     #[test]
