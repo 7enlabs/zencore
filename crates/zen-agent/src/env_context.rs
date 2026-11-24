@@ -16,6 +16,14 @@
 //! fields, and every [`RESYNC_INTERVAL`] turns the full snapshot is resent
 //! so a lost or diverged delta can never leave the model with stale state.
 //!
+//! Delivery is commit-on-success (#351): [`DeltaStore::diff`] only
+//! computes the delta, it does not advance any state. The delta is
+//! committed ([`DeltaStore::commit`]) only after the model call that
+//! carried it returned `Ok` - a request that never reaches the model
+//! (budget `Block`, API error, unparsed-reply requery) leaves the delta
+//! uncommitted, so the next request re-sends the same changed fields
+//! from the same `base_turn` instead of losing them until resync.
+//!
 //! Field set (plan section 2.1, leader Q3): `cwd`, `env`, `git`, `files`,
 //! `shell`. New fields only ever enter through the env allowlist plus
 //! redaction below; nothing here touches the stream-json contract.
@@ -249,36 +257,54 @@ impl DeltaStore {
         *self = Self::default();
     }
 
-    /// Diff `snap` against the last snapshot sent and advance the turn
-    /// counter. Full on the first call and every [`RESYNC_INTERVAL`] turns;
-    /// otherwise only fields whose hash changed are included.
-    pub fn diff(&mut self, snap: &EnvSnapshot) -> EnvDelta {
+    /// Diff `snap` against the last snapshot committed as delivered, without
+    /// advancing any state. Full on the first call and every
+    /// [`RESYNC_INTERVAL`] turns; otherwise only fields whose hash changed
+    /// are included. Call [`DeltaStore::commit`] with the same `snap` once
+    /// the model call carrying the returned delta succeeded (#351); until
+    /// then, repeating `diff` returns the same delta again, so a request
+    /// that never reached the model loses nothing.
+    pub fn diff(&self, snap: &EnvSnapshot) -> EnvDelta {
         let turn = self.next_turn;
         let full = match self.last_full_turn {
             None => true,
             Some(t) => turn.saturating_sub(t) >= RESYNC_INTERVAL,
         };
         let mut obj = serde_json::Map::new();
-        let mut hashes: BTreeMap<&'static str, String> = BTreeMap::new();
         for field in FIELDS {
             let h = snap.field_hash(field);
             let changed = self.last_hashes.get(field) != Some(&h);
-            hashes.insert(field, h);
             if full || changed {
                 obj.insert(field.to_string(), snap.field_value(field));
             }
         }
-        self.last_hashes = hashes;
-        if full {
-            self.last_full_turn = Some(turn);
-        }
-        self.next_turn += 1;
         EnvDelta {
             partial: !full,
             base_turn: if full { None } else { Some(turn - 1) },
             snapshot: serde_json::Value::Object(obj),
             turn,
         }
+    }
+
+    /// Commit a delta previously returned by [`DeltaStore::diff`] for `snap`,
+    /// marking its fields as delivered to the model: advance the turn
+    /// counter and record `snap`'s field hashes (and the full-snapshot turn
+    /// when the delta was full). Call only after the model call carrying
+    /// the delta succeeded. Idempotent for an already-committed turn, so a
+    /// retry that re-diffed the same turn can commit safely.
+    pub fn commit(&mut self, delta: &EnvDelta, snap: &EnvSnapshot) {
+        if delta.turn < self.next_turn {
+            return;
+        }
+        let mut hashes: BTreeMap<&'static str, String> = BTreeMap::new();
+        for field in FIELDS {
+            hashes.insert(field, snap.field_hash(field));
+        }
+        self.last_hashes = hashes;
+        if !delta.partial {
+            self.last_full_turn = Some(delta.turn);
+        }
+        self.next_turn = delta.turn + 1;
     }
 }
 
@@ -441,7 +467,7 @@ mod tests {
 
     #[test]
     fn turn0_is_full_with_all_fields() {
-        let mut store = DeltaStore::new();
+        let store = DeltaStore::new();
         let d = store.diff(&snap());
         assert!(!d.partial);
         assert_eq!(d.base_turn, None);
@@ -477,7 +503,9 @@ mod tests {
     #[test]
     fn later_turn_sends_only_changed_fields() {
         let mut store = DeltaStore::new();
-        store.diff(&snap());
+        let s0 = snap();
+        let d0 = store.diff(&s0);
+        store.commit(&d0, &s0);
         let mut s2 = snap();
         s2.git = Some(GitInfo {
             branch: Some("main".to_string()),
@@ -504,7 +532,9 @@ mod tests {
     #[test]
     fn unchanged_turn_sends_empty_delta() {
         let mut store = DeltaStore::new();
-        store.diff(&snap());
+        let s0 = snap();
+        let d0 = store.diff(&s0);
+        store.commit(&d0, &s0);
         let d = store.diff(&snap());
         assert!(d.partial);
         assert!(d.snapshot.as_object().unwrap().is_empty());
@@ -515,7 +545,9 @@ mod tests {
         let mut store = DeltaStore::new();
         let mut full_turns = Vec::new();
         for _ in 0..21 {
-            let d = store.diff(&snap());
+            let s = snap();
+            let d = store.diff(&s);
+            store.commit(&d, &s);
             if !d.partial {
                 full_turns.push(d.turn);
             }
@@ -526,12 +558,80 @@ mod tests {
     #[test]
     fn reset_makes_next_diff_full() {
         let mut store = DeltaStore::new();
-        store.diff(&snap());
-        store.diff(&snap());
+        let s = snap();
+        let d0 = store.diff(&s);
+        store.commit(&d0, &s);
+        let d1 = store.diff(&s);
+        store.commit(&d1, &s);
         store.reset();
         let d = store.diff(&snap());
         assert!(!d.partial);
         assert_eq!(d.turn, 0);
+    }
+
+    #[test]
+    fn undelivered_delta_is_not_consumed() {
+        // #351 (issue trigger): turn 0 delivered; turn 1 changes cwd
+        // but its request never reaches the model; turn 2 changes only
+        // git.sha. The turn 2 delta must still carry the lost cwd change
+        // and still be based on turn 0 - not a cwd-less delta based on
+        // the never-seen turn 1.
+        let mut store = DeltaStore::new();
+        let s0 = snap();
+        let d0 = store.diff(&s0);
+        assert!(!d0.partial);
+        store.commit(&d0, &s0);
+
+        let mut s1 = snap();
+        s1.cwd = "/b".to_string();
+        let d1 = store.diff(&s1);
+        assert!(d1.partial);
+        assert_eq!(d1.turn, 1);
+        assert_eq!(d1.base_turn, Some(0));
+        assert_eq!(d1.snapshot["cwd"], serde_json::json!("/b"));
+        // No commit: the request failed / was blocked / requeries.
+
+        let mut s2 = s1.clone();
+        s2.git.as_mut().unwrap().sha = Some("def456".to_string());
+        let d2 = store.diff(&s2);
+        assert!(d2.partial);
+        assert_eq!(d2.turn, 1);
+        assert_eq!(d2.base_turn, Some(0));
+        assert_eq!(d2.snapshot["cwd"], serde_json::json!("/b"));
+        assert_eq!(d2.snapshot["git"]["sha"], serde_json::json!("def456"));
+
+        // Once delivered, the next diff is empty again and the turn moves on.
+        store.commit(&d2, &s2);
+        let d3 = store.diff(&s2);
+        assert!(d3.partial);
+        assert_eq!(d3.turn, 2);
+        assert_eq!(d3.base_turn, Some(1));
+        assert!(d3.snapshot.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn diff_without_commit_repeats_same_delta() {
+        let mut store = DeltaStore::new();
+        let s0 = snap();
+        let d0 = store.diff(&s0);
+        store.commit(&d0, &s0);
+        let mut s1 = snap();
+        s1.cwd = "/elsewhere".to_string();
+        let first = store.diff(&s1);
+        let second = store.diff(&s1);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn commit_is_idempotent_for_same_turn() {
+        let mut store = DeltaStore::new();
+        let s0 = snap();
+        let d0 = store.diff(&s0);
+        store.commit(&d0, &s0);
+        store.commit(&d0, &s0); // second commit must not advance the turn
+        let d1 = store.diff(&s0);
+        assert_eq!(d1.turn, 1);
+        assert!(d1.snapshot.as_object().unwrap().is_empty());
     }
 
     #[test]
@@ -640,5 +740,100 @@ mod tests {
             "{sys2}"
         );
         assert!(sys2.contains("\"partial\":true"), "{sys2}");
+    }
+
+    #[tokio::test]
+    async fn agent_resends_delta_after_failed_request() {
+        // #351: turn 1's delta is assembled for a request that fails at
+        // the LLM call, so the next successful request must carry the
+        // same cwd change again (turn 1, based on turn 0) - not an empty
+        // delta based on the never-seen turn 1.
+        use crate::testutil::{FakePerms, MockLlm, base_cfg, build_agent, resp};
+        use zen_core::{PermissionDecision, ToolRegistry};
+        let llm = MockLlm::with_errors(vec![
+            Ok(resp("one")),
+            Err(anyhow::anyhow!("boom: upstream unavailable")),
+            Ok(resp("three")),
+        ]);
+        let mut cfg = base_cfg();
+        cfg.env_context_deltas = true;
+        let (mut agent, _sink, _h) = build_agent(
+            llm.clone(),
+            ToolRegistry::new(),
+            FakePerms::new(PermissionDecision::Allow),
+            cfg,
+        );
+        let r1 = agent.run_turn("hi").await;
+        assert!(!r1.is_error);
+        // Env changes after turn 0 was delivered: cwd moves.
+        let dir2 = std::env::temp_dir().join(format!("zen-envctx-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir2).unwrap();
+        *agent.ctx.cwd.lock().unwrap() = dir2.clone();
+        let r2 = agent.run_turn("again").await;
+        assert!(r2.is_error);
+        let r3 = agent.run_turn("third").await;
+        assert!(!r3.is_error);
+        let reqs = llm.requests();
+        assert_eq!(reqs.len(), 3);
+        let sys = |i: usize| reqs[i].messages[0].content.clone().unwrap().text();
+        // The failed request already carried the turn 1 delta ...
+        assert!(
+            sys(1).contains("Env context (turn 1, delta since turn 0)"),
+            "{}",
+            sys(1)
+        );
+        assert!(sys(1).contains(dir2.to_str().unwrap()), "{}", sys(1));
+        // ... and the next request re-sends the very same delta.
+        assert!(
+            sys(2).contains("Env context (turn 1, delta since turn 0)"),
+            "{}",
+            sys(2)
+        );
+        assert!(sys(2).contains(dir2.to_str().unwrap()), "{}", sys(2));
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[tokio::test]
+    async fn agent_resends_delta_after_unparsed_reply_requery() {
+        // #351, same loss path via `continue`: the first attempt errors
+        // with an unparsable reply, the loop requeries, and the fresh
+        // request_messages() must re-send the same turn 1 delta.
+        use crate::testutil::{FakePerms, MockLlm, base_cfg, build_agent, resp};
+        use zen_core::{PermissionDecision, ToolRegistry};
+        let llm = MockLlm::with_errors(vec![
+            Ok(resp("one")),
+            Err(anyhow::anyhow!("model returned no choices")),
+            Ok(resp("done")),
+        ]);
+        let mut cfg = base_cfg();
+        cfg.env_context_deltas = true;
+        let (mut agent, _sink, _h) = build_agent(
+            llm.clone(),
+            ToolRegistry::new(),
+            FakePerms::new(PermissionDecision::Allow),
+            cfg,
+        );
+        let r1 = agent.run_turn("hi").await;
+        assert!(!r1.is_error);
+        let dir2 = std::env::temp_dir().join(format!("zen-envctx-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir2).unwrap();
+        *agent.ctx.cwd.lock().unwrap() = dir2.clone();
+        let r2 = agent.run_turn("again").await;
+        assert!(!r2.is_error);
+        let reqs = llm.requests();
+        assert_eq!(reqs.len(), 3);
+        let sys = |i: usize| reqs[i].messages[0].content.clone().unwrap().text();
+        assert!(
+            sys(1).contains("Env context (turn 1, delta since turn 0)"),
+            "{}",
+            sys(1)
+        );
+        assert!(
+            sys(2).contains("Env context (turn 1, delta since turn 0)"),
+            "{}",
+            sys(2)
+        );
+        assert!(sys(2).contains(dir2.to_str().unwrap()), "{}", sys(2));
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 }
