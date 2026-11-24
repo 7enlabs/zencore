@@ -456,4 +456,27 @@ exclude_re = [
   # branch, this mutant stops being equivalent: remove this
   # exclusion and kill it with a similar test.
   "classifier\\.rs:740:23: replace \\+ with \\* in redirect_targets",
+  # PR #319 (issue #319, secret file locking), secret.rs lock_store
+  # (line 502, col 23): replace match guard
+  # e.kind() == std::io::ErrorKind::WouldBlock with true.
+  # EQUIVALENT (waived by ZC Leader, 2026-11-24; verified by running
+  # cargo mutants --in-diff on this branch: 50 mutants tested, this
+  # is the only missed one, 45 unviable): try_lock_exclusive runs on
+  # a file descriptor opened moments earlier (create + write, regular
+  # file in the secret store directory). On a local filesystem flock
+  # on such a descriptor can only fail with EWOULDBLOCK when another
+  # process holds the lock; the other flock errors (EBADF: the fd was
+  # just opened successfully, EINVAL: no such operation is used,
+  # ENOLCK/EOPNOTSUPP: only on non-local filesystems or lock-table
+  # exhaustion) cannot reach this match arm in practice. Replacing
+  # the guard with true therefore cannot change any observable
+  # behaviour, and no test can kill this mutant: no test can make
+  # flock return a non-WouldBlock error on a freshly opened local
+  # file.
+  # EXPIRY: if lock_store starts distinguishing non-WouldBlock
+  # errors (for example retrying EINTR explicitly, or reporting a
+  # different message for them), or the lock file moves to a
+  # non-local filesystem, this mutant stops being equivalent:
+  # remove this exclusion and kill it with a test.
+  "secret\\.rs:502:23: replace match guard e\\.kind\\(\\) == std::io::ErrorKind::WouldBlock with true in lock_store",
 ]
