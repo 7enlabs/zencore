@@ -143,6 +143,12 @@ pub const ROTATION_GRACE_HOURS: i64 = 24;
 /// 64 characters (the same shape as DS-Bot's `SECRET_NAME`).
 pub const MAX_SECRET_NAME_LEN: usize = 64;
 
+/// Issue #318: the longest registration lifetime / rotation interval,
+/// in days. `TimeDelta::days` panics out of bounds, so an absurd value
+/// registered by typo would crash every later secret command; 100 years
+/// keeps every later `now + days` inside chrono's range.
+pub const MAX_SECRET_DAYS: i64 = 36500;
+
 /// Exit codes, following the zen-pstack mapping (docs/exit-codes.md):
 /// 0 ok, 1 general, 2 auth, 3 not found, 4 validation, 5 forbidden,
 /// 6 rate limit, 7 conflict.
@@ -466,6 +472,18 @@ fn parse_time(value: &str) -> SecretResult<DateTime<Utc>> {
         .map_err(|_| {
             SecretError::validation(format!("invalid timestamp '{value}': expected RFC 3339"))
         })
+}
+
+/// Add whole days to a timestamp without panicking (issue #318):
+/// `TimeDelta::days` panics when the duration is out of bounds, so a
+/// registry value such as 100_000_000 days would crash every later
+/// `secret request` / `rotate` / `status`. A bad value is a validation
+/// error instead, so the command fails closed with a message.
+fn add_days(now: DateTime<Utc>, days: i64) -> SecretResult<DateTime<Utc>> {
+    let delta = chrono::Duration::try_days(days)
+        .ok_or_else(|| SecretError::validation(format!("days out of range: {days}")))?;
+    now.checked_add_signed(delta)
+        .ok_or_else(|| SecretError::validation(format!("date out of range adding {days} days")))
 }
 
 /// A secret name is upper snake case, starting with a letter, at most
@@ -820,13 +838,15 @@ fn validate_register_input(store: &SecretStore, input: &RegisterInput) -> Secret
     refuse_shaped("service", &input.service)?;
     refuse_shaped("owner", &input.owner)?;
     refuse_shaped("reason", &input.reason)?;
-    if input.default_until_days < 1 {
+    if !(1..=MAX_SECRET_DAYS).contains(&input.default_until_days) {
         return Err(SecretError::validation(
-            "default_until_days must be at least 1: every issuance carries an until",
+            "default_until_days must be between 1 and 36500: every issuance carries an until",
         ));
     }
-    if input.rotation_days < 1 {
-        return Err(SecretError::validation("rotation_days must be at least 1"));
+    if !(1..=MAX_SECRET_DAYS).contains(&input.rotation_days) {
+        return Err(SecretError::validation(
+            "rotation_days must be between 1 and 36500",
+        ));
     }
     // A taken name is refused unless the caller passes --force (issue
     // #278): a stale re-run must not silently move the policy class.
@@ -1014,16 +1034,20 @@ fn next_request_id(requests: &[SecretRequest], now: DateTime<Utc>) -> String {
 /// anything else lives at most the registry default. The registry
 /// default is at least 1 day by construction, so the 24-hour cap is
 /// always the binding one when it applies.
-fn max_until(entry: &RegistryEntry, one_shot: bool, now: DateTime<Utc>) -> DateTime<Utc> {
-    let default_until = now + Duration::days(entry.default_until_days);
+fn max_until(
+    entry: &RegistryEntry,
+    one_shot: bool,
+    now: DateTime<Utc>,
+) -> SecretResult<DateTime<Utc>> {
+    let default_until = add_days(now, entry.default_until_days)?;
     let short_cap = if one_shot {
         now + Duration::hours(ONE_SHOT_LIFETIME_HOURS)
     } else if entry.class == SecretClass::User {
         now + Duration::hours(BROKER_GRANT_LIFETIME_HOURS)
     } else {
-        return default_until;
+        return Ok(default_until);
     };
-    default_until.min(short_cap)
+    Ok(default_until.min(short_cap))
 }
 
 /// File a request (state: `requested`). Refused without purpose, scope,
@@ -1087,7 +1111,7 @@ pub fn request_secret(
         } else {
             "broker grant"
         };
-        let cap = max_until(entry, input.one_shot, now);
+        let cap = max_until(entry, input.one_shot, now)?;
         if until > cap {
             return Err(SecretError::validation(format!(
                 "lifetime-exceeds-24h: until {} is past the 24-hour limit for a {kind} of '{}'; ask for less, or get a Leader decision",
@@ -1095,7 +1119,7 @@ pub fn request_secret(
             )));
         }
     }
-    let default_until = now + Duration::days(entry.default_until_days);
+    let default_until = add_days(now, entry.default_until_days)?;
     if until > default_until {
         return Err(SecretError::validation(format!(
             "lifetime-exceeds-default: until {} is past the registry default of {} days for '{}'; ask for less, or get a Leader decision",
@@ -1538,7 +1562,7 @@ pub fn rotate_secret(
     )?;
     // The new request carries the same cap as a fresh request: a
     // broker grant rotated here lives at most 24 hours (D2, F1).
-    let until = max_until(&entry, false, now);
+    let until = max_until(&entry, false, now)?;
     let new_req = SecretRequest {
         v: 1,
         request_id: next_request_id(&requests, now),
@@ -1749,10 +1773,13 @@ pub fn secret_status(
                 one_shot: r.one_shot,
             })
             .collect();
-        let next_rotation_due = entry.map(|e| {
-            let registered_at = parse_time(&e.registered_at).unwrap_or(now);
-            rfc3339(registered_at + Duration::days(e.rotation_days))
-        });
+        let next_rotation_due = match entry {
+            Some(e) => {
+                let registered_at = parse_time(&e.registered_at).unwrap_or(now);
+                Some(rfc3339(add_days(registered_at, e.rotation_days)?))
+            }
+            None => None,
+        };
         out.push(SecretStatus {
             name: n,
             registered: entry.is_some(),
@@ -3054,6 +3081,83 @@ mod tests {
         let second = request_model_key(&store, "zd-developer", now + Duration::days(1), false);
         assert_eq!(first.request_id, "sr-20261108-001");
         assert_eq!(second.request_id, "sr-20261108-002");
+    }
+
+    /// Issue #318: absurd day counts are refused at registration, so a
+    /// typo can never poison the registry for every later command.
+    #[test]
+    fn register_rejects_absurd_day_counts() {
+        let (_dir, store) = temp_store("days-cap");
+        let now = fixed_now();
+        let input = |default_until_days: i64, rotation_days: i64| RegisterInput {
+            name: "BIG_DAYS".to_string(),
+            class: SecretClass::Seat,
+            service: "s".to_string(),
+            owner: "zc-leader".to_string(),
+            registered_by: LEADER_APPROVER.to_string(),
+            default_until_days,
+            rotation_days,
+            paid: false,
+            reason: "cap".to_string(),
+            force: false,
+        };
+        let err = register_secret(&store, input(100_000_000, 30), now).unwrap_err();
+        assert_eq!(err.code(), exit_code::VALIDATION);
+        // Zero days was already refused; the cap binds both fields.
+        assert!(register_secret(&store, input(0, 30), now).is_err());
+        assert!(register_secret(&store, input(7, 0), now).is_err());
+        assert!(register_secret(&store, input(7, 100_000_000), now).is_err());
+        assert!(register_secret(&store, input(36501, 30), now).is_err());
+        assert!(register_secret(&store, input(7, 36501), now).is_err());
+        // The cap itself registers.
+        register_secret(&store, input(36500, 36500), now).unwrap();
+    }
+
+    /// Issue #318: a registry entry already on disk with an absurd day
+    /// count fails closed with an error instead of panicking.
+    #[test]
+    fn absurd_days_on_disk_fail_closed_not_panic() {
+        let (_dir, store) = temp_store("days-disk");
+        let now = fixed_now();
+        let entry = RegistryEntry {
+            v: 1,
+            name: "BIG_DAYS".to_string(),
+            class: SecretClass::Seat,
+            service: "s".to_string(),
+            owner: "zc-leader".to_string(),
+            registered_by: LEADER_APPROVER.to_string(),
+            registered_at: rfc3339(now),
+            default_until_days: 100_000_000,
+            rotation_days: 100_000_000,
+            paid: false,
+            reason: "hand-written bad entry".to_string(),
+            deregistered: false,
+        };
+        std::fs::create_dir_all(&store.dir).unwrap();
+        std::fs::write(
+            store.registry_path(),
+            serde_json::to_string(&entry).unwrap(),
+        )
+        .unwrap();
+        // The issue's repro: request and status must not panic.
+        let req = request_secret(
+            &store,
+            RequestInput {
+                name: "BIG_DAYS".to_string(),
+                seat: "zc-developer".to_string(),
+                task_id: None,
+                purpose: "p".to_string(),
+                scope: "s".to_string(),
+                until: rfc3339(now + Duration::days(1)),
+                one_shot: false,
+                broker_action: None,
+            },
+            now,
+        );
+        assert!(req.is_err());
+        assert!(secret_status(&store, None, now).is_err());
+        // max_until on the same entry errors instead of panicking.
+        assert!(max_until(&entry, false, now).is_err());
     }
 
     #[test]
