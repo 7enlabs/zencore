@@ -1369,6 +1369,36 @@ mod tests {
         }
     }
 
+    // Issue #331: the cap is a strict upper bound - a file of exactly
+    // MAX_IMPORT_BYTES is still imported. This pins the boundary so the
+    // `>` (not `>=`) and the `4 * 1024 * 1024` value itself are both
+    // mutant-killing: any smaller cap or `>=` rejects this file.
+    #[test]
+    fn issue_331_import_size_boundary_kept() {
+        let tmp = TempDir::new();
+        let home = tmp.path().join("home");
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let marker = "EDGE-MARKER\n";
+        let mut edge = String::from(marker);
+        edge.push_str(&"x".repeat(MAX_IMPORT_BYTES as usize - marker.len()));
+        assert_eq!(edge.len() as u64, MAX_IMPORT_BYTES);
+        fs::write(proj.join("edge.md"), edge).unwrap();
+        fs::write(proj.join("ZEN.md"), "@edge.md\n").unwrap();
+
+        for trusted in [true, false] {
+            let files = mem_t(&proj, &home, tmp.path(), trusted);
+            let top = files
+                .iter()
+                .find(|(p, _)| p.ends_with("proj/ZEN.md"))
+                .unwrap();
+            assert!(
+                top.1.contains("EDGE-MARKER"),
+                "exactly-MAX_IMPORT_BYTES import rejected (trusted={trusted})"
+            );
+        }
+    }
+
     // Issue #331: a symlink inside the project pointing outside it
     // must not smuggle the outside file in through an import.
     #[cfg(unix)]
