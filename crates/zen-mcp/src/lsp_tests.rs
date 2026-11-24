@@ -595,6 +595,42 @@ async fn mock_server_sends_did_change_when_content_changes_but_mtime_does_not() 
 }
 
 #[tokio::test]
+async fn mock_server_reuses_cached_doc_when_nothing_changed() {
+    // Issue #383, mutant kill: `ensure_open` reuses the cached document
+    // only when BOTH the mtime and the freshly read text match
+    // (`doc.mtime == mtime && doc.text == text`). A second request with
+    // the file untouched must send neither `didOpen` nor `didChange`;
+    // replacing the guard with `false`, or flipping either `==` to
+    // `!=`, would send a spurious `didChange` instead.
+    let Some(setup) = mock_setup() else {
+        eprintln!("SKIP: python3 not found");
+        return;
+    };
+    let _ = setup
+        .manager
+        .goto_definition(&setup.main_rs, 1, 5)
+        .await
+        .unwrap();
+    let _ = setup
+        .manager
+        .goto_definition(&setup.main_rs, 1, 5)
+        .await
+        .unwrap();
+    let methods = logged_methods(&setup.log);
+    assert_eq!(
+        count(&methods, "textDocument/didOpen"),
+        1,
+        "second request must reuse the open document: {methods:?}"
+    );
+    assert_eq!(
+        count(&methods, "textDocument/didChange"),
+        0,
+        "nothing changed, so no didChange may be sent: {methods:?}"
+    );
+    assert_eq!(count(&methods, "textDocument/definition"), 2);
+}
+
+#[tokio::test]
 async fn mock_server_hover_and_references() {
     let Some(setup) = mock_setup() else {
         eprintln!("SKIP: python3 not found");
