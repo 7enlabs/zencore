@@ -512,6 +512,67 @@ async fn read_frame_accepts_large_but_capped_headers() {
 }
 
 #[tokio::test]
+async fn read_frame_accepts_max_header_lines() {
+    // Issue #385, mutant kill: the line-count check is `header_lines
+    // > MAX_HEADER_LINES` (32). A frame with 31 header lines plus the
+    // empty terminator line uses exactly 32 loop iterations, so it
+    // must still read fine; `>=` or `==` would reject the terminator
+    // iteration instead.
+    let (mut a, mut b) = tokio::io::duplex(65536);
+    let body = br#"{"ok":true}"#;
+    let mut raw = format!("Content-Length: {}\r\n", body.len());
+    for _ in 0..30 {
+        raw.push_str("X-Pad: x\r\n");
+    }
+    raw.push_str("\r\n");
+    a.write_all(raw.as_bytes()).await.unwrap();
+    a.write_all(body).await.unwrap();
+    let got = read_frame(&mut BufReader::new(&mut b)).await.unwrap();
+    assert_eq!(got, json!({"ok": true}));
+}
+
+#[tokio::test]
+async fn read_frame_rejects_headers_over_cap_across_lines() {
+    // Issue #385, mutant kill: the per-read cap is
+    // `MAX_HEADER_BYTES - header_bytes`, so the cap applies to the
+    // TOTAL of all header lines, not to each line alone. Two ~5 KiB
+    // pad lines total ~10 KiB, over the 8192-byte cap, even though
+    // neither line alone exceeds it; `+` instead of `-` would let
+    // the second line through and accept the frame.
+    let (mut a, mut b) = tokio::io::duplex(65536);
+    tokio::spawn(async move {
+        let body = br#"{"ok":true}"#;
+        let mut raw = format!("Content-Length: {}\r\n", body.len());
+        for _ in 0..2 {
+            raw.push_str(&format!("X-Pad: {}\r\n", "x".repeat(4992)));
+        }
+        raw.push_str("\r\n");
+        a.write_all(raw.as_bytes()).await.unwrap();
+        a.write_all(body).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    });
+    let err = read_frame(&mut BufReader::new(&mut b)).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("headers exceed the 8192 byte limit"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn read_frame_errors_when_server_closes_mid_headers() {
+    // Issue #385, mutant kill: when the server closes the connection
+    // mid-headers (EOF with the bytes seen so far under the cap), the
+    // error must say the server closed, not that the headers exceeded
+    // the cap; `<` instead of `>=` in the EOF branch swaps the two.
+    let (mut a, mut b) = tokio::io::duplex(65536);
+    a.write_all(b"Content-Length: 11\r\n").await.unwrap();
+    drop(a);
+    let err = read_frame(&mut BufReader::new(&mut b)).await.unwrap_err();
+    assert!(err.to_string().contains("server closed"), "got: {err}");
+}
+
+#[tokio::test]
 async fn mock_server_full_roundtrip() {
     let Some(setup) = mock_setup() else {
         eprintln!("SKIP: python3 not found");
