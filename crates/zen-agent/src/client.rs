@@ -1990,8 +1990,27 @@ const ANTHROPIC_CACHE_BETA: &str = "prompt-caching-2024-07-31";
 const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 4096;
 
 pub fn is_anthropic_url(base_url: &str) -> bool {
-    let u = base_url.trim().to_ascii_lowercase();
-    u.contains("anthropic.com") || u.contains("api.anthropic")
+    // Route on the parsed host and path, not on a substring: a
+    // substring match accepts spoofed hosts such as
+    // anthropic.com.evil.com, and misses the compatible Anthropic
+    // endpoints the registry advertises (api.z.ai/api/anthropic,
+    // api.moonshot.ai/anthropic, api.deepseek.com/anthropic), whose
+    // host is not anthropic.com (issue #335).
+    let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    if host == "api.anthropic.com" || host.ends_with(".anthropic.com") {
+        return true;
+    }
+    url.path_segments()
+        .map(|mut segments| {
+            segments
+                .rfind(|s| !s.is_empty())
+                .map(|last| last.eq_ignore_ascii_case("anthropic"))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
 }
 
 fn cache_control() -> Value {
@@ -2499,6 +2518,26 @@ mod anthropic_tests {
         assert!(!is_anthropic_url("https://openrouter.ai/api/v1"));
         assert!(!is_anthropic_url("https://api.openai.com/v1"));
         assert!(!is_anthropic_url("http://localhost:11434/v1"));
+    }
+
+    #[test]
+    fn is_anthropic_url_matches_compatible_anthropic_endpoints() {
+        // Issue #335: registry Anthropic endpoints whose host is not
+        // anthropic.com must still route to AnthropicClient.
+        assert!(is_anthropic_url("https://api.z.ai/api/anthropic"));
+        assert!(is_anthropic_url("https://api.moonshot.ai/anthropic"));
+        assert!(is_anthropic_url("https://api.deepseek.com/anthropic"));
+        assert!(is_anthropic_url("https://api.deepseek.com/anthropic/"));
+    }
+
+    #[test]
+    fn is_anthropic_url_rejects_spoofed_hosts() {
+        // Issue #335: substring matching accepted these as Anthropic.
+        assert!(!is_anthropic_url("https://anthropic.com.evil.com/v1"));
+        assert!(!is_anthropic_url("https://api.anthropic.com.evil.com/v1"));
+        assert!(!is_anthropic_url("https://notanthropic.com/v1"));
+        assert!(!is_anthropic_url("not a url"));
+        assert!(!is_anthropic_url(""));
     }
 
     #[test]
