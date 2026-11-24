@@ -3,8 +3,10 @@ use crate::gitignore::{is_ignored, load_ignore_rules};
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use zen_core::lock_recovery::lock_or_recover;
@@ -1501,9 +1503,11 @@ impl Tool for WebFetchTool {
         }
         let allow_private = ctx.allow_private_network;
 
+        let pinned = Arc::new(PinnedResolver::default());
         let client = match with_extra_roots(reqwest::Client::builder())
             .timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(pinned.clone())
             .user_agent("Zen/0.1 (+https://example.invalid/zen)")
             .build()
         {
@@ -1514,7 +1518,7 @@ impl Tool for WebFetchTool {
         let mut url = url;
         let mut hops = 0u32;
         let resp = loop {
-            if let Err(e) = check_fetch_target(&url, allow_private).await {
+            if let Err(e) = check_fetch_target(&url, allow_private, &pinned).await {
                 return ToolOutput::err(e);
             }
             let r = match client.get(&url).send().await {
@@ -1671,9 +1675,11 @@ async fn search_with_provider(
     }
     let allow_private = ctx.allow_private_network;
 
+    let pinned = Arc::new(PinnedResolver::default());
     let client = match with_extra_roots(reqwest::Client::builder())
         .timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(pinned.clone())
         .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         .build()
     {
@@ -1681,7 +1687,7 @@ async fn search_with_provider(
         Err(e) => return ToolOutput::err(format!("Error: could not build HTTP client: {}", e)),
     };
 
-    let resp = match fetch_with_redirects(&client, url, allow_private).await {
+    let resp = match fetch_with_redirects(&client, url, allow_private, &pinned).await {
         Ok(r) => r,
         Err(e) => return ToolOutput::err(e),
     };
@@ -1712,10 +1718,11 @@ async fn fetch_with_redirects(
     client: &reqwest::Client,
     mut url: String,
     allow_private: bool,
+    pinned: &PinnedResolver,
 ) -> Result<reqwest::Response, String> {
     let mut hops = 0u32;
     let resp = loop {
-        check_fetch_target(&url, allow_private).await?;
+        check_fetch_target(&url, allow_private, pinned).await?;
         let r = client
             .get(&url)
             .header(
@@ -1953,43 +1960,96 @@ fn join_redirect_url(base: &str, loc: &str) -> Result<String, String> {
         .map_err(|e| format!("Error: bad redirect target '{}': {}", loc, e))
 }
 
-async fn check_fetch_target(url: &str, allow_private: bool) -> Result<(), String> {
-    if allow_private {
-        return Ok(());
-    }
+async fn check_fetch_target(
+    url: &str,
+    allow_private: bool,
+    pinned: &PinnedResolver,
+) -> Result<(), String> {
     let (host, port) = url_host_port(url);
     if host.is_empty() {
         return Err(format!("Error: cannot parse host from URL '{}'", url));
     }
 
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        if !is_public_ip(ip) {
+        if !allow_private && !is_public_ip(ip) {
             return Err(format!(
                 "Error: refusing to fetch non-public address '{}' (set allowPrivateNetwork to allow)",
                 host
             ));
         }
+        pinned.pin(&host, vec![std::net::SocketAddr::new(ip, port)]);
         return Ok(());
     }
 
-    let addrs = tokio::net::lookup_host(format!("{}:{}", host, port))
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(format!("{}:{}", host, port))
         .await
-        .map_err(|e| format!("Error: cannot resolve host '{}': {}", host, e))?;
-    let mut any = false;
-    for addr in addrs {
-        any = true;
-        if !is_public_ip(addr.ip()) {
-            return Err(format!(
-                "Error: refusing to fetch '{}' (resolves to non-public address {}; set allowPrivateNetwork to allow)",
-                host,
-                addr.ip()
-            ));
-        }
-    }
-    if !any {
+        .map_err(|e| format!("Error: cannot resolve host '{}': {}", host, e))?
+        .collect();
+    if addrs.is_empty() {
         return Err(format!("Error: host '{}' resolved to no addresses", host));
     }
+    if !allow_private {
+        for addr in &addrs {
+            if !is_public_ip(addr.ip()) {
+                return Err(format!(
+                    "Error: refusing to fetch '{}' (resolves to non-public address {}; set allowPrivateNetwork to allow)",
+                    host,
+                    addr.ip()
+                ));
+            }
+        }
+    }
+    pinned.pin(&host, addrs);
     Ok(())
+}
+
+/// DNS resolver that only returns addresses the SSRF guard already validated.
+///
+/// `check_fetch_target` resolves the host, rejects any non-public address
+/// (unless private networks are allowed), and pins the validated addresses
+/// here. reqwest then connects to a pinned address instead of resolving the
+/// hostname a second time, closing the DNS-rebinding TOCTOU between the check
+/// and the connect: an attacker domain answering with TTL 0 can no longer
+/// return a public IP to the check and a private IP to the connect. The URL
+/// still carries the original hostname, so TLS SNI and the Host header are
+/// unchanged; only the socket address comes from the pin.
+///
+/// A host that was never pinned is resolved normally. That path exists for
+/// hosts reqwest resolves for its own plumbing, such as the egress proxy
+/// when one is configured; every fetch target is pinned by the guard before
+/// the connect, so a fetch target never takes the fallback path.
+#[derive(Debug, Default)]
+struct PinnedResolver {
+    pinned: Mutex<HashMap<String, Vec<std::net::SocketAddr>>>,
+}
+
+impl PinnedResolver {
+    fn pin(&self, host: &str, addrs: Vec<std::net::SocketAddr>) {
+        if let Ok(mut map) = self.pinned.lock() {
+            map.insert(host.to_ascii_lowercase(), addrs);
+        }
+    }
+}
+
+impl reqwest::dns::Resolve for PinnedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_ascii_lowercase();
+        let addrs = self
+            .pinned
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&host).cloned());
+        Box::pin(async move {
+            match addrs {
+                Some(addrs) => Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs),
+                None => {
+                    let resolved: Vec<std::net::SocketAddr> =
+                        tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+                    Ok(Box::new(resolved.into_iter()) as reqwest::dns::Addrs)
+                }
+            }
+        })
+    }
 }
 
 fn looks_like_html(s: &str) -> bool {
@@ -2997,19 +3057,49 @@ mod tests {
         (addr, count)
     }
 
-    fn fetch_test_client() -> reqwest::Client {
-        reqwest::Client::builder()
+    fn fetch_test_client() -> (reqwest::Client, Arc<PinnedResolver>) {
+        let pinned = Arc::new(PinnedResolver::default());
+        let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(pinned.clone())
             .build()
-            .expect("test client")
+            .expect("test client");
+        (client, pinned)
+    }
+
+    #[tokio::test]
+    async fn websearch_fetch_connects_to_pinned_address_without_dns() {
+        // Regression test for the DNS-rebinding TOCTOU (#324): the client
+        // must connect to the address the guard validated, never resolve the
+        // hostname a second time. `pinned.invalid` does not exist in DNS,
+        // so without the pinned resolver this fetch fails at name resolution.
+        // The client skips the egress proxy so the proxy never has to
+        // resolve the fake hostname either.
+        let (addr, count) = spawn_canned_server(vec![ok_response(b"<html></html>")]);
+        let pinned = Arc::new(PinnedResolver::default());
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(pinned.clone())
+            .no_proxy()
+            .build()
+            .expect("test client");
+        pinned.pin("pinned.invalid", vec![addr]);
+        let resp = client
+            .get(format!("http://pinned.invalid:{}/", addr.port()))
+            .send()
+            .await
+            .expect("pinned fetch");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn websearch_fetch_direct_200_needs_no_redirect() {
         let (addr, count) = spawn_canned_server(vec![ok_response(b"<html></html>")]);
-        let client = fetch_test_client();
-        let resp = fetch_with_redirects(&client, format!("http://{}/", addr), true)
+        let (client, pinned) = fetch_test_client();
+        let resp = fetch_with_redirects(&client, format!("http://{}/", addr), true, &pinned)
             .await
             .expect("direct 200");
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -3024,8 +3114,8 @@ mod tests {
             headers: vec![],
             body: b"nope",
         }]);
-        let client = fetch_test_client();
-        let err = fetch_with_redirects(&client, format!("http://{}/", addr), true)
+        let (client, pinned) = fetch_test_client();
+        let err = fetch_with_redirects(&client, format!("http://{}/", addr), true, &pinned)
             .await
             .expect_err("404 must fail");
         assert!(err.contains("returned HTTP 404"), "{}", err);
@@ -3038,8 +3128,8 @@ mod tests {
             redirect_response("/final"),
             ok_response(b"<html></html>"),
         ]);
-        let client = fetch_test_client();
-        let resp = fetch_with_redirects(&client, format!("http://{}/start", addr), true)
+        let (client, pinned) = fetch_test_client();
+        let resp = fetch_with_redirects(&client, format!("http://{}/start", addr), true, &pinned)
             .await
             .expect("follow redirect");
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -3056,8 +3146,8 @@ mod tests {
         }
         script.push(ok_response(b"<html></html>"));
         let (addr, count) = spawn_canned_server(script);
-        let client = fetch_test_client();
-        let err = fetch_with_redirects(&client, format!("http://{}/loop", addr), true)
+        let (client, pinned) = fetch_test_client();
+        let err = fetch_with_redirects(&client, format!("http://{}/loop", addr), true, &pinned)
             .await
             .expect_err("endless redirects must fail");
         assert!(err.contains("too many redirects"), "{}", err);
