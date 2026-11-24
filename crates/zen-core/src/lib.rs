@@ -1646,6 +1646,41 @@ pub fn api_key_env_names(api_key_env: Option<&str>) -> Vec<String> {
     names
 }
 
+/// Env var names that may hold a provider API key, from the model-routing
+/// registry (`provider_registry()` in zen-agent). Children that must never see
+/// provider credentials (notably MCP stdio servers, issue #378) strip all of
+/// these. Keep in sync with the registry; zen-agent has a test pinning the
+/// sync, so adding a provider without updating this list fails the build.
+pub const PROVIDER_API_KEY_ENV_NAMES: &[&str] = &[
+    "OPENROUTER_API_KEY",
+    "GROQ_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "ZAI_API_KEY",
+    "MOONSHOT_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "CLOUDFLARE_API_TOKEN",
+    "TOGETHER_API_KEY",
+    "MISTRAL_API_KEY",
+    "CEREBRAS_API_KEY",
+    "FIREWORKS_API_KEY",
+    "GOOGLE_API_KEY",
+];
+
+/// Every env var name that may hold a provider API key: the two defaults,
+/// the configured name, and every name in [`PROVIDER_API_KEY_ENV_NAMES`].
+/// Use this (not [`api_key_env_names`]) when stripping credentials from an
+/// untrusted child's environment; see issue #378.
+pub fn all_api_key_env_names(api_key_env: Option<&str>) -> Vec<String> {
+    let mut names = api_key_env_names(api_key_env);
+    for name in PROVIDER_API_KEY_ENV_NAMES {
+        if !names.iter().any(|x| x == name) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
 pub fn resolve_shell(preferred: &str) -> ShellSpec {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -1679,6 +1714,29 @@ pub fn resolve_shell(preferred: &str) -> ShellSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_api_key_env_names_covers_defaults_configured_and_registry() {
+        // Kills mutants that drop the configured push, the registry loop,
+        // or the dedup check in all_api_key_env_names.
+        let names = all_api_key_env_names(None);
+        assert!(names.contains(&"ZEN_API_KEY".to_string()));
+        assert!(names.contains(&"OPENAI_API_KEY".to_string()));
+        for registry in PROVIDER_API_KEY_ENV_NAMES {
+            assert!(
+                names.contains(&registry.to_string()),
+                "{registry} missing from the strip set"
+            );
+        }
+        let unique: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "no duplicates");
+        let with_custom = all_api_key_env_names(Some("MY_CUSTOM_KEY_ENV"));
+        assert!(with_custom.contains(&"MY_CUSTOM_KEY_ENV".to_string()));
+        assert_eq!(with_custom.len(), names.len() + 1);
+        // A configured name that is already known is not duplicated.
+        let with_known = all_api_key_env_names(Some("DEEPSEEK_API_KEY"));
+        assert_eq!(with_known.len(), names.len());
+    }
     #[test]
     fn sandbox_mode_as_str_and_parse_roundtrip() {
         // Kills the as_str mutants ("" / "xyzzy") and the parse

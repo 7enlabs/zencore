@@ -1946,7 +1946,8 @@ async fn build_acp_session(
     // is skipped with a stderr warning, like config-file servers;
     // the session still starts.
     if !mcp_servers.is_empty() {
-        let manager = zen_mcp::McpManager::start(mcp_servers, 30_000).await;
+        let manager =
+            zen_mcp::McpManager::start(mcp_servers, 30_000, cfg.api_key_env.as_deref()).await;
         for skipped in manager.errors() {
             eprintln!(
                 "warning: ACP MCP server {} skipped: {}",

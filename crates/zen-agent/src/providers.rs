@@ -413,6 +413,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn registry_api_key_env_names_are_all_in_strip_list() {
+        // Guards the sync between provider_registry() and
+        // zen_core::PROVIDER_API_KEY_ENV_NAMES: every key a provider may use
+        // must be stripped from MCP stdio children (issue #378). Adding a
+        // provider with a new key env without updating the strip list fails
+        // here instead of leaking the key to a third-party MCP server.
+        for p in provider_registry() {
+            if let Some(env) = p.api_key_env {
+                assert!(
+                    zen_core::PROVIDER_API_KEY_ENV_NAMES.contains(&env),
+                    "provider '{}' uses api_key_env '{env}' missing from zen_core::PROVIDER_API_KEY_ENV_NAMES",
+                    p.key
+                );
+            }
+        }
+    }
+
+    #[test]
     fn registry_has_fifteen_providers() {
         assert_eq!(provider_registry().len(), 15);
     }

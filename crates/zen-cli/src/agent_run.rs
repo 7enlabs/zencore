@@ -262,7 +262,8 @@ pub async fn assemble(
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(30_000);
-        let manager = zen_mcp::McpManager::start(mcp_configs, timeout_ms).await;
+        let manager =
+            zen_mcp::McpManager::start(mcp_configs, timeout_ms, cfg.api_key_env.as_deref()).await;
         mcp_status = manager.status();
         mcp_errors = manager
             .errors()
