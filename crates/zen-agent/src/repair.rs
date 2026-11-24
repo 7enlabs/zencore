@@ -125,7 +125,8 @@ fn alias_target(key: &str) -> Option<&'static str> {
         (
             "Grep",
             &[
-                "search",
+                // #352: "search" is intentionally absent here - it is the
+                // WebSearch alias; listing it here shadowed WebSearch.
                 "searchfiles",
                 "grepsearch",
                 "ripgrep",
@@ -825,6 +826,55 @@ mod tests {
                 want,
                 "{}",
                 input
+            );
+        }
+    }
+
+    #[test]
+    fn search_alias_resolves_to_web_search_not_grep() {
+        // #352: "search" was listed under both Grep and WebSearch, and
+        // alias_target returns the first match, so a model asking for a
+        // web search was silently dispatched to local Grep.
+        assert_eq!(alias_target("search"), Some("WebSearch"));
+        let known: Vec<String> = ["Grep", "WebSearch"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            resolve_tool_name("search", &known).as_deref(),
+            Some("WebSearch")
+        );
+        assert_eq!(
+            resolve_tool_name("Search", &known).as_deref(),
+            Some("WebSearch")
+        );
+        // Bare "search" no longer means local grep: with no WebSearch
+        // registered there is no silent fallback to Grep.
+        let grep_only: Vec<String> = ["Grep"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(resolve_tool_name("search", &grep_only), None);
+        // Grep keeps its unambiguous aliases.
+        for alias in [
+            "searchfiles",
+            "grepsearch",
+            "ripgrep",
+            "rg",
+            "findtext",
+            "codesearch",
+        ] {
+            assert_eq!(
+                resolve_tool_name(alias, &known).as_deref(),
+                Some("Grep"),
+                "{}",
+                alias
+            );
+        }
+        // WebSearch keeps its own aliases.
+        for alias in ["websearch", "web_search"] {
+            assert_eq!(
+                resolve_tool_name(alias, &known).as_deref(),
+                Some("WebSearch"),
+                "{}",
+                alias
             );
         }
     }
