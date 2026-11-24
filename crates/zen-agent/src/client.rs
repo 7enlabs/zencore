@@ -2763,6 +2763,61 @@ mod anthropic_tests {
     }
 
     #[test]
+    fn request_body_merges_tool_result_into_plain_user_text() {
+        // Issue #333: a tool result arriving after a plain user turn
+        // (String content) must convert that message to blocks
+        // [text, tool_result] instead of starting a second user
+        // message, or roles stop alternating. Kills the mutant that
+        // deletes the Value::String arm of push_tool_result.
+        let mut r = req();
+        r.messages.push(ChatMessage::tool("toolu_1", "result text"));
+        let body = anthropic_request_body(&r);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        let blocks = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "hi");
+        assert_eq!(blocks[1]["type"], "tool_result");
+        assert_eq!(blocks[1]["tool_use_id"], "toolu_1");
+    }
+
+    #[test]
+    fn request_body_appends_user_text_after_tool_results() {
+        // Issue #333: user text after tool results must append as a
+        // text block to the same user message (Array content), not
+        // start a new user message. Kills the mutants that delete
+        // the Value::Array arm of push_user_text and that flip its
+        // !text.is_empty() guard.
+        let mut r = req();
+        r.messages.push(ChatMessage::assistant(
+            Some("checking".to_string()),
+            Some(vec![ToolCall {
+                id: "toolu_1".to_string(),
+                call_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "Read".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+        ));
+        r.messages
+            .push(ChatMessage::tool("toolu_1", "first result"));
+        r.messages.push(ChatMessage::user("follow-up"));
+        let body = anthropic_request_body(&r);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[2]["role"], "user");
+        let blocks = msgs[2]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[0]["tool_use_id"], "toolu_1");
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], "follow-up");
+    }
+
+    #[test]
     fn request_body_translates_tool_calls_and_results() {
         let mut r = req();
         r.messages.push(ChatMessage::assistant(
