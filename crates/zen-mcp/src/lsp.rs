@@ -348,7 +348,9 @@ fn id_to_u64(v: &Value) -> Option<u64> {
 }
 
 pub(crate) struct LspClient {
-    writer: tokio::sync::Mutex<tokio::process::ChildStdin>,
+    // Shared with the reader task so it can answer server-to-client
+    // requests (issue #386): the reader owns no writer otherwise.
+    writer: Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>,
     pending: Pending,
     next_id: AtomicU64,
     child: Mutex<Option<tokio::process::Child>>,
@@ -392,6 +394,8 @@ impl LspClient {
 
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let reader_pending = pending.clone();
+        let writer = Arc::new(tokio::sync::Mutex::new(stdin));
+        let reader_writer = writer.clone();
         let diagnostics: DiagnosticsMap = Arc::new(Mutex::new(HashMap::new()));
         let reader_diagnostics = diagnostics.clone();
         let diagnostics_notify = Arc::new(tokio::sync::Notify::new());
@@ -408,17 +412,50 @@ impl LspClient {
                 if !val.is_object() {
                     break;
                 }
-                if let Some(id) = val.get("id").and_then(id_to_u64) {
+                // JSON-RPC routing: a `method` means the frame comes
+                // from the server (a request when it also carries an
+                // `id`, a notification when it does not); only an `id`
+                // with no `method` is a response to one of our
+                // requests. The old code checked `id` first, so a
+                // server request such as
+                // `window/workDoneProgress/create` was delivered to a
+                // pending waiter as if it were that request's response
+                // - corrupting the caller's result - or dropped
+                // silently when no waiter matched, leaving the server
+                // request unanswered (issue #386).
+                if let Some(method) = val.get("method").and_then(Value::as_str) {
+                    if method == "textDocument/publishDiagnostics"
+                        && let Some((uri, diags)) = parse_publish_diagnostics(&val)
+                    {
+                        lock_or_recover(&reader_diagnostics, "diagnostics").insert(uri, diags);
+                        reader_notify.notify_waiters();
+                    } else if let Some(id) = val.get("id") {
+                        // A server-to-client request we do not handle:
+                        // answer Method-not-found (-32601) so the server
+                        // learns the method is unsupported instead of
+                        // hanging on a reply that never comes. The
+                        // request `id` is echoed verbatim (it may be a
+                        // string, which `id_to_u64` cannot represent).
+                        let reply = json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": -32601,
+                                "message": format!("Method not found: {method}"),
+                            },
+                        });
+                        let mut w = reader_writer.lock().await;
+                        if write_frame(&mut *w, &reply).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Any other notification (a `method` with no `id`)
+                    // needs no reply: ignore it.
+                } else if let Some(id) = val.get("id").and_then(id_to_u64) {
                     let tx = lock_or_recover(&reader_pending, "reader_pending").remove(&id);
                     if let Some(tx) = tx {
                         let _ = tx.send(val);
                     }
-                } else if val.get("method").and_then(Value::as_str)
-                    == Some("textDocument/publishDiagnostics")
-                    && let Some((uri, diags)) = parse_publish_diagnostics(&val)
-                {
-                    lock_or_recover(&reader_diagnostics, "diagnostics").insert(uri, diags);
-                    reader_notify.notify_waiters();
                 }
             }
             // The server closed stdout: drop its diagnostics so a later
@@ -437,7 +474,7 @@ impl LspClient {
         });
 
         Ok(Arc::new(Self {
-            writer: tokio::sync::Mutex::new(stdin),
+            writer,
             pending,
             next_id: AtomicU64::new(1),
             child: Mutex::new(Some(child)),
