@@ -18,6 +18,11 @@ Modes:
     resource_link   - tools/call returns a resource_link content block
     resource        - tools/call returns an embedded resource block
     paged           - tools/list paginates across two pages
+    cycle           - tools/list returns the same cursor forever (#377)
+    endless         - tools/list returns a fresh cursor on every page (#377)
+    pages100        - tools/list paginates across exactly 100 pages (#377)
+    many_tools      - tools/list returns 10,001 tools in one page (#377)
+    exact_tools     - tools/list returns exactly 10,000 tools in one page (#377)
     hang            - tools/call sleeps 120s (in-flight request tests)
     spawn_worker    - tools/call spawns a long-lived grandchild, writes its PID
 """
@@ -70,6 +75,8 @@ TOOLS = [
     },
 ]
 
+list_calls = [0]
+
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -102,7 +109,91 @@ for line in sys.stdin:
         pass
     elif method == "tools/list":
         cursor = (msg.get("params") or {}).get("cursor")
-        if mode == "paged":
+        if mode == "cycle":
+            send({
+                "jsonrpc": "2.0",
+                "id": mid,
+                "result": {
+                    "tools": [{
+                        "name": "looped",
+                        "description": "loops forever",
+                        "inputSchema": {"type": "object"},
+                    }],
+                    "nextCursor": "loop",
+                },
+            })
+        elif mode == "endless":
+            list_calls[0] += 1
+            send({
+                "jsonrpc": "2.0",
+                "id": mid,
+                "result": {
+                    "tools": [{
+                        "name": "t",
+                        "description": "endless page",
+                        "inputSchema": {"type": "object"},
+                    }],
+                    "nextCursor": "page-%d" % list_calls[0],
+                },
+            })
+        elif mode == "pages100":
+            list_calls[0] += 1
+            if list_calls[0] < 100:
+                send({
+                    "jsonrpc": "2.0",
+                    "id": mid,
+                    "result": {
+                        "tools": [{
+                            "name": "tool-%d" % list_calls[0],
+                            "description": "page tool",
+                            "inputSchema": {"type": "object"},
+                        }],
+                        "nextCursor": "p%d" % list_calls[0],
+                    },
+                })
+            else:
+                send({
+                    "jsonrpc": "2.0",
+                    "id": mid,
+                    "result": {
+                        "tools": [{
+                            "name": "tool-100",
+                            "description": "last page tool",
+                            "inputSchema": {"type": "object"},
+                        }],
+                    },
+                })
+        elif mode == "many_tools":
+            send({
+                "jsonrpc": "2.0",
+                "id": mid,
+                "result": {
+                    "tools": [
+                        {
+                            "name": "tool-%d" % i,
+                            "description": "",
+                            "inputSchema": {"type": "object"},
+                        }
+                        for i in range(10001)
+                    ],
+                },
+            })
+        elif mode == "exact_tools":
+            send({
+                "jsonrpc": "2.0",
+                "id": mid,
+                "result": {
+                    "tools": [
+                        {
+                            "name": "tool-%d" % i,
+                            "description": "",
+                            "inputSchema": {"type": "object"},
+                        }
+                        for i in range(10000)
+                    ],
+                },
+            })
+        elif mode == "paged":
             if not cursor:
                 send({
                     "jsonrpc": "2.0",

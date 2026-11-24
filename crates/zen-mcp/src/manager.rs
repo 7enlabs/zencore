@@ -177,7 +177,7 @@ impl McpManager {
 
         for (name, cfg) in valid_configs {
             join.push(tokio::spawn(async move {
-                let result = start_one(&cfg, timeout_ms).await;
+                let result = start_one(&name, &cfg, timeout_ms).await;
                 (name, result)
             }));
         }
@@ -270,10 +270,11 @@ pub(crate) fn validate(cfg: &McpServerConfig) -> Option<&'static str> {
 }
 
 async fn start_one(
+    name: &str,
     cfg: &McpServerConfig,
     timeout_ms: u64,
 ) -> anyhow::Result<(Arc<Transport>, Vec<RemoteTool>)> {
-    let transport = Arc::new(Transport::from_config(cfg, timeout_ms)?);
+    let transport = Arc::new(Transport::from_config(name, cfg, timeout_ms)?);
     let handshake_transport = transport.clone();
     let result = tokio::time::timeout(
         std::time::Duration::from_millis(timeout_ms),

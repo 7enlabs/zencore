@@ -436,6 +436,8 @@ for line in sys.stdin:
             send({"jsonrpc":"2.0","id":mid,"result":{"tools":[
                 {"name":"envprobe","description":os.environ.get("ZEN_MCP_TEST_ENV","missing"),"inputSchema":{"type":"object"}}
             ]}})
+        elif mode == "cycle":
+            send({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"looped","description":"loops forever","inputSchema":{"type":"object"}}],"nextCursor":"loop"}})
         elif mode == "paged" and not msg.get("params", {}).get("cursor"):
             send({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"alpha","description":"first tool","inputSchema":{"type":"object","properties":{"x":{"type":"string"}}}}],"nextCursor":"page2"}})
         elif mode == "paged":
@@ -645,6 +647,40 @@ async fn mcp_stdio_pagination() {
         names,
         vec!["mcp__p__alpha".to_string(), "mcp__p__beta".to_string()]
     );
+    tokio::time::timeout(TEST_TIMEOUT, mgr.shutdown())
+        .await
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn mcp_cycling_server_lands_in_failed() {
+    // #377 end-to-end: a server paging the same cursor forever must land in
+    // the manager's failed list (named), not hang startup.
+    let py = match python_exe() {
+        Some(p) => p,
+        None => return,
+    };
+    let dir = tmpdir("cycling");
+    let script = write_fake_server(&dir);
+
+    let mut configs = BTreeMap::new();
+    configs.insert("bad".to_string(), stdio_config(&py, &script, "cycle"));
+
+    let mgr = tokio::time::timeout(TEST_TIMEOUT, McpManager::start(configs, 10_000))
+        .await
+        .unwrap();
+    assert_eq!(
+        mgr.status(),
+        vec![("bad".to_string(), "failed".to_string())]
+    );
+    assert!(mgr.tools().is_empty());
+    let failures = mgr.failures();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].0, "bad");
+    assert!(failures[0].1.contains("bad"), "got: {}", failures[0].1);
+    assert!(failures[0].1.contains("repeated"), "got: {}", failures[0].1);
+
     tokio::time::timeout(TEST_TIMEOUT, mgr.shutdown())
         .await
         .unwrap();
@@ -1252,7 +1288,7 @@ fn tcfg_http(url: &str, headers: BTreeMap<String, String>) -> McpServerConfig {
 async fn transport_from_config_timeout_defaults_to_30s() {
     // Kills the `if timeout_ms == 0 { 30_000 }` mutant in from_config.
     let cfg = tcfg_stdio("x", "ok", Path::new("l"), BTreeMap::new(), None);
-    match Transport::from_config(&cfg, 0).unwrap() {
+    match Transport::from_config("fake", &cfg, 0).unwrap() {
         Transport::Stdio { timeout_ms, .. } => assert_eq!(timeout_ms, 30_000),
         _ => panic!("expected Stdio"),
     }
@@ -1262,12 +1298,12 @@ async fn transport_from_config_timeout_defaults_to_30s() {
 async fn transport_from_config_keeps_explicit_timeout() {
     // Kills the counterpart mutant (always returning the default).
     let cfg = tcfg_stdio("x", "ok", Path::new("l"), BTreeMap::new(), None);
-    match Transport::from_config(&cfg, 5_000).unwrap() {
+    match Transport::from_config("fake", &cfg, 5_000).unwrap() {
         Transport::Stdio { timeout_ms, .. } => assert_eq!(timeout_ms, 5_000),
         _ => panic!("expected Stdio"),
     }
     let h = tcfg_http("http://127.0.0.1:1/mcp", BTreeMap::new());
-    match Transport::from_config(&h, 7_000).unwrap() {
+    match Transport::from_config("fake", &h, 7_000).unwrap() {
         Transport::Http { timeout_ms, .. } => assert_eq!(timeout_ms, 7_000),
         _ => panic!("expected Http"),
     }
@@ -1285,7 +1321,7 @@ async fn transport_from_config_rejects_missing_command_and_url() {
     };
     // command.is_none() && url.is_some() is false, and kind != "http", so this
     // takes the stdio branch and must fail with "no command".
-    assert!(Transport::from_config(&empty, 1_000).is_err());
+    assert!(Transport::from_config("fake", &empty, 1_000).is_err());
 
     let http_no_url = McpServerConfig {
         kind: Some("http".to_string()),
@@ -1295,7 +1331,7 @@ async fn transport_from_config_rejects_missing_command_and_url() {
         url: None,
         headers: BTreeMap::new(),
     };
-    let err = match Transport::from_config(&http_no_url, 1_000) {
+    let err = match Transport::from_config("fake", &http_no_url, 1_000) {
         Ok(_) => panic!("expected an error for http config without url"),
         Err(e) => e,
     };
@@ -1309,7 +1345,7 @@ async fn transport_stdio_tools_list_uses_tool_to_value() {
     let dir = tmpdir("t_list");
     let log = dir.join("methods.log");
     let cfg = tcfg_stdio(&py, "ok", &log, BTreeMap::new(), None);
-    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+    let tr = Transport::from_config("fake", &cfg, 10_000).unwrap();
 
     let out = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
         .await
@@ -1334,7 +1370,7 @@ async fn transport_stdio_tools_list_paginates() {
     let dir = tmpdir("t_page");
     let log = dir.join("methods.log");
     let cfg = tcfg_stdio(&py, "paged", &log, BTreeMap::new(), None);
-    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+    let tr = Transport::from_config("fake", &cfg, 10_000).unwrap();
 
     let out = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
         .await
@@ -1353,13 +1389,125 @@ async fn transport_stdio_tools_list_paginates() {
 }
 
 #[tokio::test]
+async fn tools_list_repeated_cursor_errors_and_names_server() {
+    // #377: a server returning the same cursor forever must fail fast with
+    // an error naming the server, instead of paging forever.
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_cycle");
+    let log = dir.join("methods.log");
+    let cfg = tcfg_stdio(&py, "cycle", &log, BTreeMap::new(), None);
+    let tr = Transport::from_config("cycle-server", &cfg, 10_000).unwrap();
+
+    let err = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
+        .await
+        .unwrap()
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("cycle-server"), "got: {msg}");
+    assert!(msg.contains("repeated"), "got: {msg}");
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn tools_list_endless_pagination_hits_page_cap() {
+    // #377: a server returning a fresh cursor on every page must stop at
+    // MAX_LIST_PAGES instead of paging forever.
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_endless");
+    let log = dir.join("methods.log");
+    let cfg = tcfg_stdio(&py, "endless", &log, BTreeMap::new(), None);
+    let tr = Transport::from_config("endless-server", &cfg, 10_000).unwrap();
+
+    let err = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
+        .await
+        .unwrap()
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("endless-server"), "got: {msg}");
+    assert!(msg.contains("100 pages"), "got: {msg}");
+
+    // Exactly MAX_LIST_PAGES requests were issued, no more.
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        logged.lines().filter(|l| *l == "tools/list").count(),
+        100,
+        "log:\n{logged}"
+    );
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn tools_list_exactly_100_pages_succeeds() {
+    // #377 boundary: exactly MAX_LIST_PAGES pages must still succeed, so a
+    // `>=` in place of `>` on the page cap is caught.
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_pages100");
+    let log = dir.join("methods.log");
+    let cfg = tcfg_stdio(&py, "pages100", &log, BTreeMap::new(), None);
+    let tr = Transport::from_config("paged-server", &cfg, 10_000).unwrap();
+
+    let out = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(out["tools"].as_array().unwrap().len(), 100);
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn tools_list_too_many_tools_errors() {
+    // #377: one page with more than MAX_LIST_TOOLS tools must fail.
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_manytools");
+    let log = dir.join("methods.log");
+    let cfg = tcfg_stdio(&py, "many_tools", &log, BTreeMap::new(), None);
+    let tr = Transport::from_config("greedy-server", &cfg, 10_000).unwrap();
+
+    let err = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
+        .await
+        .unwrap()
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("greedy-server"), "got: {msg}");
+    assert!(msg.contains("10000 tools"), "got: {msg}");
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn tools_list_exactly_10000_tools_succeeds() {
+    // #377 boundary: exactly MAX_LIST_TOOLS tools must still succeed.
+    let Some(py) = python_exe() else { return };
+    let dir = tmpdir("t_exacttools");
+    let log = dir.join("methods.log");
+    let cfg = tcfg_stdio(&py, "exact_tools", &log, BTreeMap::new(), None);
+    let tr = Transport::from_config("full-server", &cfg, 10_000).unwrap();
+
+    let out = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(out["tools"].as_array().unwrap().len(), 10_000);
+
+    tr.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn transport_stdio_call_tool_text_blocks() {
     // Baseline Complete arm + text rendering.
     let Some(py) = python_exe() else { return };
     let dir = tmpdir("t_text");
     let log = dir.join("methods.log");
     let cfg = tcfg_stdio(&py, "ok", &log, BTreeMap::new(), None);
-    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+    let tr = Transport::from_config("fake", &cfg, 10_000).unwrap();
 
     let out = tokio::time::timeout(
         TEST_TIMEOUT,
@@ -1389,7 +1537,7 @@ async fn transport_stdio_call_tool_input_required_arm() {
     let dir = tmpdir("t_ir");
     let log = dir.join("methods.log");
     let cfg = tcfg_stdio(&py, "input_required", &log, BTreeMap::new(), None);
-    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+    let tr = Transport::from_config("fake", &cfg, 10_000).unwrap();
 
     let err = tokio::time::timeout(
         TEST_TIMEOUT,
@@ -1414,7 +1562,7 @@ async fn transport_stdio_call_tool_task_arm() {
     let dir = tmpdir("t_task");
     let log = dir.join("methods.log");
     let cfg = tcfg_stdio(&py, "task", &log, BTreeMap::new(), None);
-    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+    let tr = Transport::from_config("fake", &cfg, 10_000).unwrap();
 
     let err = tokio::time::timeout(
         TEST_TIMEOUT,
@@ -1446,7 +1594,7 @@ async fn transport_stdio_content_block_variants() {
         let dir = tmpdir(&format!("t_cb_{mode}"));
         let log = dir.join("methods.log");
         let cfg = tcfg_stdio(&py, mode, &log, BTreeMap::new(), None);
-        let tr = Transport::from_config(&cfg, 10_000).unwrap();
+        let tr = Transport::from_config("fake", &cfg, 10_000).unwrap();
 
         let out = tokio::time::timeout(
             TEST_TIMEOUT,
@@ -1493,7 +1641,7 @@ async fn transport_stdio_connect_passes_env_to_child() {
     env.insert("ZEN_MCP_TEST_TOKEN".to_string(), "secret123".to_string());
 
     let cfg = tcfg_stdio(&py, "ok", &log, env, Some(&dump));
-    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+    let tr = Transport::from_config("fake", &cfg, 10_000).unwrap();
     // Any request forces the handshake, which spawns the child with the env.
     let _ = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
         .await
@@ -1623,7 +1771,7 @@ async fn transport_http_connect_sends_configured_headers() {
     headers.insert("X-Second".to_string(), "two".to_string());
 
     let cfg = tcfg_http(&url, headers);
-    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+    let tr = Transport::from_config("fake", &cfg, 10_000).unwrap();
     let out = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
         .await
         .unwrap()
@@ -1647,7 +1795,7 @@ async fn transport_http_without_headers_still_connects() {
     // Companion to the header test: the empty-headers branch must not panic.
     let (url, seen, handle) = spawn_header_recording_http_mock().await;
     let cfg = tcfg_http(&url, BTreeMap::new());
-    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+    let tr = Transport::from_config("fake", &cfg, 10_000).unwrap();
     let out = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
         .await
         .unwrap()
@@ -1679,7 +1827,7 @@ async fn transport_kill_tears_down_the_session() {
     let log = dir.join("methods.log");
     let pid_file = dir.join("methods.log.pid");
     let cfg = tcfg_stdio(&py, "ok", &log, BTreeMap::new(), None);
-    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+    let tr = Transport::from_config("fake", &cfg, 10_000).unwrap();
 
     let ok = tokio::time::timeout(TEST_TIMEOUT, tr.request("tools/list", json!({})))
         .await
@@ -1725,7 +1873,7 @@ async fn transport_request_rejects_unknown_method_and_bad_params() {
     let dir = tmpdir("t_req");
     let log = dir.join("methods.log");
     let cfg = tcfg_stdio(&py, "ok", &log, BTreeMap::new(), None);
-    let tr = Transport::from_config(&cfg, 10_000).unwrap();
+    let tr = Transport::from_config("fake", &cfg, 10_000).unwrap();
 
     // Unknown method needs no live session.
     let err = tr.request("resources/list", json!({})).await.unwrap_err();
@@ -1757,7 +1905,7 @@ async fn transport_shutdown_kills_the_whole_process_group() {
     let log = dir.join("methods.log");
     let worker_pid_file = dir.join("methods.log.worker.pid");
     let cfg = tcfg_stdio(&py, "spawn_worker", &log, BTreeMap::new(), None);
-    let tr = Transport::from_config(&cfg, 15_000).unwrap();
+    let tr = Transport::from_config("fake", &cfg, 15_000).unwrap();
 
     let _ = tokio::time::timeout(
         TEST_TIMEOUT,
@@ -1814,7 +1962,7 @@ fn transport_from_config_defaults_timeout_and_does_not_connect() {
         url: None,
         headers: BTreeMap::new(),
     };
-    let tr = Transport::from_config(&stdio_cfg, 0).unwrap();
+    let tr = Transport::from_config("fake", &stdio_cfg, 0).unwrap();
     assert_eq!(tr.resolved_timeout_ms(), 30_000);
     assert!(
         matches!(tr, Transport::Stdio { .. }),
@@ -1823,7 +1971,7 @@ fn transport_from_config_defaults_timeout_and_does_not_connect() {
     // Never connected: kill must be a no-op, not a panic.
     tr.kill();
 
-    let explicit = Transport::from_config(&stdio_cfg, 1234).unwrap();
+    let explicit = Transport::from_config("fake", &stdio_cfg, 1234).unwrap();
     assert_eq!(explicit.resolved_timeout_ms(), 1234);
     explicit.kill();
 
@@ -1835,7 +1983,7 @@ fn transport_from_config_defaults_timeout_and_does_not_connect() {
         url: Some("http://127.0.0.1:9/mcp".to_string()),
         headers: BTreeMap::new(),
     };
-    let http = Transport::from_config(&http_cfg, 0).unwrap();
+    let http = Transport::from_config("fake", &http_cfg, 0).unwrap();
     assert_eq!(http.resolved_timeout_ms(), 30_000);
     assert!(
         matches!(http, Transport::Http { .. }),
@@ -1852,7 +2000,7 @@ fn transport_from_config_defaults_timeout_and_does_not_connect() {
         url: None,
         headers: BTreeMap::new(),
     };
-    assert!(Transport::from_config(&bad_stdio, 1000).is_err());
+    assert!(Transport::from_config("fake", &bad_stdio, 1000).is_err());
     let bad_http = McpServerConfig {
         kind: Some("http".to_string()),
         command: None,
@@ -1861,7 +2009,7 @@ fn transport_from_config_defaults_timeout_and_does_not_connect() {
         url: None,
         headers: BTreeMap::new(),
     };
-    assert!(Transport::from_config(&bad_http, 1000).is_err());
+    assert!(Transport::from_config("fake", &bad_http, 1000).is_err());
 }
 
 #[test]
@@ -1924,7 +2072,7 @@ async fn transport_kill_terminates_session() {
         url: None,
         headers: std::collections::BTreeMap::new(),
     };
-    let transport = Transport::from_config(&cfg, 10_000).unwrap();
+    let transport = Transport::from_config("fake", &cfg, 10_000).unwrap();
 
     // Get a session first (this spawns the process)
     let _session = tokio::time::timeout(
@@ -2017,7 +2165,7 @@ for line in sys.stdin:
         url: None,
         headers: std::collections::BTreeMap::new(),
     };
-    let transport = Transport::from_config(&cfg, 10_000).unwrap();
+    let transport = Transport::from_config("fake", &cfg, 10_000).unwrap();
 
     // Call tools/list via transport.request which uses tool_to_value
     let result = tokio::time::timeout(
