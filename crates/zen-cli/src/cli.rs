@@ -1140,6 +1140,10 @@ pub enum McpSubcommand {
 
         /// Server configuration as JSON
         json: String,
+
+        /// Replace the server if the name already exists
+        #[arg(long)]
+        force: bool,
     },
 }
 
