@@ -2181,7 +2181,7 @@ pub(crate) fn parse_anthropic_response(body: &str) -> anyhow::Result<ChatRespons
         usage: Usage {
             prompt_tokens: u("input_tokens"),
             completion_tokens: u("output_tokens"),
-            total_tokens: 0,
+            total_tokens: u("input_tokens").saturating_add(u("output_tokens")),
             cache_read_input_tokens: u("cache_read_input_tokens"),
             cache_creation_input_tokens: u("cache_creation_input_tokens"),
         },
@@ -2596,6 +2596,7 @@ mod anthropic_tests {
         assert!(calls[0].function.arguments.contains("ls"));
         assert_eq!(resp.usage.prompt_tokens, 120);
         assert_eq!(resp.usage.completion_tokens, 30);
+        assert_eq!(resp.usage.total_tokens, 150);
         assert_eq!(resp.usage.cache_read_input_tokens, 0);
         assert_eq!(resp.usage.cache_creation_input_tokens, 0);
         assert_eq!(resp.finish_reason.as_deref(), Some("tool_use"));
@@ -2617,6 +2618,7 @@ mod anthropic_tests {
         assert_eq!(resp.usage.prompt_tokens, 10000);
         assert_eq!(resp.usage.cache_read_input_tokens, 9500);
         assert_eq!(resp.usage.cache_creation_input_tokens, 500);
+        assert_eq!(resp.usage.total_tokens, 10005);
 
         assert!(
             (zen_core::cache_hit_rate(
@@ -2650,6 +2652,29 @@ mod anthropic_tests {
     #[test]
     fn parse_response_malformed_json_fails() {
         assert!(parse_anthropic_response("not json").is_err());
+    }
+
+    #[test]
+    fn parse_response_total_tokens_sums_input_and_output() {
+        // Issue #337: Anthropic sends no total; report input + output.
+        let body = r#"{
+            "content": [{"type": "text", "text": "done"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 120, "output_tokens": 30}
+        }"#;
+        let resp = parse_anthropic_response(body).unwrap();
+        assert_eq!(resp.usage.total_tokens, 150);
+    }
+
+    #[test]
+    fn parse_response_total_tokens_saturates_on_overflow() {
+        let body = r#"{
+            "content": [{"type": "text", "text": "done"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 18446744073709551615, "output_tokens": 1}
+        }"#;
+        let resp = parse_anthropic_response(body).unwrap();
+        assert_eq!(resp.usage.total_tokens, u64::MAX);
     }
 
     #[tokio::test]
