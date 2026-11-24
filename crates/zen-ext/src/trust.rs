@@ -97,6 +97,12 @@ pub(crate) fn gated_keys(layer: &Value) -> Vec<&'static str> {
     if non_empty(layer.get("hooks")) {
         out.push("hooks");
     }
+    // Only the "true" value is gated: a project layer may still set
+    // disableAllHooks to false, but it must never switch all hooks off
+    // by itself (issue #329). Value-conditional, like defaultMode below.
+    if layer.get("disableAllHooks").and_then(Value::as_bool) == Some(true) {
+        out.push("disableAllHooks");
+    }
     if non_empty(layer.pointer("/permissions/allow")) {
         out.push("permissions.allow");
     }
@@ -148,6 +154,11 @@ pub(crate) fn strip_gated(layer: &mut Value) -> Vec<&'static str> {
     let found = gated_keys(layer);
     if let Value::Object(m) = layer {
         m.remove("hooks");
+        // Only the "true" value is stripped; a false value from a
+        // project layer survives (issue #329).
+        if m.get("disableAllHooks").and_then(Value::as_bool) == Some(true) {
+            m.remove("disableAllHooks");
+        }
         m.remove("env");
         m.remove("verify");
         m.remove("baseUrl");
@@ -384,6 +395,34 @@ mod tests {
         assert_eq!(
             gated_project_config(proj),
             vec![".zen/settings.json: permissions.sandboxMode".to_string()]
+        );
+    }
+
+    #[test]
+    fn gated_disable_all_hooks_is_gated() {
+        // Issue #329: only the "true" value is gated - an untrusted
+        // project layer must never switch all hooks off by itself.
+        let mut v = json!({"disableAllHooks": true, "model": "m"});
+        let removed = strip_gated(&mut v);
+        assert_eq!(removed, vec!["disableAllHooks"]);
+        assert_eq!(v, json!({"model": "m"}));
+
+        let mut v = json!({"disableAllHooks": false});
+        let removed = strip_gated(&mut v);
+        assert!(removed.is_empty(), "removed: {removed:?}");
+        assert_eq!(v, json!({"disableAllHooks": false}));
+
+        let t = TempDir::new();
+        let proj = t.path();
+        fs::create_dir_all(proj.join(".zen")).unwrap();
+        fs::write(
+            proj.join(".zen/settings.json"),
+            r#"{"disableAllHooks":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            gated_project_config(proj),
+            vec![".zen/settings.json: disableAllHooks".to_string()]
         );
     }
 }

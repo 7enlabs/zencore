@@ -1865,6 +1865,46 @@ mod tests {
     }
 
     #[test]
+    fn folder_trust_gates_disable_all_hooks() {
+        // Issue #329: an untrusted project layer must not switch all
+        // hooks off; user-layer hooks survive, and the skip is reported.
+        let _env = env_lock();
+        let dir = std::env::temp_dir().join(format!("zen_cfg_nohooks329_{}", std::process::id()));
+        let home = dir.join("home");
+        let proj = dir.join("proj");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(proj.join(".zen")).unwrap();
+        fs::create_dir_all(home.join(".zen")).unwrap();
+        fs::write(
+            home.join(".zen/settings.json"),
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}"#,
+        )
+        .unwrap();
+        fs::write(
+            proj.join(".zen/settings.json"),
+            r#"{"disableAllHooks":true}"#,
+        )
+        .unwrap();
+        let _env_guard = EnvGuard::remove(zen_ext::TRUST_ENV);
+
+        let cfg = resolve_config_with_home(&base_cli(), &proj, Some(&home)).unwrap();
+        assert!(!cfg.folder_trusted);
+        assert!(cfg.hooks.get("Stop").is_some());
+        assert_eq!(
+            cfg.trust_skipped,
+            vec![".zen/settings.json: disableAllHooks"]
+        );
+
+        // Once trusted, the same project setting is honored.
+        zen_ext::trust_folder(&proj, Some(&home)).unwrap();
+        let cfg = resolve_config_with_home(&base_cli(), &proj, Some(&home)).unwrap();
+        assert!(cfg.folder_trusted);
+        assert_eq!(cfg.hooks, serde_json::json!({}));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn trunc_max_continuations_parse() {
         assert_eq!(
             max_continuations(None),
