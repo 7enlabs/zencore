@@ -2272,15 +2272,26 @@ mod cache_tests {
         // the && -> || mutant, and the whole-body -> true / -> false
         // mutants.
         assert!(ChildSpend::default().is_empty());
-        let mut tokens_only = ChildSpend::default();
-        tokens_only.usage.input_tokens = 10;
+        let tokens_only = ChildSpend {
+            usage: UsageStats {
+                input_tokens: 10,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         assert!(!tokens_only.is_empty());
-        let mut cost_only = ChildSpend::default();
-        cost_only.total_cost_usd = 0.5;
+        let cost_only = ChildSpend {
+            total_cost_usd: 0.5,
+            ..Default::default()
+        };
         assert!(!cost_only.is_empty());
-        let mut both = ChildSpend::default();
-        both.usage.output_tokens = 5;
-        both.total_cost_usd = 0.25;
+        let both = ChildSpend {
+            usage: UsageStats {
+                output_tokens: 5,
+                ..Default::default()
+            },
+            total_cost_usd: 0.25,
+        };
         assert!(!both.is_empty());
     }
 
