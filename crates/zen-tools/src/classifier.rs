@@ -166,11 +166,14 @@ fn tokenize(part: &str) -> Part<'_> {
         .first()
         .map(|t| t.rsplit(['/', '\\']).next().unwrap_or(t).to_lowercase())
         .unwrap_or_default();
-    let args = if tokens.len() > 1 {
-        tokens[1..].to_vec()
-    } else {
-        Vec::new()
-    };
+    // get(1..) takes the tail without a length comparison, so there is
+    // no boundary mutant to be equivalent: on a one-token command the
+    // tail is empty either way, and on an empty token list get returns
+    // None (no panic, unlike drain/split_off).
+    let args: Vec<String> = tokens
+        .get(1..)
+        .map(|tail| tail.to_vec())
+        .unwrap_or_default();
     Part {
         raw: part,
         program,
@@ -194,7 +197,11 @@ fn classify_bash(command: &str, cwd: &Path, workdirs: &[PathBuf]) -> Classificat
 
     let input = serde_json::json!({ "command": command });
     let parts: Vec<String> = match bash_parts("Bash", &input) {
-        Some(Some(parts)) if !parts.is_empty() => parts,
+        // No emptiness guard: bash_parts only returns an empty list for
+        // an empty or whitespace-only command, and that falls back to a
+        // single empty part, which classifies as mutating, the same as
+        // no parts at all (see the empty-command test below).
+        Some(Some(parts)) => parts,
         _ => vec![command.to_string()],
     };
     let parsed: Vec<Part> = parts.iter().map(|p| tokenize(p)).collect();
@@ -210,7 +217,9 @@ fn classify_bash(command: &str, cwd: &Path, workdirs: &[PathBuf]) -> Classificat
     let has_fetch = parsed
         .iter()
         .any(|p| matches!(p.program.as_str(), "curl" | "wget"));
-    if (has_shell && has_fetch && parsed.len() > 1)
+    // has_shell and has_fetch name disjoint programs, so both can only
+    // be true when two different parts are present; no length check.
+    if (has_shell && has_fetch)
         || command.contains("<(curl")
         || command.contains("<(wget")
         || command.contains("$(curl")
@@ -729,48 +738,50 @@ fn non_flag_args(args: &[String]) -> Vec<&str> {
 
 /// Targets of `>` / `>>` redirections inside one part's raw text.
 ///
-/// Slice-based scan: the outer loop only ever drops the leading byte
-/// of the remaining input, and the inner skips are bounded
-/// `take_while` counts, so no mutant on an advance can stall the
-/// scan into an infinite loop (the `+=` mutants on the old index
-/// loops timed out instead of being killed).
+/// Slice-based scan: every iteration consumes at least the redirect
+/// operator itself with a slice drop, never index arithmetic, so no
+/// mutant on an advance can stall the scan into an infinite loop (the
+/// `+=` mutants on the old index loops timed out instead of being
+/// killed: a `*=` mutant could reset the index to 0 on an empty
+/// target). The target scan below only ever shortens the slice
+/// further, and a zero-length target still leaves the operator
+/// consumed.
 fn redirect_targets(raw: &str) -> impl Iterator<Item = &str> {
     let mut out = Vec::new();
     let bytes = raw.as_bytes();
     let mut rest = bytes;
     while !rest.is_empty() {
-        if rest[0] != b'>' {
+        // Skip to the next '>'.
+        let Some(pos) = rest.iter().position(|&b| b == b'>') else {
+            break;
+        };
+        rest = &rest[pos..];
+        // Consume the operator: '>' or '>>'.
+        rest = &rest[1..];
+        if rest.first() == Some(&b'>') {
             rest = &rest[1..];
-            continue;
-        }
-        // rest[0] == b'>': parse the redirect.
-        let mut j = 1;
-        if rest.get(j) == Some(&b'>') {
-            j += 1;
         }
         // Skip spaces/tabs after the operator.
-        j += rest[j..]
+        let spaces = rest
             .iter()
             .take_while(|&&b| b == b' ' || b == b'\t')
             .count();
-        if rest.get(j) == Some(&b'&') {
+        rest = &rest[spaces..];
+        if rest.first() == Some(&b'&') {
             // Fd duplication (>&2): no file target; resume after '&'.
-            // Two slice drops (no arithmetic) so the advance cannot
-            // be stalled by a mutant.
-            rest = &rest[j..];
             rest = &rest[1..];
             continue;
         }
-        let start = j;
-        j += rest[j..]
+        // The target is the run of non-separator bytes.
+        let target_len = rest
             .iter()
             .take_while(|&&b| !matches!(b, b' ' | b'\t' | b';' | b'|' | b'&'))
             .count();
-        if start < j {
+        if target_len > 0 {
             let base = raw.len() - rest.len();
-            out.push(raw[base + start..base + j].trim_matches(|c| c == '"' || c == '\''));
+            out.push(raw[base..base + target_len].trim_matches(|c| c == '"' || c == '\''));
         }
-        rest = &rest[j..];
+        rest = &rest[target_len..];
     }
     out.into_iter()
 }
@@ -1413,5 +1424,16 @@ mod tests {
         // And at classifier level the unquoted system path is danger.
         assert_eq!(code("echo x > '/etc/hosts'"), "danger.system-write");
         assert_eq!(code("echo x > \"/etc/hosts\""), "danger.system-write");
+    }
+
+    #[test]
+    fn empty_bash_command_is_mutating() {
+        // Pins the empty-command behaviour that makes the empty-parts
+        // guard in classify_bash redundant: bash_parts("") returns an
+        // empty parts list, which falls back to a single empty part,
+        // and an empty part classifies as mutating, the same as no
+        // parts at all.
+        assert_eq!(code(""), "mutating.default");
+        assert_eq!(code("   "), "mutating.default");
     }
 }
