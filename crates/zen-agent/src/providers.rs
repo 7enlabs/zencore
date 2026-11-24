@@ -257,38 +257,53 @@ pub struct ModelSpec {
 }
 
 impl ModelSpec {
-    pub fn parse(spec: &str, default_base_url: &str, anthropic_available: bool) -> Self {
+    /// Parse `provider/model` into a resolved spec.
+    ///
+    /// A bare model (no `/`) and an unknown provider keep the old
+    /// whole-spec default: the caller never named a provider we know,
+    /// so there is nothing to resolve. A *known* provider whose
+    /// endpoint cannot resolve is different: the user explicitly chose
+    /// that provider, so silently sending the whole spec to the default
+    /// gateway would discard the provider, model and key env and fail
+    /// later with a confusing model-not-found or 401. That case is an
+    /// error naming what the provider needs (issue #346).
+    pub fn parse(
+        spec: &str,
+        default_base_url: &str,
+        anthropic_available: bool,
+    ) -> Result<Self, String> {
         let spec = spec.trim();
         match spec.split_once('/') {
             Some((provider, model)) => {
                 let key = provider.to_ascii_lowercase();
-                if let Some(info) = find_provider(&key)
-                    && let Some((standard, url)) = info.endpoint_resolved(anthropic_available)
-                {
-                    return Self {
-                        provider: key,
-                        model: model.to_string(),
-                        api_standard: standard,
-                        base_url: url,
-                        api_key_env: info.api_key_env.map(str::to_string),
+                if let Some(info) = find_provider(&key) {
+                    return match info.endpoint_resolved(anthropic_available) {
+                        Some((standard, url)) => Ok(Self {
+                            provider: key,
+                            model: model.to_string(),
+                            api_standard: standard,
+                            base_url: url,
+                            api_key_env: info.api_key_env.map(str::to_string),
+                        }),
+                        None => Err(resolution_error(&info, anthropic_available)),
                     };
                 }
 
-                Self {
+                Ok(Self {
                     provider: "default".to_string(),
                     model: spec.to_string(),
                     api_standard: ApiStandard::OpenAi,
                     base_url: default_base_url.to_string(),
                     api_key_env: None,
-                }
+                })
             }
-            None => Self {
+            None => Ok(Self {
                 provider: "default".to_string(),
                 model: spec.to_string(),
                 api_standard: ApiStandard::OpenAi,
                 base_url: default_base_url.to_string(),
                 api_key_env: None,
-            },
+            }),
         }
     }
 
@@ -300,6 +315,26 @@ impl ModelSpec {
             return Some(v);
         }
         ambient.map(str::to_string)
+    }
+}
+
+/// Why a known provider's endpoint did not resolve, for the
+/// `ModelSpec::parse` error (issue #346). Two cases exist: the provider
+/// has no usable endpoint at all (Anthropic-only provider without an
+/// Anthropic client), or its endpoint URL is a template that cannot be
+/// resolved (today only `{ACCOUNT_ID}`, filled from
+/// `CLOUDFLARE_ACCOUNT_ID`).
+fn resolution_error(info: &ProviderInfo, anthropic_available: bool) -> String {
+    if info.endpoint(anthropic_available).is_none() {
+        format!(
+            "provider '{}' has no usable endpoint: it has no OpenAI-compatible endpoint and no Anthropic-compatible client is available",
+            info.key
+        )
+    } else {
+        format!(
+            "provider '{}' cannot resolve its endpoint URL: CLOUDFLARE_ACCOUNT_ID is not set or empty",
+            info.key
+        )
     }
 }
 
@@ -452,7 +487,8 @@ mod tests {
 
     #[test]
     fn parse_zai_spec() {
-        let s = ModelSpec::parse("zai/glm-5.2", "http://default/v1", false);
+        let s =
+            ModelSpec::parse("zai/glm-5.2", "http://default/v1", false).expect("parse resolves");
         assert_eq!(s.provider, "zai");
         assert_eq!(s.model, "glm-5.2");
         assert_eq!(s.api_standard, ApiStandard::OpenAi);
@@ -462,7 +498,7 @@ mod tests {
 
     #[test]
     fn parse_zai_spec_anthropic_client() {
-        let s = ModelSpec::parse("zai/glm-5.2", "http://default/v1", true);
+        let s = ModelSpec::parse("zai/glm-5.2", "http://default/v1", true).expect("parse resolves");
         assert_eq!(s.api_standard, ApiStandard::Anthropic);
         assert_eq!(s.base_url, "https://api.z.ai/api/anthropic");
 
@@ -471,12 +507,14 @@ mod tests {
 
     #[test]
     fn parse_moonshot_and_deepseek_specs() {
-        let s = ModelSpec::parse("moonshot/kimi-k2.7", "http://default/v1", false);
+        let s = ModelSpec::parse("moonshot/kimi-k2.7", "http://default/v1", false)
+            .expect("parse resolves");
         assert_eq!(s.provider, "moonshot");
         assert_eq!(s.model, "kimi-k2.7");
         assert_eq!(s.base_url, "https://api.moonshot.ai/v1");
 
-        let s = ModelSpec::parse("deepseek/deepseek-v4-flash", "http://default/v1", false);
+        let s = ModelSpec::parse("deepseek/deepseek-v4-flash", "http://default/v1", false)
+            .expect("parse resolves");
         assert_eq!(s.provider, "deepseek");
         assert_eq!(s.model, "deepseek-v4-flash");
         assert_eq!(s.base_url, "https://api.deepseek.com/v1");
@@ -484,14 +522,15 @@ mod tests {
 
     #[test]
     fn parse_is_case_insensitive() {
-        let s = ModelSpec::parse("ZAI/glm-5.2", "http://default/v1", false);
+        let s =
+            ModelSpec::parse("ZAI/glm-5.2", "http://default/v1", false).expect("parse resolves");
         assert_eq!(s.provider, "zai");
         assert_eq!(s.model, "glm-5.2");
     }
 
     #[test]
     fn parse_bare_model_uses_default() {
-        let s = ModelSpec::parse("gpt-4o", "http://default/v1", false);
+        let s = ModelSpec::parse("gpt-4o", "http://default/v1", false).expect("parse resolves");
         assert_eq!(s.provider, "default");
         assert_eq!(s.model, "gpt-4o");
         assert_eq!(s.base_url, "http://default/v1");
@@ -499,7 +538,8 @@ mod tests {
 
     #[test]
     fn parse_unknown_provider_keeps_whole_spec() {
-        let s = ModelSpec::parse("futureai/new-model", "http://default/v1", false);
+        let s = ModelSpec::parse("futureai/new-model", "http://default/v1", false)
+            .expect("parse resolves");
         assert_eq!(s.provider, "default");
         assert_eq!(s.model, "futureai/new-model");
         assert_eq!(s.base_url, "http://default/v1");
@@ -564,7 +604,8 @@ mod tests {
 
     #[test]
     fn api_key_prefers_provider_env_then_ambient() {
-        let s = ModelSpec::parse("zai/glm-5.2", "http://default/v1", false);
+        let s =
+            ModelSpec::parse("zai/glm-5.2", "http://default/v1", false).expect("parse resolves");
 
         assert_eq!(
             s.api_key(Some("ambient-key")),
@@ -660,7 +701,8 @@ mod tests {
                 "cloudflare/@cf/meta/llama-3.1-8b-instruct",
                 "http://default/v1",
                 false,
-            );
+            )
+            .expect("cloudflare resolves with account id");
             assert_eq!(s.provider, "cloudflare");
             assert_eq!(s.model, "@cf/meta/llama-3.1-8b-instruct");
             assert_eq!(
@@ -672,14 +714,42 @@ mod tests {
     }
 
     #[test]
-    fn cloudflare_without_account_id_falls_back_to_default() {
+    fn cloudflare_without_account_id_is_an_error() {
+        // Issue #346: a known provider whose endpoint cannot resolve
+        // must not silently fall back to the default gateway - the
+        // explicit provider choice, model and key env would be
+        // discarded and the whole spec sent as a model name instead.
         with_account_id_env(None, || {
             let p = find_provider("cloudflare").unwrap();
             assert!(p.endpoint_resolved(false).is_none());
-            let s = ModelSpec::parse("cloudflare/some-model", "http://default/v1", false);
-            assert_eq!(s.provider, "default");
-            assert_eq!(s.base_url, "http://default/v1");
+            let err = ModelSpec::parse("cloudflare/some-model", "http://default/v1", false)
+                .expect_err("known provider that cannot resolve must error");
+            assert!(
+                err.contains("cloudflare") && err.contains("CLOUDFLARE_ACCOUNT_ID"),
+                "error must name the provider and what it needs: {err}"
+            );
         });
+    }
+
+    #[test]
+    fn anthropic_without_anthropic_client_is_an_error() {
+        // Issue #346: `anthropic/...` has no OpenAI-compatible endpoint,
+        // so with no Anthropic client it cannot resolve - and must not
+        // fall back to the default gateway either.
+        let err = ModelSpec::parse("anthropic/claude-sonnet-4-6", "http://default/v1", false)
+            .expect_err("anthropic without an Anthropic client must error");
+        assert!(
+            err.contains("anthropic") && err.contains("Anthropic"),
+            "error must name the provider and what it needs: {err}"
+        );
+
+        let s = ModelSpec::parse("anthropic/claude-sonnet-4-6", "http://default/v1", true)
+            .expect("anthropic resolves with an Anthropic client");
+        assert_eq!(s.provider, "anthropic");
+        assert_eq!(s.model, "claude-sonnet-4-6");
+        assert_eq!(s.api_standard, ApiStandard::Anthropic);
+        assert_eq!(s.base_url, "https://api.anthropic.com");
+        assert_eq!(s.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
     }
 
     #[test]
