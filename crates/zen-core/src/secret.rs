@@ -505,7 +505,13 @@ fn lock_store(store: &SecretStore) -> SecretResult<StoreLock> {
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(StoreLock { _file: file }),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            // Contention means retry until the deadline: Unix reports
+            // it as WouldBlock, Windows as ERROR_LOCK_VIOLATION
+            // (raw OS error 33), which std maps to ErrorKind::Other
+            // instead of WouldBlock (issue #319).
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(33) =>
+            {
                 if std::time::Instant::now() >= deadline {
                     return Err(SecretError::new(
                         exit_code::GENERAL,
