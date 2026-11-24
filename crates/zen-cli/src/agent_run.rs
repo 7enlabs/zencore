@@ -1078,7 +1078,7 @@ pub(crate) async fn run_agent_with_result(args: AgentRunArgs<'_>) -> Result<(i32
             agent.set_messages(msgs);
         }
     }
-    let usage_before = agent.usage.clone();
+    let usage_before = agent.total_usage();
 
     let mut local_failed = false;
     if let Some((name, args)) = &builtin {
@@ -1130,7 +1130,7 @@ pub(crate) async fn run_agent_with_result(args: AgentRunArgs<'_>) -> Result<(i32
                 }
             }
             "cost" => Some(commands::cost_report(
-                &agent.usage,
+                &agent.total_usage(),
                 &agent.config.model,
                 &cfg.base_url,
             )),
@@ -1200,7 +1200,7 @@ pub(crate) async fn run_agent_with_result(args: AgentRunArgs<'_>) -> Result<(i32
             transcript_path,
             session_id,
             &usage_before,
-            &agent.usage,
+            &agent.total_usage(),
             home,
             &agent.config.model,
             &cfg.base_url,
@@ -1334,12 +1334,12 @@ pub(crate) async fn run_agent_with_result(args: AgentRunArgs<'_>) -> Result<(i32
             transcript_path,
             session_id,
             &usage_before,
-            &agent.usage,
+            &agent.total_usage(),
             home,
             &agent.config.model,
             &cfg.base_url,
         );
-        usage_before = agent.usage.clone();
+        usage_before = agent.total_usage();
 
         let Some(v) = verify.as_ref() else {
             break turn_result;

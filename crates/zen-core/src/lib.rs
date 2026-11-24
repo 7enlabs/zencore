@@ -1248,6 +1248,35 @@ impl UsageStats {
     pub fn cache_hit_rate(&self) -> f64 {
         cache_hit_rate(self.cache_read_input_tokens, self.input_tokens)
     }
+
+    /// Add another run's tokens into this total (issue #349: the
+    /// parent folds finished sub-agents' tokens into its own total).
+    pub fn add_assign(&mut self, other: &Self) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_read_input_tokens += other.cache_read_input_tokens;
+    }
+}
+
+/// Spend of finished sub-agents, as reported by a `SubAgentRunner`
+/// (issue #349). Tokens and dollars are kept together because a child
+/// may run on a different model than its parent, so its dollars cannot
+/// be re-derived from its tokens at the parent's price.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ChildSpend {
+    pub usage: UsageStats,
+    pub total_cost_usd: f64,
+}
+
+impl ChildSpend {
+    pub fn is_empty(&self) -> bool {
+        self.usage == UsageStats::default() && self.total_cost_usd == 0.0
+    }
+
+    pub fn add(&mut self, usage: &UsageStats, total_cost_usd: f64) {
+        self.usage.add_assign(usage);
+        self.total_cost_usd += total_cost_usd;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1413,6 +1442,16 @@ pub trait SubAgentRunner: Send + Sync {
         parent_tool_use_id: &str,
         parent_depth: usize,
     ) -> anyhow::Result<String>;
+
+    /// Spend of children this runner has finished since the last drain
+    /// (issue #349): the parent takes it after each tool batch and folds
+    /// it into its own usage, so `/cost` and the budget check see child
+    /// spend. Taking empties the balance, so a child is never counted
+    /// twice. The default is empty: runners that never run a child
+    /// (e.g. the docs-only runner) report nothing and need no change.
+    fn take_child_spend(&self) -> ChildSpend {
+        ChildSpend::default()
+    }
 
     /// The post-edit LSP diagnostics provider spawned children inherit
     /// (`None` when the parent session has the feedback loop off).
@@ -2201,6 +2240,88 @@ mod cache_tests {
         };
         assert!((u.cache_hit_rate() - 0.9).abs() < 1e-9);
         assert_eq!(UsageStats::default().cache_hit_rate(), 0.0);
+    }
+
+    #[test]
+    fn usage_stats_add_assign_sums_all_fields() {
+        // Issue #349: add_assign folds another run's tokens into this
+        // total. Each field must add, not multiply or subtract (kills
+        // the += -> *= / -= mutants on all three fields and the
+        // whole-body -> () mutant).
+        let mut total = UsageStats {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_input_tokens: 100,
+        };
+        total.add_assign(&UsageStats {
+            input_tokens: 5,
+            output_tokens: 3,
+            cache_read_input_tokens: 7,
+        });
+        assert_eq!(total.input_tokens, 15);
+        assert_eq!(total.output_tokens, 23);
+        assert_eq!(total.cache_read_input_tokens, 107);
+    }
+
+    #[test]
+    fn child_spend_is_empty_covers_all_combinations() {
+        // Issue #349: is_empty is true only when both the usage and
+        // the cost are zero. A free child (tokens but no dollars) and
+        // a cost-only spend are both non-empty; folding them must not
+        // be skipped. Kills the == -> != mutants on both comparisons,
+        // the && -> || mutant, and the whole-body -> true / -> false
+        // mutants.
+        assert!(ChildSpend::default().is_empty());
+        let tokens_only = ChildSpend {
+            usage: UsageStats {
+                input_tokens: 10,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!tokens_only.is_empty());
+        let cost_only = ChildSpend {
+            total_cost_usd: 0.5,
+            ..Default::default()
+        };
+        assert!(!cost_only.is_empty());
+        let both = ChildSpend {
+            usage: UsageStats {
+                output_tokens: 5,
+                ..Default::default()
+            },
+            total_cost_usd: 0.25,
+        };
+        assert!(!both.is_empty());
+    }
+
+    #[test]
+    fn child_spend_add_accumulates_usage_and_cost() {
+        // Issue #349: add folds a finished child's usage and dollars
+        // into the running total. Kills the whole-body -> () mutant
+        // and the += -> *= / -= mutants on the cost.
+        let mut spend = ChildSpend::default();
+        spend.add(
+            &UsageStats {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_input_tokens: 2,
+            },
+            0.5,
+        );
+        spend.add(
+            &UsageStats {
+                input_tokens: 4,
+                output_tokens: 1,
+                cache_read_input_tokens: 0,
+            },
+            0.25,
+        );
+        assert_eq!(spend.usage.input_tokens, 14);
+        assert_eq!(spend.usage.output_tokens, 6);
+        assert_eq!(spend.usage.cache_read_input_tokens, 2);
+        assert!((spend.total_cost_usd - 0.75).abs() < 1e-9);
+        assert!(!spend.is_empty());
     }
 
     #[test]
