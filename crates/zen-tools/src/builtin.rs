@@ -3096,6 +3096,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn check_fetch_target_rejects_literal_private_ip() {
+        // Kills the mutants that flip the is_public_ip guard on the
+        // literal-IP path (#324): without the guard a literal 127.0.0.1
+        // fetch would pass the SSRF check.
+        let pinned = PinnedResolver::default();
+        let err = check_fetch_target("http://127.0.0.1:8080/", false, &pinned)
+            .await
+            .expect_err("literal private IP must be refused");
+        assert!(err.contains("non-public"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn check_fetch_target_rejects_hostname_resolving_to_private_ip() {
+        // `localhost` resolves to a loopback address, so the DNS path must
+        // refuse it too; otherwise the guard only protects literal IPs
+        // (#324).
+        let pinned = PinnedResolver::default();
+        let err = check_fetch_target("http://localhost:8080/", false, &pinned)
+            .await
+            .expect_err("localhost must be refused");
+        assert!(err.contains("non-public"), "{}", err);
+    }
+
+    #[tokio::test]
     async fn websearch_fetch_direct_200_needs_no_redirect() {
         let (addr, count) = spawn_canned_server(vec![ok_response(b"<html></html>")]);
         let (client, pinned) = fetch_test_client();
