@@ -778,7 +778,7 @@ fn load_agents_from_dirs_and_cli() {
     )
     .unwrap();
 
-    let agents = load_agents(&cwd, Some(&home), None);
+    let agents = load_agents(&cwd, Some(&home), None).unwrap();
     let by_name: std::collections::HashMap<_, _> =
         agents.iter().map(|a| (a.name.clone(), a)).collect();
 
@@ -792,7 +792,7 @@ fn load_agents_from_dirs_and_cli() {
 
     assert!(agents.iter().any(|a| a.name == "proj"));
 
-    let only_user = load_agents(&tmpdir("empty_cwd"), Some(&home), None);
+    let only_user = load_agents(&tmpdir("empty_cwd"), Some(&home), None).unwrap();
     let u = only_user.iter().find(|a| a.name == "researcher").unwrap();
     assert_eq!(u.description, "Finds things");
     assert_eq!(u.tools, Some(vec!["Read".to_string(), "Grep".to_string()]));
@@ -808,7 +808,7 @@ fn load_agents_cli_json_and_file() {
     let home = tmpdir("agents_cli_home");
 
     let inline = r#"{"helper":{"description":"inline helper","prompt":"Do it","tools":["Read","Bash"],"model":"inherit"}}"#;
-    let agents = load_agents(&cwd, Some(&home), Some(inline));
+    let agents = load_agents(&cwd, Some(&home), Some(inline)).unwrap();
     let h = agents.iter().find(|a| a.name == "helper").unwrap();
     assert_eq!(h.description, "inline helper");
     assert_eq!(h.system_prompt, "Do it");
@@ -817,10 +817,10 @@ fn load_agents_cli_json_and_file() {
 
     let file = cwd.join("agents.json");
     std::fs::write(&file, r#"{"fromfile":{"description":"d","prompt":"p"}}"#).unwrap();
-    let agents = load_agents(&cwd, Some(&home), Some(&file.to_string_lossy()));
+    let agents = load_agents(&cwd, Some(&home), Some(&file.to_string_lossy())).unwrap();
     assert!(agents.iter().any(|a| a.name == "fromfile"));
 
-    let agents = load_agents(&cwd, Some(&home), None);
+    let agents = load_agents(&cwd, Some(&home), None).unwrap();
     assert_eq!(
         agents
             .iter()
@@ -831,6 +831,49 @@ fn load_agents_cli_json_and_file() {
     let gp = agents.iter().find(|a| a.name == "general-purpose").unwrap();
     assert!(gp.tools.is_none());
     assert!(!gp.system_prompt.is_empty());
+
+    let _ = std::fs::remove_dir_all(&cwd);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn load_agents_cli_unreadable_file_is_an_error() {
+    // Issue #376: a --agents file that cannot be read must fail loudly
+    // instead of silently falling back to the builtins.
+    let cwd = tmpdir("agents_unreadable");
+    let home = tmpdir("agents_unreadable_home");
+
+    let missing = cwd.join("no-such-agents.json");
+    let err = load_agents(&cwd, Some(&home), Some(&missing.to_string_lossy()))
+        .expect_err("unreadable --agents file must fail loudly");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("cannot read --agents file"),
+        "unexpected error: {msg}"
+    );
+    assert!(
+        msg.contains("no-such-agents.json"),
+        "error must name the file: {msg}"
+    );
+    let err = load_cli_agents(Some(&missing.to_string_lossy()))
+        .expect_err("load_cli_agents must fail on the same input");
+    assert!(
+        format!("{err:#}").contains("cannot read --agents file"),
+        "unexpected error: {err:#}"
+    );
+
+    // A directory is not a readable file either.
+    let dir = cwd.join("agents-dir.json");
+    std::fs::create_dir_all(&dir).unwrap();
+    assert!(
+        load_agents(&cwd, Some(&home), Some(&dir.to_string_lossy())).is_err(),
+        "a directory passed as --agents file must fail"
+    );
+
+    // The failure is specific to the unreadable-file path: inline JSON
+    // and a readable file still load.
+    let agents = load_agents(&cwd, Some(&home), Some(r#"{"ok":{"description":"d"}}"#)).unwrap();
+    assert!(agents.iter().any(|a| a.name == "ok"));
 
     let _ = std::fs::remove_dir_all(&cwd);
     let _ = std::fs::remove_dir_all(&home);

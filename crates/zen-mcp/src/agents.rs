@@ -332,7 +332,7 @@ pub fn load_agents(
     cwd: &Path,
     home: Option<&Path>,
     cli_agents: Option<&str>,
-) -> Vec<AgentDefinition> {
+) -> anyhow::Result<Vec<AgentDefinition>> {
     let mut out: Vec<AgentDefinition> = Vec::new();
 
     if let Some(h) = home_dir(home) {
@@ -340,24 +340,31 @@ pub fn load_agents(
     }
     load_dir(&mut out, &cwd.join(".zen").join("agents"));
 
-    add_cli_agents(&mut out, cli_agents);
-    out
+    add_cli_agents(&mut out, cli_agents)?;
+    Ok(out)
 }
 
-pub fn load_cli_agents(cli_agents: Option<&str>) -> Vec<AgentDefinition> {
+pub fn load_cli_agents(cli_agents: Option<&str>) -> anyhow::Result<Vec<AgentDefinition>> {
     let mut out = Vec::new();
-    add_cli_agents(&mut out, cli_agents);
-    out
+    add_cli_agents(&mut out, cli_agents)?;
+    Ok(out)
 }
 
-fn add_cli_agents(out: &mut Vec<AgentDefinition>, cli_agents: Option<&str>) {
+fn add_cli_agents(out: &mut Vec<AgentDefinition>, cli_agents: Option<&str>) -> anyhow::Result<()> {
     if let Some(raw) = cli_agents {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
+            // A value that is not inline JSON is a file path. A path that
+            // cannot be read must fail loudly: silently falling back to the
+            // builtins hides a typo, a permission error or a deleted file
+            // behind the default agent set (issue #376).
             let json_text = if trimmed.starts_with('{') {
                 Some(trimmed.to_string())
             } else {
-                std::fs::read_to_string(PathBuf::from(trimmed)).ok()
+                let path = PathBuf::from(trimmed);
+                Some(std::fs::read_to_string(&path).map_err(|e| {
+                    anyhow::anyhow!("cannot read --agents file '{}': {}", path.display(), e)
+                })?)
             };
             if let Some(text) = json_text
                 && let Err(e) = load_agents_from_json(out, &text)
@@ -373,6 +380,7 @@ fn add_cli_agents(out: &mut Vec<AgentDefinition>, cli_agents: Option<&str>) {
         .collect();
     builtins.append(out);
     *out = builtins;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -413,7 +421,7 @@ mod c6_tests {
             Some(
                 r#"{"j":{"prompt":"no description"},"k":{"description":"K","disallowedTools":["Bash"],"permissionMode":"acceptEdits","maxTurns":3,"skills":"a, b"}}"#,
             ),
-        );
+        ).unwrap();
         let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
         assert!(
             !names.contains(&"nodesc") && !names.contains(&"blankdesc") && !names.contains(&"j"),
@@ -465,7 +473,7 @@ mod c6_tests {
                 .map(|a| a.description.clone())
         };
 
-        let agents = load_agents(&cwd, Some(&home), None);
+        let agents = load_agents(&cwd, Some(&home), None).unwrap();
         assert_eq!(
             get(&agents, "a").as_deref(),
             Some("project"),
@@ -498,7 +506,8 @@ mod c6_tests {
             &cwd,
             Some(&home),
             Some(r#"{"a":{"description":"cli"},"general-purpose":{"description":"mine"}}"#),
-        );
+        )
+        .unwrap();
         assert_eq!(
             get(&agents, "a").as_deref(),
             Some("cli"),
@@ -513,7 +522,7 @@ mod c6_tests {
             1
         );
 
-        let bare = load_cli_agents(None);
+        let bare = load_cli_agents(None).unwrap();
         let names: Vec<&str> = bare.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(
             names,
