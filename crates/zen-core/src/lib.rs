@@ -2243,6 +2243,77 @@ mod cache_tests {
     }
 
     #[test]
+    fn usage_stats_add_assign_sums_all_fields() {
+        // Issue #349: add_assign folds another run's tokens into this
+        // total. Each field must add, not multiply or subtract (kills
+        // the += -> *= / -= mutants on all three fields and the
+        // whole-body -> () mutant).
+        let mut total = UsageStats {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_input_tokens: 100,
+        };
+        total.add_assign(&UsageStats {
+            input_tokens: 5,
+            output_tokens: 3,
+            cache_read_input_tokens: 7,
+        });
+        assert_eq!(total.input_tokens, 15);
+        assert_eq!(total.output_tokens, 23);
+        assert_eq!(total.cache_read_input_tokens, 107);
+    }
+
+    #[test]
+    fn child_spend_is_empty_covers_all_combinations() {
+        // Issue #349: is_empty is true only when both the usage and
+        // the cost are zero. A free child (tokens but no dollars) and
+        // a cost-only spend are both non-empty; folding them must not
+        // be skipped. Kills the == -> != mutants on both comparisons,
+        // the && -> || mutant, and the whole-body -> true / -> false
+        // mutants.
+        assert!(ChildSpend::default().is_empty());
+        let mut tokens_only = ChildSpend::default();
+        tokens_only.usage.input_tokens = 10;
+        assert!(!tokens_only.is_empty());
+        let mut cost_only = ChildSpend::default();
+        cost_only.total_cost_usd = 0.5;
+        assert!(!cost_only.is_empty());
+        let mut both = ChildSpend::default();
+        both.usage.output_tokens = 5;
+        both.total_cost_usd = 0.25;
+        assert!(!both.is_empty());
+    }
+
+    #[test]
+    fn child_spend_add_accumulates_usage_and_cost() {
+        // Issue #349: add folds a finished child's usage and dollars
+        // into the running total. Kills the whole-body -> () mutant
+        // and the += -> *= / -= mutants on the cost.
+        let mut spend = ChildSpend::default();
+        spend.add(
+            &UsageStats {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_input_tokens: 2,
+            },
+            0.5,
+        );
+        spend.add(
+            &UsageStats {
+                input_tokens: 4,
+                output_tokens: 1,
+                cache_read_input_tokens: 0,
+            },
+            0.25,
+        );
+        assert_eq!(spend.usage.input_tokens, 14);
+        assert_eq!(spend.usage.output_tokens, 6);
+        assert_eq!(spend.usage.cache_read_input_tokens, 2);
+        assert!((spend.total_cost_usd - 0.75).abs() < 1e-9);
+        assert!(!spend.is_empty());
+    }
+
+    #[test]
     fn usage_deserializes_old_json_without_cache_fields() {
         let u: Usage =
             serde_json::from_str(r#"{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}"#)

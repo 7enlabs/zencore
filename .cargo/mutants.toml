@@ -490,4 +490,18 @@ exclude_re = [
   # remove these exclusions and kill them with tests.
   "secret\\.rs:513:20: replace match guard e\\.kind\\(\\) == std::io::ErrorKind::WouldBlock \\|\\| e\\.raw_os_error\\(\\) == Some\\(33\\) with true in lock_store",
   "secret\\.rs:513:83: replace == with != in lock_store",
+  # PR #492 (issue #349), lib.rs SubAgentRunner::take_child_spend
+  # (line 1453, col 9): replace the trait-default body with
+  # Default::default().
+  # EQUIVALENT (waived by ZC Leader, 2026-11-24; verified by reading
+  # the code at lib.rs:1452-1454): the default body IS
+  # `ChildSpend::default()`, and `Default::default()` for ChildSpend
+  # is the same derived Default, so the replacement is identical and
+  # no test can kill this mutant. Only implementors that override the
+  # default (SubAgentExecutor) carry real behaviour, and that override
+  # is covered by the c349 agent tests in zen-agent.
+  # EXPIRY: if the trait default gains real behaviour (for example it
+  # stops returning ChildSpend::default()), this mutant stops being
+  # equivalent: remove this exclusion and kill it with a test.
+  "lib\\.rs:1453:9: replace SubAgentRunner::take_child_spend -> ChildSpend with Default::default\\(\\)",
 ]
