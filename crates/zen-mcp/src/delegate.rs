@@ -317,9 +317,16 @@ fn parse_raw_envelope(text: &str) -> Option<RawEnvelope> {
 }
 
 /// Build the envelope the parent receives from one child's raw output text:
-/// parse the child's JSON envelope when present (otherwise wrap the raw text
-/// as the summary), cap the summary at 50 KB, scan for injection, and stamp
-/// the parent-computed sha256 of the raw output.
+/// parse the child's JSON envelope when present, cap the summary at 50 KB,
+/// scan for injection, and stamp the parent-computed sha256 of the raw output.
+///
+/// Contract (issue #379): only a parseable envelope whose status is "done"
+/// is Done. Output that cannot be trusted as a completed handoff —
+/// unparseable JSON, no envelope at all, or an unknown status string — is
+/// Failed, never Done: a child that crashes mid-write, prints a stack trace,
+/// or returns free-form text must not read as a successful handoff. The raw
+/// text is kept as the summary in those cases so the parent can see what
+/// the child said.
 pub fn build_envelope(raw: &str) -> HandoffEnvelope {
     let (status, summary, evidence, usage) = match parse_raw_envelope(raw) {
         Some(env) => match env.status.as_str() {
@@ -335,9 +342,9 @@ pub fn build_envelope(raw: &str) -> HandoffEnvelope {
                     .unwrap_or_else(|| raw.to_string());
                 (status, summary, env.evidence.unwrap_or_default(), env.usage)
             }
-            _ => (HandoffStatus::Done, raw.to_string(), Vec::new(), None),
+            _ => (HandoffStatus::Failed, raw.to_string(), Vec::new(), None),
         },
-        None => (HandoffStatus::Done, raw.to_string(), Vec::new(), None),
+        None => (HandoffStatus::Failed, raw.to_string(), Vec::new(), None),
     };
     let (capped, truncated) = cap_text(&summary);
     let (scanned, flagged_lines) = scan_child_output(&capped);
@@ -855,18 +862,55 @@ mod tests {
     }
 
     #[test]
-    fn envelope_plain_text_wrapped_as_done() {
+    fn envelope_plain_text_wrapped_as_failed() {
+        // Contract (#379): output with no envelope is Failed, never Done —
+        // a child that returns free-form text has not delivered a handoff.
         let env = build_envelope("just some text");
-        assert_eq!(env.status, HandoffStatus::Done);
+        assert_eq!(env.status, HandoffStatus::Failed);
         assert_eq!(env.summary, "just some text");
         assert!(env.evidence.is_empty());
     }
 
     #[test]
-    fn envelope_unknown_status_wrapped() {
+    fn envelope_unknown_status_is_failed() {
+        // Contract (#379): an unknown status string is Failed, never Done.
         let env = build_envelope(r#"{"status": "weird", "summary": "x"}"#);
-        assert_eq!(env.status, HandoffStatus::Done);
+        assert_eq!(env.status, HandoffStatus::Failed);
         assert!(env.summary.contains("weird"));
+    }
+
+    #[test]
+    fn envelope_unparseable_json_is_failed() {
+        // Broken JSON (braces present but not parseable) is Failed.
+        let env = build_envelope(r#"{"status": "done", "summary": }"#);
+        assert_eq!(env.status, HandoffStatus::Failed);
+        let env = build_envelope("half an envelope {\"status\": \"done\"");
+        assert_eq!(env.status, HandoffStatus::Failed);
+    }
+
+    #[test]
+    fn envelope_empty_output_is_failed() {
+        let env = build_envelope("");
+        assert_eq!(env.status, HandoffStatus::Failed);
+        let env = build_envelope("   \n  ");
+        assert_eq!(env.status, HandoffStatus::Failed);
+    }
+
+    #[test]
+    fn envelope_done_without_summary_uses_raw() {
+        // A done envelope with no summary still counts as done; the raw
+        // text becomes the summary (kept behaviour).
+        let raw = r#"{"status": "done"}"#;
+        let env = build_envelope(raw);
+        assert_eq!(env.status, HandoffStatus::Done);
+        assert_eq!(env.summary, raw);
+    }
+
+    #[test]
+    fn envelope_failed_status_stays_failed() {
+        let env = build_envelope(r#"{"status": "failed", "summary": "step broke"}"#);
+        assert_eq!(env.status, HandoffStatus::Failed);
+        assert_eq!(env.summary, "step broke");
     }
 
     #[test]
@@ -1319,7 +1363,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_mode_plain_text_wrapped() {
+    async fn single_mode_plain_text_is_failed() {
         let t = tool(Arc::new(FakeRunner::new(0)));
         let out = t
             .call(
@@ -1329,7 +1373,7 @@ mod tests {
             .await;
         assert!(!out.is_error, "{}", out.content);
         let v: Value = serde_json::from_str(&out.content).unwrap();
-        assert_eq!(v["status"], "done");
+        assert_eq!(v["status"], "failed");
         assert_eq!(v["summary"], "plain result text");
     }
 
