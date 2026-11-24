@@ -30,6 +30,15 @@ pub struct TurnGuard {
 }
 
 impl TurnGuard {
+    /// Clear the per-turn counters so nudges are one-shot per model turn,
+    /// not per run: edit counts, failure counts, and the set of keys already
+    /// nudged. Scope and cwd are run-level settings and are kept.
+    pub fn reset_turn(&mut self) {
+        self.edits.clear();
+        self.failures.clear();
+        self.nudged.clear();
+    }
+
     pub fn set_scope(&mut self, scope: Vec<String>) {
         self.scope = scope;
     }
@@ -157,6 +166,62 @@ mod tests {
         for _ in 0..5 {
             assert!(g.observe("Read", &a, &ok()).is_none());
         }
+    }
+
+    #[test]
+    fn reset_turn_restarts_per_turn_nudges() {
+        // Regression test for #345: without a reset, the edit nudge says
+        // "in this turn" but counts the whole run, and a file nudged once
+        // never nudges again in a later turn.
+        let mut g = TurnGuard::default();
+        let a = json!({"file_path": "a.rs"});
+        let notes: Vec<Option<String>> = (0..4).map(|_| g.observe("Edit", &a, &ok())).collect();
+        assert!(notes[3].as_deref().unwrap().contains("a.rs 4 times"));
+        // Same file, next model turn: the counter restarts, so three more
+        // edits are quiet and the fourth nudges again.
+        g.reset_turn();
+        let notes: Vec<Option<String>> = (0..4).map(|_| g.observe("Edit", &a, &ok())).collect();
+        assert!(notes[..3].iter().all(Option::is_none));
+        assert!(notes[3].as_deref().unwrap().contains("a.rs 4 times"));
+
+        // The scope nudge resets too: an out-of-scope file nudges again in
+        // the next turn instead of staying silent for the rest of the run.
+        g.set_cwd(PathBuf::from("/repo"));
+        g.set_scope(vec!["src/**".into()]);
+        let out_scope = json!({"file_path": "other/x.rs"});
+        assert!(
+            g.observe("Edit", &out_scope, &ok())
+                .unwrap()
+                .contains("outside your declared task scope")
+        );
+        assert!(
+            g.observe("Edit", &out_scope, &ok()).is_none(),
+            "one nudge per file per turn"
+        );
+        g.reset_turn();
+        assert!(
+            g.observe("Edit", &out_scope, &ok())
+                .unwrap()
+                .contains("outside your declared task scope"),
+            "scope nudge fires again next turn"
+        );
+
+        // Identical failures reset too.
+        let cmd = json!({"command": "cargo test"});
+        let fail = ToolOutput::err("exit 101");
+        assert!(g.observe("Bash", &cmd, &fail).is_none());
+        assert!(
+            g.observe("Bash", &cmd, &fail)
+                .unwrap()
+                .contains("failed 2 times")
+        );
+        g.reset_turn();
+        assert!(g.observe("Bash", &cmd, &fail).is_none());
+        assert!(
+            g.observe("Bash", &cmd, &fail)
+                .unwrap()
+                .contains("failed 2 times")
+        );
     }
 
     #[test]
