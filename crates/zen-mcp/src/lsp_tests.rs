@@ -823,6 +823,186 @@ async fn request_timeout_is_surfaced_not_hung() {
     assert!(err.to_string().contains("timed out"), "got: {err}");
 }
 
+/// Mock server for issue #386: it sends server-to-client requests
+/// while a client request is pending, and logs every frame it receives
+/// (full JSON, one per line) so the test can check the client answered
+/// those requests instead of misrouting them. The `read_msg_timeout`
+/// read keeps the mock from hanging when the client never answers: a
+/// missing answer is logged as `{"timeout": true}` and the mock moves
+/// on, so the test fails on its assertions instead of hanging.
+const MOCK_SERVER_386: &str = r##"#!/usr/bin/env python3
+import sys, json, threading, queue
+
+log_path = sys.argv[1]
+
+def log(obj):
+    with open(log_path, "a") as f:
+        f.write(json.dumps(obj) + "\n")
+
+def _read_msg_raw():
+    headers = {}
+    while True:
+        raw = sys.stdin.buffer.readline()
+        if not raw:
+            return None
+        line = raw.decode("utf-8", "replace")
+        if line in ("\r\n", "\n", ""):
+            break
+        if ":" in line:
+            k, v = line.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+    n = int(headers.get("content-length", "0"))
+    if n <= 0:
+        return None
+    return json.loads(sys.stdin.buffer.read(n).decode("utf-8"))
+
+# One reader thread feeds every read: `select` on stdin does not work on
+# Windows (sockets only), so the mock crashed there as soon as it waited
+# for the client's answer and the server looked closed during
+# initialize. A single thread also means a timed-out wait can never
+# steal bytes from a later read.
+_msg_queue = queue.Queue()
+
+def _reader():
+    while True:
+        msg = _read_msg_raw()
+        _msg_queue.put(msg)
+        if msg is None:
+            return
+
+threading.Thread(target=_reader, daemon=True).start()
+
+def read_msg():
+    return _msg_queue.get()
+
+def read_msg_timeout(seconds):
+    try:
+        return _msg_queue.get(timeout=seconds)
+    except queue.Empty:
+        return {"timeout": True}
+
+def send(obj):
+    data = json.dumps(obj).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(data) + data)
+    sys.stdout.buffer.flush()
+
+while True:
+    msg = read_msg()
+    if msg is None:
+        break
+    method, mid = msg.get("method", ""), msg.get("id")
+    log(msg)
+    if method == "initialize":
+        # Server-to-client request reusing the pending initialize id:
+        # the old reader routed on `id` first, so this landed in the
+        # initialize waiter as if it were the initialize response.
+        send({"jsonrpc": "2.0", "id": mid, "method": "window/workDoneProgress/create",
+              "params": {"token": "mock-progress"}})
+        # The next frame from the client must be the -32601 answer to
+        # that request; read it before sending the real response.
+        log(read_msg_timeout(5))
+        send({"jsonrpc": "2.0", "id": mid, "result": {"capabilities": {}}})
+    elif method == "textDocument/definition":
+        # Server-to-client request with an id no waiter holds: the old
+        # reader dropped it silently instead of answering it.
+        send({"jsonrpc": "2.0", "id": 9999, "method": "client/registerCapability",
+              "params": {"registrations": []}})
+        log(read_msg_timeout(5))
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "uri": "file:///target.rs",
+            "range": {"start": {"line": 9, "character": 4},
+                      "end": {"line": 9, "character": 12}}}})
+    elif method == "shutdown":
+        send({"jsonrpc": "2.0", "id": mid, "result": None})
+    elif method == "exit":
+        break
+    # notifications (initialized) and unknown methods: no reply
+"##;
+
+fn logged_messages(log: &Path) -> Vec<Value> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn server_request_is_answered_not_misrouted_as_response() {
+    // Issue #386: the reader loop dispatched on `id` before `method`,
+    // so a server-to-client request was delivered to a pending waiter
+    // as if it were that request's response (corrupting the caller)
+    // or dropped silently when no waiter matched its id.
+    let Some(py) = find_binary("python3") else {
+        eprintln!("SKIP: python3 not found");
+        return;
+    };
+    let tmp = unique_tmpdir("386");
+    let script = tmp.join("mock_386.py");
+    write_file(&script, MOCK_SERVER_386);
+    let log = tmp.join("messages.log");
+    write_file(&log, "");
+    let client = LspClient::spawn(
+        py.to_str().unwrap(),
+        &[
+            script.to_string_lossy().into_owned(),
+            log.to_string_lossy().into_owned(),
+        ],
+    )
+    .unwrap();
+
+    // The mock answers `initialize` only after the client answers its
+    // colliding server request, so a misrouted request would surface
+    // here as a wrong initialize result or a stalled handshake.
+    client.initialize(tmp.as_path()).await.unwrap();
+    let result = client
+        .request(
+            "textDocument/definition",
+            json!({"textDocument": {"uri": "file:///main.rs"},
+                   "position": {"line": 0, "character": 4}}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    // The definition result must be the real response, not the server
+    // request that arrived while it was pending.
+    assert_eq!(
+        result.get("uri").and_then(Value::as_str),
+        Some("file:///target.rs"),
+        "got: {result}"
+    );
+
+    client.kill();
+
+    let messages = logged_messages(&log);
+    // The colliding server request (same id as the pending initialize)
+    // must have been answered with Method-not-found, not fed to the
+    // initialize waiter.
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.get("id").and_then(Value::as_u64) == Some(1)
+                && m.get("error")
+                    .and_then(|e| e.get("code"))
+                    .and_then(Value::as_i64)
+                    == Some(-32601)),
+        "expected a -32601 answer to the colliding server request (id 1): {messages:?}"
+    );
+    // The unmatched server request (id 9999, no waiter) must have been
+    // answered too, not dropped silently.
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.get("id").and_then(Value::as_u64) == Some(9999)
+                && m.get("error")
+                    .and_then(|e| e.get("code"))
+                    .and_then(Value::as_i64)
+                    == Some(-32601)),
+        "expected a -32601 answer to the unmatched server request (id 9999): {messages:?}"
+    );
+}
+
 /// A fake server that answers `initialize` with a bare JSON number
 /// instead of an object: not a valid JSON-RPC frame.
 const MOCK_NON_OBJECT_SERVER: &str = r##"#!/usr/bin/env python3
