@@ -1577,6 +1577,61 @@ mod tests {
     }
 
     #[test]
+    fn read_ref_file_exact_cap_is_not_truncated() {
+        // Issue #444 (mutant-killer): `read_ref_file` truncates only when
+        // the file is strictly larger than the cap. A file of exactly
+        // MAX_MENTION_FILE_BYTES must inline whole, with no marker.
+        // Kills commands.rs:609 `>` -> `>=`.
+        let tmp = read_ref_tmp("exactcap");
+        let cap = crate::mentions::MAX_MENTION_FILE_BYTES as usize;
+        let content = "a".repeat(cap);
+        fs::write(tmp.join("exact.txt"), &content).unwrap();
+        let out = read_ref_file(&tmp.join("exact.txt")).expect("file must read");
+        assert_eq!(out, content);
+        assert!(!out.contains("[truncated"));
+    }
+
+    #[test]
+    fn read_ref_file_truncates_at_char_boundary() {
+        // Issue #444 (mutant-killer): when a multi-byte character straddles
+        // the cap, truncation must back up to the previous char boundary,
+        // never split the character and never panic.
+        // Kills commands.rs:612 `>` -> `==`, `<`, delete-`!`;
+        // commands.rs:613 `-=` -> `+=`, `/=` (the last one by timeout:
+        // `/=` never moves `end`, so the loop never ends).
+        let tmp = read_ref_tmp("boundary");
+        let cap = crate::mentions::MAX_MENTION_FILE_BYTES as usize;
+        let mut content = "a".repeat(cap - 1);
+        content.push('\u{e9}'); // 2-byte char straddling the cap
+        content.push_str(&"b".repeat(10));
+        fs::write(tmp.join("straddle.txt"), &content).unwrap();
+        let out = read_ref_file(&tmp.join("straddle.txt")).expect("file must read");
+        let expected = format!(
+            "{}\n[truncated: file exceeds the 512 KiB mention cap]",
+            "a".repeat(cap - 1)
+        );
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn read_ref_file_over_cap_ascii_truncates_exactly() {
+        // Issue #444 (mutant-killer): an over-cap ASCII file truncates to
+        // exactly the cap plus the marker, nothing less.
+        // Kills commands.rs:612 `&&` -> `||` and delete-`!` (both walk
+        // `end` all the way to 0, returning an empty body).
+        let tmp = read_ref_tmp("asciicap");
+        let cap = crate::mentions::MAX_MENTION_FILE_BYTES as usize;
+        let content = "a".repeat(cap + 1);
+        fs::write(tmp.join("over.txt"), &content).unwrap();
+        let out = read_ref_file(&tmp.join("over.txt")).expect("file must read");
+        let expected = format!(
+            "{}\n[truncated: file exceeds the 512 KiB mention cap]",
+            "a".repeat(cap)
+        );
+        assert_eq!(out, expected);
+    }
+
+    #[test]
     fn read_ref_allows_absolute_path_inside_project() {
         // Containment, not a blanket ban: an absolute path that stays
         // inside the project still inlines.

@@ -525,4 +525,32 @@ exclude_re = [
   # CI shard mutants (10) on head 5ce94973 failed on this mutant
   # because the stale 1194 number did not match.
   "lsp\\.rs:1200:32: replace match guard !remaining\\.is_zero\\(\\) with true in LspManager::check_respawn_backoff",
+  # PR #554 (issue #444), commands.rs read_ref_file
+  # (line 612, col 19): replace `>` with `>=` in the char-boundary
+  # back-up loop `while end > 0 && !text.is_char_boundary(end)`.
+  # EQUIVALENT (waived by ZC Leader, 2026-11-26; verified by reading
+  # read_ref_file): `end` is usize (from keep.min(text.len())), so
+  # `end >= 0` is always true; byte index 0 is always a char
+  # boundary, so `!is_char_boundary(0)` is false and the loop exits
+  # at end=0 either way. The mutant cannot change any observable
+  # behaviour, and no test can kill this mutant.
+  # EXPIRY (2027-02-26): if the loop is rewritten so `end` can go
+  # negative, or 0 stops being a char boundary, this mutant stops
+  # being equivalent: remove this exclusion and kill it with a test.
+  "commands\\.rs:612:19: replace > with >= in read_ref_file",
+  # PR #554 (issue #444), mentions.rs expand_pattern
+  # (line 194, col 48): replace `>` with `>=` in
+  # `if e.file_type().is_dir() && e.depth() > 0`.
+  # EQUIVALENT (waived by ZC Leader, 2026-11-26; verified by reading
+  # expand_pattern and zen-core gitignore::is_ignored): the mutant
+  # only differs at entry depth 0 (the walk root); is_ignored(root)
+  # always returns false because gitignore.rs skips every rule when
+  # the stripped rel path is empty, so the entry is kept either way.
+  # The mutant cannot change any observable behaviour, and no test
+  # can kill this mutant.
+  # EXPIRY (2027-02-26): if is_ignored stops returning false for the
+  # empty rel, or the walk root stops being the entry at depth 0,
+  # this mutant stops being equivalent: remove this exclusion and
+  # kill it with a test.
+  "mentions\\.rs:194:48: replace > with >= in expand_pattern",
 ]

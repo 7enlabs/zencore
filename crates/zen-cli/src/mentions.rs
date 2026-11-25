@@ -474,6 +474,20 @@ mod tests {
     }
 
     #[test]
+    fn expand_pattern_dir_only_pattern_does_not_prune_file() {
+        // Issue #444 (mutant-killer): a dir-only .gitignore pattern
+        // (`build/`) must not prune a FILE named `build` from a glob walk.
+        // Kills mentions.rs:194 `&&` -> `||`: with `||` every entry below
+        // the root is gitignore-checked as if it were a directory, so the
+        // file is pruned and the glob finds nothing.
+        let cwd = tmpdir("expdironly");
+        write(&cwd, ".gitignore", "build/\n");
+        write(&cwd, "build", "x");
+        let hits = expand_pattern("b*", &cwd).expect("glob must match the file");
+        assert_eq!(hits, vec![cwd.join("build")]);
+    }
+
+    #[test]
     fn expand_token_budget_warns() {
         let cwd = tmpdir("exp5");
         write(&cwd, "big.txt", &"x".repeat(4000));
