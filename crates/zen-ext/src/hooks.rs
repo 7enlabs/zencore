@@ -655,15 +655,24 @@ fn interpret_json_stdout(obj: &serde_json::Map<String, Value>, event: HookEvent)
     }
 
     // `watchPaths` (CwdChanged / FileChanged): replace the dynamic watch list.
-    if matches!(event, HookEvent::CwdChanged | HookEvent::FileChanged)
-        && let Some(paths) = obj.get("watchPaths").and_then(|v| v.as_array())
-    {
-        out.watch_paths = Some(
-            paths
-                .iter()
-                .filter_map(|p| p.as_str().map(str::to_string))
-                .collect(),
-        );
+    // Canonical location is `hookSpecificOutput.watchPaths` (see
+    // docs/hooks.md); a top-level `watchPaths` is also accepted for
+    // backwards compatibility. When both are present, the canonical
+    // `hookSpecificOutput` form wins.
+    if matches!(event, HookEvent::CwdChanged | HookEvent::FileChanged) {
+        let paths = obj
+            .get("hookSpecificOutput")
+            .and_then(|v| v.as_object())
+            .and_then(|hso| hso.get("watchPaths").and_then(|v| v.as_array()))
+            .or_else(|| obj.get("watchPaths").and_then(|v| v.as_array()));
+        if let Some(paths) = paths {
+            out.watch_paths = Some(
+                paths
+                    .iter()
+                    .filter_map(|p| p.as_str().map(str::to_string))
+                    .collect(),
+            );
+        }
     }
 
     // `MessageDisplay`: a JSON object may carry the replacement text.
@@ -1701,6 +1710,54 @@ mod tests {
             out.watch_paths,
             Some(vec!["/tmp/a.env".to_string(), "/tmp/b.env".to_string()])
         );
+    }
+
+    #[test]
+    fn watch_paths_from_hook_specific_output() {
+        // Issue #394: docs/hooks.md shows `watchPaths` inside
+        // `hookSpecificOutput`, but the parser only read the JSON top
+        // level, so the documented form was silently ignored.
+        let cases: &[(HookEvent, Value, Option<Vec<&str>>)] = &[
+            (
+                HookEvent::CwdChanged,
+                json!({"hookSpecificOutput": {"watchPaths": ["src/", "docs/"]}}),
+                Some(vec!["src/", "docs/"]),
+            ),
+            (
+                HookEvent::FileChanged,
+                json!({"hookSpecificOutput": {"watchPaths": ["src/"]}}),
+                Some(vec!["src/"]),
+            ),
+            // Other events must NOT pick up a watch list.
+            (
+                HookEvent::PreToolUse,
+                json!({"hookSpecificOutput": {"watchPaths": ["src/"]}}),
+                None,
+            ),
+            // Top-level form still works (backwards compatibility).
+            (
+                HookEvent::CwdChanged,
+                json!({"watchPaths": ["legacy/"]}),
+                Some(vec!["legacy/"]),
+            ),
+            // When both are present, the canonical
+            // `hookSpecificOutput` form wins.
+            (
+                HookEvent::CwdChanged,
+                json!({"watchPaths": ["legacy/"], "hookSpecificOutput": {"watchPaths": ["src/"]}}),
+                Some(vec!["src/"]),
+            ),
+        ];
+        for (event, obj, expected) in cases {
+            let out = interpret_json_stdout(&json_obj(obj.clone()), *event);
+            assert_eq!(
+                out.watch_paths,
+                expected
+                    .as_ref()
+                    .map(|paths| paths.iter().map(|p| p.to_string()).collect()),
+                "event: {event:?}, obj: {obj}"
+            );
+        }
     }
 
     #[tokio::test]

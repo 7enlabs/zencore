@@ -387,6 +387,10 @@ permission precedence is deny > ask > allow; the first `updatedInput` /
 `updatedToolOutput` in config order wins; feedback and system messages are joined
 with newlines. Hook output fed back is capped at 10,000 chars per hook.
 
+`watchPaths` lives inside `hookSpecificOutput` - that is the canonical
+location. A top-level `watchPaths` is also accepted for backwards
+compatibility; when both are present, `hookSpecificOutput.watchPaths` wins.
+
 ## Security notes
 
 - Hook commands run with the user's privileges - only install hooks you trust,
@@ -502,7 +506,7 @@ stdout is treated as additional context for `UserPromptSubmit`/`SessionStart` on
 | `hookSpecificOutput.updatedToolOutput` | (`PostToolUse`) replace the tool result text |
 | `hookSpecificOutput.permissionDecision` | (`PreToolUse`, `PreModelSwitch`) force `allow` / `deny` / `ask`, with optional `permissionDecisionReason` |
 | `hookSpecificOutput.additionalContext` | (`Stop`/`SubagentStop`/`PostToolBatch`) continue the run with this as feedback |
-| `hookSpecificOutput.watchPaths` | (`CwdChanged` / `FileChanged`) replace the dynamic watch list |
+| `hookSpecificOutput.watchPaths` | (`CwdChanged` / `FileChanged`) replace the dynamic watch list - canonical location; a top-level `watchPaths` is also accepted, `hookSpecificOutput` wins when both are present |
 | `hookSpecificOutput.worktreePath` | (`WorktreeCreate`) path of the created worktree |
 | `hookSpecificOutput.retry` | (`PermissionDenied`) `true` tells the model it may retry the denied call |
 | `hookSpecificOutput.displayText` (or `replacement`) | (`MessageDisplay`) text shown instead of the assistant message |
