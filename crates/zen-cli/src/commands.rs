@@ -609,8 +609,15 @@ fn read_ref_file(path: &Path) -> Option<String> {
     if bytes.len() as u64 > crate::mentions::MAX_MENTION_FILE_BYTES {
         let keep = crate::mentions::MAX_MENTION_FILE_BYTES as usize;
         let mut end = keep.min(text.len());
-        while end > 0 && !text.is_char_boundary(end) {
+        // A UTF-8 char is at most 4 bytes, so the previous char boundary
+        // is at most 3 bytes back. Bounding the walk keeps the loop from
+        // hanging forever if `end -= 1` is ever replaced by a no-op
+        // (e.g. the `/=` mutant): the loop exits after 3 steps and the
+        // test fails on the wrong output instead of timing out.
+        let mut steps = 0;
+        while end > 0 && !text.is_char_boundary(end) && steps < 3 {
             end -= 1;
+            steps += 1;
         }
         text.truncate(end);
         text.push_str("\n[truncated: file exceeds the 512 KiB mention cap]");
