@@ -8,7 +8,12 @@ pub const MAX_IMPORT_DEPTH: usize = 4;
 /// Maximum size of a single `@import`ed file. SPEC C4.6 skips memory
 /// files over 4 MiB; imports get the same bound (issue #331) so one
 /// `@` line can never pull an unbounded file into the system prompt.
-pub const MAX_IMPORT_BYTES: u64 = 4 * 1024 * 1024;
+pub const MAX_IMPORT_BYTES: u64 = MAX_MEMORY_BYTES;
+
+/// Maximum size of a single memory file. SPEC C4.6 skips memory files
+/// over 4 MiB (issue #397); imports share the bound via
+/// `MAX_IMPORT_BYTES`.
+pub const MAX_MEMORY_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryFile {
@@ -58,11 +63,64 @@ pub fn memory_files_with_root(
     )
 }
 
+/// Load memory files, skipping every file matched by `excludes`
+/// (SPEC C4.6 `zenMdExcludes`: absolute-path globs). The managed file
+/// can never be excluded.
+pub fn memory_files_with_excludes(
+    cwd: &Path,
+    home: Option<&Path>,
+    excludes: &[String],
+    trusted: bool,
+) -> Vec<(PathBuf, String)> {
+    memory_files_with_managed_excludes(
+        cwd,
+        home,
+        Some(Path::new(MANAGED_MEMORY_PATH)),
+        None,
+        excludes,
+        trusted,
+    )
+}
+
+/// Like [`memory_files_with_excludes`], stopping the ancestor walk at
+/// `root` (inclusive, issue #395). Production callers must use this so
+/// memory files above the project root never load.
+pub fn memory_files_with_root_and_excludes(
+    cwd: &Path,
+    home: Option<&Path>,
+    root: &Path,
+    excludes: &[String],
+    trusted: bool,
+) -> Vec<(PathBuf, String)> {
+    memory_files_with_managed_excludes(
+        cwd,
+        home,
+        Some(Path::new(MANAGED_MEMORY_PATH)),
+        Some(root),
+        excludes,
+        trusted,
+    )
+}
+
 pub fn memory_files_with_managed(
     cwd: &Path,
     home: Option<&Path>,
     managed: Option<&Path>,
     root: Option<&Path>,
+    trusted: bool,
+) -> Vec<(PathBuf, String)> {
+    memory_files_with_managed_excludes(cwd, home, managed, root, &[], trusted)
+}
+
+/// Load memory files with an explicit managed file and root bound,
+/// skipping every file matched by `excludes` (SPEC C4.6
+/// `zenMdExcludes`). The managed file can never be excluded.
+pub fn memory_files_with_managed_excludes(
+    cwd: &Path,
+    home: Option<&Path>,
+    managed: Option<&Path>,
+    root: Option<&Path>,
+    excludes: &[String],
     trusted: bool,
 ) -> Vec<(PathBuf, String)> {
     let home_dir = home.map(Path::to_path_buf).or_else(dirs::home_dir);
@@ -74,6 +132,8 @@ pub fn memory_files_with_managed(
         // in through an import that looks relative.
         trusted,
         project_root: canonicalize(&abs_path(cwd)),
+        managed: managed.map(normalize),
+        excludes: build_excludes(excludes),
         seen: HashSet::new(),
         out: Vec::new(),
     };
@@ -118,6 +178,22 @@ pub fn memory_files_with_managed(
     loader.out
 }
 
+/// Compile `zenMdExcludes` patterns (SPEC C4.6: absolute-path globs)
+/// into a matcher. Invalid patterns are ignored, never fatal: a typo
+/// in settings must not break session start.
+fn build_excludes(patterns: &[String]) -> globset::GlobSet {
+    let mut builder = globset::GlobSetBuilder::new();
+    for pat in patterns {
+        if let Ok(glob) = globset::GlobBuilder::new(pat)
+            .literal_separator(true)
+            .build()
+        {
+            builder.add(glob);
+        }
+    }
+    builder.build().unwrap_or_default()
+}
+
 struct Loader {
     home: Option<PathBuf>,
 
@@ -128,6 +204,11 @@ struct Loader {
     /// Canonicalised project root the confinement check is measured
     /// against.
     project_root: PathBuf,
+    /// The managed file, normalised. SPEC C4.6: it can never be
+    /// excluded by `zenMdExcludes` (issue #397).
+    managed: Option<PathBuf>,
+    /// Compiled `zenMdExcludes` globs (issue #397).
+    excludes: globset::GlobSet,
 
     seen: HashSet<PathBuf>,
     out: Vec<(PathBuf, String)>,
@@ -137,6 +218,23 @@ impl Loader {
     fn push_file(&mut self, path: &Path, is_rule: bool, trusted_source: bool) {
         let path = normalize(path);
         if self.seen.contains(&path) || !path.is_file() {
+            return;
+        }
+        // Issue #397: SPEC C4.6 `zenMdExcludes` globs skip files;
+        // the managed file can never be excluded.
+        let is_managed = self.managed.as_ref().is_some_and(|m| *m == path);
+        if !is_managed && self.excluded(&path) {
+            return;
+        }
+        // Issue #397: SPEC C4.6 skips memory files over 4 MiB, so a
+        // single huge ZEN.md / AGENTS.md cannot blow up the context
+        // and the token bill. The file is named so the user can find
+        // and shrink it.
+        if std::fs::metadata(&path)
+            .map(|m| m.len() > MAX_MEMORY_BYTES)
+            .unwrap_or(false)
+        {
+            eprintln!("zen: skipping memory file over 4 MiB: {}", path.display());
             return;
         }
         let Ok(raw) = std::fs::read_to_string(&path) else {
@@ -153,6 +251,17 @@ impl Loader {
         self.seen.insert(path.clone());
         let expanded = self.expand(&body, &path, 0, trusted_source);
         self.out.push((path, expanded));
+    }
+
+    /// Whether an absolute-path glob in `zenMdExcludes` matches this
+    /// file. Paths are compared with `/` separators so a glob written
+    /// on any platform matches on every platform.
+    fn excluded(&self, path: &Path) -> bool {
+        if self.excludes.is_empty() {
+            return false;
+        }
+        let slash = path.to_string_lossy().replace('\\', "/");
+        self.excludes.is_match(slash.as_str())
     }
 
     fn expand(&mut self, content: &str, file: &Path, depth: usize, file_trusted: bool) -> String {
@@ -524,7 +633,31 @@ fn render_memory_section(path: &Path, content: &str) -> String {
 /// Unbounded (walks to `/`); production callers use
 /// `memory_prompt_with_root` with the project root (issue #395).
 pub fn memory_prompt(cwd: &Path, home: Option<&Path>, trusted: bool) -> String {
-    memory_prompt_with_root_impl(cwd, home, None, trusted)
+    memory_prompt_with_root_impl(cwd, home, None, &[], trusted)
+}
+
+/// Like [`memory_prompt`], skipping every file matched by `excludes`
+/// (SPEC C4.6 `zenMdExcludes`).
+pub fn memory_prompt_with_excludes(
+    cwd: &Path,
+    home: Option<&Path>,
+    excludes: &[String],
+    trusted: bool,
+) -> String {
+    memory_prompt_with_root_impl(cwd, home, None, excludes, trusted)
+}
+
+/// Like [`memory_prompt_with_excludes`], stopping the ancestor walk at
+/// `root` (inclusive, issue #395). Production callers must use this so
+/// memory files above the project root never reach the system prompt.
+pub fn memory_prompt_with_root_and_excludes(
+    cwd: &Path,
+    home: Option<&Path>,
+    root: &Path,
+    excludes: &[String],
+    trusted: bool,
+) -> String {
+    memory_prompt_with_root_impl(cwd, home, Some(root), excludes, trusted)
 }
 
 /// Render the loaded memory files as a system-prompt section,
@@ -536,20 +669,22 @@ pub fn memory_prompt_with_root(
     root: &Path,
     trusted: bool,
 ) -> String {
-    memory_prompt_with_root_impl(cwd, home, Some(root), trusted)
+    memory_prompt_with_root_impl(cwd, home, Some(root), &[], trusted)
 }
 
 fn memory_prompt_with_root_impl(
     cwd: &Path,
     home: Option<&Path>,
     root: Option<&Path>,
+    excludes: &[String],
     trusted: bool,
 ) -> String {
-    let files = memory_files_with_managed(
+    let files = memory_files_with_managed_excludes(
         cwd,
         home,
         Some(Path::new(MANAGED_MEMORY_PATH)),
         root,
+        excludes,
         trusted,
     );
     if files.is_empty() {
@@ -593,7 +728,30 @@ fn display_path(path: &Path, home: Option<&Path>) -> String {
 /// Unbounded (walks to `/`); production callers use
 /// `memories_report_with_root` with the project root (issue #395).
 pub fn memories_report(cwd: &Path, home: Option<&Path>, trusted: bool) -> String {
-    memories_report_with_root_impl(cwd, home, None, trusted)
+    memories_report_with_root_impl(cwd, home, None, &[], trusted)
+}
+
+/// Like [`memories_report`], skipping every file matched by `excludes`
+/// (SPEC C4.6 `zenMdExcludes`).
+pub fn memories_report_with_excludes(
+    cwd: &Path,
+    home: Option<&Path>,
+    excludes: &[String],
+    trusted: bool,
+) -> String {
+    memories_report_with_root_impl(cwd, home, None, excludes, trusted)
+}
+
+/// Like [`memories_report_with_excludes`], stopping the ancestor walk at
+/// `root` (inclusive, issue #395).
+pub fn memories_report_with_root_and_excludes(
+    cwd: &Path,
+    home: Option<&Path>,
+    root: &Path,
+    excludes: &[String],
+    trusted: bool,
+) -> String {
+    memories_report_with_root_impl(cwd, home, Some(root), excludes, trusted)
 }
 
 /// List the loaded memory files with token counts, stopping the
@@ -605,20 +763,22 @@ pub fn memories_report_with_root(
     root: &Path,
     trusted: bool,
 ) -> String {
-    memories_report_with_root_impl(cwd, home, Some(root), trusted)
+    memories_report_with_root_impl(cwd, home, Some(root), &[], trusted)
 }
 
 fn memories_report_with_root_impl(
     cwd: &Path,
     home: Option<&Path>,
     root: Option<&Path>,
+    excludes: &[String],
     trusted: bool,
 ) -> String {
-    let files = memory_files_with_managed(
+    let files = memory_files_with_managed_excludes(
         cwd,
         home,
         Some(Path::new(MANAGED_MEMORY_PATH)),
         root,
+        excludes,
         trusted,
     );
     let mut sections: Vec<(PathBuf, String)> = Vec::new();
@@ -1625,5 +1785,109 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert_eq!(names, vec!["at_cap.md"]);
+    }
+    // Issue #397: a memory file over 4 MiB is skipped (SPEC C4.6),
+    // trusted or not. The size is hardcoded so a mutant that shrinks
+    // the constant cannot shrink the test file with it.
+    #[test]
+    fn issue_397_memory_file_over_4mib_skipped() {
+        assert_eq!(MAX_MEMORY_BYTES, 4_194_304);
+        const OVER_BYTES: usize = 4_194_304 + 1;
+        let tmp = TempDir::new();
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let marker = "BIG-MEMORY-MARKER\n";
+        let mut big = String::from(marker);
+        big.push_str(&"x".repeat(OVER_BYTES - marker.len()));
+        assert_eq!(big.len(), OVER_BYTES);
+        fs::write(proj.join("ZEN.md"), big).unwrap();
+
+        let files = memory_files_with_root(&proj, None, tmp.path(), true);
+        assert!(
+            !files.iter().any(|(p, _)| p.ends_with("proj/ZEN.md")),
+            "over-4-MiB memory file loaded into the prompt"
+        );
+    }
+
+    // Issue #397: a memory file of exactly 4 MiB is still loaded;
+    // the cap is a strict upper bound (`>`, not `>=`).
+    #[test]
+    fn issue_397_memory_file_at_4mib_kept() {
+        const EDGE_BYTES: usize = 4_194_304;
+        let tmp = TempDir::new();
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let marker = "EDGE-MEMORY-MARKER\n";
+        let mut edge = String::from(marker);
+        edge.push_str(&"x".repeat(EDGE_BYTES - marker.len()));
+        assert_eq!(edge.len(), EDGE_BYTES);
+        fs::write(proj.join("ZEN.md"), edge).unwrap();
+
+        let files = memory_files_with_root(&proj, None, tmp.path(), true);
+        let top = files
+            .iter()
+            .find(|(p, _)| p.ends_with("proj/ZEN.md"))
+            .unwrap();
+        assert!(top.1.contains("EDGE-MEMORY-MARKER"));
+    }
+
+    // Issue #397: zenMdExcludes globs (absolute paths) skip matching
+    // memory files; non-matching files still load.
+    #[test]
+    fn issue_397_zen_md_excludes_skips_matching_file() {
+        let tmp = TempDir::new();
+        let home = tmp.path().join("home");
+        let proj = tmp.path().join("proj");
+        let sub = proj.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(proj.join("ZEN.md"), "skip me").unwrap();
+        fs::write(sub.join("ZEN.md"), "keep me").unwrap();
+
+        let excludes = vec![proj.join("ZEN.md").to_string_lossy().to_string()];
+        // cwd is the subdir: the ancestor walk loads proj/ZEN.md
+        // (excluded) and sub/ZEN.md (kept).
+        let files = memory_files_with_excludes(&sub, Some(&home), &excludes, true);
+        assert!(
+            !files.iter().any(|(p, _)| p.ends_with("proj/ZEN.md")),
+            "excluded memory file loaded: {:?}",
+            files.iter().map(|(p, _)| p).collect::<Vec<_>>()
+        );
+        assert!(files.iter().any(|(_, c)| c.trim() == "keep me"));
+    }
+
+    // Issue #397: a `*` glob in zenMdExcludes matches within one
+    // directory, and the managed file can never be excluded (SPEC
+    // C4.6) even when a glob matches it.
+    #[test]
+    fn issue_397_zen_md_excludes_glob_and_managed_kept() {
+        let tmp = TempDir::new();
+        let home = tmp.path().join("home");
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let managed = tmp.path().join("managed.md");
+        fs::write(&managed, "managed memory").unwrap();
+        fs::write(proj.join("ZEN.md"), "skip me").unwrap();
+
+        let excludes = vec![
+            format!("{}/*", proj.display()),
+            managed.to_string_lossy().to_string(),
+        ];
+        let files = memory_files_with_managed_excludes(
+            &proj,
+            Some(&home),
+            Some(&managed),
+            Some(tmp.path()),
+            &excludes,
+            true,
+        );
+        assert!(
+            !files.iter().any(|(p, _)| p.ends_with("proj/ZEN.md")),
+            "glob-excluded memory file loaded"
+        );
+        assert!(
+            files.iter().any(|(_, c)| c.trim() == "managed memory"),
+            "managed file was excluded: {:?}",
+            files.iter().map(|(p, _)| p).collect::<Vec<_>>()
+        );
     }
 }

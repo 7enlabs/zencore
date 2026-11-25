@@ -14,3 +14,4 @@ tokio.workspace = true
 regex.workspace = true
 dirs.workspace = true
 futures.workspace = true
+globset.workspace = true

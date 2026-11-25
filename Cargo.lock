@@ -3773,6 +3773,7 @@ dependencies = [
  "async-trait",
  "dirs",
  "futures",
+ "globset",
  "regex",
  "serde",
  "serde_json",

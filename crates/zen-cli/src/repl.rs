@@ -2017,7 +2017,13 @@ async fn handle_slash(
             "{}",
             commands::context_report(
                 &agent.config.system_prompt,
-                &zen_ext::memory_prompt_with_root(cwd, home, cwd, cfg.folder_trusted),
+                &zen_ext::memory_prompt_with_root_and_excludes(
+                    cwd,
+                    home,
+                    cwd,
+                    &cfg.zen_md_excludes,
+                    cfg.folder_trusted,
+                ),
                 &agent.tools_for_request(),
                 agent.messages(),
                 agent.config.context_window,
@@ -2557,14 +2563,26 @@ async fn handle_slash(
             }
         }
         "/memory" => {
-            for (p, _) in zen_ext::memory_files_with_root(cwd, home, cwd, cfg.folder_trusted) {
+            for (p, _) in zen_ext::memory_files_with_root_and_excludes(
+                cwd,
+                home,
+                cwd,
+                &cfg.zen_md_excludes,
+                cfg.folder_trusted,
+            ) {
                 println!("{}", p.display());
             }
         }
         "/memories" => {
             println!(
                 "{}",
-                zen_ext::memories_report_with_root(cwd, home, cwd, cfg.folder_trusted)
+                zen_ext::memories_report_with_root_and_excludes(
+                    cwd,
+                    home,
+                    cwd,
+                    &cfg.zen_md_excludes,
+                    cfg.folder_trusted,
+                )
             );
         }
         "/todos" => {
@@ -2944,7 +2962,8 @@ fn build_repl_config(
     let mut config = zen_agent::AgentConfig {
         model: cfg.model.clone(),
         fallback_models: cfg.fallback_models.clone(),
-        system_prompt: crate::build_system_prompt(cli, cwd, None).unwrap_or_default(),
+        system_prompt: crate::build_system_prompt(cli, cwd, None, &cfg.zen_md_excludes)
+            .unwrap_or_default(),
         max_turns: cfg.max_turns.max(1),
         loop_stuck_k: cfg.loop_stuck_k,
         permission_mode: crate::agent_run::core_mode(cfg.permission_mode),

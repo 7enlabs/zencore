@@ -1985,7 +1985,7 @@ async fn build_acp_session(
     }
     assembly.subagent_sink.set(sink.clone());
 
-    let system_prompt = crate::build_system_prompt(cli, cwd, home)?;
+    let system_prompt = crate::build_system_prompt(cli, cwd, home, &cfg.zen_md_excludes)?;
     let llm: Arc<dyn LlmBackend> = cfg.llm_client(sink.clone());
     let mut agent_config = agent_run::base_agent_config(&cfg, cli, &system_prompt);
     agent_config.diagnostics_provider = assembly.diagnostics_provider.clone();

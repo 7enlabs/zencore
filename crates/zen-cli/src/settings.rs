@@ -190,6 +190,10 @@ pub struct ResolvedConfig {
 
     pub folder_trusted: bool,
 
+    /// Merged `zenMdExcludes` setting (SPEC C4.6): absolute-path
+    /// globs of memory files to skip at session start.
+    pub zen_md_excludes: Vec<String>,
+
     pub trust_skipped: Vec<String>,
 
     pub rate_gate: zen_agent::RateGateSettings,
@@ -352,6 +356,7 @@ pub fn merge_settings(base: &Settings, over: &Settings) -> Settings {
         out.api_key_env = over.api_key_env.clone();
     }
     dedup_append(&mut out.fallback_models, &over.fallback_models);
+    dedup_append(&mut out.zen_md_excludes, &over.zen_md_excludes);
 
     dedup_append(&mut out.permissions.allow, &over.permissions.allow);
     dedup_append(&mut out.permissions.ask, &over.permissions.ask);
@@ -1030,6 +1035,7 @@ pub fn resolve_config_with_home(
         setting_sources: enabled_sources.clone(),
         bypass_forbidden: loaded.bypass_forbidden,
         folder_trusted,
+        zen_md_excludes: merged.zen_md_excludes.clone(),
         trust_skipped,
         rate_gate: rate_gate_settings(&merged.rate_gate),
         mention_token_budget: crate::mentions::mention_token_budget(merged.extra.get("mentions")),
@@ -1112,6 +1118,25 @@ mod tests {
         // And a default override leaves the base untouched.
         let untouched = merge_settings(&base, &Settings::default());
         assert_eq!(untouched, base);
+    }
+
+    #[test]
+    fn merge_settings_dedups_zen_md_excludes() {
+        // Issue #397: zenMdExcludes layers merge like fallbackModels:
+        // project globs append to user globs, duplicates dropped.
+        let base = Settings {
+            zen_md_excludes: vec!["/abs/skip.md".to_string()],
+            ..Default::default()
+        };
+        let over = Settings {
+            zen_md_excludes: vec!["/abs/skip.md".to_string(), "/abs/other/**".to_string()],
+            ..Default::default()
+        };
+        let merged = merge_settings(&base, &over);
+        assert_eq!(
+            merged.zen_md_excludes,
+            vec!["/abs/skip.md".to_string(), "/abs/other/**".to_string()]
+        );
     }
 
     #[test]

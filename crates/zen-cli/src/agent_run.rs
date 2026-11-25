@@ -1152,7 +1152,13 @@ pub(crate) async fn run_agent_with_result(args: AgentRunArgs<'_>) -> Result<(i32
             "mcp" => Some(commands::mcp_report(&assembly.mcp_status)),
             "context" => Some(commands::context_report(
                 &agent.config.system_prompt,
-                &zen_ext::memory_prompt_with_root(cwd, home, cwd, cfg.folder_trusted),
+                &zen_ext::memory_prompt_with_root_and_excludes(
+                    cwd,
+                    home,
+                    cwd,
+                    &cfg.zen_md_excludes,
+                    cfg.folder_trusted,
+                ),
                 &agent.tools_for_request(),
                 agent.messages(),
                 agent.config.context_window,
@@ -1743,7 +1749,13 @@ pub(crate) async fn run_session_start(
     // `InstructionsLoaded`: one event per memory file (ZEN.md / AGENTS.md
     // / rules) loaded into context at session start. The matcher filters
     // on the load reason (`session_start` here).
-    for (path, _) in zen_ext::memory_files_with_root(cwd, None, cwd, cfg.folder_trusted) {
+    for (path, _) in zen_ext::memory_files_with_root_and_excludes(
+        cwd,
+        None,
+        cwd,
+        &cfg.zen_md_excludes,
+        cfg.folder_trusted,
+    ) {
         let _ = hooks
             .run(
                 HookEvent::InstructionsLoaded,
