@@ -505,7 +505,7 @@ exclude_re = [
   # equivalent: remove this exclusion and kill it with a test.
   "lib\\.rs:1453:9: replace SubAgentRunner::take_child_spend -> ChildSpend with Default::default\\(\\)",
   # PR #521 (issue #387), lsp.rs LspManager::check_respawn_backoff
-  # (line 1194, col 32): replace match guard `!remaining.is_zero()`
+  # (line 1200, col 32): replace match guard `!remaining.is_zero()`
   # with true.
   # EQUIVALENT (waived by ZC Leader, 2026-11-25; verified by reading
   # check_respawn_backoff): `remaining` is
@@ -520,5 +520,9 @@ exclude_re = [
   # instant (for example it rounds the elapsed time, or the guard is
   # rewritten to compare seconds), this mutant stops being equivalent:
   # remove this exclusion and kill it with a test.
-  "lsp\\.rs:1194:32: replace match guard !remaining\\.is_zero\\(\\) with true in LspManager::check_respawn_backoff",
+  # NOTE (2026-11-25, PR #521 follow-up): the rebase + follow-up moved
+  # the guard from line 1194 to line 1200; exclusion updated to match.
+  # CI shard mutants (10) on head 5ce94973 failed on this mutant
+  # because the stale 1194 number did not match.
+  "lsp\\.rs:1200:32: replace match guard !remaining\\.is_zero\\(\\) with true in LspManager::check_respawn_backoff",
 ]
