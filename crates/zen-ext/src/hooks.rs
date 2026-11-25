@@ -114,16 +114,30 @@ impl CommandHooks {
                     Some(s) if s.eq_ignore_ascii_case("block") => OnFailure::Block,
                     _ => OnFailure::Ignore,
                 };
-                if out.iter().any(|s| s.command == command && s.args == args) {
-                    continue;
-                }
-                out.push(CommandHookSpec {
+                // Issue #393: dedupe on the execution-relevant fields, not
+                // on (command, args) alone. Two specs for the same command
+                // that differ in timeout or on_failure are different hooks:
+                // dropping the second one could silently drop a
+                // block-on-failure hook. `matcher` is intentionally excluded:
+                // it is only a routing filter (already applied above) and is
+                // never read when the hook runs, so the same hook listed
+                // under two matchers is still one hook.
+                let spec = CommandHookSpec {
                     matcher: matcher.map(str::to_string),
                     command: command.to_string(),
                     args,
                     timeout_secs,
                     on_failure,
-                });
+                };
+                if out.iter().any(|s| {
+                    s.command == spec.command
+                        && s.args == spec.args
+                        && s.timeout_secs == spec.timeout_secs
+                        && s.on_failure == spec.on_failure
+                }) {
+                    continue;
+                }
+                out.push(spec);
             }
         }
         out
@@ -1455,6 +1469,59 @@ mod tests {
             "hooks should run concurrently"
         );
         assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 1);
+    }
+
+    // Issue #393: specs for the same command that differ in timeout or
+    // on_failure are different hooks and must both survive dedupe; only
+    // exact duplicates are dropped.
+    #[test]
+    fn issue_393_dedupe_keeps_specs_differing_in_timeout_or_on_failure() {
+        let tmp = TempDir::new();
+        let hooks = json!({"PreToolUse": [
+            {"matcher": "Bash", "hooks": [
+                {"type": "command", "command": "true", "timeout": 30, "onFailure": "block"},
+                {"type": "command", "command": "true", "timeout": 60, "onFailure": "ignore"},
+            ]},
+            {"matcher": "Bash", "hooks": [
+                {"type": "command", "command": "true", "timeout": 30, "onFailure": "block"},
+            ]},
+        ]});
+        let r = runner(hooks, tmp.path());
+        let specs = r.matching_specs(HookEvent::PreToolUse, "Bash");
+        assert_eq!(specs.len(), 2);
+        assert!(
+            specs
+                .iter()
+                .any(|s| s.timeout_secs == 30 && s.on_failure == OnFailure::Block),
+            "the block-on-failure spec must survive dedupe"
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|s| s.timeout_secs == 60 && s.on_failure == OnFailure::Ignore),
+            "the differing-timeout spec must survive dedupe"
+        );
+    }
+
+    // Issue #393: the exact reported harm - a block-on-failure hook listed
+    // after an ignore twin for the same command must still block the event.
+    // on_failure only bites on spawn failure / timeout (exit codes go through
+    // interpret_output, which blocks on exit 2 regardless), so the twins
+    // sleep past a 1s timeout instead of exiting 2.
+    #[tokio::test]
+    async fn issue_393_block_hook_survives_when_ignore_twin_exists() {
+        let tmp = TempDir::new();
+        let hooks = json!({"PreToolUse": [
+            {"matcher": "Bash", "hooks": [
+                {"type": "command", "command": "sleep 5", "timeout": 1, "onFailure": "ignore"},
+            ]},
+            {"matcher": "Bash", "hooks": [
+                {"type": "command", "command": "sleep 5", "timeout": 1, "onFailure": "block"},
+            ]},
+        ]});
+        let r = runner(hooks, tmp.path());
+        let out = run_ev(&r, HookEvent::PreToolUse, "Bash", json!({})).await;
+        assert!(out.blocked, "the block-on-failure hook must not vanish");
     }
 
     #[tokio::test]
