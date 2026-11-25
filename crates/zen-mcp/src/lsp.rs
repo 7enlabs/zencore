@@ -376,7 +376,13 @@ impl LspClient {
         let mut cmd = tokio::process::Command::new(command);
         cmd.args(args);
 
-        for name in ["ZEN_API_KEY", "OPENAI_API_KEY"] {
+        // Strip every known provider API key, not just the two defaults:
+        // on the provider-routed path the live key (GROQ_API_KEY, ...)
+        // would otherwise be inherited by the language server child
+        // (issue #523). LspClient has no ResolvedConfig, so there is no
+        // configured name to add: None covers the defaults plus the
+        // whole registry list.
+        for name in zen_core::all_api_key_env_names(None) {
             cmd.env_remove(name);
         }
         cmd.stdin(Stdio::piped());
