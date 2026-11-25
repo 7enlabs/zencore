@@ -1416,4 +1416,182 @@ mod tests {
             assert_eq!(pair[1]["parentUuid"], pair[0]["uuid"]);
         }
     }
+
+    #[test]
+    fn normalize_path_form_lowercases_and_unifies_separators() {
+        // Kills the cargo-mutants "replace body with String::new() /
+        // "xyzzy" mutants on normalize_path_form (line 91): a constant
+        // return makes every decoded path compare equal in the drift
+        // fallback of latest_session_for_cwd, so --continue could resolve
+        // to a sibling project's session. The existing case-variant test
+        // has only one sibling directory, so it passes under the mutant.
+        assert_eq!(normalize_path_form("/A/B.C"), "/a/b.c");
+        assert_eq!(
+            normalize_path_form(r"C:\Users\Runner\Work"),
+            "c:/users/runner/work"
+        );
+        assert_eq!(normalize_path_form("/a\\b/c"), "/a/b/c");
+        // Punctuation stays significant: `.` vs `-` must not collapse (#458).
+        assert_ne!(normalize_path_form("/a/b.c"), normalize_path_form("/a/b-c"));
+        assert_eq!(normalize_path_form(""), "");
+    }
+
+    #[test]
+    fn migrate_legacy_project_dir_skips_when_legacy_and_new_coincide() {
+        // Kills the `||` -> `&&` mutant on the early-return guard (line
+        // 110). A relative cwd that does not exist on disk makes
+        // canonicalize() fail, so both encoders fall back to the path as
+        // given and agree on the name (only file-name-safe chars), and the
+        // legacy directory IS the new directory. Production cwds are
+        // absolute, so this coincidence is only reachable here; the test
+        // pins the guard's intended logic directly.
+        let base = std::env::temp_dir().join(format!("zen_mut2_{}", Uuid::new_v4()));
+        let home = base.join("home");
+        let rel = format!("zen_mut2_rel_{}", Uuid::new_v4());
+        let rel_cwd = Path::new(&rel);
+        let legacy_dir = project_dir(&home, &encode_cwd(rel_cwd));
+        assert_eq!(legacy_dir, project_dir(&home, &legacy_encode_cwd(rel_cwd)));
+        fs::create_dir_all(&legacy_dir).unwrap();
+        // A session belonging to another project, stranded in the shared dir.
+        let other_cwd = format!("/tmp/zen-mut2-other-{}", Uuid::new_v4());
+        let other_path = legacy_dir.join("other.jsonl");
+        append_typed(
+            &other_path,
+            "user",
+            "other",
+            &other_cwd,
+            "u",
+            None,
+            Some(serde_json::json!({"role":"user","content":"hi"})),
+            None,
+        )
+        .unwrap();
+        // Correct code returns early: nothing moves, the directory stays.
+        // Under the `&&` mutant the guard no longer fires, the foreign
+        // file is migrated out to its owner's directory and the legacy
+        // directory is removed.
+        migrate_legacy_project_dir(&home, rel_cwd);
+        assert!(
+            legacy_dir.exists(),
+            "legacy dir must survive when it coincides with the new dir"
+        );
+        assert!(
+            other_path.exists(),
+            "foreign session must stay put when migration is skipped"
+        );
+        assert!(
+            !project_dir(&home, &encode_cwd(Path::new(&other_cwd)))
+                .join("other.jsonl")
+                .exists()
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn latest_session_prefers_old_timestamp_over_missing_timestamp() {
+        // Kills the cargo-mutants mutants replacing the (i64::MIN, 0)
+        // fallback in recorded_timestamp_key (line 355) with (-1, 1),
+        // (0, 0) or (1, 1): a session with no parseable timestamp must sort
+        // before ANY timestamped session, even one from 1960. The existing
+        // latest_session_picks_newest test stamps both files with now, so
+        // the fallback is never exercised there.
+        let base = std::env::temp_dir().join(format!("zen_mut3_{}", Uuid::new_v4()));
+        let home = base.join("home");
+        let cwd = base.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        let dir = project_dir(&home, &encode_cwd(&cwd));
+        fs::create_dir_all(&dir).unwrap();
+        let cwd_str = cwd.to_str().unwrap();
+        // No parseable timestamp: the fallback (i64::MIN, 0) applies.
+        let no_ts = dir.join("aaa-no-ts.jsonl");
+        fs::write(
+            &no_ts,
+            serde_json::json!({
+                "type": "user",
+                "uuid": "u1",
+                "session_id": "aaa-no-ts",
+                "cwd": cwd_str,
+                "message": {"role": "user", "content": "hi"},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(recorded_timestamp_key(&no_ts), (i64::MIN, 0));
+        // A real timestamp from 1960: negative unix seconds, still newer
+        // than "no timestamp at all".
+        let old = dir.join("zzz-old.jsonl");
+        fs::write(
+            &old,
+            serde_json::json!({
+                "type": "user",
+                "uuid": "u2",
+                "session_id": "zzz-old",
+                "timestamp": "1960-01-01T00:00:00+00:00",
+                "cwd": cwd_str,
+                "message": {"role": "user", "content": "hi"},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(recorded_timestamp_key(&old), (-315619200, 0));
+        // Behavioural check: --continue resolves to the 1960 session, not
+        // the timestamp-less one. Under any of the three fallback mutants
+        // the timestamp-less file's key (-1/0/1, ...) beats 1960 and wins.
+        let latest = latest_session_for_cwd(&home, &encode_cwd(&cwd)).unwrap();
+        assert_eq!(latest.file_name().unwrap(), "zzz-old.jsonl");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn list_sessions_for_cwd_filters_legacy_dir_by_recorded_cwd() {
+        // Kills the `!=` -> `==` mutant in sessions_in_dir (line 660):
+        // the legacy-directory filter must KEEP a file whose recorded cwd
+        // encodes to the wanted cwd and SKIP the others. Under the mutant
+        // the filter inverts, so each project lists the OTHER project's
+        // session. The existing migration test only asserts the list LENGTH
+        // (1) for each cwd, which stays 1 under the mutant - only the
+        // identity flips.
+        let base = std::env::temp_dir().join(format!("zen_mut4_{}", Uuid::new_v4()));
+        let home = base.join("home");
+        let cwd_dot = base.join("a").join("b.c");
+        let cwd_slash = base.join("a").join("b").join("c");
+        for d in [&cwd_dot, &cwd_slash] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let legacy_dir = home
+            .join(".zen")
+            .join("projects")
+            .join(legacy_encode(&cwd_dot));
+        assert_eq!(
+            legacy_dir,
+            home.join(".zen")
+                .join("projects")
+                .join(legacy_encode(&cwd_slash))
+        );
+        fs::create_dir_all(&legacy_dir).unwrap();
+        for (id, cwd) in [("old-dot", &cwd_dot), ("old-slash", &cwd_slash)] {
+            let p = legacy_dir.join(format!("{id}.jsonl"));
+            append_typed(
+                &p,
+                "user",
+                id,
+                cwd.to_str().unwrap(),
+                "u",
+                None,
+                Some(serde_json::json!({"role":"user","content":"hi"})),
+                None,
+            )
+            .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        // Each project lists exactly its own legacy session - identity,
+        // not just count.
+        let dot_list = list_sessions_for_cwd(&home, &cwd_dot);
+        assert_eq!(dot_list.len(), 1);
+        assert_eq!(dot_list[0].0, "old-dot");
+        let slash_list = list_sessions_for_cwd(&home, &cwd_slash);
+        assert_eq!(slash_list.len(), 1);
+        assert_eq!(slash_list[0].0, "old-slash");
+        let _ = fs::remove_dir_all(&base);
+    }
 }
