@@ -2197,4 +2197,166 @@ mod tests {
             "hook child lost its normal env: {feedback}"
         );
     }
+    // #391 mutant kills: the byte-cap arithmetic at hooks.rs:20 and the
+    // probe logic in `read_capped` (hooks.rs:482/484). Each test pins an
+    // exact boundary so a one-operator mutation changes an observed
+    // length or flag:
+    // - exactly HOOK_OUTPUT_CAP_BYTES bytes: kept whole, not truncated.
+    //   Kills `*` -> `+` at 20:56 (cap 10_005), `+` -> `-`/`*` at 20:60
+    //   (cap 39_999/40_000), `+` -> `-` at 482:64 (take 40_000), and
+    //   `>` -> `>=`/`==` at 484:28 (40_001 reported truncated).
+    // - one byte over the cap: kept at exactly the cap, truncated.
+    //   Kills `+` -> `*` at 482:64 (take 40_001 reads only the cap, so
+    //   the extra byte is never seen) and `>` -> `==`/`<` at 484:28.
+    // - a huge stream: kept at exactly the cap, truncated.
+    /// Absolute byte cap the reader must enforce: HOOK_OUTPUT_LIMIT
+    /// chars (10_000) at up to 4 bytes each, plus one probe byte.
+    /// Written out instead of reusing HOOK_OUTPUT_CAP_BYTES on purpose:
+    /// the tests pin the cap's VALUE, so mutating the arithmetic at
+    /// hooks.rs:20 (e.g. star to plus, cap 10_005) changes what the code
+    /// keeps but not what the test expects, and the test fails.
+    const EXPECTED_CAP_BYTES: usize = 40_001;
+
+    #[tokio::test]
+    async fn c391_read_capped_keeps_exact_cap_bytes() {
+        let data = vec![b'x'; EXPECTED_CAP_BYTES];
+        let mut cursor = std::io::Cursor::new(data);
+        let (buf, truncated) = read_capped(&mut cursor).await;
+        assert_eq!(buf.len(), EXPECTED_CAP_BYTES);
+        assert!(
+            !truncated,
+            "a stream ending exactly at the cap is not truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn c391_read_capped_reports_one_byte_over_cap() {
+        let data = vec![b'x'; EXPECTED_CAP_BYTES + 1];
+        let mut cursor = std::io::Cursor::new(data);
+        let (buf, truncated) = read_capped(&mut cursor).await;
+        assert_eq!(buf.len(), EXPECTED_CAP_BYTES);
+        assert!(
+            truncated,
+            "one byte past the cap must be reported truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn c391_read_capped_truncates_huge_stream_to_cap() {
+        let data = vec![b'x'; EXPECTED_CAP_BYTES * 3];
+        let mut cursor = std::io::Cursor::new(data);
+        let (buf, truncated) = read_capped(&mut cursor).await;
+        assert_eq!(buf.len(), EXPECTED_CAP_BYTES);
+        assert!(truncated);
+    }
+
+    // #391 mutant kill: the `||` at hooks.rs:549 combines the two
+    // per-stream flags. A flood on exactly one stream must still mark
+    // the output truncated; `||` -> `&&` would clear it whenever the
+    // other stream stayed under the cap. The producers mirror the
+    // c391 flood tests: an echo loop the bounded reader kills as soon
+    // as the cap is hit.
+    #[tokio::test]
+    async fn c391_stdout_only_flood_marks_output_truncated() {
+        let tmp = TempDir::new();
+        let spec = CommandHookSpec {
+            matcher: None,
+            command: "while true; do echo 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; done"
+                .to_string(),
+            args: None,
+            timeout_secs: 10,
+            on_failure: OnFailure::Ignore,
+        };
+        let out = run_one(
+            &spec,
+            "{}",
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            HookEvent::UserPromptSubmit,
+        )
+        .await;
+        assert!(
+            out.output_truncated,
+            "stdout past the cap must mark the output truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn c391_stderr_only_flood_marks_output_truncated() {
+        let tmp = TempDir::new();
+        let spec = CommandHookSpec {
+            matcher: None,
+            command: "while true; do echo 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' >&2; done"
+                .to_string(),
+            args: None,
+            timeout_secs: 10,
+            on_failure: OnFailure::Ignore,
+        };
+        let out = run_one(
+            &spec,
+            "{}",
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            HookEvent::UserPromptSubmit,
+        )
+        .await;
+        assert!(
+            out.output_truncated,
+            "stderr past the cap must mark the output truncated"
+        );
+    }
+
+    /// Probe entry point for `c391_hook_error_is_logged_to_stderr` below.
+    /// The parent test runs this test as a subprocess (current_exe with
+    /// this test name); it runs a hook that times out with on_failure
+    /// Ignore, so `run` logs the failure to stderr. Without the env var
+    /// it is a no-op, so a plain `cargo test` run is unaffected. If the
+    /// `!` at hooks.rs:342 were deleted, the non-empty error would never
+    /// reach stderr and the parent test would fail.
+    #[tokio::test]
+    async fn __c391_probe_hook_error_logged() {
+        if std::env::var("C391_PROBE_HOOK_ERROR").is_err() {
+            return;
+        }
+        let tmp = TempDir::new();
+        let hooks = hooks_with("UserPromptSubmit", None, "sleep 5", 1);
+        let out = run_ev(
+            &runner(hooks, tmp.path()),
+            HookEvent::UserPromptSubmit,
+            "",
+            json!({}),
+        )
+        .await;
+        assert!(out.failed, "the timed-out hook must report failed");
+    }
+
+    #[test]
+    fn c391_hook_error_is_logged_to_stderr() {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .args([
+                "hooks::tests::__c391_probe_hook_error_logged",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("C391_PROBE_HOOK_ERROR", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "probe run failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("hook error:"),
+            "expected the hook failure on stderr, got: {stderr}"
+        );
+        assert!(
+            stderr.contains("timed out"),
+            "expected the timeout message on stderr, got: {stderr}"
+        );
+    }
 }
