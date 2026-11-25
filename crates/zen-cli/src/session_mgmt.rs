@@ -667,4 +667,32 @@ mod tests {
         let found = find_managed_session(&home, "Cargo.toml");
         assert!(found.is_some(), "session id must still resolve");
     }
+
+    #[test]
+    fn issue_454_archived_flag_correct_for_path_lookup() {
+        // is_archived_path is only consulted on the path branches of
+        // find_managed_session: the id loop reports the flag from
+        // list_all_sessions instead. So a path lookup must return
+        // archived=false for an active session and archived=true for
+        // an archived one. Replacing the function body with `true`
+        // or `false` must fail this test.
+        let home = tmp_home("454arc");
+        let cwd = home.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        let active = make_session(&home, &cwd, "sess-act");
+        make_session(&home, &cwd, "sess-arch");
+        let archived_path = archive_session(&home, "sess-arch").unwrap();
+
+        let (_, active_archived) = find_managed_session(&home, active.to_str().unwrap()).unwrap();
+        assert!(
+            !active_archived,
+            "active session found by path must not be archived"
+        );
+        let (_, archived_archived) =
+            find_managed_session(&home, archived_path.to_str().unwrap()).unwrap();
+        assert!(
+            archived_archived,
+            "archived session found by path must be archived"
+        );
+    }
 }
