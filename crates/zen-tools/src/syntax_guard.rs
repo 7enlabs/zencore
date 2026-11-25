@@ -3,10 +3,69 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
-// 30s: on a loaded Windows CI runner `node --check` can take over 10s;
-// timing out silently passes broken code (main run 44441607802), so give
-// the checker room before giving up.
+// 30s: on a loaded Windows CI runner `node --check` can take over 10s.
+// A timeout used to silently pass broken code (main run 44441607802); the
+// fix then was a longer timeout, but the silent pass remained. Since #325
+// the guard is fail-closed: a checker that cannot run refuses the write
+// instead of reporting a clean pass, so the timeout only buys room.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Outcome of a syntax check: `Ok(None)` means the check ran and passed,
+/// `Ok(Some(msg))` means it ran and found a syntax error, `Err(reason)`
+/// means the check could not run at all (checker binary missing, crashed,
+/// or timed out). The `Err` case must never be treated as a clean pass.
+pub async fn syntax_error(path: &Path, text: &str) -> Result<Option<String>, String> {
+    let Some(lang) = lang_of(path) else {
+        return Ok(None);
+    };
+    match lang {
+        Lang::Json => Ok(
+            serde_json::from_str::<serde_json::Value>(text)
+                .err()
+                .map(|e| e.to_string()),
+        ),
+        Lang::Python => {
+            run_checker(
+                "python3",
+                &["-c", "import ast,sys\nsrc=sys.stdin.read()\ntry:\n ast.parse(src)\nexcept SyntaxError as e:\n print('line %s: %s' % (e.lineno, e.msg)); sys.exit(1)"],
+                text,
+            )
+            .await
+        }
+        Lang::Shell => {
+            let sh = zen_core::resolve_shell("bash");
+            if sh.kind != zen_core::ShellKind::Posix {
+                return Ok(None);
+            }
+            run_checker(&sh.program, &["-n"], text)
+                .await
+                .map(|m| m.map(|m| m.replace("bash: ", "")))
+        }
+        Lang::JavaScript => {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("js");
+            let (tmp, mut f) = create_js_temp(ext)?;
+            {
+                use std::io::Write;
+                if let Err(e) = f.write_all(text.as_bytes()) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(format!(
+                        "failed to write syntax-check temp file {}: {e}",
+                        tmp.display()
+                    ));
+                }
+            }
+            let tmp_str = tmp.to_str().ok_or_else(|| {
+                format!(
+                    "syntax-check temp path is not valid UTF-8: {}",
+                    tmp.display()
+                )
+            })?;
+            let out = run_checker("node", &["--check", tmp_str], "").await;
+            let _ = tokio::fs::remove_file(&tmp).await;
+            out.map(|m| m.map(|m| m.replace(tmp_str, "file")))
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Lang {
@@ -26,45 +85,11 @@ fn lang_of(path: &Path) -> Option<Lang> {
     }
 }
 
-pub async fn syntax_error(path: &Path, text: &str) -> Option<String> {
-    let lang = lang_of(path)?;
-    match lang {
-        Lang::Json => serde_json::from_str::<serde_json::Value>(text).err().map(|e| e.to_string()),
-        Lang::Python => run_checker(
-            "python3",
-            &["-c", "import ast,sys\nsrc=sys.stdin.read()\ntry:\n ast.parse(src)\nexcept SyntaxError as e:\n print('line %s: %s' % (e.lineno, e.msg)); sys.exit(1)"],
-            text,
-        )
-        .await,
-        Lang::Shell => {
-
-            let sh = zen_core::resolve_shell("bash");
-            if sh.kind != zen_core::ShellKind::Posix {
-                return None;
-            }
-            run_checker(&sh.program, &["-n"], text).await.map(|m| m.replace("bash: ", ""))
-        }
-        Lang::JavaScript => {
-
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("js");
-            let (tmp, mut f) = create_js_temp(ext)?;
-            {
-                use std::io::Write;
-                if f.write_all(text.as_bytes()).is_err() {
-                    let _ = std::fs::remove_file(&tmp);
-                    return None;
-                }
-            }
-            let out = run_checker("node", &["--check", tmp.to_str()?], "").await;
-            let _ = tokio::fs::remove_file(&tmp).await;
-            out.map(|m| m.replace(tmp.to_str().unwrap_or(""), "file"))
-        }
-    }
-}
-
 /// Create the temp file `node --check` reads (#326): the file holds the new
 /// content, so it must not be world-readable while the check runs.
-fn create_js_temp(ext: &str) -> Option<(std::path::PathBuf, std::fs::File)> {
+/// Returns `Err` when the file cannot be created (#325: fail closed, the
+/// caller must not treat a missing temp file as a clean pass).
+fn create_js_temp(ext: &str) -> Result<(std::path::PathBuf, std::fs::File), String> {
     let tmp = std::env::temp_dir().join(format!("zen-syntax-{}.{}", random_suffix(), ext));
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
@@ -73,8 +98,13 @@ fn create_js_temp(ext: &str) -> Option<(std::path::PathBuf, std::fs::File)> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let f = opts.open(&tmp).ok()?;
-    Some((tmp, f))
+    let f = opts.open(&tmp).map_err(|e| {
+        format!(
+            "failed to create syntax-check temp file {}: {e}",
+            tmp.display()
+        )
+    })?;
+    Ok((tmp, f))
 }
 
 fn random_suffix() -> String {
@@ -110,7 +140,20 @@ fn random_suffix() -> String {
     )
 }
 
-async fn run_checker(cmd: &str, args: &[&str], text: &str) -> Option<String> {
+/// Runs the external checker. `Ok(None)` means it ran and passed,
+/// `Ok(Some(msg))` means it ran and found a syntax error, `Err(reason)`
+/// means it could not run at all. The `Err` case is a failure of the
+/// guard itself and must never be read as "no error found" (#325).
+async fn run_checker(cmd: &str, args: &[&str], text: &str) -> Result<Option<String>, String> {
+    run_checker_with_timeout(cmd, args, text, CHECK_TIMEOUT).await
+}
+
+async fn run_checker_with_timeout(
+    cmd: &str,
+    args: &[&str],
+    text: &str,
+    timeout: Duration,
+) -> Result<Option<String>, String> {
     let mut child = tokio::process::Command::new(cmd)
         .args(args)
         .stdin(Stdio::piped())
@@ -118,25 +161,31 @@ async fn run_checker(cmd: &str, args: &[&str], text: &str) -> Option<String> {
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .ok()?;
+        .map_err(|e| format!("failed to start checker '{cmd}': {e}"))?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(text.as_bytes()).await;
     }
-    let out = tokio::time::timeout(CHECK_TIMEOUT, child.wait_with_output())
-        .await
-        .ok()?
-        .ok()?;
+    let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return Err(format!("checker '{cmd}' failed while waiting: {e}")),
+        Err(_) => {
+            return Err(format!(
+                "checker '{cmd}' timed out after {}s",
+                timeout.as_secs()
+            ));
+        }
+    };
     if out.status.success() {
-        return None;
+        return Ok(None);
     }
     let mut msg = String::from_utf8_lossy(&out.stdout).to_string();
     msg.push_str(&String::from_utf8_lossy(&out.stderr));
     let msg = msg.trim().to_string();
-    Some(if msg.is_empty() {
+    Ok(Some(if msg.is_empty() {
         "syntax check failed".into()
     } else {
         msg.chars().take(1500).collect()
-    })
+    }))
 }
 
 fn error_line(msg: &str) -> Option<usize> {
@@ -179,6 +228,15 @@ fn refusal(path: &Path, new_text: &str, msg: &str) -> String {
     out
 }
 
+fn refusal_unavailable(path: &Path, reason: &str) -> String {
+    format!(
+        "Error: this change was NOT applied because the syntax guard could not run for {}: {}\n\
+         The file on disk is unchanged. Install or repair the checker, or set ZEN_NO_SYNTAX_GUARD=1 to bypass the guard, then edit again.",
+        path.display(),
+        reason
+    )
+}
+
 pub async fn guard_write(
     path: &Path,
     old_text: Option<&str>,
@@ -187,13 +245,19 @@ pub async fn guard_write(
     if std::env::var_os("ZEN_NO_SYNTAX_GUARD").is_some() {
         return Ok(());
     }
-    let Some(msg) = syntax_error(path, new_text).await else {
-        return Ok(());
+    // Fail closed (#325): a checker that could not run refuses the write
+    // instead of silently passing, so the agent knows the guard did not run.
+    let msg = match syntax_error(path, new_text).await {
+        Ok(Some(msg)) => msg,
+        Ok(None) => return Ok(()),
+        Err(reason) => return Err(refusal_unavailable(path, &reason)),
     };
-    if let Some(old) = old_text
-        && syntax_error(path, old).await.is_some()
-    {
-        return Ok(());
+    if let Some(old) = old_text {
+        // Old text already broken: allow the edit. Old text clean, or its
+        // check could not run (cannot prove it was already broken): stay refused.
+        if let Ok(Some(_)) = syntax_error(path, old).await {
+            return Ok(());
+        }
     }
     Err(refusal(path, new_text, &msg))
 }
@@ -305,6 +369,64 @@ mod tests {
                 guard_write(Path::new("f.js"), Some("let a = 1;\n"), "let a = 2;\n")
                     .await
                     .is_ok()
+            );
+        }
+    }
+
+    // #325: a checker that cannot run must be an error, never a clean pass.
+    #[tokio::test]
+    async fn missing_checker_binary_is_an_error_not_a_clean_pass() {
+        let r = run_checker("zen-no-such-checker-binary-xyz", &["--version"], "x = 1\n").await;
+        assert!(
+            r.is_err(),
+            "missing checker must not report a clean pass: {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checker_timeout_is_an_error_not_a_clean_pass() {
+        if !has("python3") {
+            return;
+        }
+        let r = run_checker_with_timeout(
+            "python3",
+            &["-c", "import time; time.sleep(5)"],
+            "",
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(
+            r.is_err(),
+            "timed-out checker must not report a clean pass: {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_checker_reports_exit_status() {
+        if !has("true") || !has("false") {
+            return;
+        }
+        assert_eq!(run_checker("true", &[], "x = 1\n").await, Ok(None));
+        assert!(matches!(
+            run_checker("false", &[], "x = 1\n").await,
+            Ok(Some(_))
+        ));
+    }
+
+    // #325: on a machine without python3 the check must report
+    // unavailable instead of silently passing. (No-op where python3
+    // exists; the missing-binary case is covered by
+    // missing_checker_binary_is_an_error_not_a_clean_pass, and the
+    // guard_write level by the harness binary, see SUMMARY.md.)
+    #[tokio::test]
+    async fn syntax_error_reports_unavailable_checker() {
+        if !has("python3") {
+            // No python3 here: the check itself must report unavailable,
+            // not silently pass.
+            let r = syntax_error(Path::new("m.py"), "x = 1\n").await;
+            assert!(
+                r.is_err(),
+                "missing python3 must not report a clean pass: {r:?}"
             );
         }
     }
