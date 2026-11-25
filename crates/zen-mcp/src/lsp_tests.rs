@@ -9,8 +9,8 @@ use zen_core::{DiagnosticsProvider, Tool, ToolContext};
 use crate::lsp::LspClient;
 use crate::lsp::{
     LspConnection, LspLanguage, LspManager, col_to_utf16, detect_language, find_binary,
-    find_project_root, parse_locations, parse_publish_diagnostics, path_to_uri, render_hover,
-    server_spec, uri_to_path, utf16_to_col,
+    find_project_root, is_lsp_transport_error, parse_locations, parse_publish_diagnostics,
+    path_to_uri, render_hover, server_key, server_spec, uri_to_path, utf16_to_col,
 };
 use crate::lsp::{MAX_FRAME_BYTES, MAX_HEADER_BYTES, read_frame, write_frame};
 use crate::lsp_tools::{DiagnosticsTool, FindReferencesTool, GotoDefinitionTool, HoverTool};
@@ -214,6 +214,190 @@ import sys
 sys.exit(0)
 "##;
 
+/// Mock server that answers one `textDocument/definition` request and
+/// then exits (#387): the manager must notice the corpse, evict it,
+/// and serve the next call from a fresh server instead of failing
+/// every later call until the process restarts.
+/// Mock server that dies after answering its first textDocument
+/// request (#387), but only on its first start: later starts see the
+/// marker file (`<log>.died`) and stay alive. The first server's death
+/// exercises the evict + respawn path; the respawned server must stay up
+/// so the retry can succeed on it (a mock that died on every start
+/// would make every retry fail too). The one answered request may be a
+/// definition, a hover or a references call, so the same mock covers
+/// the retry arm of all three methods.
+const MOCK_SERVER_DIES_ONCE: &str = r##"#!/usr/bin/env python3
+import sys, json, os
+
+log_path, target_uri = sys.argv[1], sys.argv[2]
+marker = log_path + ".died"
+
+def log(method):
+    with open(log_path, "a") as f:
+        f.write(method + "\n")
+
+def read_msg():
+    headers = {}
+    while True:
+        raw = sys.stdin.buffer.readline()
+        if not raw:
+            return None
+        line = raw.decode("utf-8", "replace")
+        if line in ("\r\n", "\n", ""):
+            break
+        if ":" in line:
+            k, v = line.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+    n = int(headers.get("content-length", "0"))
+    if n <= 0:
+        return None
+    return json.loads(sys.stdin.buffer.read(n).decode("utf-8"))
+
+def send(obj):
+    data = json.dumps(obj).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(data) + data)
+    sys.stdout.buffer.flush()
+
+dies_once = not os.path.exists(marker)
+answered = 0
+while True:
+    msg = read_msg()
+    if msg is None:
+        break
+    method, mid = msg.get("method", ""), msg.get("id")
+    log(method)
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "capabilities": {"textDocumentSync": 2, "definitionProvider": True,
+                             "hoverProvider": True, "referencesProvider": True}}})
+    elif method == "textDocument/definition":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "uri": target_uri,
+            "range": {"start": {"line": 9, "character": 4},
+                      "end": {"line": 9, "character": 12}}}})
+        answered += 1
+    elif method == "textDocument/hover":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "contents": {"kind": "markdown", "value": "**mock** hover"}}})
+        answered += 1
+    elif method == "textDocument/references":
+        send({"jsonrpc": "2.0", "id": mid, "result": [{
+            "uri": target_uri,
+            "range": {"start": {"line": 9, "character": 4},
+                      "end": {"line": 9, "character": 12}}}]})
+        answered += 1
+    elif method == "shutdown":
+        send({"jsonrpc": "2.0", "id": mid, "result": None})
+    elif method == "exit":
+        break
+    if dies_once and answered >= 1:
+        with open(marker, "w") as f:
+            f.write("died\n")
+        sys.exit(0)
+    # notifications (initialized / didOpen / didChange) and unknown methods: no reply
+"##;
+
+/// Mock server whose behaviour depends on how many times it has been
+/// started (#387): starts listed in argv[3] exit at once, starts listed
+/// in argv[4] answer one request then exit, all other starts stay alive.
+/// The start counter lives in `<log>.starts`, so every fresh process in
+/// the same test sees the running total. Used to build an exact failure
+/// streak (deaths, then a success, then more deaths) for the backoff
+/// tests.
+const MOCK_SERVER_FLAKY: &str = r##"#!/usr/bin/env python3
+import sys, json
+
+log_path, target_uri = sys.argv[1], sys.argv[2]
+die_at_start = set(sys.argv[3].split(",")) if len(sys.argv) > 3 and sys.argv[3] else set()
+die_after_one = set(sys.argv[4].split(",")) if len(sys.argv) > 4 and sys.argv[4] else set()
+counter_path = log_path + ".starts"
+
+def log(method):
+    with open(log_path, "a") as f:
+        f.write(method + "\n")
+
+try:
+    with open(counter_path) as f:
+        n = int(f.read().strip() or 0)
+except FileNotFoundError:
+    n = 0
+n += 1
+with open(counter_path, "w") as f:
+    f.write(str(n))
+
+if str(n) in die_at_start:
+    log("started")
+    sys.exit(0)
+
+def read_msg():
+    headers = {}
+    while True:
+        raw = sys.stdin.buffer.readline()
+        if not raw:
+            return None
+        line = raw.decode("utf-8", "replace")
+        if line in ("\r\n", "\n", ""):
+            break
+        if ":" in line:
+            k, v = line.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+    n = int(headers.get("content-length", "0"))
+    if n <= 0:
+        return None
+    return json.loads(sys.stdin.buffer.read(n).decode("utf-8"))
+
+def send(obj):
+    data = json.dumps(obj).encode("utf-8")
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(data) + data)
+    sys.stdout.buffer.flush()
+
+dies_once = str(n) in die_after_one
+answered = 0
+while True:
+    msg = read_msg()
+    if msg is None:
+        break
+    method, mid = msg.get("method", ""), msg.get("id")
+    log(method)
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "capabilities": {"textDocumentSync": 2, "definitionProvider": True,
+                             "hoverProvider": True, "referencesProvider": True}}})
+    elif method == "textDocument/definition":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "uri": target_uri,
+            "range": {"start": {"line": 9, "character": 4},
+                      "end": {"line": 9, "character": 12}}}})
+        answered += 1
+    elif method == "textDocument/hover":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "contents": {"kind": "markdown", "value": "**mock** hover"}}})
+        answered += 1
+    elif method == "textDocument/references":
+        send({"jsonrpc": "2.0", "id": mid, "result": [{
+            "uri": target_uri,
+            "range": {"start": {"line": 9, "character": 4},
+                      "end": {"line": 9, "character": 12}}}]})
+        answered += 1
+    elif method == "shutdown":
+        send({"jsonrpc": "2.0", "id": mid, "result": None})
+    elif method == "exit":
+        break
+    if dies_once and answered >= 1:
+        sys.exit(0)
+    # notifications (initialized / didOpen / didChange) and unknown methods: no reply
+"##;
+
+/// Mock server that logs one `started` line and exits at once (#387):
+/// every start dies immediately, so repeated calls must hit the
+/// respawn backoff instead of spawning forever.
+const MOCK_SERVER_DIES_AT_START: &str = r##"#!/usr/bin/env python3
+import sys
+with open(sys.argv[1], "a") as f:
+    f.write("started\n")
+sys.exit(0)
+"##;
+
 struct MockSetup {
     manager: LspManager,
     _tmp: PathBuf,
@@ -250,6 +434,108 @@ fn mock_setup() -> Option<MockSetup> {
             script.to_string_lossy().into_owned(),
             log.to_string_lossy().into_owned(),
             path_to_uri(&target_rs),
+        ],
+    );
+    Some(MockSetup {
+        manager,
+        _tmp: tmp,
+        main_rs,
+        target_rs,
+        log,
+    })
+}
+
+/// Same files and command override as `mock_setup`, but the server
+/// dies after answering one request, first start only (#387).
+fn dying_mock_setup() -> Option<MockSetup> {
+    let py = find_binary("python3")?;
+    let tmp = unique_tmpdir("mock-dying");
+    let main_rs = tmp.join("main.rs");
+    write_file(&main_rs, "fn main() {\n    let x = 1;\n}\n");
+    let target_rs = tmp.join("target.rs");
+    write_file(&target_rs, "pub fn target_fn() {}\n");
+    let script = tmp.join("mock_dying_lsp.py");
+    write_file(&script, MOCK_SERVER_DIES_ONCE);
+    let log = tmp.join("methods.log");
+    write_file(&log, "");
+
+    let manager = LspManager::new();
+    manager.set_server_command(
+        LspLanguage::Rust,
+        py.to_string_lossy().into_owned(),
+        vec![
+            script.to_string_lossy().into_owned(),
+            log.to_string_lossy().into_owned(),
+            path_to_uri(&target_rs),
+        ],
+    );
+    Some(MockSetup {
+        manager,
+        _tmp: tmp,
+        main_rs,
+        target_rs,
+        log,
+    })
+}
+
+/// Same files and command override as `mock_setup`, but the server is
+/// the flaky mock (#387): `die_at_start` and `die_after_one` are
+/// comma-separated start numbers (see `MOCK_SERVER_FLAKY`).
+fn flaky_mock_setup(die_at_start: &str, die_after_one: &str) -> Option<MockSetup> {
+    let py = find_binary("python3")?;
+    let tmp = unique_tmpdir("mock-flaky");
+    let main_rs = tmp.join("main.rs");
+    write_file(&main_rs, "fn main() {\n    let x = 1;\n}\n");
+    let target_rs = tmp.join("target.rs");
+    write_file(&target_rs, "pub fn target_fn() {}\n");
+    let script = tmp.join("mock_flaky_lsp.py");
+    write_file(&script, MOCK_SERVER_FLAKY);
+    let log = tmp.join("methods.log");
+    write_file(&log, "");
+
+    let manager = LspManager::new();
+    manager.set_server_command(
+        LspLanguage::Rust,
+        py.to_string_lossy().into_owned(),
+        vec![
+            script.to_string_lossy().into_owned(),
+            log.to_string_lossy().into_owned(),
+            path_to_uri(&target_rs),
+            die_at_start.to_owned(),
+            die_after_one.to_owned(),
+        ],
+    );
+    Some(MockSetup {
+        manager,
+        _tmp: tmp,
+        main_rs,
+        target_rs,
+        log,
+    })
+}
+
+/// Same shape as `mock_setup`, but the server logs one `started` line
+/// and exits at once (#387). No target file is needed: the server
+/// never answers a request.
+fn dies_at_start_setup() -> Option<MockSetup> {
+    let py = find_binary("python3")?;
+    let tmp = unique_tmpdir("mock-dies-at-start");
+    let main_rs = tmp.join("main.rs");
+    write_file(&main_rs, "fn main() {\n    let x = 1;\n}\n");
+    let target_rs = tmp.join("target.rs");
+    write_file(&target_rs, "pub fn target_fn() {}\n");
+    let script = tmp.join("mock_dies_at_start.py");
+    write_file(&script, MOCK_SERVER_DIES_AT_START);
+    let log = tmp.join("methods.log");
+    write_file(&log, "");
+
+    let manager = LspManager::new();
+    manager.set_server_command(
+        LspLanguage::Rust,
+        py.to_string_lossy().into_owned(),
+        vec![
+            script.to_string_lossy().into_owned(),
+            log.to_string_lossy().into_owned(),
         ],
     );
     Some(MockSetup {
@@ -1934,4 +2220,420 @@ fn parse_publish_diagnostics_rejects_bad_shapes() {
             .expect("an empty diagnostics array is valid");
     assert_eq!(uri, "file:///a.rs");
     assert!(diags.is_empty());
+}
+
+#[tokio::test]
+async fn dead_server_is_evicted_and_next_call_respawns() {
+    // Issue #387: a dead LSP server used to stay cached forever, so
+    // every later call failed until the process restarted. The manager
+    // must evict the corpse (liveness probe, or the transport error
+    // from the call itself) and serve the next call from a fresh
+    // server.
+    let Some(setup) = dying_mock_setup() else {
+        eprintln!("SKIP: python3 not found");
+        return;
+    };
+    let locs = setup
+        .manager
+        .goto_definition(&setup.main_rs, 1, 5)
+        .await
+        .unwrap();
+    assert_eq!(locs.len(), 1, "first call must succeed: {locs:?}");
+
+    // The server exited after answering. The next call must NOT fail
+    // with the corpse's transport error: it respawns and answers.
+    let locs = setup
+        .manager
+        .goto_definition(&setup.main_rs, 1, 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        locs.len(),
+        1,
+        "second call must succeed on a fresh server: {locs:?}"
+    );
+
+    let methods = logged_methods(&setup.log);
+    assert_eq!(
+        count(&methods, "initialize"),
+        2,
+        "a fresh server must have been started after the death: {methods:?}"
+    );
+    assert_eq!(count(&methods, "textDocument/definition"), 2);
+}
+
+#[tokio::test]
+async fn cached_diagnostics_reports_no_server_after_death() {
+    // Issue #387: after the server dies, the read-only diagnostics
+    // query must report "no server" instead of serving an empty cache
+    // from the corpse. The child exits right after answering the
+    // first call, so poll until the probe sees it (a fixed wait would
+    // be racy on a loaded machine; on unfixed code this never turns
+    // None and the test fails).
+    let Some(setup) = dying_mock_setup() else {
+        eprintln!("SKIP: python3 not found");
+        return;
+    };
+    let _ = setup
+        .manager
+        .goto_definition(&setup.main_rs, 1, 5)
+        .await
+        .unwrap();
+    let start = Instant::now();
+    loop {
+        if setup.manager.cached_diagnostics(&setup.main_rs).is_none() {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "cached_diagnostics must report no server once the child has exited"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn dead_server_backoff_stops_respawn_loop() {
+    // Issue #387: a server that dies on every start must not be
+    // respawned in a tight loop. After MAX_CONSECUTIVE_DEAD_SERVERS
+    // failures the manager refuses to spawn again until the cooldown
+    // passes, and the refusal names the failure count.
+    let Some(setup) = dies_at_start_setup() else {
+        eprintln!("SKIP: python3 not found");
+        return;
+    };
+    for attempt in 1..=3 {
+        let err = setup
+            .manager
+            .goto_definition(&setup.main_rs, 1, 5)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("failed to start"),
+            "attempt {attempt} must fail at start, got: {err}"
+        );
+    }
+    let err = setup
+        .manager
+        .goto_definition(&setup.main_rs, 1, 5)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not respawning"),
+        "fourth call must hit the backoff, got: {err}"
+    );
+    let methods = logged_methods(&setup.log);
+    assert_eq!(
+        count(&methods, "started"),
+        3,
+        "no server must have been started on the backed-off call: {methods:?}"
+    );
+}
+
+#[test]
+fn transport_error_classifier_only_matches_dead_server_errors() {
+    // Issue #387, mutant killer: the eviction decision must split
+    // transport errors (dead server) from call errors (a live server
+    // rejecting the request) and timeouts (a live but slow server).
+    for msg in [
+        "write to LSP server failed: broken pipe",
+        "LSP server dropped the response",
+        "LSP error: {\"code\":-32000,\"message\":\"LSP server closed\"}",
+        "LSP notify 'textDocument/didOpen' failed: broken pipe",
+        "textDocument/didOpen failed: LSP notify 'textDocument/didOpen' failed: broken pipe",
+        "LSP initialize failed: LSP server closed",
+    ] {
+        assert!(
+            is_lsp_transport_error(&anyhow::anyhow!(msg)),
+            "must classify as transport: {msg}"
+        );
+    }
+    for msg in [
+        "LSP error: {\"code\":-32601,\"message\":\"Method not found\"}",
+        "LSP request 'textDocument/hover' timed out after 15s",
+        "cannot stat 'main.rs': No such file or directory",
+        "line 99 out of range (file has 10 lines)",
+        "unsupported file type '.txt'",
+    ] {
+        assert!(
+            !is_lsp_transport_error(&anyhow::anyhow!(msg)),
+            "must NOT classify as transport: {msg}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn live_server_is_reused_across_calls() {
+    // Issue #387, mutant killer for both `is_alive -> false` mutants
+    // (`LspClient::is_alive` and `LspConnection::is_alive`): the
+    // liveness probe must report a live server as alive, or every call
+    // evicts the live server and spawns a fresh one. Two calls on the
+    // live mock must share exactly one `initialize`.
+    let Some(setup) = mock_setup() else {
+        eprintln!("SKIP: python3 not found");
+        return;
+    };
+    for _ in 0..2 {
+        let locs = setup
+            .manager
+            .goto_definition(&setup.main_rs, 1, 5)
+            .await
+            .unwrap();
+        assert_eq!(locs.len(), 1, "call must succeed: {locs:?}");
+    }
+    let methods = logged_methods(&setup.log);
+    assert_eq!(
+        count(&methods, "initialize"),
+        1,
+        "a live server must be reused, not respawned per call: {methods:?}"
+    );
+}
+
+#[tokio::test]
+async fn hover_dead_server_is_evicted_and_next_call_respawns() {
+    // Issue #387, mutant killer for the hover retry arm: a hover on a
+    // dead server must evict it and retry once on a fresh server, the
+    // same shape as goto_definition. The dying mock answers one hover
+    // then exits, so the second call exercises the retry.
+    let Some(setup) = dying_mock_setup() else {
+        eprintln!("SKIP: python3 not found");
+        return;
+    };
+    let hover = setup.manager.hover(&setup.main_rs, 1, 5).await.unwrap();
+    assert!(
+        hover.contains("**mock** hover"),
+        "first hover must succeed: {hover}"
+    );
+    let hover = setup.manager.hover(&setup.main_rs, 1, 5).await.unwrap();
+    assert!(
+        hover.contains("**mock** hover"),
+        "second hover must succeed on a fresh server: {hover}"
+    );
+    let methods = logged_methods(&setup.log);
+    assert_eq!(
+        count(&methods, "initialize"),
+        2,
+        "a fresh server must have been started after the death: {methods:?}"
+    );
+}
+
+#[tokio::test]
+async fn references_dead_server_is_evicted_and_next_call_respawns() {
+    // Issue #387, mutant killer for the find_references retry arm (and
+    // for the whole-method replacement with `Ok(vec![])`): the dying
+    // mock answers one references request with a single location, then
+    // exits, so the second call must respawn and return that location
+    // again instead of an empty list.
+    let Some(setup) = dying_mock_setup() else {
+        eprintln!("SKIP: python3 not found");
+        return;
+    };
+    let locs = setup
+        .manager
+        .find_references(&setup.main_rs, 1, 5, false)
+        .await
+        .unwrap();
+    assert_eq!(locs.len(), 1, "first references call: {locs:?}");
+    let locs = setup
+        .manager
+        .find_references(&setup.main_rs, 1, 5, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        locs.len(),
+        1,
+        "second references call must succeed on a fresh server: {locs:?}"
+    );
+    let methods = logged_methods(&setup.log);
+    assert_eq!(
+        count(&methods, "initialize"),
+        2,
+        "a fresh server must have been started after the death: {methods:?}"
+    );
+}
+
+#[tokio::test]
+async fn call_error_is_not_retried_and_server_stays_cached() {
+    // Issue #387, mutant killer for the `is_lsp_transport_error` guard
+    // replaced with true in all three methods: a call error from a LIVE
+    // server (here a local out-of-range position) must NOT evict the
+    // server or retry. The error text is identical either way, so the
+    // only observable difference is the server count: with the guard
+    // replaced, each failed call spawns a fresh server.
+    let Some(setup) = mock_setup() else {
+        eprintln!("SKIP: python3 not found");
+        return;
+    };
+    let err = setup
+        .manager
+        .goto_definition(&setup.main_rs, 99, 1)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("out of range"), "got: {err}");
+    let err = setup
+        .manager
+        .hover(&setup.main_rs, 99, 1)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("out of range"), "got: {err}");
+    let err = setup
+        .manager
+        .find_references(&setup.main_rs, 99, 1, false)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("out of range"), "got: {err}");
+    let methods = logged_methods(&setup.log);
+    assert_eq!(
+        count(&methods, "initialize"),
+        1,
+        "a call error must not evict or respawn the live server: {methods:?}"
+    );
+}
+
+#[tokio::test]
+async fn evict_ignores_stale_failure_after_respawn() {
+    // Issue #387, mutant killer for the `Arc::ptr_eq` guard replaced
+    // with true: evicting the OLD connection after another call already
+    // respawned must leave the fresh server alone. The dying mock kills
+    // the first server after one request, so the second call respawns a
+    // live one; evicting the stale first connection afterwards must be
+    // a no-op, and the next call must reuse the live server.
+    let Some(setup) = dying_mock_setup() else {
+        eprintln!("SKIP: python3 not found");
+        return;
+    };
+    let first = setup.manager.connection_for(&setup.main_rs).await.unwrap();
+    let locs = setup
+        .manager
+        .goto_definition(&setup.main_rs, 1, 5)
+        .await
+        .unwrap();
+    assert_eq!(locs.len(), 1, "first call must succeed: {locs:?}");
+    // The first server exited after answering; the next call evicts it
+    // and respawns a live server.
+    let locs = setup
+        .manager
+        .goto_definition(&setup.main_rs, 1, 5)
+        .await
+        .unwrap();
+    assert_eq!(locs.len(), 1, "second call must succeed: {locs:?}");
+    // A stale failure for the first connection arrives now: it must not
+    // touch the live second server.
+    let key = server_key(&setup.main_rs).unwrap();
+    setup.manager.evict(&key, &first);
+    let second = setup.manager.connection_for(&setup.main_rs).await.unwrap();
+    assert!(
+        !std::sync::Arc::ptr_eq(&first, &second),
+        "the second call must have respawned a different connection"
+    );
+    let locs = setup
+        .manager
+        .goto_definition(&setup.main_rs, 1, 5)
+        .await
+        .unwrap();
+    assert_eq!(locs.len(), 1, "third call must succeed: {locs:?}");
+    let methods = logged_methods(&setup.log);
+    assert_eq!(
+        count(&methods, "initialize"),
+        2,
+        "the stale evict must not have killed the live server: {methods:?}"
+    );
+}
+
+#[tokio::test]
+async fn evict_kills_the_evicted_child() {
+    // Issue #387, mutant killer for the evict guard replaced with false
+    // (and for `kill` replaced with ()): evicting a connection must
+    // terminate its child process, so no orphan survives the cache
+    // removal. With the guard replaced, evict is a no-op and the child
+    // keeps running.
+    let Some(setup) = mock_setup() else {
+        eprintln!("SKIP: python3 not found");
+        return;
+    };
+    let conn = setup.manager.connection_for(&setup.main_rs).await.unwrap();
+    assert!(conn.is_alive(), "the server must be alive before evict");
+    let key = server_key(&setup.main_rs).unwrap();
+    setup.manager.evict(&key, &conn);
+    let start = Instant::now();
+    loop {
+        if !conn.is_alive() {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "evict must terminate the child process"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn kill_terminates_the_child_process() {
+    // Issue #387, mutant killer for `LspConnection::kill` replaced with
+    // (): killing a live connection must terminate its child. The
+    // liveness probe returns false once the child handle is taken, so
+    // the loop exits at once on correct code and times out under the
+    // mutant.
+    let Some(setup) = mock_setup() else {
+        eprintln!("SKIP: python3 not found");
+        return;
+    };
+    let conn = setup.manager.connection_for(&setup.main_rs).await.unwrap();
+    assert!(conn.is_alive(), "the server must be alive before kill");
+    conn.kill();
+    let start = Instant::now();
+    loop {
+        if !conn.is_alive() {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "kill must terminate the child process"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn success_clears_the_failure_streak() {
+    // Issue #387, mutant killer for `record_success` replaced with ():
+    // a successful call must forget earlier dead-server failures, so
+    // the backoff counts only consecutive deaths. Two deaths, one
+    // success, then two more deaths must still spawn (the streak is 2,
+    // below the threshold of 3); if the success never cleared the
+    // streak, the second death after it would already hit the backoff
+    // and report "not respawning" instead of "failed to start".
+    let Some(setup) = flaky_mock_setup("1,2,4,5", "3") else {
+        eprintln!("SKIP: python3 not found");
+        return;
+    };
+    for attempt in 1..=2 {
+        let err = setup
+            .manager
+            .goto_definition(&setup.main_rs, 1, 5)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("failed to start"),
+            "attempt {attempt} must fail at start, got: {err}"
+        );
+    }
+    let locs = setup
+        .manager
+        .goto_definition(&setup.main_rs, 1, 5)
+        .await
+        .unwrap();
+    assert_eq!(locs.len(), 1, "the third call must succeed: {locs:?}");
+    for attempt in 4..=5 {
+        let err = setup
+            .manager
+            .goto_definition(&setup.main_rs, 1, 5)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("failed to start"),
+            "attempt {attempt} must fail at start, not hit the backoff, got: {err}"
+        );
+    }
 }
