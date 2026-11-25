@@ -667,27 +667,66 @@ pub fn split_kv(entry: &str) -> Option<(String, String)> {
     (!k.is_empty()).then(|| (k.to_string(), v.to_string()))
 }
 
-fn read_mcp_file(path: &Path) -> Value {
-    let mut root = match std::fs::read_to_string(path) {
-        Ok(t) if !t.trim().is_empty() => {
-            serde_json::from_str::<Value>(&t).unwrap_or_else(|_| Value::Object(Default::default()))
+fn read_mcp_file(path: &Path) -> Result<Value> {
+    // Issue #449: a corrupt config is a hard error, never a silent reset
+    // to empty. The old code coerced any parse failure (and any read
+    // failure) to an empty object, so `mcp add` then overwrote the file
+    // and destroyed the user's existing servers.
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(anyhow!("cannot read MCP config {}: {}", path.display(), e));
         }
-        _ => Value::Object(Default::default()),
+    };
+    let root = if text.trim().is_empty() {
+        Value::Object(Default::default())
+    } else {
+        serde_json::from_str::<Value>(&text)
+            .map_err(|e| anyhow!("MCP config {} is corrupt: {}", path.display(), e))?
     };
     if !root.is_object() {
-        root = Value::Object(Default::default());
+        return Err(anyhow!(
+            "MCP config {} is corrupt: top level must be an object",
+            path.display()
+        ));
     }
+    let mut root = root;
     if !root
         .get("mcpServers")
         .map(|v| v.is_object())
         .unwrap_or(false)
+        && let Some(obj) = root.as_object_mut()
     {
-        // `root` was coerced to an object above, so this always succeeds.
-        if let Some(obj) = root.as_object_mut() {
-            obj.insert("mcpServers".to_string(), Value::Object(Default::default()));
-        }
+        obj.insert("mcpServers".to_string(), Value::Object(Default::default()));
     }
-    root
+    Ok(root)
+}
+
+fn empty_mcp_root() -> Value {
+    serde_json::json!({"mcpServers": {}})
+}
+
+/// Read the MCP config for a write command (issue #449). A corrupt or
+/// unreadable file is a hard error (exit 7, like the #285 name conflict)
+/// unless --force was given, in which case the corrupt content is
+/// discarded explicitly, with a warning on stderr.
+fn read_mcp_file_for_write(path: &Path, force: bool) -> Result<Value> {
+    match read_mcp_file(path) {
+        Ok(root) => Ok(root),
+        Err(e) if force => {
+            eprintln!(
+                "warning: discarding corrupt MCP config {}: {}",
+                path.display(),
+                e
+            );
+            Ok(empty_mcp_root())
+        }
+        Err(e) => Err(crate::coded_error(
+            crate::exit_code::CONFLICT,
+            format!("{e}; pass --force to discard the corrupt config and start empty"),
+        )),
+    }
 }
 
 fn write_mcp_file(path: &Path, root: &Value) -> Result<()> {
@@ -833,7 +872,7 @@ pub async fn mcp_command(
                 ));
             }
             let path = mcp_scope_path(scope, cwd, home)?;
-            let mut root = read_mcp_file(&path);
+            let mut root = read_mcp_file_for_write(&path, *force)?;
             let mut cfg: Value = if transport == "http" {
                 let url = rest
                     .first()
@@ -914,7 +953,7 @@ pub async fn mcp_command(
             };
             for sc in scopes {
                 let path = mcp_scope_path(sc, cwd, home)?;
-                let root = read_mcp_file(&path);
+                let root = read_mcp_file(&path)?;
                 if let Some(server) = root["mcpServers"].get(name) {
                     if !cli.quiet {
                         if cli.raw {
@@ -935,7 +974,7 @@ pub async fn mcp_command(
             force,
         } => {
             let path = mcp_scope_path(scope, cwd, home)?;
-            let mut root = read_mcp_file(&path);
+            let mut root = read_mcp_file_for_write(&path, *force)?;
             let cfg: Value = serde_json::from_str(json)?;
             if !cfg.is_object() {
                 return Err(anyhow!("server JSON must be an object"));
@@ -976,7 +1015,7 @@ pub async fn mcp_command(
             dry_run,
         } => {
             let path = mcp_scope_path(scope, cwd, home)?;
-            let mut root = read_mcp_file(&path);
+            let mut root = read_mcp_file(&path)?;
             if *dry_run {
                 match root["mcpServers"].get(name) {
                     Some(old) => {
@@ -1623,5 +1662,146 @@ mod tests {
         assert!(reject_swallowed_mcp_flags(&t(&["echo", "--", "--scope", "project"])).is_ok());
         assert!(reject_swallowed_mcp_flags(&t(&["echo", "--", "-e", "hi"])).is_ok());
         assert!(reject_swallowed_mcp_flags(&[]).is_ok());
+    }
+
+    fn mcp_tmp(tag: &str) -> std::path::PathBuf {
+        let tmp = std::env::temp_dir().join(format!(
+            "zen_mcp_449_{}_{}_{}",
+            tag,
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join(".zen")).unwrap();
+        tmp
+    }
+
+    fn mcp_cli() -> crate::cli::Cli {
+        use clap::Parser;
+        crate::cli::Cli::parse_from(["zen", "--quiet", "-p", "hi"])
+    }
+
+    fn mcp_add_args(force: bool) -> crate::cli::McpArgs {
+        crate::cli::McpArgs {
+            command: crate::cli::McpSubcommand::Add {
+                transport: "stdio".to_string(),
+                scope: "local".to_string(),
+                name: "probe".to_string(),
+                args: vec!["echo".to_string(), "hi".to_string()],
+                env: vec![],
+                header: vec![],
+                dry_run: false,
+                force,
+            },
+        }
+    }
+
+    #[test]
+    fn read_mcp_file_rejects_corrupt_json() {
+        // Issue #449: a corrupt config must be a hard error, never a
+        // silent reset to empty.
+        let tmp = mcp_tmp("corrupt");
+        let p = tmp.join(".zen").join("mcp.json");
+        fs::write(&p, "{\"mcpServers\": {\"old\": ").unwrap();
+        let err = read_mcp_file(&p).unwrap_err();
+        assert!(err.to_string().contains("corrupt"), "{err}");
+        assert!(err.to_string().contains(&p.display().to_string()), "{err}");
+    }
+
+    #[test]
+    fn read_mcp_file_rejects_non_object_top_level() {
+        let tmp = mcp_tmp("nonobj");
+        let p = tmp.join(".zen").join("mcp.json");
+        fs::write(&p, "[1, 2]").unwrap();
+        assert!(read_mcp_file(&p).is_err());
+    }
+
+    #[test]
+    fn read_mcp_file_missing_and_empty_ok() {
+        let tmp = mcp_tmp("empty");
+        let p = tmp.join(".zen").join("mcp.json");
+        let root = read_mcp_file(&p).unwrap();
+        assert!(root["mcpServers"].is_object());
+        fs::write(&p, "  \n").unwrap();
+        assert!(read_mcp_file(&p).unwrap()["mcpServers"].is_object());
+        // A valid object without mcpServers keeps its other keys.
+        fs::write(&p, "{\"version\": 1}").unwrap();
+        let root = read_mcp_file(&p).unwrap();
+        assert_eq!(root["version"], 1);
+        assert!(root["mcpServers"].is_object());
+    }
+
+    #[test]
+    fn read_mcp_file_rejects_non_not_found_io_error() {
+        // Issue #449: only a missing file may read as empty. Any other
+        // read failure must be a hard error, never a silent empty root.
+        // Here the path is a directory, so the read fails with EISDIR,
+        // not NotFound. Kills the mutant that drops the NotFound match
+        // guard on the read error (PR #553).
+        let tmp = mcp_tmp("isdir");
+        let dir = tmp.join(".zen").join("mcp.json");
+        fs::create_dir_all(&dir).unwrap();
+        let err = read_mcp_file(&dir).unwrap_err();
+        assert!(err.to_string().contains("cannot read MCP config"), "{err}");
+        assert!(
+            err.to_string().contains(&dir.display().to_string()),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn empty_mcp_root_is_servers_object() {
+        // Issue #449: the empty root a forced `mcp add` starts from
+        // must be exactly {"mcpServers": {}}, not Null. Kills the
+        // mutant that replaces the body with Default::default()
+        // (PR #553).
+        assert_eq!(empty_mcp_root(), serde_json::json!({"mcpServers": {}}));
+    }
+
+    #[tokio::test]
+    async fn mcp_add_refuses_corrupt_config() {
+        // Issue #449: `mcp add` must not overwrite a corrupt config.
+        let tmp = mcp_tmp("addrefuse");
+        let p = tmp.join(".zen").join("mcp.json");
+        let before = "{\"mcpServers\": {\"old\": {\"type\": \"http\", \"url\": \"http://127.0.0.1:8931/\"}}, BROKEN";
+        fs::write(&p, before).unwrap();
+        let cli = mcp_cli();
+        let err = mcp_command(&cli, &tmp, None, &mcp_add_args(false))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("corrupt"), "{err}");
+        assert_eq!(fs::read_to_string(&p).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn mcp_add_force_discards_corrupt_config() {
+        // Issue #449: with --force the corrupt content is discarded
+        // explicitly, and only then.
+        let tmp = mcp_tmp("addforce");
+        let p = tmp.join(".zen").join("mcp.json");
+        fs::write(&p, "{\"mcpServers\": {\"old\": ").unwrap();
+        let cli = mcp_cli();
+        mcp_command(&cli, &tmp, None, &mcp_add_args(true))
+            .await
+            .unwrap();
+        let root: Value = serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        assert!(root["mcpServers"]["probe"].is_object());
+    }
+
+    #[tokio::test]
+    async fn mcp_get_reports_corrupt_config() {
+        // A corrupt config must not look like "no such server".
+        let tmp = mcp_tmp("get");
+        let p = tmp.join(".zen").join("mcp.json");
+        fs::write(&p, "{oops").unwrap();
+        let cli = mcp_cli();
+        let args = crate::cli::McpArgs {
+            command: crate::cli::McpSubcommand::Get {
+                scope: "local".to_string(),
+                name: "probe".to_string(),
+            },
+        };
+        let err = mcp_command(&cli, &tmp, None, &args).await.unwrap_err();
+        assert!(err.to_string().contains("corrupt"), "{err}");
     }
 }
