@@ -227,6 +227,34 @@ const REVIEW_GIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 const UNTRACKED_FILE_CAP: usize = 20_000;
 
+/// Join a reader thread only until `deadline`.
+///
+/// Issue #545: after git exits, `read_to_end` on a reader thread only
+/// returns at EOF, and EOF only arrives once every process holding the
+/// pipe's write end has closed it. A grandchild that outlives git (for
+/// example a background process started by a git shell alias) therefore
+/// held the old unconditional `join()` past the 15s deadline. Dropping
+/// the parent's read end cannot force EOF while the grandchild still
+/// holds the write end, so the only bound available here is to stop
+/// joining at the deadline and let the reader thread finish on its own.
+/// Returns `None` when the thread is still running at the deadline; the
+/// handle is dropped, detaching the thread.
+fn join_reader_until(
+    handle: Option<std::thread::JoinHandle<Vec<u8>>>,
+    deadline: Instant,
+) -> Option<Vec<u8>> {
+    let Some(handle) = handle else {
+        return Some(Vec::new());
+    };
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    handle.join().ok()
+}
+
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {
     let mut child = Command::new("git")
         .arg("-C")
@@ -260,12 +288,27 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {
     loop {
         match child.try_wait().context("failed to poll git")? {
             Some(status) => {
-                let out = stdout_thread
-                    .map(|t| t.join().unwrap_or_default())
-                    .unwrap_or_default();
-                let err = stderr_thread
-                    .map(|t| t.join().unwrap_or_default())
-                    .unwrap_or_default();
+                // Issue #545: bound the whole call by the deadline,
+                // including waiting for reader-thread EOF. A reader
+                // still blocked at the deadline means a child is
+                // holding the pipe past the deadline; report a timeout
+                // instead of joining forever.
+                let out = match join_reader_until(stdout_thread, deadline) {
+                    Some(out) => out,
+                    None => anyhow::bail!(
+                        "git {} timed out after {:?} waiting for output",
+                        args.join(" "),
+                        REVIEW_GIT_TIMEOUT
+                    ),
+                };
+                let err = match join_reader_until(stderr_thread, deadline) {
+                    Some(err) => err,
+                    None => anyhow::bail!(
+                        "git {} timed out after {:?} waiting for output",
+                        args.join(" "),
+                        REVIEW_GIT_TIMEOUT
+                    ),
+                };
                 if !status.success() {
                     let err = String::from_utf8_lossy(&err);
                     anyhow::bail!("git {} failed: {}", args.join(" "), err.trim());
@@ -1132,6 +1175,37 @@ mod tests {
             .expect("large diff must return instead of timing out");
         assert!(diff.diff_text.len() > 64 * 1024);
         assert!(diff.diff_text.contains("line of changed text"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn issue_545_reader_eof_wait_is_bounded_by_deadline() {
+        // Issue #545: git itself exits, but a grandchild started by a
+        // git shell alias keeps the stdout pipe open for 18s. The old
+        // unconditional join of the reader threads waited for EOF and
+        // returned after ~18s, past the 15s deadline. The call must
+        // return within the deadline instead.
+        let dir = git_repo();
+        git_in(
+            &dir,
+            &[
+                "config",
+                "alias.hold-pipe",
+                "!sh -c 'echo held; sleep 18 &'",
+            ],
+        );
+        let start = Instant::now();
+        let result = run_git(&dir, &["hold-pipe"]);
+        let elapsed = start.elapsed();
+        let err = result.expect_err("expected a timeout error, not success");
+        assert!(
+            err.to_string().contains("timed out"),
+            "expected a timeout error, got {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(17),
+            "call must return within the deadline, took {elapsed:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
