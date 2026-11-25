@@ -1594,4 +1594,19 @@ mod tests {
         assert_eq!(slash_list[0].0, "old-slash");
         let _ = fs::remove_dir_all(&base);
     }
+
+    #[test]
+    fn decode_cwd_advances_past_percent_escape_not_at_start() {
+        // Kills the `i += 3` -> `i *= 3` mutant in decode_cwd (line 77):
+        // after decoding a `%XX` escape the cursor must move past exactly
+        // the three consumed bytes. Under the mutant the cursor jumps to
+        // `3 * i` instead, so the hex digits leak into the output as
+        // literal characters (and the tail is skipped). `%` must NOT be
+        // at index 0 here: at i = 0 the mutant leaves i at 0 and the
+        // test hangs instead of failing the assert, which is what the
+        // existing `%`-first cases already do (CI shard 10 TIMEOUT).
+        assert_eq!(decode_cwd("a%2Fb").unwrap(), "a/b");
+        assert_eq!(decode_cwd("abc%2Fdef").unwrap(), "abc/def");
+        assert_eq!(decode_cwd("a%2Fb%2Fc").unwrap(), "a/b/c");
+    }
 }
