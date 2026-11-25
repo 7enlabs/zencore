@@ -592,15 +592,20 @@ fn read_ref(path: &str, base: &Path) -> Option<String> {
     if zen_core::gitignore::is_ignored(&rules, &canon, false) {
         return None;
     }
-    read_ref_file(&canon)
+    // TOCTOU (issue #444): the checks above read the path, but the file
+    // could be replaced by a symlink to outside before the open below.
+    // `open_file_inside_project` binds the containment check to the
+    // descriptor that is actually read, so a swap in between is caught.
+    let file = zen_core::fs::open_file_inside_project(&canon, &root)?;
+    read_ref_file(file)
 }
 
 /// Read a file for `@ref` inlining, capped at the 512 KiB mention cap
 /// (issue #444). Reads at most cap + 1 bytes, so a huge file never lands
-/// fully in memory.
-fn read_ref_file(path: &Path) -> Option<String> {
+/// fully in memory. The file arrives already opened and verified inside
+/// the project by `read_ref`; this function only reads the descriptor.
+fn read_ref_file(file: std::fs::File) -> Option<String> {
     use std::io::Read;
-    let file = std::fs::File::open(path).ok()?;
     let mut bytes = Vec::new();
     file.take(crate::mentions::MAX_MENTION_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -1593,7 +1598,8 @@ mod tests {
         let cap = crate::mentions::MAX_MENTION_FILE_BYTES as usize;
         let content = "a".repeat(cap);
         fs::write(tmp.join("exact.txt"), &content).unwrap();
-        let out = read_ref_file(&tmp.join("exact.txt")).expect("file must read");
+        let out = read_ref_file(std::fs::File::open(tmp.join("exact.txt")).unwrap())
+            .expect("file must read");
         assert_eq!(out, content);
         assert!(!out.contains("[truncated"));
     }
@@ -1612,7 +1618,8 @@ mod tests {
         content.push('\u{e9}'); // 2-byte char straddling the cap
         content.push_str(&"b".repeat(10));
         fs::write(tmp.join("straddle.txt"), &content).unwrap();
-        let out = read_ref_file(&tmp.join("straddle.txt")).expect("file must read");
+        let out = read_ref_file(std::fs::File::open(tmp.join("straddle.txt")).unwrap())
+            .expect("file must read");
         let expected = format!(
             "{}\n[truncated: file exceeds the 512 KiB mention cap]",
             "a".repeat(cap - 1)
@@ -1630,7 +1637,8 @@ mod tests {
         let cap = crate::mentions::MAX_MENTION_FILE_BYTES as usize;
         let content = "a".repeat(cap + 1);
         fs::write(tmp.join("over.txt"), &content).unwrap();
-        let out = read_ref_file(&tmp.join("over.txt")).expect("file must read");
+        let out = read_ref_file(std::fs::File::open(tmp.join("over.txt")).unwrap())
+            .expect("file must read");
         let expected = format!(
             "{}\n[truncated: file exceeds the 512 KiB mention cap]",
             "a".repeat(cap)
@@ -1649,6 +1657,66 @@ mod tests {
             read_ref(p.to_str().unwrap(), &tmp).as_deref(),
             Some("inside-content")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_ref_rejects_symlink_to_outside_file() {
+        // Issue #444 (TOCTOU): a symlink inside the project pointing
+        // to an outside file must not inline, and the decision must be
+        // made on the descriptor actually read, not on the path spelling.
+        let tmp = read_ref_tmp("symlink");
+        let secret = tmp.join("secret.txt");
+        fs::write(&secret, "top-secret").unwrap();
+        let proj = tmp.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        std::os::unix::fs::symlink(&secret, proj.join("link.txt")).unwrap();
+        assert_eq!(read_ref("link.txt", &proj), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_ref_swapped_symlink_mid_read_never_leaks_outside() {
+        // Issue #444 (TOCTOU): `read_ref` used to check the path and
+        // open it in two steps, so a file swapped for a symlink to
+        // outside in between leaked the outside file. A swapper thread
+        // flips the victim between a regular in-project file and a
+        // symlink to an outside secret while the reader loops; the
+        // outside content must never come back. Fails on the pre-fix
+        // code (the swap lands in the check-then-open window) and
+        // passes with the fd-bound open.
+        let tmp = read_ref_tmp("toctou");
+        let secret = tmp.join("secret.txt");
+        fs::write(&secret, "TOP-SECRET-444").unwrap();
+        let proj = tmp.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let victim = proj.join("victim.txt");
+        fs::write(&victim, "inside").unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let swapper = {
+            let stop = std::sync::Arc::clone(&stop);
+            let victim = victim.clone();
+            let secret = secret.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = fs::remove_file(&victim);
+                    let _ = std::os::unix::fs::symlink(&secret, &victim);
+                    let _ = fs::remove_file(&victim);
+                    let _ = fs::write(&victim, "inside");
+                }
+            })
+        };
+        for _ in 0..300 {
+            if let Some(content) = read_ref("victim.txt", &proj) {
+                assert!(
+                    !content.contains("TOP-SECRET-444"),
+                    "TOCTOU leak: swapped symlink read the outside file"
+                );
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = swapper.join();
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]

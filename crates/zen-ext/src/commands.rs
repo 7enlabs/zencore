@@ -350,9 +350,15 @@ fn cap_text(s: &str, label: &str, exact: bool) -> String {
 /// Read a file for `@path` inlining, capped at `HOOK_OUTPUT_LIMIT` chars
 /// (issue #392). Reads at most `CAPPED_READ_LIMIT + 1` bytes, so a huge file
 /// never lands fully in memory.
-fn read_inline_file(p: &Path) -> Option<String> {
+///
+/// TOCTOU (issue #444): `resolve_ref` checked the path, but the file
+/// could be replaced by a symlink to outside before this open. The file
+/// is opened through `open_file_inside_project`, which binds the
+/// containment check to the descriptor actually read, so a swap in
+/// between cannot redirect the read outside `root`.
+fn read_inline_file(p: &Path, root: &Path) -> Option<String> {
     use std::io::Read;
-    let mut file = std::fs::File::open(p).ok()?;
+    let mut file = zen_core::fs::open_file_inside_project(p, root)?;
     let mut buf = Vec::new();
     file.by_ref()
         .take(CAPPED_READ_LIMIT as u64 + 1)
@@ -494,7 +500,8 @@ fn inline_files(text: &str, base: &Path) -> String {
 
             let trimmed = token.trim_end_matches([',', '.', ';', ':', ')', '!', '?']);
             if !trimmed.is_empty()
-                && let Some(content) = resolve_ref(trimmed, base).and_then(|p| read_inline_file(&p))
+                && let Some(content) =
+                    resolve_ref(trimmed, base).and_then(|p| read_inline_file(&p, base))
             {
                 out.push_str(content.trim_end_matches('\n'));
                 out.push_str(&token[trimmed.len()..]);
@@ -740,6 +747,62 @@ mod tests {
             resolve_ref(p.to_str().unwrap(), t.path()),
             Some(std::fs::canonicalize(&p).unwrap())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_inline_file_rejects_symlink_to_outside_file() {
+        // Issue #444 (TOCTOU): `read_inline_file` must refuse a symlink
+        // to outside even when called directly with the link path - the
+        // old code opened whatever path it was given.
+        let t = TempDir::new();
+        let secret = t.path().join("secret.txt");
+        write(&secret, "top-secret");
+        let proj = t.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        std::os::unix::fs::symlink(&secret, proj.join("link.txt")).unwrap();
+        assert_eq!(read_inline_file(&proj.join("link.txt"), &proj), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inline_files_swapped_symlink_mid_read_never_leaks_outside() {
+        // Issue #444 (TOCTOU): same gap on the `@path` flow -
+        // `resolve_ref` checked the path, `read_inline_file` opened it
+        // later. The swapper flips the victim between an in-project
+        // file and a symlink to an outside secret while `inline_files`
+        // loops; the secret must never appear in the output. Fails on
+        // the pre-fix code and passes with the fd-bound open.
+        let t = TempDir::new();
+        let secret = t.path().join("secret.txt");
+        write(&secret, "TOP-SECRET-444");
+        let proj = t.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let victim = proj.join("victim.txt");
+        write(&victim, "inside");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let swapper = {
+            let stop = std::sync::Arc::clone(&stop);
+            let victim = victim.clone();
+            let secret = secret.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = fs::remove_file(&victim);
+                    let _ = std::os::unix::fs::symlink(&secret, &victim);
+                    let _ = fs::remove_file(&victim);
+                    let _ = fs::write(&victim, "inside");
+                }
+            })
+        };
+        for _ in 0..300 {
+            let out = inline_files("@victim.txt", &proj);
+            assert!(
+                !out.contains("TOP-SECRET-444"),
+                "TOCTOU leak: swapped symlink read the outside file"
+            );
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = swapper.join();
     }
 
     #[test]
@@ -1075,7 +1138,7 @@ mod tests {
         let t = TempDir::new();
         let content = "a".repeat(5_000);
         write(&t.path().join("mid.txt"), &content);
-        let out = read_inline_file(&t.path().join("mid.txt")).unwrap();
+        let out = read_inline_file(&t.path().join("mid.txt"), t.path()).unwrap();
         assert!(
             !out.contains("truncated"),
             "5_000-char file must inline whole, got: {out:.200}"
@@ -1092,7 +1155,7 @@ mod tests {
         let t = TempDir::new();
         let content = "a".repeat(20_000);
         write(&t.path().join("big2.txt"), &content);
-        let out = read_inline_file(&t.path().join("big2.txt")).unwrap();
+        let out = read_inline_file(&t.path().join("big2.txt"), t.path()).unwrap();
         assert!(
             out.contains("of 20000 chars shown"),
             "over-limit file must report its exact total, got: {out:.200}"
@@ -1108,7 +1171,7 @@ mod tests {
         let t = TempDir::new();
         let content = "a".repeat(CAPPED_READ_LIMIT);
         write(&t.path().join("exact.txt"), &content);
-        let out = read_inline_file(&t.path().join("exact.txt")).unwrap();
+        let out = read_inline_file(&t.path().join("exact.txt"), t.path()).unwrap();
         assert!(
             out.contains(&format!("of {CAPPED_READ_LIMIT} chars shown")),
             "file at the byte limit must report its exact total, got: {out:.200}"
@@ -1124,7 +1187,7 @@ mod tests {
         let t = TempDir::new();
         let content = "a".repeat(CAPPED_READ_LIMIT + 1);
         write(&t.path().join("over.txt"), &content);
-        let out = read_inline_file(&t.path().join("over.txt")).unwrap();
+        let out = read_inline_file(&t.path().join("over.txt"), t.path()).unwrap();
         assert!(
             out.contains(&format!("first {} chars shown", crate::HOOK_OUTPUT_LIMIT)),
             "file past the byte limit must not claim an exact total, got: {out:.200}"
@@ -1140,7 +1203,7 @@ mod tests {
         let t = TempDir::new();
         let p = t.path().join("bad.txt");
         fs::write(&p, [b'a', b'b', 0xFF]).unwrap();
-        let out = read_inline_file(&p).unwrap();
+        let out = read_inline_file(&p, t.path()).unwrap();
         assert!(
             out.contains('\u{FFFD}'),
             "trailing invalid byte must survive as a replacement char, got: {out:?}"
