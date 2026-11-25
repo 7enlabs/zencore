@@ -906,6 +906,21 @@ fn validate_register_input(store: &SecretStore, input: &RegisterInput) -> Secret
     refuse_shaped("service", &input.service)?;
     refuse_shaped("owner", &input.owner)?;
     refuse_shaped("reason", &input.reason)?;
+    if input.service.trim().is_empty() {
+        return Err(SecretError::validation(
+            "a registration without a service is refused: the missing field is service",
+        ));
+    }
+    if input.owner.trim().is_empty() {
+        return Err(SecretError::validation(
+            "a registration without an owner is refused: the missing field is owner",
+        ));
+    }
+    if input.reason.trim().is_empty() {
+        return Err(SecretError::validation(
+            "a registration without a reason is refused: the missing field is reason",
+        ));
+    }
     if !(1..=MAX_SECRET_DAYS).contains(&input.default_until_days) {
         return Err(SecretError::validation(
             "default_until_days must be between 1 and 36500: every issuance carries an until",
@@ -1120,8 +1135,8 @@ fn max_until(
     Ok(default_until.min(short_cap))
 }
 
-/// File a request (state: `requested`). Refused without purpose, scope,
-/// or until; refused for an unregistered name; refused for a user/Zen
+/// File a request (state: `requested`). Refused without seat, purpose,
+/// scope, or until; refused for an unregistered name; refused for a user/Zen
 /// secret asked as a value; refused when a field carries a
 /// secret-shaped value. Prints nothing; the caller reports the id.
 pub fn request_secret(
@@ -1148,6 +1163,11 @@ pub fn request_secret(
             "secret '{}' is deregistered; it refuses all new requests",
             input.name
         )));
+    }
+    if input.seat.trim().is_empty() {
+        return Err(SecretError::validation(
+            "a request without a seat is refused: the missing field is seat",
+        ));
     }
     if input.purpose.trim().is_empty() {
         return Err(SecretError::validation(
@@ -2506,6 +2526,41 @@ mod tests {
         assert!(load_audit(&store).unwrap().is_empty());
     }
 
+    /// Issue #320: a request naming no seat is refused, so a direct
+    /// library caller cannot file a request the D4 Vault entry records
+    /// as `<NAME>:`.
+    #[test]
+    fn request_without_a_seat_is_refused() {
+        let (_dir, store) = temp_store("missingseat");
+        let now = fixed_now();
+        register_model_key(&store, now);
+        let until = rfc3339(now + Duration::days(1));
+        for seat in ["", "   "] {
+            let err = request_secret(
+                &store,
+                RequestInput {
+                    name: "MODEL_API_KEY".to_string(),
+                    seat: seat.to_string(),
+                    task_id: None,
+                    purpose: "work".to_string(),
+                    scope: "task:DS-7".to_string(),
+                    until: until.clone(),
+                    one_shot: false,
+                    broker_action: None,
+                },
+                now,
+            )
+            .unwrap_err();
+            assert_eq!(err.code(), exit_code::VALIDATION);
+            assert!(
+                err.to_string().contains("missing field is seat"),
+                "{seat:?}: {err}"
+            );
+        }
+        assert!(load_requests(&store).unwrap().is_empty());
+        assert!(load_audit(&store).unwrap().is_empty());
+    }
+
     #[test]
     fn near_miss_names_do_not_count() {
         let (_dir, store) = temp_store("nearmiss");
@@ -3195,6 +3250,38 @@ mod tests {
         assert!(register_secret(&store, input(7, 36501), now).is_err());
         // The cap itself registers.
         register_secret(&store, input(36500, 36500), now).unwrap();
+    }
+
+    /// Issue #320: a registration naming no owner, service, or reason
+    /// is refused, so an empty field can never land in the registry.
+    #[test]
+    fn register_without_owner_service_or_reason_is_refused() {
+        let (_dir, store) = temp_store("missingregister");
+        let now = fixed_now();
+        let input = |service: &str, owner: &str, reason: &str| RegisterInput {
+            name: "EMPTY_FIELD".to_string(),
+            class: SecretClass::Seat,
+            service: service.to_string(),
+            owner: owner.to_string(),
+            registered_by: LEADER_APPROVER.to_string(),
+            default_until_days: 7,
+            rotation_days: 90,
+            paid: false,
+            reason: reason.to_string(),
+            force: false,
+        };
+        for (service, owner, reason) in [
+            ("", "zc-leader", "provider key"),
+            ("   ", "zc-leader", "provider key"),
+            ("model-service", "", "provider key"),
+            ("model-service", "  ", "provider key"),
+            ("model-service", "zc-leader", ""),
+            ("model-service", "zc-leader", " "),
+        ] {
+            let err = register_secret(&store, input(service, owner, reason), now).unwrap_err();
+            assert_eq!(err.code(), exit_code::VALIDATION);
+        }
+        assert!(load_registry(&store).unwrap().is_empty());
     }
 
     /// Issue #318: a registry entry already on disk with an absurd day
