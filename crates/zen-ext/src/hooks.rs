@@ -4,11 +4,20 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use zen_core::{HookEvent, HookOutcome, HookRunner, PermissionDecision, PermissionMode};
 
 pub const HOOK_OUTPUT_LIMIT: usize = 10_000;
+
+/// Bytes retained per hook output stream (#391). `cap_output` counts chars,
+/// and one char is up to 4 bytes in UTF-8, so `HOOK_OUTPUT_LIMIT * 4` bytes
+/// hold any output of at most `HOOK_OUTPUT_LIMIT` chars unchanged; the +1
+/// is the probe byte that tells a truncated stream from one that ended
+/// exactly at the cap. Bounded either way: ~40 KB per stream, ~80 KB per
+/// hook, instead of the whole stream `wait_with_output` used to keep.
+const HOOK_OUTPUT_CAP_BYTES: usize = HOOK_OUTPUT_LIMIT * 4 + 1;
 
 pub struct CommandHooks {
     pub hooks: Value,
@@ -171,16 +180,27 @@ pub fn matches_target(matcher: Option<&str>, target: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn cap_output(s: &str) -> String {
+/// Truncate `s` to `HOOK_OUTPUT_LIMIT` chars for display. `truncated`
+/// means the reader already cut the stream (#391): the buffered char count
+/// is then only a lower bound on the true total, so the note says so
+/// instead of stating the buffered count as the total.
+fn cap_output(s: &str, truncated: bool) -> String {
     let count = s.chars().count();
     if count <= HOOK_OUTPUT_LIMIT {
         return s.to_string();
     }
     let head: String = s.chars().take(HOOK_OUTPUT_LIMIT).collect();
-    format!(
-        "{}\n[hook output truncated: {} of {} chars shown]",
-        head, HOOK_OUTPUT_LIMIT, count
-    )
+    if truncated {
+        format!(
+            "{}\n[hook output truncated: {} of at least {} chars shown]",
+            head, HOOK_OUTPUT_LIMIT, count
+        )
+    } else {
+        format!(
+            "{}\n[hook output truncated: {} of {} chars shown]",
+            head, HOOK_OUTPUT_LIMIT, count
+        )
+    }
 }
 
 fn exit2_blocks(event: HookEvent) -> bool {
@@ -230,6 +250,10 @@ struct SingleOutcome {
     watch_paths: Option<Vec<String>>,
 
     failed: bool,
+
+    /// Set when stdout or stderr produced more than the bounded reader kept
+    /// (#391): the true output was larger than what `interpret_output` saw.
+    output_truncated: bool,
 
     logged_error: Option<String>,
 }
@@ -310,13 +334,17 @@ impl HookRunner for CommandHooks {
             if let Some(fb) = r.feedback {
                 let fb = fb.trim();
                 if !fb.is_empty() {
-                    feedback_parts.push(cap_output(fb));
+                    feedback_parts.push(cap_output(fb, r.output_truncated));
                 }
             }
             if let Some(err) = r.logged_error {
                 let err = err.trim();
                 if !err.is_empty() {
-                    eprintln!("{} hook error: {}", event.as_str(), cap_output(err));
+                    eprintln!(
+                        "{} hook error: {}",
+                        event.as_str(),
+                        cap_output(err, r.output_truncated)
+                    );
                 }
             }
         }
@@ -417,7 +445,7 @@ async fn run_one(
         }
     }
 
-    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+    match tokio::time::timeout(timeout, wait_with_bounded_output(&mut child)).await {
         Err(_) => failure(format!(
             "hook timed out after {}s: {} [hook-diag] {}",
             spec.timeout_secs,
@@ -429,8 +457,14 @@ async fn run_one(
             e,
             hook_diag(spec, &cmd_display, cwd)
         )),
-        Ok(Ok(output)) => {
+        Ok(Ok(bounded)) => {
+            let output = std::process::Output {
+                status: bounded.status,
+                stdout: bounded.stdout,
+                stderr: bounded.stderr,
+            };
             let mut out = interpret_output(&output, event);
+            out.output_truncated = bounded.truncated;
             if let Some(err) = &mut out.logged_error {
                 err.push_str(" [hook-diag] ");
                 err.push_str(&hook_diag(spec, &cmd_display, cwd));
@@ -451,6 +485,86 @@ async fn run_one(
             out
         }
     }
+}
+
+/// Read at most `HOOK_OUTPUT_CAP_BYTES` bytes from `reader`, returning the
+/// bytes kept and whether the stream produced more (#391). The extra probe
+/// byte is read but discarded, so a stream that ends exactly at the cap is
+/// not reported as truncated.
+async fn read_capped<R>(reader: &mut R) -> (Vec<u8>, bool)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buf = Vec::new();
+    let mut limited = reader.take(HOOK_OUTPUT_CAP_BYTES as u64 + 1);
+    let truncated = match limited.read_to_end(&mut buf).await {
+        Ok(_) => buf.len() > HOOK_OUTPUT_CAP_BYTES,
+        Err(_) => false,
+    };
+    buf.truncate(HOOK_OUTPUT_CAP_BYTES);
+    (buf, truncated)
+}
+
+struct BoundedOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    truncated: bool,
+}
+
+/// Bounded replacement for `Child::wait_with_output` (#391): stdout and
+/// stderr are drained concurrently with a per-stream byte cap, so a hook
+/// that streams output forever cannot grow the parent's memory without
+/// bound. As soon as either stream passes the cap the child is killed, so
+/// the other stream's drain cannot block on a child wedged writing to a
+/// full pipe. The exit status is then the kill's (signal on Unix), which
+/// `interpret_output` already reports as a failed hook.
+async fn wait_with_bounded_output(
+    child: &mut tokio::process::Child,
+) -> std::io::Result<BoundedOutput> {
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let mut stdout_task = tokio::spawn(async move {
+        match stdout_pipe {
+            Some(mut pipe) => read_capped(&mut pipe).await,
+            None => (Vec::new(), false),
+        }
+    });
+    let mut stderr_task = tokio::spawn(async move {
+        match stderr_pipe {
+            Some(mut pipe) => read_capped(&mut pipe).await,
+            None => (Vec::new(), false),
+        }
+    });
+    let mut stdout_out: Option<(Vec<u8>, bool)> = None;
+    let mut stderr_out: Option<(Vec<u8>, bool)> = None;
+    while stdout_out.is_none() || stderr_out.is_none() {
+        tokio::select! {
+            result = &mut stdout_task, if stdout_out.is_none() => {
+                let out = result.unwrap_or((Vec::new(), false));
+                if out.1 {
+                    let _ = child.kill().await;
+                }
+                stdout_out = Some(out);
+            }
+            result = &mut stderr_task, if stderr_out.is_none() => {
+                let out = result.unwrap_or((Vec::new(), false));
+                if out.1 {
+                    let _ = child.kill().await;
+                }
+                stderr_out = Some(out);
+            }
+        }
+    }
+    let status = child.wait().await?;
+    let (stdout, stdout_truncated) = stdout_out.unwrap_or_default();
+    let (stderr, stderr_truncated) = stderr_out.unwrap_or_default();
+    Ok(BoundedOutput {
+        status,
+        stdout,
+        stderr,
+        truncated: stdout_truncated || stderr_truncated,
+    })
 }
 
 /// Round-4 diagnostics for PR #18 - diagnostics ONLY: this never
@@ -1481,9 +1595,96 @@ mod tests {
     #[test]
     fn c3_13_cap_is_char_safe() {
         let s = "é".repeat(HOOK_OUTPUT_LIMIT + 5);
-        let capped = cap_output(&s);
+        let capped = cap_output(&s, false);
         assert!(capped.starts_with(&"é".repeat(HOOK_OUTPUT_LIMIT)));
         assert!(capped.contains("truncated"));
+        assert!(!capped.contains("at least"));
+        // The reader already cut the stream (#391): the note must say the
+        // buffered count is only a lower bound on the true total.
+        let capped_cut = cap_output(&s, true);
+        assert!(capped_cut.contains("at least"));
+    }
+
+    // #391: a hook that streams output forever must not grow the parent's
+    // memory without bound. Before the fix `run_one` used
+    // `wait_with_output`, so a flooding hook ran until its timeout; these
+    // tests fail on the old code because the run takes the whole timeout.
+    // The producers below are bash `echo` loops on purpose: `yes` would
+    // buffer gigabytes in the 10s pre-fix window, these stay in the tens
+    // of MB while still hitting the cap instantly after the fix.
+    #[tokio::test]
+    async fn c391_stdout_flood_is_bounded() {
+        let tmp = TempDir::new();
+        let hooks = hooks_with(
+            "UserPromptSubmit",
+            None,
+            "while true; do echo 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; done",
+            10,
+        );
+        let start = std::time::Instant::now();
+        let out = run_ev(
+            &runner(hooks, tmp.path()),
+            HookEvent::UserPromptSubmit,
+            "",
+            json!({}),
+        )
+        .await;
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "flooding hook took {:?}, expected it to be killed once the output cap is hit",
+            start.elapsed()
+        );
+        assert!(out.failed);
+    }
+
+    #[tokio::test]
+    async fn c391_stderr_flood_is_bounded() {
+        let tmp = TempDir::new();
+        let hooks = hooks_with(
+            "UserPromptSubmit",
+            None,
+            "while true; do echo 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' >&2; done",
+            10,
+        );
+        let start = std::time::Instant::now();
+        let out = run_ev(
+            &runner(hooks, tmp.path()),
+            HookEvent::UserPromptSubmit,
+            "",
+            json!({}),
+        )
+        .await;
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "flooding hook took {:?}, expected it to be killed once the output cap is hit",
+            start.elapsed()
+        );
+        assert!(out.failed);
+    }
+
+    #[tokio::test]
+    async fn c391_both_streams_flood_is_bounded() {
+        let tmp = TempDir::new();
+        let hooks = hooks_with(
+            "UserPromptSubmit",
+            None,
+            "while true; do echo 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; echo 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' >&2; done",
+            10,
+        );
+        let start = std::time::Instant::now();
+        let out = run_ev(
+            &runner(hooks, tmp.path()),
+            HookEvent::UserPromptSubmit,
+            "",
+            json!({}),
+        )
+        .await;
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "flooding hook took {:?}, expected it to be killed once the output cap is hit",
+            start.elapsed()
+        );
+        assert!(out.failed);
     }
 
     #[tokio::test]
@@ -1994,6 +2195,168 @@ mod tests {
         assert!(
             feedback.contains("visible"),
             "hook child lost its normal env: {feedback}"
+        );
+    }
+    // #391 mutant kills: the byte-cap arithmetic at hooks.rs:20 and the
+    // probe logic in `read_capped` (hooks.rs:482/484). Each test pins an
+    // exact boundary so a one-operator mutation changes an observed
+    // length or flag:
+    // - exactly HOOK_OUTPUT_CAP_BYTES bytes: kept whole, not truncated.
+    //   Kills `*` -> `+` at 20:56 (cap 10_005), `+` -> `-`/`*` at 20:60
+    //   (cap 39_999/40_000), `+` -> `-` at 482:64 (take 40_000), and
+    //   `>` -> `>=`/`==` at 484:28 (40_001 reported truncated).
+    // - one byte over the cap: kept at exactly the cap, truncated.
+    //   Kills `+` -> `*` at 482:64 (take 40_001 reads only the cap, so
+    //   the extra byte is never seen) and `>` -> `==`/`<` at 484:28.
+    // - a huge stream: kept at exactly the cap, truncated.
+    /// Absolute byte cap the reader must enforce: HOOK_OUTPUT_LIMIT
+    /// chars (10_000) at up to 4 bytes each, plus one probe byte.
+    /// Written out instead of reusing HOOK_OUTPUT_CAP_BYTES on purpose:
+    /// the tests pin the cap's VALUE, so mutating the arithmetic at
+    /// hooks.rs:20 (e.g. star to plus, cap 10_005) changes what the code
+    /// keeps but not what the test expects, and the test fails.
+    const EXPECTED_CAP_BYTES: usize = 40_001;
+
+    #[tokio::test]
+    async fn c391_read_capped_keeps_exact_cap_bytes() {
+        let data = vec![b'x'; EXPECTED_CAP_BYTES];
+        let mut cursor = std::io::Cursor::new(data);
+        let (buf, truncated) = read_capped(&mut cursor).await;
+        assert_eq!(buf.len(), EXPECTED_CAP_BYTES);
+        assert!(
+            !truncated,
+            "a stream ending exactly at the cap is not truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn c391_read_capped_reports_one_byte_over_cap() {
+        let data = vec![b'x'; EXPECTED_CAP_BYTES + 1];
+        let mut cursor = std::io::Cursor::new(data);
+        let (buf, truncated) = read_capped(&mut cursor).await;
+        assert_eq!(buf.len(), EXPECTED_CAP_BYTES);
+        assert!(
+            truncated,
+            "one byte past the cap must be reported truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn c391_read_capped_truncates_huge_stream_to_cap() {
+        let data = vec![b'x'; EXPECTED_CAP_BYTES * 3];
+        let mut cursor = std::io::Cursor::new(data);
+        let (buf, truncated) = read_capped(&mut cursor).await;
+        assert_eq!(buf.len(), EXPECTED_CAP_BYTES);
+        assert!(truncated);
+    }
+
+    // #391 mutant kill: the `||` at hooks.rs:549 combines the two
+    // per-stream flags. A flood on exactly one stream must still mark
+    // the output truncated; `||` -> `&&` would clear it whenever the
+    // other stream stayed under the cap. The producers mirror the
+    // c391 flood tests: an echo loop the bounded reader kills as soon
+    // as the cap is hit.
+    #[tokio::test]
+    async fn c391_stdout_only_flood_marks_output_truncated() {
+        let tmp = TempDir::new();
+        let spec = CommandHookSpec {
+            matcher: None,
+            command: "while true; do echo 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; done"
+                .to_string(),
+            args: None,
+            timeout_secs: 10,
+            on_failure: OnFailure::Ignore,
+        };
+        let out = run_one(
+            &spec,
+            "{}",
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            HookEvent::UserPromptSubmit,
+        )
+        .await;
+        assert!(
+            out.output_truncated,
+            "stdout past the cap must mark the output truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn c391_stderr_only_flood_marks_output_truncated() {
+        let tmp = TempDir::new();
+        let spec = CommandHookSpec {
+            matcher: None,
+            command: "while true; do echo 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' >&2; done"
+                .to_string(),
+            args: None,
+            timeout_secs: 10,
+            on_failure: OnFailure::Ignore,
+        };
+        let out = run_one(
+            &spec,
+            "{}",
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            HookEvent::UserPromptSubmit,
+        )
+        .await;
+        assert!(
+            out.output_truncated,
+            "stderr past the cap must mark the output truncated"
+        );
+    }
+
+    /// Probe entry point for `c391_hook_error_is_logged_to_stderr` below.
+    /// The parent test runs this test as a subprocess (current_exe with
+    /// this test name); it runs a hook that times out with on_failure
+    /// Ignore, so `run` logs the failure to stderr. Without the env var
+    /// it is a no-op, so a plain `cargo test` run is unaffected. If the
+    /// `!` at hooks.rs:342 were deleted, the non-empty error would never
+    /// reach stderr and the parent test would fail.
+    #[tokio::test]
+    async fn __c391_probe_hook_error_logged() {
+        if std::env::var("C391_PROBE_HOOK_ERROR").is_err() {
+            return;
+        }
+        let tmp = TempDir::new();
+        let hooks = hooks_with("UserPromptSubmit", None, "sleep 5", 1);
+        let out = run_ev(
+            &runner(hooks, tmp.path()),
+            HookEvent::UserPromptSubmit,
+            "",
+            json!({}),
+        )
+        .await;
+        assert!(out.failed, "the timed-out hook must report failed");
+    }
+
+    #[test]
+    fn c391_hook_error_is_logged_to_stderr() {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .args([
+                "hooks::tests::__c391_probe_hook_error_logged",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("C391_PROBE_HOOK_ERROR", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "probe run failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("hook error:"),
+            "expected the hook failure on stderr, got: {stderr}"
+        );
+        assert!(
+            stderr.contains("timed out"),
+            "expected the timeout message on stderr, got: {stderr}"
         );
     }
 }
