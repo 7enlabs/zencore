@@ -1671,7 +1671,8 @@ pub const PROVIDER_API_KEY_ENV_NAMES: &[&str] = &[
 /// the configured name, and every name in [`PROVIDER_API_KEY_ENV_NAMES`].
 /// Use this (not [`api_key_env_names`]) when stripping credentials from an
 /// untrusted child's environment: hook processes (issue #390), MCP stdio
-/// children (issue #378), Bash and background-job shells all strip this set.
+/// children (issue #378), LSP children (issue #523), Bash and
+/// background-job shells all strip this set.
 pub fn all_api_key_env_names(api_key_env: Option<&str>) -> Vec<String> {
     let mut names = api_key_env_names(api_key_env);
     for name in PROVIDER_API_KEY_ENV_NAMES {

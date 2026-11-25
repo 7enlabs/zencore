@@ -823,6 +823,92 @@ async fn request_timeout_is_surfaced_not_hung() {
     assert!(err.to_string().contains("timed out"), "got: {err}");
 }
 
+/// Mock child for issue #523: dumps its inherited environment (values
+/// redacted) to the given path, then blocks on stdin until the parent
+/// closes it, so the child stays alive while the test reads the dump.
+const ENV_DUMP_SERVER: &str = r##"#!/usr/bin/env python3
+import os, sys
+with open(sys.argv[1], "w") as f:
+    for k in sorted(os.environ):
+        f.write(f"{k}=<redacted>\n")
+sys.stdin.buffer.read()
+"##;
+
+#[tokio::test]
+async fn spawn_strips_provider_routed_api_keys_from_child() {
+    // Issue #523: LspClient::spawn stripped only ZEN_API_KEY and
+    // OPENAI_API_KEY, so on the provider-routed path a language server
+    // child inherited the live provider key (GROQ_API_KEY, ...) and
+    // could exfiltrate it. The child must see none of the known
+    // provider keys, while its normal env still passes through.
+    let Some(py) = find_binary("python3") else {
+        eprintln!("SKIP: python3 not found");
+        return;
+    };
+    let tmp = unique_tmpdir("spawn-keys");
+    let script = tmp.join("env_dump.py");
+    write_file(&script, ENV_DUMP_SERVER);
+    let dump = tmp.join("env.txt");
+
+    // Hold PATH_LOCK while setting the fixture env, then release it
+    // across the awaits (clippy::await_holding_lock) and re-acquire it
+    // before restoring, mirroring missing_binary_names_the_install_command.
+    let mut env_lock = Some(PATH_LOCK.lock().unwrap());
+    let _groq = EnvGuard::set("GROQ_API_KEY", "sk-live-groq");
+    let _anthropic = EnvGuard::set("ANTHROPIC_API_KEY", "sk-live-anthropic");
+    let _deepseek = EnvGuard::set("DEEPSEEK_API_KEY", "sk-live-deepseek");
+    let _zen = EnvGuard::set("ZEN_API_KEY", "sk-live-zen");
+    let _marker = EnvGuard::set("ZEN_LSP_TEST_MARKER", "visible");
+    drop(env_lock.take());
+
+    let client = LspClient::spawn(
+        py.to_str().unwrap(),
+        &[
+            script.to_string_lossy().into_owned(),
+            dump.to_string_lossy().into_owned(),
+        ],
+    )
+    .unwrap();
+
+    // The dump is written in one go at startup; ZEN_LSP_TEST_MARKER
+    // sorts after every key asserted below, so its presence proves the
+    // dump is complete (same trick as the #378 test in tests.rs).
+    let mut text = String::new();
+    let mut found = false;
+    for _ in 0..50 {
+        if let Ok(t) = std::fs::read_to_string(&dump) {
+            text = t;
+            if text.contains("ZEN_LSP_TEST_MARKER=<redacted>") {
+                found = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(found, "child did not dump its env");
+    for leaked in [
+        "GROQ_API_KEY=",
+        "ANTHROPIC_API_KEY=",
+        "DEEPSEEK_API_KEY=",
+        "ZEN_API_KEY=",
+    ] {
+        assert!(
+            !text.contains(leaked),
+            "provider key leaked to LSP child: {leaked}"
+        );
+    }
+
+    // Drop the client so its child is killed (kill_on_drop), then
+    // re-acquire the lock before restoring the fixture env.
+    drop(client);
+    let _env_lock = PATH_LOCK.lock().unwrap();
+    drop(_groq);
+    drop(_anthropic);
+    drop(_deepseek);
+    drop(_zen);
+    drop(_marker);
+}
+
 /// Mock server for issue #386: it sends server-to-client requests
 /// while a client request is pending, and logs every frame it receives
 /// (full JSON, one per line) so the test can check the client answered
