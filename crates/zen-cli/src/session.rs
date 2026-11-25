@@ -23,13 +23,128 @@ pub fn strip_verbatim_prefix(p: &Path) -> PathBuf {
     p.to_path_buf()
 }
 
+/// Encode a working directory as one project-directory name.
+///
+/// Injective (#458): every byte outside `[A-Za-z0-9._-]` is percent-encoded
+/// (`%XX`, uppercase hex, over the UTF-8 bytes), and `%` itself encodes as
+/// `%25`, so decoding is unambiguous and two distinct paths can never share
+/// a name. The old dash mapping sent every separator and `.` to the same
+/// `-`, so `/a/b.c`, `/a/b/c` and `/a/b-c` all encoded to `-a-b-c` and
+/// their sessions interleaved in one project directory; resuming the
+/// latest session for one project could return the other project's
+/// session. `.` stays literal: it is legal in a file name on every OS,
+/// and keeping it makes the names shorter and still distinct because `/`
+/// is encoded (`/a/b.c` -> `%2Fa%2Fb.c`, `/a/b/c` -> `%2Fa%2Fb%2Fc`).
 pub fn encode_cwd(path: &Path) -> String {
+    let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let abs = strip_verbatim_prefix(&abs);
+    let s = abs.to_string_lossy();
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Pre-#458 encoding: every separator and `.` maps to `-`, so distinct
+/// paths collide (`/a/b.c`, `/a/b/c`, `/a/b-c` all -> `-a-b-c`). Kept
+/// only to locate (and migrate) project directories created before the
+/// fix. New code must use [`encode_cwd`].
+fn legacy_encode_cwd(path: &Path) -> String {
     let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let abs = strip_verbatim_prefix(&abs);
     let s = abs.to_string_lossy();
     // Replace every character Windows forbids in a file name, not just the
     // separators: `?` from a verbatim prefix, plus `* " < > |`.
     s.replace(['/', '\\', ':', '.', '?', '*', '"', '<', '>', '|'], "-")
+}
+
+/// Inverse of [`encode_cwd`]: `%XX` back to the byte, everything else
+/// literal. `None` on a malformed `%` sequence or non-UTF-8 result, so a
+/// legacy dash-encoded name (which may contain a stray `%` from the path
+/// itself) never decodes into a wrong path.
+fn decode_cwd(encoded: &str) -> Option<String> {
+    // Iterator-based so no manual index can stall: the `i += 3` form
+    // let the `i += 3` -> `i *= 3` mutant hang forever on an escape at
+    // position 0 (0 * 3 stays 0), which cargo-mutants reports as a
+    // TIMEOUT instead of a kill and fails the shard. Advancing with
+    // `next()` always consumes input, so a mutant here can only give a
+    // wrong value, which the tests catch.
+    let bytes = encoded.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut iter = bytes.iter();
+    while let Some(&b) = iter.next() {
+        if b == b'%' {
+            let h1 = *iter.next()?;
+            let h2 = *iter.next()?;
+            let pair = [h1, h2];
+            let hex = std::str::from_utf8(&pair).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+        } else {
+            out.push(b);
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Compare two cwd spellings ignoring only form differences: letter case
+/// and `/` vs `\`. Punctuation such as `.` vs `-` stays significant, so
+/// `/a/b.c` never matches `/a/b-c` (#458) the way the old encoded-name
+/// normalization did.
+fn normalize_path_form(p: &str) -> String {
+    p.replace('\\', "/").to_lowercase()
+}
+
+/// Move the sessions out of a pre-#458 legacy project directory into the
+/// project directories the injective encoding gives them, one file at a
+/// time by the `cwd` its own first transcript record carries. Colliding
+/// projects shared one legacy directory, so a blind rename of the whole
+/// directory would hand every session to a single owner; splitting by
+/// recorded `cwd` gives each project exactly its own sessions. Files
+/// with no parseable recorded `cwd` stay put (they cannot be attributed
+/// safely) and the legacy directory is removed only once it is empty.
+/// No-op when there is no legacy directory. Called from the write paths
+/// (`ensure_session_path`, `ensure_session_dir`) so an upgrade self-heals
+/// on next use; read paths never mutate (`latest_session_for_cwd` and
+/// `list_sessions_for_cwd` read the legacy directory filtered by recorded
+/// `cwd` instead).
+fn migrate_legacy_project_dir(home: &Path, cwd: &Path) {
+    let new_dir = project_dir(home, &encode_cwd(cwd));
+    let legacy_dir = project_dir(home, &legacy_encode_cwd(cwd));
+    if legacy_dir == new_dir || !legacy_dir.exists() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&legacy_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(owner) = recorded_cwd(&path) else {
+            continue;
+        };
+        let owner_dir = project_dir(home, &encode_cwd(Path::new(&owner)));
+        if owner_dir == legacy_dir {
+            continue;
+        }
+        if std::fs::create_dir_all(&owner_dir).is_err() {
+            continue;
+        }
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let target = owner_dir.join(name);
+        if target.exists() {
+            continue;
+        }
+        let _ = std::fs::rename(&path, &target);
+    }
+    let _ = std::fs::remove_dir(&legacy_dir);
 }
 
 pub fn project_dir(home: &Path, encoded: &str) -> PathBuf {
@@ -103,23 +218,45 @@ pub fn find_session_path(home: &Path, id_or_path: &str) -> Option<PathBuf> {
 
 pub fn latest_session_for_cwd(home: &Path, encoded: &str) -> Option<PathBuf> {
     let dir = project_dir(home, encoded);
-    if let Some(p) = latest_in_project_dir(&dir) {
+    if let Some(p) = latest_in_project_dir(&dir, None) {
         return Some(p);
+    }
+    // Pre-#458 sessions live under the legacy dash-encoded name. The
+    // encoding is injective now, so decode it back to the cwd and look in
+    // the legacy directory - but only at sessions whose own recorded `cwd`
+    // is this cwd. A legacy directory may hold several projects' sessions
+    // (that is the #458 collision), so an unfiltered latest pick could
+    // still return another project's session. Files found here are moved
+    // to their owners' directories by the next write path; this read path
+    // never mutates.
+    if let Some(cwd) = decode_cwd(encoded) {
+        let legacy_dir = project_dir(home, &legacy_encode_cwd(Path::new(&cwd)));
+        if legacy_dir != dir {
+            let want = encode_cwd(Path::new(&cwd));
+            if let Some(p) = latest_in_project_dir(&legacy_dir, Some(&want)) {
+                return Some(p);
+            }
+        }
     }
     // Encoded-name drift fallback (round 5): on Windows the encoded
     // project name is computed from `canonicalize()` output in the
     // calling process, but the directory on disk may have been created
     // by another process whose form of the same cwd differs only in
-    // case, separators, or punctuation (verbatim prefix, short/long
-    // name forms). The exact-name lookup above then misses a project
-    // directory that does hold this cwd sessions, and `--continue`
-    // silently starts a new session. If - and only if - the exact
-    // directory yields nothing, retry against sibling project
-    // directories whose names match under a normalization that erases
-    // exactly those form differences. A normalized match still has to
-    // name the same path: every alphanumeric character must agree.
+    // case or separators (verbatim prefix, short/long name forms). The
+    // exact-name lookup above then misses a project directory that does
+    // hold this cwd's sessions, and `--continue` silently starts a new
+    // session. If - and only if - the exact directory yields nothing,
+    // retry against sibling project directories whose DECODED path
+    // matches under `normalize_path_form`. Comparing decoded paths (not
+    // the encoded names, as round 5 did) matters for #458: the old
+    // normalization collapsed every run of punctuation to one `-`, so
+    // `/a/b.c` and `/a/b-c` compared equal and the fallback itself
+    // cross-matched the colliding projects. Decoded-path comparison
+    // keeps `.` vs `-` distinct while still forgiving case and
+    // separator form. Legacy dash-encoded siblings do not decode to a
+    // path, so they never match here; they are covered above.
+    let want = decode_cwd(encoded).map(|s| normalize_path_form(&s))?;
     let root = home.join(".zen").join("projects");
-    let target = normalize_project_name(encoded);
     for entry in std::fs::read_dir(&root).ok()? {
         let Ok(entry) = entry else { continue };
         let candidate = entry.path();
@@ -132,37 +269,26 @@ pub fn latest_session_for_cwd(home: &Path, encoded: &str) -> Option<PathBuf> {
         else {
             continue;
         };
-        if normalize_project_name(&name) != target {
+        let Some(decoded) = decode_cwd(&name) else {
+            continue;
+        };
+        if normalize_path_form(&decoded) != want {
             continue;
         }
-        if let Some(p) = latest_in_project_dir(&candidate) {
+        if let Some(p) = latest_in_project_dir(&candidate, None) {
             return Some(p);
         }
     }
     None
 }
 
-/// Normalize an encoded project directory name for comparison:
-/// lowercase, and collapse every run of non-alphanumeric characters
-/// to a single `-`. Two names that differ only in letter case or in
-/// which punctuation a path form produced compare equal; any
-/// difference in the alphanumeric content itself does not.
-fn normalize_project_name(name: &str) -> String {
-    let mut out = String::new();
-    let mut last_dash = true;
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.extend(ch.to_lowercase());
-            last_dash = false;
-        } else if !last_dash {
-            out.push('-');
-            last_dash = true;
-        }
-    }
-    out.trim_end_matches('-').to_string()
-}
-
-fn latest_in_project_dir(dir: &Path) -> Option<PathBuf> {
+/// `want_cwd` is an `encode_cwd` value: when set, only session files
+/// whose own recorded `cwd` encodes to it are considered. Used for the
+/// pre-#458 legacy directory, which may hold several projects' sessions;
+/// without the filter, "latest" there could be another project's
+/// session. `None` keeps the old unfiltered behaviour for a directory
+/// that belongs to exactly one (new-scheme) encoding.
+fn latest_in_project_dir(dir: &Path, want_cwd: Option<&str>) -> Option<PathBuf> {
     if !dir.exists() {
         return None;
     }
@@ -181,6 +307,11 @@ fn latest_in_project_dir(dir: &Path) -> Option<PathBuf> {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if let Some(want) = want_cwd
+            && recorded_cwd(&path).is_none_or(|c| encode_cwd(Path::new(&c)) != want)
+        {
             continue;
         }
         let recorded = recorded_timestamp_key(&path);
@@ -203,6 +334,24 @@ fn latest_in_project_dir(dir: &Path) -> Option<PathBuf> {
     latest.map(|(_, _, _, p)| p)
 }
 
+/// The first transcript record of a session file, if it parses as JSON.
+/// A torn first line (crash mid-append) yields `None`; callers that need
+/// the value treat that as "unknown", never as a match.
+fn first_record(path: &Path) -> Option<Value> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let first_line = content.lines().next()?;
+    serde_json::from_str::<Value>(first_line).ok()
+}
+
+/// The `cwd` the session writer recorded when the session started.
+/// Attribution for the pre-#458 legacy directory: each file carries its
+/// owner's cwd, which is how colliding projects sharing one legacy
+/// directory are told apart again (migration and the legacy fallback in
+/// `latest_session_for_cwd`).
+fn recorded_cwd(path: &Path) -> Option<String> {
+    first_record(path)?.get("cwd")?.as_str().map(String::from)
+}
+
 /// Ordering key from the `timestamp` of the first record in a session
 /// file: (unix seconds, sub-second nanos) of the RFC 3339 value the
 /// session writer recorded when the session started. `(i64::MIN, 0)`
@@ -211,13 +360,7 @@ fn latest_in_project_dir(dir: &Path) -> Option<PathBuf> {
 /// decides between them.
 fn recorded_timestamp_key(path: &Path) -> (i64, u32) {
     let fallback = (i64::MIN, 0);
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return fallback;
-    };
-    let Some(first_line) = content.lines().next() else {
-        return fallback;
-    };
-    let Ok(v) = serde_json::from_str::<Value>(first_line) else {
+    let Some(v) = first_record(path) else {
         return fallback;
     };
     let Some(ts) = v.get("timestamp").and_then(|t| t.as_str()) else {
@@ -471,6 +614,7 @@ impl TranscriptWriter {
 pub fn ensure_session_path(home: &Path, cwd: &Path, session_id: &str) -> Result<PathBuf> {
     let encoded = encode_cwd(cwd);
     let proj = project_dir(home, &encoded);
+    migrate_legacy_project_dir(home, cwd);
     create_project_dir(&proj)?;
     Ok(session_path(&proj, session_id))
 }
@@ -478,6 +622,7 @@ pub fn ensure_session_path(home: &Path, cwd: &Path, session_id: &str) -> Result<
 pub fn ensure_session_dir(home: &Path, cwd: &Path, session_id: &str) -> Result<PathBuf> {
     let encoded = encode_cwd(cwd);
     let proj = project_dir(home, &encoded);
+    migrate_legacy_project_dir(home, cwd);
     create_project_dir(&proj)?;
     let _ = session_id;
     Ok(proj)
@@ -490,14 +635,37 @@ pub fn new_session_id() -> String {
 pub fn list_sessions_for_cwd(home: &Path, cwd: &Path) -> Vec<(String, PathBuf)> {
     let encoded = encode_cwd(cwd);
     let dir = project_dir(home, &encoded);
+    let mut sessions = sessions_in_dir(&dir, None);
+    // Pre-#458 sessions not yet migrated out of the legacy directory:
+    // include this cwd's own files (attributed by recorded `cwd`),
+    // never another project's files sharing that directory. Read-only:
+    // the files move to their owners' directories on the next write.
+    let legacy_dir = project_dir(home, &legacy_encode_cwd(cwd));
+    if legacy_dir != dir {
+        sessions.extend(sessions_in_dir(&legacy_dir, Some(&encoded)));
+    }
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.0));
+    sessions.into_iter().map(|(_, id, p)| (id, p)).collect()
+}
+
+/// `(mtime, session id, path)` of the `*.jsonl` files in one project
+/// directory, newest first by mtime. With `want_cwd` set (an
+/// `encode_cwd` value), only files whose own recorded `cwd` encodes to
+/// it are returned - the legacy-directory filter of #458.
+fn sessions_in_dir(dir: &Path, want_cwd: Option<&str>) -> Vec<(SystemTime, String, PathBuf)> {
     if !dir.exists() {
         return vec![];
     }
     let mut sessions: Vec<(SystemTime, String, PathBuf)> = vec![];
-    for entry in std::fs::read_dir(&dir).ok().into_iter().flatten() {
+    for entry in std::fs::read_dir(dir).ok().into_iter().flatten() {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if let Some(want) = want_cwd
+            && recorded_cwd(&path).is_none_or(|c| encode_cwd(Path::new(&c)) != want)
+        {
             continue;
         }
         if let Ok(mtime) = entry.metadata().and_then(|m| m.modified())
@@ -506,8 +674,7 @@ pub fn list_sessions_for_cwd(home: &Path, cwd: &Path) -> Vec<(String, PathBuf)> 
             sessions.push((mtime, stem.to_string(), path));
         }
     }
-    sessions.sort_by_key(|s| std::cmp::Reverse(s.0));
-    sessions.into_iter().map(|(_, id, p)| (id, p)).collect()
+    sessions
 }
 
 pub fn append_usage(path: &Path, session_id: &str, usage: &zen_core::UsageStats) -> Result<()> {
@@ -594,6 +761,21 @@ mod tests {
     use super::*;
     use std::fs;
 
+    // The pre-#458 dash encoding, replicated here (not via
+    // `legacy_encode_cwd`, so the migration test also runs against the
+    // unfixed code and fails there). It must replicate the old encoder
+    // faithfully: `canonicalize()` returns a verbatim `\\?\...` path on
+    // Windows, and the old encoder stripped that prefix before the dash
+    // mapping. Replicating the mapping without the strip builds a legacy
+    // directory name (`----C--...`) production code never creates and
+    // never looks up, so on Windows the migration test's lookup misses
+    // and panics unwrapping `None` (PR #537 windows-check, session.rs:939).
+    fn legacy_encode(p: &Path) -> String {
+        strip_verbatim_prefix(&p.canonicalize().unwrap_or_else(|_| p.to_path_buf()))
+            .to_string_lossy()
+            .replace(['/', '\\', ':', '.', '?', '*', '"', '<', '>', '|'], "-")
+    }
+
     #[test]
     fn p0b_1_session_scratch_dir_sits_next_to_the_transcript() {
         let t = Path::new("/h/.zen/projects/-p/abc-123.jsonl");
@@ -629,15 +811,13 @@ mod tests {
     }
 
     #[test]
-    fn encode_cwd_replaces_slashes_and_dots() {
+    fn encode_cwd_uses_only_file_name_safe_chars() {
         let tmp = std::env::temp_dir().join(format!("zenenc_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
 
-        let enc = encode_cwd(&tmp);
-        let s = enc;
+        let s = encode_cwd(&tmp);
         assert!(!s.contains('/'));
-        assert!(!s.contains('.'));
         assert!(!s.contains('\\'));
         assert!(!s.contains(':'));
         // Windows verbatim `\\?\` prefix must not leak a `?` into the name
@@ -649,6 +829,205 @@ mod tests {
         assert!(!s.contains('<'));
         assert!(!s.contains('>'));
         assert!(!s.contains('|'));
+        // `.` is legal in a file name and stays literal under #458, so
+        // the old "no dots" assertion no longer applies.
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn encode_cwd_is_injective_for_dot_slash_and_dash() {
+        // #458: the old dash mapping collapsed all three to `-a-b-c`.
+        // They need not exist: canonicalize() falls back to the path
+        // as given.
+        let a = encode_cwd(Path::new("/a/b.c"));
+        let b = encode_cwd(Path::new("/a/b/c"));
+        let c = encode_cwd(Path::new("/a/b-c"));
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
+    }
+
+    #[test]
+    fn decode_cwd_roundtrips_encode_cwd() {
+        for p in ["/a/b.c", "/a/b/c", "/a/b-c", "/a%b", "/a b/c", "/café/x"] {
+            let enc = encode_cwd(Path::new(p));
+            assert_eq!(decode_cwd(&enc).unwrap(), p);
+        }
+        // Malformed `%` never decodes to a wrong path.
+        assert!(decode_cwd("%2").is_none());
+        assert!(decode_cwd("%zz").is_none());
+        assert!(decode_cwd("%2Ftmp%").is_none());
+    }
+
+    #[test]
+    fn colliding_cwds_get_separate_project_dirs() {
+        // #458: /a/b.c, /a/b/c, /a/b-c shared one project directory
+        // under the old encoding, so --continue could resume another
+        // project's session.
+        let base = std::env::temp_dir().join(format!("zen_collide_{}", Uuid::new_v4()));
+        let home = base.join("home");
+        let cwd_dot = base.join("a").join("b.c");
+        let cwd_slash = base.join("a").join("b").join("c");
+        let cwd_dash = base.join("a").join("b-c");
+        for d in [&cwd_dot, &cwd_slash, &cwd_dash] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let p_dot = ensure_session_path(&home, &cwd_dot, "sess-dot").unwrap();
+        let p_slash = ensure_session_path(&home, &cwd_slash, "sess-slash").unwrap();
+        let p_dash = ensure_session_path(&home, &cwd_dash, "sess-dash").unwrap();
+        assert_ne!(p_dot.parent().unwrap(), p_slash.parent().unwrap());
+        assert_ne!(p_dot.parent().unwrap(), p_dash.parent().unwrap());
+        assert_ne!(p_slash.parent().unwrap(), p_dash.parent().unwrap());
+        for (p, id, cwd) in [
+            (&p_dot, "sess-dot", &cwd_dot),
+            (&p_slash, "sess-slash", &cwd_slash),
+            (&p_dash, "sess-dash", &cwd_dash),
+        ] {
+            append_typed(
+                p,
+                "user",
+                id,
+                cwd.to_str().unwrap(),
+                "u",
+                None,
+                Some(serde_json::json!({"role":"user","content":"hi"})),
+                None,
+            )
+            .unwrap();
+        }
+        // --continue for each cwd resolves to its own session only.
+        for (cwd, want) in [
+            (&cwd_dot, "sess-dot.jsonl"),
+            (&cwd_slash, "sess-slash.jsonl"),
+            (&cwd_dash, "sess-dash.jsonl"),
+        ] {
+            let latest = latest_session_for_cwd(&home, &encode_cwd(cwd)).unwrap();
+            assert_eq!(latest.file_name().unwrap(), want);
+            let listed = list_sessions_for_cwd(&home, cwd);
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].0, want.trim_end_matches(".jsonl"));
+        }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn legacy_project_dir_is_migrated_and_split_by_cwd() {
+        // Simulate a pre-#458 home: two projects' sessions share one
+        // legacy dash-encoded directory.
+        let base = std::env::temp_dir().join(format!("zen_legacy_{}", Uuid::new_v4()));
+        let home = base.join("home");
+        let cwd_dot = base.join("a").join("b.c");
+        let cwd_slash = base.join("a").join("b").join("c");
+        for d in [&cwd_dot, &cwd_slash] {
+            fs::create_dir_all(d).unwrap();
+        }
+        // The old dash mapping (see `legacy_encode` above): the legacy
+        // directory both colliding projects share.
+        let legacy_dir = home
+            .join(".zen")
+            .join("projects")
+            .join(legacy_encode(&cwd_dot));
+        assert_eq!(
+            legacy_dir,
+            home.join(".zen")
+                .join("projects")
+                .join(legacy_encode(&cwd_slash))
+        );
+        fs::create_dir_all(&legacy_dir).unwrap();
+        // One session per project, each recording its own cwd.
+        for (id, cwd) in [("old-dot", &cwd_dot), ("old-slash", &cwd_slash)] {
+            let p = legacy_dir.join(format!("{id}.jsonl"));
+            append_typed(
+                &p,
+                "user",
+                id,
+                cwd.to_str().unwrap(),
+                "u",
+                None,
+                Some(serde_json::json!({"role":"user","content":"hi"})),
+                None,
+            )
+            .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        // Before any new session is created, --continue must already
+        // return each project's own legacy session, not the other's.
+        let found_dot = latest_session_for_cwd(&home, &encode_cwd(&cwd_dot)).unwrap();
+        assert_eq!(found_dot.file_name().unwrap(), "old-dot.jsonl");
+        let found_slash = latest_session_for_cwd(&home, &encode_cwd(&cwd_slash)).unwrap();
+        assert_eq!(found_slash.file_name().unwrap(), "old-slash.jsonl");
+        assert_eq!(list_sessions_for_cwd(&home, &cwd_dot).len(), 1);
+        assert_eq!(list_sessions_for_cwd(&home, &cwd_slash).len(), 1);
+        // Creating a new session migrates the legacy directory: each
+        // file moves to its owner's new directory and the legacy one
+        // goes away.
+        let _ = ensure_session_path(&home, &cwd_dot, "new-dot").unwrap();
+        assert!(!legacy_dir.exists());
+        assert!(
+            project_dir(&home, &encode_cwd(&cwd_dot))
+                .join("old-dot.jsonl")
+                .exists()
+        );
+        assert!(
+            project_dir(&home, &encode_cwd(&cwd_slash))
+                .join("old-slash.jsonl")
+                .exists()
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn legacy_encode_matches_production_for_verbatim_windows_paths() {
+        // Regression test for the PR #537 windows-check failure: on
+        // Windows `canonicalize()` returns verbatim paths
+        // (`\\?\C:\...`, `\\?\UNC\server\share\...`), and the pre-#458
+        // encoder stripped that prefix before the dash mapping, so a
+        // real legacy directory is named `C--...`, never `----C--...`.
+        // These are pure string paths (nothing on disk), so the test
+        // runs on every OS: `canonicalize()` falls back to the path
+        // itself for them and the strip is a pure string transform.
+        // With the old helper (no strip) this fails; with the fix it passes.
+        for p in [
+            r"\\?\C:\Users\runner\work\a\b.c",
+            r"\\?\UNC\server\share\a\b",
+            r"C:\a\b.c",
+        ] {
+            assert_eq!(legacy_encode(Path::new(p)), legacy_encode_cwd(Path::new(p)));
+        }
+    }
+
+    #[test]
+    fn latest_session_finds_case_variant_project_dir() {
+        // Round-5 drift fallback, reworked for #458: a sibling project
+        // directory whose DECODED path differs from the requested cwd
+        // only in letter case still resolves, so --continue does not
+        // silently start a new session on Windows form drift.
+        let base = std::env::temp_dir().join(format!("zen_drift_{}", Uuid::new_v4()));
+        let home = base.join("home");
+        let cwd = base.join("drift").join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        let encoded = encode_cwd(&cwd);
+        // Same path, different letter case: on disk the directory was
+        // created from another spelling of the cwd.
+        let variant = encoded.to_uppercase();
+        assert_ne!(variant, encoded);
+        let dir = home.join(".zen").join("projects").join(&variant);
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("drifted.jsonl");
+        append_typed(
+            &p,
+            "user",
+            "drifted",
+            cwd.to_str().unwrap(),
+            "u",
+            None,
+            Some(serde_json::json!({"role":"user","content":"hi"})),
+            None,
+        )
+        .unwrap();
+        let latest = latest_session_for_cwd(&home, &encoded).unwrap();
+        assert_eq!(latest.file_name().unwrap(), "drifted.jsonl");
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -1043,5 +1422,198 @@ mod tests {
         for pair in users.windows(2) {
             assert_eq!(pair[1]["parentUuid"], pair[0]["uuid"]);
         }
+    }
+
+    #[test]
+    fn normalize_path_form_lowercases_and_unifies_separators() {
+        // Kills the cargo-mutants "replace body with String::new() /
+        // "xyzzy" mutants on normalize_path_form (line 91): a constant
+        // return makes every decoded path compare equal in the drift
+        // fallback of latest_session_for_cwd, so --continue could resolve
+        // to a sibling project's session. The existing case-variant test
+        // has only one sibling directory, so it passes under the mutant.
+        assert_eq!(normalize_path_form("/A/B.C"), "/a/b.c");
+        assert_eq!(
+            normalize_path_form(r"C:\Users\Runner\Work"),
+            "c:/users/runner/work"
+        );
+        assert_eq!(normalize_path_form("/a\\b/c"), "/a/b/c");
+        // Punctuation stays significant: `.` vs `-` must not collapse (#458).
+        assert_ne!(normalize_path_form("/a/b.c"), normalize_path_form("/a/b-c"));
+        assert_eq!(normalize_path_form(""), "");
+    }
+
+    #[test]
+    fn migrate_legacy_project_dir_skips_when_legacy_and_new_coincide() {
+        // Kills the `||` -> `&&` mutant on the early-return guard (line
+        // 110). A relative cwd that does not exist on disk makes
+        // canonicalize() fail, so both encoders fall back to the path as
+        // given and agree on the name (only file-name-safe chars), and the
+        // legacy directory IS the new directory. Production cwds are
+        // absolute, so this coincidence is only reachable here; the test
+        // pins the guard's intended logic directly.
+        let base = std::env::temp_dir().join(format!("zen_mut2_{}", Uuid::new_v4()));
+        let home = base.join("home");
+        let rel = format!("zen_mut2_rel_{}", Uuid::new_v4());
+        let rel_cwd = Path::new(&rel);
+        let legacy_dir = project_dir(&home, &encode_cwd(rel_cwd));
+        assert_eq!(legacy_dir, project_dir(&home, &legacy_encode_cwd(rel_cwd)));
+        fs::create_dir_all(&legacy_dir).unwrap();
+        // A session belonging to another project, stranded in the shared dir.
+        let other_cwd = format!("/tmp/zen-mut2-other-{}", Uuid::new_v4());
+        let other_path = legacy_dir.join("other.jsonl");
+        append_typed(
+            &other_path,
+            "user",
+            "other",
+            &other_cwd,
+            "u",
+            None,
+            Some(serde_json::json!({"role":"user","content":"hi"})),
+            None,
+        )
+        .unwrap();
+        // Correct code returns early: nothing moves, the directory stays.
+        // Under the `&&` mutant the guard no longer fires, the foreign
+        // file is migrated out to its owner's directory and the legacy
+        // directory is removed.
+        migrate_legacy_project_dir(&home, rel_cwd);
+        assert!(
+            legacy_dir.exists(),
+            "legacy dir must survive when it coincides with the new dir"
+        );
+        assert!(
+            other_path.exists(),
+            "foreign session must stay put when migration is skipped"
+        );
+        assert!(
+            !project_dir(&home, &encode_cwd(Path::new(&other_cwd)))
+                .join("other.jsonl")
+                .exists()
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn latest_session_prefers_old_timestamp_over_missing_timestamp() {
+        // Kills the cargo-mutants mutants replacing the (i64::MIN, 0)
+        // fallback in recorded_timestamp_key (line 355) with (-1, 1),
+        // (0, 0) or (1, 1): a session with no parseable timestamp must sort
+        // before ANY timestamped session, even one from 1960. The existing
+        // latest_session_picks_newest test stamps both files with now, so
+        // the fallback is never exercised there.
+        let base = std::env::temp_dir().join(format!("zen_mut3_{}", Uuid::new_v4()));
+        let home = base.join("home");
+        let cwd = base.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        let dir = project_dir(&home, &encode_cwd(&cwd));
+        fs::create_dir_all(&dir).unwrap();
+        let cwd_str = cwd.to_str().unwrap();
+        // No parseable timestamp: the fallback (i64::MIN, 0) applies.
+        let no_ts = dir.join("aaa-no-ts.jsonl");
+        fs::write(
+            &no_ts,
+            serde_json::json!({
+                "type": "user",
+                "uuid": "u1",
+                "session_id": "aaa-no-ts",
+                "cwd": cwd_str,
+                "message": {"role": "user", "content": "hi"},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(recorded_timestamp_key(&no_ts), (i64::MIN, 0));
+        // A real timestamp from 1960: negative unix seconds, still newer
+        // than "no timestamp at all".
+        let old = dir.join("zzz-old.jsonl");
+        fs::write(
+            &old,
+            serde_json::json!({
+                "type": "user",
+                "uuid": "u2",
+                "session_id": "zzz-old",
+                "timestamp": "1960-01-01T00:00:00+00:00",
+                "cwd": cwd_str,
+                "message": {"role": "user", "content": "hi"},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(recorded_timestamp_key(&old), (-315619200, 0));
+        // Behavioural check: --continue resolves to the 1960 session, not
+        // the timestamp-less one. Under any of the three fallback mutants
+        // the timestamp-less file's key (-1/0/1, ...) beats 1960 and wins.
+        let latest = latest_session_for_cwd(&home, &encode_cwd(&cwd)).unwrap();
+        assert_eq!(latest.file_name().unwrap(), "zzz-old.jsonl");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn list_sessions_for_cwd_filters_legacy_dir_by_recorded_cwd() {
+        // Kills the `!=` -> `==` mutant in sessions_in_dir (line 660):
+        // the legacy-directory filter must KEEP a file whose recorded cwd
+        // encodes to the wanted cwd and SKIP the others. Under the mutant
+        // the filter inverts, so each project lists the OTHER project's
+        // session. The existing migration test only asserts the list LENGTH
+        // (1) for each cwd, which stays 1 under the mutant - only the
+        // identity flips.
+        let base = std::env::temp_dir().join(format!("zen_mut4_{}", Uuid::new_v4()));
+        let home = base.join("home");
+        let cwd_dot = base.join("a").join("b.c");
+        let cwd_slash = base.join("a").join("b").join("c");
+        for d in [&cwd_dot, &cwd_slash] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let legacy_dir = home
+            .join(".zen")
+            .join("projects")
+            .join(legacy_encode(&cwd_dot));
+        assert_eq!(
+            legacy_dir,
+            home.join(".zen")
+                .join("projects")
+                .join(legacy_encode(&cwd_slash))
+        );
+        fs::create_dir_all(&legacy_dir).unwrap();
+        for (id, cwd) in [("old-dot", &cwd_dot), ("old-slash", &cwd_slash)] {
+            let p = legacy_dir.join(format!("{id}.jsonl"));
+            append_typed(
+                &p,
+                "user",
+                id,
+                cwd.to_str().unwrap(),
+                "u",
+                None,
+                Some(serde_json::json!({"role":"user","content":"hi"})),
+                None,
+            )
+            .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        // Each project lists exactly its own legacy session - identity,
+        // not just count.
+        let dot_list = list_sessions_for_cwd(&home, &cwd_dot);
+        assert_eq!(dot_list.len(), 1);
+        assert_eq!(dot_list[0].0, "old-dot");
+        let slash_list = list_sessions_for_cwd(&home, &cwd_slash);
+        assert_eq!(slash_list.len(), 1);
+        assert_eq!(slash_list[0].0, "old-slash");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn decode_cwd_advances_past_percent_escape_not_at_start() {
+        // Kills the `i += 3` -> `i *= 3` mutant in decode_cwd (line 77):
+        // after decoding a `%XX` escape the cursor must move past exactly
+        // the three consumed bytes. Under the mutant the cursor jumps to
+        // `3 * i` instead, so the hex digits leak into the output as
+        // literal characters (and the tail is skipped). `%` must NOT be
+        // at index 0 here: at i = 0 the mutant leaves i at 0 and the
+        // test hangs instead of failing the assert, which is what the
+        // existing `%`-first cases already do (CI shard 10 TIMEOUT).
+        assert_eq!(decode_cwd("a%2Fb").unwrap(), "a/b");
+        assert_eq!(decode_cwd("abc%2Fdef").unwrap(), "abc/def");
+        assert_eq!(decode_cwd("a%2Fb%2Fc").unwrap(), "a/b/c");
     }
 }
