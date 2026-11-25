@@ -851,6 +851,27 @@ pub async fn run_agent_headless(args: AgentRunArgs<'_>) -> Result<i32> {
     Ok(code)
 }
 
+/// Resolve a parsed builtin slash command to the prompt it expands to.
+/// Returns `Some(prompt)` for `review` and `init`, `None` for any other
+/// builtin (the caller keeps the raw prompt) and for non-builtin input.
+/// Kept as a small pure helper so the dispatch is unit-testable without
+/// running the whole agent (issue #395: the `/init` guard needs a test
+/// that fails when the guard is dropped).
+fn builtin_prompt(cwd: &Path, builtin: &Option<(String, String)>) -> Option<String> {
+    match builtin {
+        Some((name, args)) if name == "review" => Some(commands::review_prompt(args)),
+        Some((name, _)) if name == "init" => {
+            let candidates = zen_ext::detect_import_candidates_with_root(cwd, cwd);
+            Some(if candidates.is_empty() {
+                commands::init_prompt()
+            } else {
+                commands::init_prompt_with_imports(&candidates)
+            })
+        }
+        _ => None,
+    }
+}
+
 /// The model a slash command pins for this run, if it names a real
 /// catalog id: an empty pin and "inherit" pin nothing, so the run
 /// keeps the startup model (and its explicit base URL).
@@ -932,19 +953,12 @@ pub(crate) async fn run_agent_with_result(args: AgentRunArgs<'_>) -> Result<(i32
         _ => None,
     };
 
-    let (prompt, slash_cmd) = match &builtin {
-        Some((name, args)) if name == "review" => (commands::review_prompt(args), None),
-        Some((name, _)) if name == "init" => {
-            let candidates = zen_ext::detect_import_candidates(cwd);
-            let prompt = if candidates.is_empty() {
-                commands::init_prompt()
-            } else {
-                commands::init_prompt_with_imports(&candidates)
-            };
-            (prompt, None)
-        }
-        Some(_) => (prompt.to_string(), None),
-        None => expand_slash_prompt_cmd(cli, cwd, home, prompt, cfg, session_id)?,
+    let (prompt, slash_cmd) = match builtin_prompt(cwd, &builtin) {
+        Some(p) => (p, None),
+        None => match &builtin {
+            Some(_) => (prompt.to_string(), None),
+            None => expand_slash_prompt_cmd(cli, cwd, home, prompt, cfg, session_id)?,
+        },
     };
 
     let pinned_model = slash_pin_model(&slash_cmd);
@@ -1138,7 +1152,7 @@ pub(crate) async fn run_agent_with_result(args: AgentRunArgs<'_>) -> Result<(i32
             "mcp" => Some(commands::mcp_report(&assembly.mcp_status)),
             "context" => Some(commands::context_report(
                 &agent.config.system_prompt,
-                &zen_ext::memory_prompt(cwd, home, cfg.folder_trusted),
+                &zen_ext::memory_prompt_with_root(cwd, home, cwd, cfg.folder_trusted),
                 &agent.tools_for_request(),
                 agent.messages(),
                 agent.config.context_window,
@@ -1729,7 +1743,7 @@ pub(crate) async fn run_session_start(
     // `InstructionsLoaded`: one event per memory file (ZEN.md / AGENTS.md
     // / rules) loaded into context at session start. The matcher filters
     // on the load reason (`session_start` here).
-    for (path, _) in zen_ext::memory_files(cwd, None, cfg.folder_trusted) {
+    for (path, _) in zen_ext::memory_files_with_root(cwd, None, cwd, cfg.folder_trusted) {
         let _ = hooks
             .run(
                 HookEvent::InstructionsLoaded,
@@ -2487,6 +2501,80 @@ mod slash_pin_tests {
     fn none_without_a_command_or_model() {
         assert_eq!(slash_pin_model(&None), None);
         assert_eq!(slash_pin_model(&cmd(None)), None);
+    }
+}
+
+#[cfg(test)]
+mod builtin_prompt_tests {
+    use super::*;
+
+    /// A fresh empty directory under the system temp dir, removed on drop.
+    /// `tempfile` is not a dev-dependency of this crate, so the helper
+    /// builds the unique path from the process id and the test name.
+    struct ScratchDir {
+        path: std::path::PathBuf,
+    }
+
+    impl ScratchDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "zen-builtin-prompt-{}-{}",
+                std::process::id(),
+                name
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn builtin(name: &str, args: &str) -> Option<(String, String)> {
+        Some((name.to_string(), args.to_string()))
+    }
+
+    #[test]
+    fn init_without_candidates_returns_base_prompt() {
+        let dir = ScratchDir::new("empty");
+        assert_eq!(
+            builtin_prompt(&dir.path, &builtin("init", "")),
+            Some(commands::init_prompt())
+        );
+    }
+
+    #[test]
+    fn init_with_candidate_offers_import() {
+        let dir = ScratchDir::new("candidate");
+        let claude = dir.path.join("CLAUDE.md");
+        std::fs::write(&claude, "existing memory").unwrap();
+        let got = builtin_prompt(&dir.path, &builtin("init", "")).unwrap();
+        assert!(got.starts_with(&commands::init_prompt()), "{got}");
+        assert!(
+            got.contains("Before writing, read these existing agent memory files"),
+            "{got}"
+        );
+        assert!(got.contains(&claude.display().to_string()), "{got}");
+    }
+
+    #[test]
+    fn review_returns_review_prompt() {
+        let dir = ScratchDir::new("review");
+        assert_eq!(
+            builtin_prompt(&dir.path, &builtin("review", "focus area")),
+            Some(commands::review_prompt("focus area"))
+        );
+    }
+
+    #[test]
+    fn other_builtin_and_non_builtin_return_none() {
+        let dir = ScratchDir::new("none");
+        assert_eq!(builtin_prompt(&dir.path, &builtin("model", "")), None);
+        assert_eq!(builtin_prompt(&dir.path, &None), None);
     }
 }
 

@@ -888,7 +888,7 @@ fn print_turn(result: Option<RunResult>) {
 }
 
 fn init_prompt_with_import_offer(cwd: &std::path::Path) -> String {
-    let candidates = zen_ext::detect_import_candidates(cwd);
+    let candidates = zen_ext::detect_import_candidates_with_root(cwd, cwd);
     if candidates.is_empty() {
         return commands::init_prompt();
     }
@@ -2017,7 +2017,7 @@ async fn handle_slash(
             "{}",
             commands::context_report(
                 &agent.config.system_prompt,
-                &zen_ext::memory_prompt(cwd, home, cfg.folder_trusted),
+                &zen_ext::memory_prompt_with_root(cwd, home, cwd, cfg.folder_trusted),
                 &agent.tools_for_request(),
                 agent.messages(),
                 agent.config.context_window,
@@ -2557,14 +2557,14 @@ async fn handle_slash(
             }
         }
         "/memory" => {
-            for (p, _) in zen_ext::memory_files(cwd, home, cfg.folder_trusted) {
+            for (p, _) in zen_ext::memory_files_with_root(cwd, home, cwd, cfg.folder_trusted) {
                 println!("{}", p.display());
             }
         }
         "/memories" => {
             println!(
                 "{}",
-                zen_ext::memories_report(cwd, home, cfg.folder_trusted)
+                zen_ext::memories_report_with_root(cwd, home, cwd, cfg.folder_trusted)
             );
         }
         "/todos" => {
@@ -6071,5 +6071,28 @@ mod pr208_mutant_tests {
             std::fs::remove_dir_all(&dir).ok();
             std::fs::remove_dir_all(&home).ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod init_prompt_tests {
+    use super::*;
+
+    fn temp_dir(prefix: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("{prefix}_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn import_offer_without_candidates_returns_base_prompt() {
+        // No memory files under the temp dir: no import offer, no stdin
+        // read, the plain init prompt. Kills the mutants that replace
+        // this whole function with an empty or a canned string.
+        let dir = temp_dir("zen_init_offer_empty");
+        let got = init_prompt_with_import_offer(&dir);
+        assert_eq!(got, commands::init_prompt());
+        assert!(!got.is_empty(), "init prompt must not be empty");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -56,8 +56,15 @@ pub fn build_system_prompt(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result
             parts.push(map.text().to_string());
         }
 
-        let mem =
-            zen_ext::memory_prompt(cwd, home, crate::settings::folder_trusted(cli, cwd, home));
+        let mem = zen_ext::memory_prompt_with_root(
+            cwd,
+            home,
+            // Issue #395: the ancestor walk stops at the session
+            // working directory (the project root). Memory files above
+            // it never reach the system prompt.
+            cwd,
+            crate::settings::folder_trusted(cli, cwd, home),
+        );
         if !mem.trim().is_empty() {
             parts.push(mem);
         }
@@ -404,6 +411,33 @@ call sites) and check them too. Only then report what you changed.
         assert!(has_terse_style(&p));
         assert_eq!(without_terse_style(&p), "BASE PROMPT");
         assert_eq!(without_terse_style("BASE PROMPT"), "BASE PROMPT");
+    }
+
+    #[test]
+    fn issue_395_system_prompt_excludes_memory_above_project_root() {
+        // Issue #395: production memory loading must stop the ancestor
+        // walk at the project root (the session working directory). An
+        // AGENTS.md sitting in a parent of the project must not leak
+        // into the system prompt.
+        let base = std::env::temp_dir().join(format!("zen_sp_395_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let proj = base.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(base.join("AGENTS.md"), "OUTSIDE-PROJECT-ROOT").unwrap();
+        std::fs::write(proj.join("ZEN.md"), "INSIDE-PROJECT-ROOT").unwrap();
+        let nohome = base.join("nohome");
+
+        let p =
+            build_system_prompt(&cli(&["--setting-sources", ""]), &proj, Some(&nohome)).unwrap();
+        assert!(
+            !p.contains("OUTSIDE-PROJECT-ROOT"),
+            "AGENTS.md above the project root leaked into the system prompt: {p}"
+        );
+        assert!(
+            p.contains("INSIDE-PROJECT-ROOT"),
+            "project memory missing from the prompt: {p}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
