@@ -659,16 +659,18 @@ class EvidenceATests(Base):
         f = os.path.join(d, "a.txt")
         Path(f).write_bytes(b"hello")
         sha = hashlib.sha256(b"hello").hexdigest()
+        # #424: artifact paths must be relative to base_dir; the old test
+        # passed an absolute path, which the confinement fix now rejects.
         ev = json.dumps({"cmd": "t", "exit": 0,
-                         "artifacts": [{"path": f, "sha256": sha}]})
-        self.assertEqual(ztask.check_evidence(ev), "verified")
+                         "artifacts": [{"path": "a.txt", "sha256": sha}]})
+        self.assertEqual(ztask.check_evidence(ev, d), "verified")
         self.assertEqual(ztask.check_evidence("raw text"), "reported")
         Path(f).write_bytes(b"hellp")  # 1 byte changed
         with self.assertRaises(ZtaskError):
-            ztask.check_evidence(ev)
+            ztask.check_evidence(ev, d)
         os.remove(f)
         with self.assertRaises(ZtaskError):
-            ztask.check_evidence(ev)
+            ztask.check_evidence(ev, d)
         shutil.rmtree(d)
 
     def test_verify_evidence_pass_and_each_failure(self):
@@ -705,10 +707,12 @@ class EvidenceATests(Base):
             self.assertEqual(ztask.verify_evidence(EV, nogit, repo=REPO)
                              ["verdict"], "verified")
             # a directory where a file should be: cannot read -> undecided
+            # #424: the old test passed an absolute path, which the
+            # confinement fix now rejects (failed); use a relative path.
             os.mkdir(os.path.join(nogit, "dir"))
-            self.assertEqual(self.verdict(evidence(artifacts=[
-                {"path": os.path.join(nogit, "dir"),
-                 "sha256": "0" * 64}])), "undecided")
+            self.assertEqual(ztask.verify_evidence(evidence(artifacts=[
+                {"path": "dir", "sha256": "0" * 64}]), nogit,
+                repo=REPO)["verdict"], "undecided")
             # git missing from PATH: undecided, not pass
             old = os.environ.get("PATH", "")
             os.environ["PATH"] = nogit
@@ -810,6 +814,162 @@ class EvidenceATests(Base):
         self.store.attest(tid, QA, command="c", receipt="r")
         self.store.approve(tid, LEADER)
         self.assertEqual(self.store.task(tid)["state"], "DONE")
+
+
+class EvidenceConfinementTests(Base):
+    """Issue #424: artifact paths confined to base_dir, no hash oracle,
+    special / oversized files refused before reading.
+
+    Seven of the eight tests FAIL on the unfixed code (wrong verdict,
+    leaked hash, or a hang) and PASS with the fix; the eighth
+    (test_benign_dotdot_staying_inside_still_verified) is a regression
+    guard that passes on both - it pins that a benign `..` staying inside
+    base_dir is still accepted.
+    """
+
+    def _ev(self, artifacts, base=None):
+        return json.dumps({"cmd": "t", "exit": 0, "commit": HEAD,
+                           "artifacts": artifacts})
+
+    def _art(self, path, data):
+        return {"path": path,
+                "sha256": hashlib.sha256(data).hexdigest()}
+
+    def test_absolute_path_rejected_both_sites(self):
+        d = tempfile.mkdtemp()
+        try:
+            outside = os.path.join(d, "outside.txt")
+            Path(outside).write_bytes(b"secret")
+            art = self._art(outside, b"secret")
+            with self.assertRaises(ZtaskError):
+                ztask.check_evidence(self._ev([art]), d)
+            out = ztask.verify_evidence(self._ev([art]), d, repo=REPO)
+            self.assertEqual(out["verdict"], "failed")
+            self.assertNotIn(hashlib.sha256(b"secret").hexdigest(),
+                             json.dumps(out))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_dotdot_path_rejected_both_sites(self):
+        base = tempfile.mkdtemp()
+        try:
+            Path(os.path.join(base, "secret.txt")).write_bytes(b"secret")
+            inner = os.path.join(base, "inner")
+            os.mkdir(inner)
+            art = self._art("../secret.txt", b"secret")
+            with self.assertRaises(ZtaskError):
+                ztask.check_evidence(self._ev([art]), inner)
+            out = ztask.verify_evidence(self._ev([art]), inner, repo=REPO)
+            self.assertEqual(out["verdict"], "failed")
+            self.assertNotIn(hashlib.sha256(b"secret").hexdigest(),
+                             json.dumps(out))
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_symlink_inside_base_pointing_out_rejected(self):
+        base = tempfile.mkdtemp()
+        try:
+            target = os.path.join(base, "target.txt")
+            Path(target).write_bytes(b"secret")
+            inner = os.path.join(base, "inner")
+            os.mkdir(inner)
+            os.symlink(target, os.path.join(inner, "link.txt"))
+            art = self._art("link.txt", b"secret")
+            with self.assertRaises(ZtaskError):
+                ztask.check_evidence(self._ev([art]), inner)
+            out = ztask.verify_evidence(self._ev([art]), inner, repo=REPO)
+            self.assertEqual(out["verdict"], "failed")
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_benign_dotdot_staying_inside_still_verified(self):
+        # "sub/../out.txt" resolves inside base_dir: still accepted.
+        sub = os.path.join(REPO, "sub")
+        os.mkdir(sub)
+        try:
+            art = {"path": "sub/../out.txt",
+                   "sha256": hashlib.sha256(ARTIFACT).hexdigest()}
+            self.assertEqual(ztask.check_evidence(self._ev([art]), REPO),
+                             "verified")
+            self.assertEqual(ztask.verify_evidence(self._ev([art]), REPO)
+                             ["verdict"], "verified")
+        finally:
+            shutil.rmtree(sub, ignore_errors=True)
+
+    def test_mismatch_never_prints_recomputed_hash(self):
+        true_sha = hashlib.sha256(ARTIFACT).hexdigest()
+        wrong = hashlib.sha256(b"something else").hexdigest()
+        ev = self._ev([{"path": "out.txt", "sha256": wrong}])
+        out = ztask.verify_evidence(ev, REPO)
+        self.assertEqual(out["verdict"], "failed")
+        self.assertNotIn(true_sha, json.dumps(out))
+        self.assertTrue(any("sha256 mismatch" in c["detail"]
+                            for c in out["checks"]))
+        with self.assertRaises(ZtaskError) as cm:
+            ztask.check_evidence(ev, REPO)
+        self.assertNotIn(true_sha, str(cm.exception))
+        self.assertIn("hash mismatch", str(cm.exception))
+
+    def _run_driver(self, path, base, want_verdict):
+        # Runs both sites in a child process with a timeout: on unfixed
+        # code a FIFO / /dev/zero artifact blocks forever on open/read,
+        # so the child times out and this test fails instead of hanging.
+        lines = [
+            "import json, sys",
+            "sys.path.insert(0, %r)" % str(Path(__file__).parent),
+            "import ztask",
+            "ev = json.dumps({'cmd': 't', 'exit': 0, 'commit': %r,"
+            % HEAD,
+            "  'artifacts': [{'path': %r, 'sha256': '0' * 64}]})" % path,
+            "try:",
+            "    ztask.check_evidence(ev, %r)" % base,
+            "    sys.exit('check_evidence accepted')",
+            "except ztask.ZtaskError:",
+            "    pass",
+            "out = ztask.verify_evidence(ev, %r, repo=%r)" % (base, REPO),
+            "assert out['verdict'] == %r, out" % want_verdict,
+        ]
+        try:
+            r = subprocess.run([sys.executable, "-c", "\n".join(lines)],
+                               capture_output=True, text=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            self.fail("verification hung on special file %r" % path)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_dev_zero_rejected_without_hanging(self):
+        d = tempfile.mkdtemp()
+        try:
+            self._run_driver("/dev/zero", d, "failed")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_fifo_rejected_without_hanging(self):
+        d = tempfile.mkdtemp()
+        try:
+            os.mkfifo(os.path.join(d, "pipe"))
+            self._run_driver("pipe", d, "undecided")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_oversized_artifact_refused_before_reading(self):
+        d = tempfile.mkdtemp()
+        try:
+            big = os.path.join(d, "big.bin")
+            size = getattr(ztask, "EVIDENCE_MAX_ARTIFACT_BYTES",
+                            64 << 20) + 1
+            with open(big, "wb") as f:  # sparse: fast, no 64 MiB written
+                f.truncate(size)
+            with open(big, "rb") as f:
+                sha = hashlib.sha256(f.read()).hexdigest()
+            ev = self._ev([{"path": "big.bin", "sha256": sha}])
+            out = ztask.verify_evidence(ev, d, repo=REPO)
+            self.assertEqual(out["verdict"], "undecided")
+            self.assertIn("too large", json.dumps(out))
+            with self.assertRaises(ZtaskError) as cm:
+                ztask.check_evidence(ev, d)
+            self.assertIn("too large", str(cm.exception))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":

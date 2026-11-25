@@ -19,6 +19,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -139,10 +140,57 @@ class ZtaskError(Exception):
     code = "error"
 
 
+# Evidence A artifact limits (#424). Artifacts are small test logs, never
+# whole filesystems: refuse anything bigger before reading it.
+EVIDENCE_MAX_ARTIFACT_BYTES = 64 << 20  # 64 MiB
+_EVIDENCE_HASH_CHUNK = 1 << 20
+
+
+def _resolve_artifact_path(base_dir, path):
+    """Confine an artifact path to base_dir (#424). Rejects absolute paths
+    and anything that resolves outside base_dir (`..`, or a symlink that
+    points out). Returns the resolved absolute path. Raises ValueError."""
+    if os.path.isabs(path):
+        raise ValueError("artifact path must be relative: %s" % path)
+    base = os.path.realpath(base_dir)
+    full = os.path.realpath(os.path.join(base, path))
+    if os.path.commonpath([base, full]) != base:
+        raise ValueError("artifact path escapes base_dir: %s" % path)
+    return full
+
+
+def _hash_artifact_file(full):
+    """SHA-256 of a regular file (#424). Refuses non-regular files (device,
+    FIFO, directory, socket) and files over EVIDENCE_MAX_ARTIFACT_BYTES
+    before any byte is read, so /dev/zero and FIFOs cannot hang verification
+    or exhaust memory. The byte count is also checked while reading, in case
+    the file grows between stat and read. Raises ValueError on refusal and
+    lets FileNotFoundError / OSError from stat / open propagate."""
+    st = os.stat(full)
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError("artifact is not a regular file")
+    if st.st_size > EVIDENCE_MAX_ARTIFACT_BYTES:
+        raise ValueError("artifact too large: exceeds %d bytes"
+                         % EVIDENCE_MAX_ARTIFACT_BYTES)
+    h = hashlib.sha256()
+    total = 0
+    with open(full, "rb") as f:
+        for chunk in iter(lambda: f.read(_EVIDENCE_HASH_CHUNK), b""):
+            total += len(chunk)
+            if total > EVIDENCE_MAX_ARTIFACT_BYTES:
+                raise ValueError("artifact too large: exceeds %d bytes"
+                                 % EVIDENCE_MAX_ARTIFACT_BYTES)
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def check_evidence(evidence, base_dir="."):
     """Submit-time check. Plain string -> 'reported'. JSON {cmd, exit,
     artifacts: [{path, sha256}]} -> re-hash every file; missing/mismatch
     raises ZtaskError. Returns 'verified' only when all artifacts match.
+    Artifact paths are confined to base_dir (#424): absolute paths, `..`
+    escapes and symlinks out are rejected, as are non-regular files and
+    files over EVIDENCE_MAX_ARTIFACT_BYTES.
     The approve gate runs the full verify_evidence() (adds exit 0 + commit)."""
     text = (evidence or "").strip()
     if not text.startswith("{"):
@@ -160,15 +208,21 @@ def check_evidence(evidence, base_dir="."):
     for a in arts:
         if not isinstance(a, dict):
             raise ZtaskError("evidence artifact must be an object")
-        path = os.path.join(base_dir, str(a.get("path", "")))
+        raw = a.get("path", "")
         try:
-            with open(path, "rb") as f:
-                got = hashlib.sha256(f.read()).hexdigest()
+            full = _resolve_artifact_path(base_dir, str(raw))
+        except ValueError as e:
+            raise ZtaskError("evidence artifact path rejected: %s (%s)"
+                             % (raw, e))
+        try:
+            got = _hash_artifact_file(full)
+        except ValueError as e:
+            raise ZtaskError("evidence artifact rejected: %s (%s)"
+                             % (raw, e))
         except OSError:
-            raise ZtaskError("evidence artifact missing: %s" % a.get("path"))
+            raise ZtaskError("evidence artifact missing: %s" % raw)
         if got != a.get("sha256"):
-            raise ZtaskError("evidence artifact hash mismatch: %s"
-                             % a.get("path"))
+            raise ZtaskError("evidence artifact hash mismatch: %s" % raw)
     return "verified"
 
 
@@ -191,8 +245,12 @@ def verify_evidence(evidence, base_dir: str = ".",
     """Evidence A full check. `evidence` is the JSON text (or a dict):
     {"cmd": str, "exit": 0, "commit": "<7-40 hex>",
      "artifacts": [{"path": str, "sha256": "<64 hex>"}, ...]}.
-    Relative artifact paths resolve against base_dir; the commit must exist
-    in the git repo at `repo` (default base_dir).
+    Relative artifact paths resolve against base_dir and must stay inside
+    it (#424): absolute paths, `..` escapes and symlinks out are rejected,
+    as are non-regular files and files over EVIDENCE_MAX_ARTIFACT_BYTES.
+    A mismatch reports only "mismatch" - the recomputed hash is never
+    printed, so the check cannot be used as a hash oracle. The commit must
+    exist in the git repo at `repo` (default base_dir).
     Returns {"verdict": verified|failed|undecided, "checks": [...]}.
     failed = a check ran and disproved the evidence; undecided = a check could
     not run (unreadable file, no git, not a repo, unexpected error)."""
@@ -259,22 +317,26 @@ def verify_evidence(evidence, base_dir: str = ".",
                 add(name, FAILED, "%s: sha256 must be 64 lowercase hex"
                     % path)
                 continue
-            full = os.path.join(base_dir, path)
             try:
-                h = hashlib.sha256()
-                with open(full, "rb") as f:
-                    for chunk in iter(lambda: f.read(1 << 20), b""):
-                        h.update(chunk)
-                got = h.hexdigest()
+                full = _resolve_artifact_path(base_dir, path)
+            except ValueError:
+                add(name, FAILED, "%s: artifact path rejected" % path)
+                continue
+            try:
+                got = _hash_artifact_file(full)
             except FileNotFoundError:
                 add(name, FAILED, "%s: artifact missing" % path)
+                continue
+            except ValueError as e:
+                add(name, UNDECIDED, "%s: cannot read (%s)" % (path, e))
                 continue
             except OSError as e:
                 add(name, UNDECIDED, "%s: cannot read (%s)" % (path, e))
                 continue
             if got != want:
-                add(name, FAILED, "%s: sha256 mismatch, recomputed %s"
-                    % (path, got))
+                # Never print the recomputed hash: it would turn the check
+                # into a hash oracle for any file on the machine (#424).
+                add(name, FAILED, "%s: sha256 mismatch" % path)
             else:
                 add(name, VERIFIED, "%s %s" % (path, got))
         except Exception as e:  # any surprise is undecided, not a pass
