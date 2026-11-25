@@ -855,7 +855,7 @@ impl Tool for BashTool {
             .stderr(Stdio::null())
             .kill_on_drop(true);
 
-        for name in zen_core::api_key_env_names(ctx.api_key_env.as_deref()) {
+        for name in zen_core::all_api_key_env_names(ctx.api_key_env.as_deref()) {
             command.env_remove(name);
         }
 

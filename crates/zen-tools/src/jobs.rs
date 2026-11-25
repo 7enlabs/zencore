@@ -85,7 +85,7 @@ pub fn start_job(
         .stderr(Stdio::from(err))
         .kill_on_drop(false);
 
-    for name in zen_core::api_key_env_names(api_key_env) {
+    for name in zen_core::all_api_key_env_names(api_key_env) {
         cmd.env_remove(name);
     }
     #[cfg(unix)]
