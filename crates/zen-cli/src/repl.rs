@@ -6073,3 +6073,26 @@ mod pr208_mutant_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod init_prompt_tests {
+    use super::*;
+
+    fn temp_dir(prefix: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("{prefix}_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn import_offer_without_candidates_returns_base_prompt() {
+        // No memory files under the temp dir: no import offer, no stdin
+        // read, the plain init prompt. Kills the mutants that replace
+        // this whole function with an empty or a canned string.
+        let dir = temp_dir("zen_init_offer_empty");
+        let got = init_prompt_with_import_offer(&dir);
+        assert_eq!(got, commands::init_prompt());
+        assert!(!got.is_empty(), "init prompt must not be empty");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
