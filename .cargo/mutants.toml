@@ -526,7 +526,7 @@ exclude_re = [
   # because the stale 1194 number did not match.
   "lsp\\.rs:1200:32: replace match guard !remaining\\.is_zero\\(\\) with true in LspManager::check_respawn_backoff",
   # PR #554 (issue #444), commands.rs read_ref_file
-  # (line 618, col 19): replace `>` with `>=` in the char-boundary
+  # (line 623, col 19): replace `>` with `>=` in the char-boundary
   # back-up loop `while end > 0 && !text.is_char_boundary(end)`.
   # EQUIVALENT (waived by ZC Leader, 2026-11-26; verified by reading
   # read_ref_file): `end` is usize (from keep.min(text.len())), so
@@ -540,9 +540,13 @@ exclude_re = [
   # NOTE (2026-11-26): the loop-bound guard (5-line comment +
   # `let mut steps = 0;`) moved the loop from line 612 to line 618;
   # exclusion updated to match, equivalence argument unchanged.
-  "commands\\.rs:618:19: replace > with >= in read_ref_file",
+  # NOTE (2026-11-26): the TOCTOU fix (read_ref_file now takes an
+  # opened File, plus the open_file_inside_project call in read_ref)
+  # moved the loop from line 618 to line 623; exclusion updated to
+  # match, equivalence argument unchanged.
+  "commands\\.rs:623:19: replace > with >= in read_ref_file",
   # PR #554 (issue #444), commands.rs read_ref_file
-  # (line 618, col 63): replace `<` with `<=` in the loop bound
+  # (line 623, col 63): replace `<` with `<=` in the loop bound
   # `steps < 3` of the char-boundary back-up loop.
   # EQUIVALENT (waived by ZC Leader, 2026-11-26; verified by reading
   # read_ref_file): `text` comes from String::from_utf8_lossy, so it
@@ -555,9 +559,12 @@ exclude_re = [
   # be reached (for example `text` stops being valid UTF-8), this
   # mutant stops being equivalent: remove this exclusion and kill it
   # with a test.
-  "commands\\.rs:618:63: replace < with <= in read_ref_file",
+  # NOTE (2026-11-26): the TOCTOU fix moved the loop from line 618
+  # to line 623; exclusion updated to match, equivalence argument
+  # unchanged.
+  "commands\\.rs:623:63: replace < with <= in read_ref_file",
   # PR #554 (issue #444), commands.rs read_ref_file
-  # (line 620, col 19): replace `+=` with `-=` in `steps += 1`.
+  # (line 625, col 19): replace `+=` with `-=` in `steps += 1`.
   # EQUIVALENT (waived by ZC Leader, 2026-11-26; verified by reading
   # read_ref_file): `steps` is an unconstrained integer (inferred
   # i32); with `-=` it goes 0, -1, -2, ... and `steps < 3` stays
@@ -569,9 +576,12 @@ exclude_re = [
   # output (for example the loop bound is removed, or `steps` gains
   # another use), this mutant stops being equivalent: remove this
   # exclusion and kill it with a test.
-  "commands\\.rs:620:19: replace \\+= with -= in read_ref_file",
+  # NOTE (2026-11-26): the TOCTOU fix moved the counter from line
+  # 620 to line 625; exclusion updated to match, equivalence
+  # argument unchanged.
+  "commands\\.rs:625:19: replace \\+= with -= in read_ref_file",
   # PR #554 (issue #444), commands.rs read_ref_file
-  # (line 620, col 19): replace `+=` with `*=` in `steps += 1`.
+  # (line 625, col 19): replace `+=` with `*=` in `steps += 1`.
   # EQUIVALENT (waived by ZC Leader, 2026-11-26; verified by reading
   # read_ref_file): `steps *= 1` leaves `steps` at 0 forever, so
   # `steps < 3` stays true and the loop exits only on the
@@ -582,7 +592,74 @@ exclude_re = [
   # output (for example the loop bound is removed, or `steps` gains
   # another use), this mutant stops being equivalent: remove this
   # exclusion and kill it with a test.
-  "commands\\.rs:620:19: replace \\+= with \\*= in read_ref_file",
+  # NOTE (2026-11-26): the TOCTOU fix moved the counter from line
+  # 620 to line 625; exclusion updated to match, equivalence
+  # argument unchanged.
+  "commands\\.rs:625:19: replace \\+= with \\*= in read_ref_file",
+  # PR #554 (issue #444), commands.rs read_ref
+  # (line 588, col 34): replace `||` with `&&` in
+  # `if !canon.starts_with(&root) || !canon.is_file()`.
+  # EQUIVALENT (waived by ZC Leader, 2026-11-26; verified by reading
+  # read_ref and zen-core fs::open_file_inside_project): the early
+  # return is defense in depth; the descriptor-bound check downstream
+  # re-verifies both conditions, so weakening the early check cannot
+  # change the outcome. Inside the project but not a file (a
+  # directory): the mutant proceeds, but open_file_inside_project
+  # rejects it on metadata.is_file(). Outside the project but a
+  # file: the mutant proceeds, but open_file_inside_project rejects
+  # it because the resolved fd path does not start with root. Both
+  # cases return None either way, and no test can kill this mutant.
+  # EXPIRY (2027-02-26): if open_file_inside_project stops
+  # re-checking is_file or the fd-path containment, this mutant stops
+  # being equivalent: remove this exclusion and kill it with a test
+  # where the path is a directory inside the project, and one where
+  # it is a file outside the project.
+  "commands\\.rs:588:34: replace \\|\\| with && in read_ref",
+  # PR #554 (issue #444), fs.rs resolved_fd_path (Windows)
+  # (line 51, col 5): replace the body with None / with
+  # Some(Default::default()).
+  # EQUIVALENT on Linux (waived by ZC Leader, 2026-11-26; same shape
+  # as the sandbox.rs:194 non-unix fallback, waived 2026-11-21): the
+  # whole function is #[cfg(windows)], so on Linux this code is never
+  # compiled and the mutant cannot change anything the Linux build
+  # observes; the Windows CI job (windows-check) verifies the code
+  # itself. No Linux test can kill these mutants. The Unix twin at
+  # fs.rs:44 is live on Linux and its mutants are caught by the
+  # zen-core fs unit tests.
+  # EXPIRY: if the mutants job runs on Windows, these mutants stop
+  # being equivalent: remove these exclusions and kill them with
+  # tests that call open_file_inside_project on Windows.
+  "fs\\.rs:51:5: replace resolved_fd_path -> Option<PathBuf> with None",
+  "fs\\.rs:51:5: replace resolved_fd_path -> Option<PathBuf> with Some\\(Default::default\\(\\)\\)",
+  # PR #554 (issue #444), fs.rs resolved_fd_path (Windows)
+  # (line 64, col 10): replace `==` with `!=` in
+  # `if n == 0 || n as usize >= buf.len()`, and (line 64, col 15)
+  # replace `||` with `&&` in the same guard.
+  # EQUIVALENT on Linux (waived by ZC Leader, 2026-11-26; same shape
+  # as the sandbox.rs:194 non-unix fallback): the whole function is
+  # #[cfg(windows)], so on Linux this code is never compiled and the
+  # mutants cannot change anything the Linux build observes. No
+  # Linux test can kill these mutants; the Windows CI job verifies
+  # the guard itself.
+  # EXPIRY: if the mutants job runs on Windows, these mutants stop
+  # being equivalent: remove these exclusions and kill them with
+  # tests where GetFinalPathNameByHandleW returns 0 and where it
+  # returns a full buffer.
+  "fs\\.rs:64:10: replace == with != in resolved_fd_path",
+  "fs\\.rs:64:15: replace \\|\\| with && in resolved_fd_path",
+  # PR #554 (issue #444), fs.rs normalize_verbatim_prefix (Windows)
+  # (line 78, col 5): replace the body with Default::default().
+  # EQUIVALENT on Linux (waived by ZC Leader, 2026-11-26; same shape
+  # as the sandbox.rs:194 non-unix fallback): the whole function is
+  # #[cfg(windows)], so on Linux this code is never compiled and the
+  # mutant cannot change anything the Linux build observes. The
+  # non-Windows twin at fs.rs:87 is the identity function and is live
+  # on Linux. No Linux test can kill this mutant; the Windows CI job
+  # verifies the function itself.
+  # EXPIRY: if the mutants job runs on Windows, this mutant stops
+  # being equivalent: remove this exclusion and kill it with a test
+  # where the path carries the `\\?\` or `\\?\UNC\` prefix.
+  "fs\\.rs:78:5: replace normalize_verbatim_prefix -> PathBuf with Default::default\\(\\)",
   # PR #554 (issue #444), mentions.rs expand_pattern
   # (line 194, col 48): replace `>` with `>=` in
   # `if e.file_type().is_dir() && e.depth() > 0`.
