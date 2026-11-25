@@ -526,7 +526,7 @@ exclude_re = [
   # because the stale 1194 number did not match.
   "lsp\\.rs:1200:32: replace match guard !remaining\\.is_zero\\(\\) with true in LspManager::check_respawn_backoff",
   # PR #554 (issue #444), commands.rs read_ref_file
-  # (line 612, col 19): replace `>` with `>=` in the char-boundary
+  # (line 618, col 19): replace `>` with `>=` in the char-boundary
   # back-up loop `while end > 0 && !text.is_char_boundary(end)`.
   # EQUIVALENT (waived by ZC Leader, 2026-11-26; verified by reading
   # read_ref_file): `end` is usize (from keep.min(text.len())), so
@@ -537,7 +537,52 @@ exclude_re = [
   # EXPIRY (2027-02-26): if the loop is rewritten so `end` can go
   # negative, or 0 stops being a char boundary, this mutant stops
   # being equivalent: remove this exclusion and kill it with a test.
-  "commands\\.rs:612:19: replace > with >= in read_ref_file",
+  # NOTE (2026-11-26): the loop-bound guard (5-line comment +
+  # `let mut steps = 0;`) moved the loop from line 612 to line 618;
+  # exclusion updated to match, equivalence argument unchanged.
+  "commands\\.rs:618:19: replace > with >= in read_ref_file",
+  # PR #554 (issue #444), commands.rs read_ref_file
+  # (line 618, col 63): replace `<` with `<=` in the loop bound
+  # `steps < 3` of the char-boundary back-up loop.
+  # EQUIVALENT (waived by ZC Leader, 2026-11-26; verified by reading
+  # read_ref_file): `text` comes from String::from_utf8_lossy, so it
+  # is always valid UTF-8, and a UTF-8 char is at most 4 bytes, so
+  # the previous char boundary is at most 3 bytes back; the loop
+  # always finds a boundary within 3 iterations and a 4th iteration
+  # is never reached. The mutant cannot change any observable
+  # behaviour, and no test can kill this mutant.
+  # EXPIRY (2027-02-26): if the loop is rewritten so the bound can
+  # be reached (for example `text` stops being valid UTF-8), this
+  # mutant stops being equivalent: remove this exclusion and kill it
+  # with a test.
+  "commands\\.rs:618:63: replace < with <= in read_ref_file",
+  # PR #554 (issue #444), commands.rs read_ref_file
+  # (line 620, col 19): replace `+=` with `-=` in `steps += 1`.
+  # EQUIVALENT (waived by ZC Leader, 2026-11-26; verified by reading
+  # read_ref_file): `steps` is an unconstrained integer (inferred
+  # i32); with `-=` it goes 0, -1, -2, ... and `steps < 3` stays
+  # true, so the loop exits only on the char-boundary condition,
+  # which for valid UTF-8 is found within 3 steps, exactly like the
+  # original. The counter never changes the output, and no test can
+  # kill this mutant.
+  # EXPIRY (2027-02-26): if the step counter starts affecting the
+  # output (for example the loop bound is removed, or `steps` gains
+  # another use), this mutant stops being equivalent: remove this
+  # exclusion and kill it with a test.
+  "commands\\.rs:620:19: replace \\+= with -= in read_ref_file",
+  # PR #554 (issue #444), commands.rs read_ref_file
+  # (line 620, col 19): replace `+=` with `*=` in `steps += 1`.
+  # EQUIVALENT (waived by ZC Leader, 2026-11-26; verified by reading
+  # read_ref_file): `steps *= 1` leaves `steps` at 0 forever, so
+  # `steps < 3` stays true and the loop exits only on the
+  # char-boundary condition, which for valid UTF-8 is found within
+  # 3 steps, exactly like the original. The counter never changes
+  # the output, and no test can kill this mutant.
+  # EXPIRY (2027-02-26): if the step counter starts affecting the
+  # output (for example the loop bound is removed, or `steps` gains
+  # another use), this mutant stops being equivalent: remove this
+  # exclusion and kill it with a test.
+  "commands\\.rs:620:19: replace \\+= with \\*= in read_ref_file",
   # PR #554 (issue #444), mentions.rs expand_pattern
   # (line 194, col 48): replace `>` with `>=` in
   # `if e.file_type().is_dir() && e.depth() > 0`.
