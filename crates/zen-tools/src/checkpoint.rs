@@ -296,14 +296,27 @@ impl Checkpoints {
                 return Err(UndoError::Modified(modified));
             }
         }
-        let turn = st.done.pop().expect("checked above");
+        // Keep the turn on `done` until the restore loop finishes:
+        // popping it first (as before) lost the turn when a restore
+        // step failed, so a retry undid the previous turn instead
+        // (#323). Each entry is marked undone (its `after` stamp
+        // cleared) as soon as it is restored, so a retry after a
+        // failure resumes where the failed undo stopped: entries
+        // already restored are skipped by the loop and by the
+        // Modified pre-check above, both of which ignore
+        // `after: None`. Without the marking, a plain retry would be
+        // refused as Modified for the files already restored.
+        let turn = st.done.last_mut().expect("checked above");
+        let turn_id = turn.id;
         let mut report = UndoReport {
-            turn_id: turn.id,
+            turn_id,
             label: turn.label.clone(),
             ..Default::default()
         };
 
-        for e in turn.entries.iter().rev() {
+        let n = turn.entries.len();
+        for idx in (0..n).rev() {
+            let e = turn.entries[idx].clone();
             if e.after.is_none() {
                 continue;
             }
@@ -324,11 +337,13 @@ impl Checkpoints {
                 },
                 Before::Skipped(why) => report.skipped.push((e.path.clone(), why.clone())),
             }
+            turn.entries[idx].after = None;
         }
         report.restored.reverse();
         report.removed.reverse();
         report.skipped.reverse();
-        let _ = std::fs::remove_dir_all(self.dir.join(turn.id.to_string()));
+        st.done.pop();
+        let _ = std::fs::remove_dir_all(self.dir.join(turn_id.to_string()));
         Ok(report)
     }
 
@@ -621,6 +636,104 @@ mod tests {
         assert_eq!(c.depth(), 1, "turn kept for a forced retry");
         c.undo(true).unwrap();
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "v1");
+    }
+
+    /// #323: a failed undo must keep the turn, so a retry undoes the
+    /// same turn instead of the previous one. Two turns edit the
+    /// same file; the second turn's backup is sabotaged (replaced by
+    /// a directory), so its restore fails. With the old code the
+    /// failed turn was already popped, so the retry undid turn 1.
+    #[test]
+    fn p0_3_failed_undo_keeps_turn_for_retry() {
+        let d = tmp("failed-undo");
+        let a = d.join("a.txt");
+        std::fs::write(&a, "v1").unwrap();
+        let c = Checkpoints::new(d.join(".ck"));
+        c.start_turn("first edit");
+        write(&c, &a, "v2");
+        c.start_turn("second edit");
+        write(&c, &a, "v3");
+        c.start_turn("just chatting");
+        assert_eq!(c.depth(), 2);
+        // Turn 2, entry 0: the backup of a.txt.
+        let bak = d.join(".ck/2/0.bak");
+        let saved = std::fs::read(&bak).unwrap();
+        std::fs::remove_file(&bak).unwrap();
+        std::fs::create_dir(&bak).unwrap();
+        assert!(matches!(c.undo(false), Err(UndoError::Io(_))));
+        assert_eq!(c.depth(), 2, "the failed turn must stay undoable");
+        assert_eq!(
+            c.last_turn().unwrap().label,
+            "second edit",
+            "retry must target the same turn, not the previous one"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&a).unwrap(),
+            "v3",
+            "nothing restored yet"
+        );
+        // Put the backup back and retry with a plain undo: it must
+        // undo turn 2 (a back to "v2"), not turn 1, with no
+        // `--force` needed.
+        std::fs::remove_dir(&bak).unwrap();
+        std::fs::write(&bak, saved).unwrap();
+        let r = c.undo(false).unwrap();
+        assert_eq!(r.turn_id, 2);
+        assert_eq!(r.restored, vec![a.clone()]);
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "v2");
+        assert_eq!(c.depth(), 1);
+        let r = c.undo(false).unwrap();
+        assert_eq!(r.turn_id, 1);
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "v1");
+        assert_eq!(c.depth(), 0);
+        assert_eq!(c.undo(false), Err(UndoError::Nothing));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// #323: when a restore step fails halfway, the entries already
+    /// restored stay restored and a retry resumes after them instead
+    /// of redoing them (or refusing them as outside edits). The
+    /// failure here is a backup replaced by a directory, so the
+    /// created file is removed first and the edit restore fails.
+    #[test]
+    fn p0_3_failed_undo_resumes_after_partial_restore() {
+        let d = tmp("failed-undo-resume");
+        let (a, b) = (d.join("a.txt"), d.join("b.txt"));
+        std::fs::write(&a, "old\n").unwrap();
+        let c = Checkpoints::new(d.join(".ck"));
+        c.start_turn("edit a, create b");
+        write(&c, &a, "new\n");
+        write(&c, &b, "fresh\n");
+        c.start_turn("just chatting");
+        // Turn 1, entry 0: the backup of a.txt.
+        let bak = d.join(".ck/1/0.bak");
+        let saved = std::fs::read(&bak).unwrap();
+        std::fs::remove_file(&bak).unwrap();
+        std::fs::create_dir(&bak).unwrap();
+        assert!(matches!(c.undo(false), Err(UndoError::Io(_))));
+        assert!(!b.exists(), "b was removed before the failure");
+        assert_eq!(
+            std::fs::read_to_string(&a).unwrap(),
+            "new\n",
+            "a was not restored yet"
+        );
+        assert_eq!(c.depth(), 1, "the failed turn must stay undoable");
+        assert_eq!(c.last_turn().unwrap().label, "edit a, create b");
+        // Put the backup back and retry with a plain undo: it must
+        // restore only a, not touch b again, and not refuse the
+        // already-restored entries as outside edits.
+        std::fs::remove_dir(&bak).unwrap();
+        std::fs::write(&bak, saved).unwrap();
+        let r = c.undo(false).unwrap();
+        assert_eq!(r.restored, vec![a.clone()]);
+        assert!(r.removed.is_empty(), "b was already removed: {r:?}");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "old\n");
+        assert_eq!(c.depth(), 0);
+        assert!(
+            !d.join(".ck/1").exists(),
+            "backups of an undone turn are removed"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
