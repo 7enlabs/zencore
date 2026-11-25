@@ -47,9 +47,7 @@ pub async fn syntax_error(path: &Path, text: &str) -> Option<String> {
         Lang::JavaScript => {
 
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("js");
-            let tmp = std::env::temp_dir().join(format!("zen-syntax-{}.{}", random_suffix(), ext));
-
-            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp).ok()?;
+            let (tmp, mut f) = create_js_temp(ext)?;
             {
                 use std::io::Write;
                 if f.write_all(text.as_bytes()).is_err() {
@@ -62,6 +60,21 @@ pub async fn syntax_error(path: &Path, text: &str) -> Option<String> {
             out.map(|m| m.replace(tmp.to_str().unwrap_or(""), "file"))
         }
     }
+}
+
+/// Create the temp file `node --check` reads (#326): the file holds the new
+/// content, so it must not be world-readable while the check runs.
+fn create_js_temp(ext: &str) -> Option<(std::path::PathBuf, std::fs::File)> {
+    let tmp = std::env::temp_dir().join(format!("zen-syntax-{}.{}", random_suffix(), ext));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let f = opts.open(&tmp).ok()?;
+    Some((tmp, f))
 }
 
 fn random_suffix() -> String {
@@ -232,6 +245,20 @@ mod tests {
         for _ in 0..1000 {
             assert!(seen.insert(random_suffix()));
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn js_temp_file_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, _f) = create_js_temp("js").expect("temp file");
+        let mode = std::fs::metadata(&tmp)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(mode, 0o600, "temp file mode is {:o}, expected 600", mode);
     }
 
     #[tokio::test]
