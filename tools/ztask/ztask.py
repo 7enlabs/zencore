@@ -14,11 +14,13 @@ QUEUED -> CLAIMED -> DOING -> BLOCKED -> REVIEW -> DONE -> DROPPED.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -139,10 +141,81 @@ class ZtaskError(Exception):
     code = "error"
 
 
+# Evidence A artifact limits (#424). Artifacts are small test logs, never
+# whole filesystems: refuse anything bigger before reading it.
+EVIDENCE_MAX_ARTIFACT_BYTES = 64 << 20  # 64 MiB
+_EVIDENCE_HASH_CHUNK = 1 << 20
+
+
+def _resolve_artifact_path(base_dir, path):
+    """Confine an artifact path to base_dir (#424). Rejects absolute paths
+    and anything that resolves outside base_dir (`..`, or a symlink that
+    points out). Returns the resolved absolute path. Raises ValueError."""
+    if os.path.isabs(path):
+        raise ValueError("artifact path must be relative: %s" % path)
+    base = os.path.realpath(base_dir)
+    full = os.path.realpath(os.path.join(base, path))
+    if os.path.commonpath([base, full]) != base:
+        raise ValueError("artifact path escapes base_dir: %s" % path)
+    return full
+
+
+def _hash_artifact_file(full):
+    """SHA-256 of a regular file (#424, #533). Opens the file first with
+    O_NOFOLLOW (where the platform has it) so a symlink swapped in after
+    the path was resolved is refused instead of followed, then fstats the
+    opened fd: the regularity and size checks run on the file actually
+    read, never on a path that could name a different file by the time
+    it is opened. Refuses non-regular files (device, FIFO, directory,
+    socket) and files over EVIDENCE_MAX_ARTIFACT_BYTES before any byte
+    is read, so /dev/zero and FIFOs cannot hang verification or exhaust
+    memory. The byte count is also checked while reading, in case the
+    file grows. Raises ValueError on refusal and lets FileNotFoundError /
+    OSError from open propagate (a symlink refused by O_NOFOLLOW surfaces
+    as ELOOP and is turned into ValueError). The open also sets
+    O_NONBLOCK (where the platform has it) so opening a FIFO never
+    blocks waiting for a writer: the fstat right after the open refuses
+    it as non-regular before any byte is read. The bytes are then read
+    with os.read on the fd, which is safe for a regular file even with
+    O_NONBLOCK set."""
+    flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_NONBLOCK", 0))
+    try:
+        fd = os.open(full, flags)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise ValueError("artifact is a symlink")
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError("artifact is not a regular file")
+        if st.st_size > EVIDENCE_MAX_ARTIFACT_BYTES:
+            raise ValueError("artifact too large: exceeds %d bytes"
+                             % EVIDENCE_MAX_ARTIFACT_BYTES)
+        h = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = os.read(fd, _EVIDENCE_HASH_CHUNK)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > EVIDENCE_MAX_ARTIFACT_BYTES:
+                raise ValueError("artifact too large: exceeds %d bytes"
+                                 % EVIDENCE_MAX_ARTIFACT_BYTES)
+            h.update(chunk)
+        return h.hexdigest()
+    finally:
+        os.close(fd)
+
+
 def check_evidence(evidence, base_dir="."):
     """Submit-time check. Plain string -> 'reported'. JSON {cmd, exit,
     artifacts: [{path, sha256}]} -> re-hash every file; missing/mismatch
     raises ZtaskError. Returns 'verified' only when all artifacts match.
+    Artifact paths are confined to base_dir (#424): absolute paths, `..`
+    escapes and symlinks out are rejected, as are non-regular files and
+    files over EVIDENCE_MAX_ARTIFACT_BYTES.
     The approve gate runs the full verify_evidence() (adds exit 0 + commit)."""
     text = (evidence or "").strip()
     if not text.startswith("{"):
@@ -160,15 +233,21 @@ def check_evidence(evidence, base_dir="."):
     for a in arts:
         if not isinstance(a, dict):
             raise ZtaskError("evidence artifact must be an object")
-        path = os.path.join(base_dir, str(a.get("path", "")))
+        raw = a.get("path", "")
         try:
-            with open(path, "rb") as f:
-                got = hashlib.sha256(f.read()).hexdigest()
+            full = _resolve_artifact_path(base_dir, str(raw))
+        except ValueError as e:
+            raise ZtaskError("evidence artifact path rejected: %s (%s)"
+                             % (raw, e))
+        try:
+            got = _hash_artifact_file(full)
+        except ValueError as e:
+            raise ZtaskError("evidence artifact rejected: %s (%s)"
+                             % (raw, e))
         except OSError:
-            raise ZtaskError("evidence artifact missing: %s" % a.get("path"))
+            raise ZtaskError("evidence artifact missing: %s" % raw)
         if got != a.get("sha256"):
-            raise ZtaskError("evidence artifact hash mismatch: %s"
-                             % a.get("path"))
+            raise ZtaskError("evidence artifact hash mismatch: %s" % raw)
     return "verified"
 
 
@@ -191,8 +270,12 @@ def verify_evidence(evidence, base_dir: str = ".",
     """Evidence A full check. `evidence` is the JSON text (or a dict):
     {"cmd": str, "exit": 0, "commit": "<7-40 hex>",
      "artifacts": [{"path": str, "sha256": "<64 hex>"}, ...]}.
-    Relative artifact paths resolve against base_dir; the commit must exist
-    in the git repo at `repo` (default base_dir).
+    Relative artifact paths resolve against base_dir and must stay inside
+    it (#424): absolute paths, `..` escapes and symlinks out are rejected,
+    as are non-regular files and files over EVIDENCE_MAX_ARTIFACT_BYTES.
+    A mismatch reports only "mismatch" - the recomputed hash is never
+    printed, so the check cannot be used as a hash oracle. The commit must
+    exist in the git repo at `repo` (default base_dir).
     Returns {"verdict": verified|failed|undecided, "checks": [...]}.
     failed = a check ran and disproved the evidence; undecided = a check could
     not run (unreadable file, no git, not a repo, unexpected error)."""
@@ -259,22 +342,26 @@ def verify_evidence(evidence, base_dir: str = ".",
                 add(name, FAILED, "%s: sha256 must be 64 lowercase hex"
                     % path)
                 continue
-            full = os.path.join(base_dir, path)
             try:
-                h = hashlib.sha256()
-                with open(full, "rb") as f:
-                    for chunk in iter(lambda: f.read(1 << 20), b""):
-                        h.update(chunk)
-                got = h.hexdigest()
+                full = _resolve_artifact_path(base_dir, path)
+            except ValueError:
+                add(name, FAILED, "%s: artifact path rejected" % path)
+                continue
+            try:
+                got = _hash_artifact_file(full)
             except FileNotFoundError:
                 add(name, FAILED, "%s: artifact missing" % path)
+                continue
+            except ValueError as e:
+                add(name, UNDECIDED, "%s: cannot read (%s)" % (path, e))
                 continue
             except OSError as e:
                 add(name, UNDECIDED, "%s: cannot read (%s)" % (path, e))
                 continue
             if got != want:
-                add(name, FAILED, "%s: sha256 mismatch, recomputed %s"
-                    % (path, got))
+                # Never print the recomputed hash: it would turn the check
+                # into a hash oracle for any file on the machine (#424).
+                add(name, FAILED, "%s: sha256 mismatch" % path)
             else:
                 add(name, VERIFIED, "%s %s" % (path, got))
         except Exception as e:  # any surprise is undecided, not a pass
