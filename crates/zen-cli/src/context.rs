@@ -215,8 +215,12 @@ fn tool_call_label(name: &str, arguments: &str) -> String {
         .iter()
         .find_map(|k| args.get(k).and_then(|v| v.as_str()))
         .map(|s| {
-            if s.len() > 60 {
-                format!("{}…", &s[..57])
+            // Count chars, not bytes: `&s[..57]` panicked when a multi-byte
+            // char straddled byte 57, and a short non-ASCII string (<= 60
+            // chars but > 60 bytes) was truncated for no reason (issue #436).
+            if s.chars().count() > 60 {
+                let head: String = s.chars().take(57).collect();
+                format!("{head}…")
             } else {
                 s.to_string()
             }
@@ -858,6 +862,58 @@ mod tests {
             "bash cargo test --workspace"
         );
         assert_eq!(tool_call_label("read", "not json"), "read");
+    }
+
+    #[test]
+    fn issue_436_tool_call_label_does_not_panic_on_non_ascii() {
+        // A multi-byte char straddling byte 57: the old byte slice `&s[..57]`
+        // panicked ("byte index 57 is not a char boundary").
+        let path = format!("{}{}{}", "a".repeat(56), "\u{00e9}", "b".repeat(10));
+        let args = format!("{{\"path\": \"{path}\"}}");
+        let expected = format!("read {}{}\u{2026}", "a".repeat(56), "\u{00e9}");
+        assert_eq!(tool_call_label("read", &args), expected);
+    }
+
+    #[test]
+    fn issue_436_tool_call_label_keeps_short_non_ascii_label_whole() {
+        // 31 chars but 62 bytes: short in chars, so it must not be truncated
+        // (the old code counted bytes and truncated mid-char, panicking).
+        let path = "\u{00e9}".repeat(31);
+        let args = format!("{{\"path\": \"{path}\"}}");
+        assert_eq!(tool_call_label("read", &args), format!("read {path}"));
+    }
+
+    #[test]
+    fn issue_436_tool_call_label_truncates_long_ascii_path() {
+        // ASCII behaviour pinned: longer than 60 chars keeps 57 chars + "\u{2026}".
+        // (Passes on the old code too; guards the truncation rule itself.)
+        let path = "x".repeat(70);
+        let args = format!("{{\"path\": \"{path}\"}}");
+        assert_eq!(
+            tool_call_label("read", &args),
+            format!("read {}\u{2026}", "x".repeat(57))
+        );
+    }
+
+    #[test]
+    fn issue_436_mutant_exactly_60_chars_kept_whole() {
+        // Boundary pin for the `count() > 60` guard: exactly 60 chars must
+        // stay whole. The `>` -> `>=` mutant truncates this to 57 + ellipsis.
+        let path = "x".repeat(60);
+        let args = format!("{{\"path\": \"{path}\"}}");
+        assert_eq!(tool_call_label("read", &args), format!("read {path}"));
+    }
+
+    #[test]
+    fn issue_436_mutant_61_chars_truncated() {
+        // Just over the boundary: 61 chars truncate to 57 + ellipsis.
+        // (Also kills a `60` -> `61` constant mutant, which would keep 61 whole.)
+        let path = "x".repeat(61);
+        let args = format!("{{\"path\": \"{path}\"}}");
+        assert_eq!(
+            tool_call_label("read", &args),
+            format!("read {}…", "x".repeat(57))
+        );
     }
 
     fn analyzed(messages: Vec<ChatMessage>) -> ContextAnalysis {
