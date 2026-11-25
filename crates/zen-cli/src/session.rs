@@ -67,17 +67,24 @@ fn legacy_encode_cwd(path: &Path) -> String {
 /// legacy dash-encoded name (which may contain a stray `%` from the path
 /// itself) never decodes into a wrong path.
 fn decode_cwd(encoded: &str) -> Option<String> {
+    // Iterator-based so no manual index can stall: the `i += 3` form
+    // let the `i += 3` -> `i *= 3` mutant hang forever on an escape at
+    // position 0 (0 * 3 stays 0), which cargo-mutants reports as a
+    // TIMEOUT instead of a kill and fails the shard. Advancing with
+    // `next()` always consumes input, so a mutant here can only give a
+    // wrong value, which the tests catch.
     let bytes = encoded.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            let hex = encoded.get(i + 1..i + 3)?;
+    let mut iter = bytes.iter();
+    while let Some(&b) = iter.next() {
+        if b == b'%' {
+            let h1 = *iter.next()?;
+            let h2 = *iter.next()?;
+            let pair = [h1, h2];
+            let hex = std::str::from_utf8(&pair).ok()?;
             out.push(u8::from_str_radix(hex, 16).ok()?);
-            i += 3;
         } else {
-            out.push(bytes[i]);
-            i += 1;
+            out.push(b);
         }
     }
     String::from_utf8(out).ok()
