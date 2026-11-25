@@ -895,6 +895,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn issue_436_mutant_exactly_60_chars_kept_whole() {
+        // Boundary pin for the `count() > 60` guard: exactly 60 chars must
+        // stay whole. The `>` -> `>=` mutant truncates this to 57 + ellipsis.
+        let path = "x".repeat(60);
+        let args = format!("{{\"path\": \"{path}\"}}");
+        assert_eq!(tool_call_label("read", &args), format!("read {path}"));
+    }
+
+    #[test]
+    fn issue_436_mutant_61_chars_truncated() {
+        // Just over the boundary: 61 chars truncate to 57 + ellipsis.
+        // (Also kills a `60` -> `61` constant mutant, which would keep 61 whole.)
+        let path = "x".repeat(61);
+        let args = format!("{{\"path\": \"{path}\"}}");
+        assert_eq!(
+            tool_call_label("read", &args),
+            format!("read {}…", "x".repeat(57))
+        );
+    }
+
     fn analyzed(messages: Vec<ChatMessage>) -> ContextAnalysis {
         let parsed = ParsedSession {
             session_id: "s".to_string(),
