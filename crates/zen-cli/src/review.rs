@@ -1202,6 +1202,14 @@ mod tests {
             err.to_string().contains("timed out"),
             "expected a timeout error, got {err}"
         );
+        // The timeout must come from respecting the deadline, not from
+        // returning at once: the `>=` -> `<` mutant in join_reader_until
+        // bails immediately and still passes the error check above, so
+        // pin the lower bound too (Z Tester verdict on #546).
+        assert!(
+            elapsed >= Duration::from_secs(14),
+            "call must wait until the deadline, took only {elapsed:?}"
+        );
         assert!(
             elapsed < Duration::from_secs(17),
             "call must return within the deadline, took {elapsed:?}"
