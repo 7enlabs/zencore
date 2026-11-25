@@ -961,7 +961,9 @@ pub(crate) fn resolve_session_for_repl(
     cwd: &Path,
     home: Option<&Path>,
 ) -> Result<Option<std::path::PathBuf>> {
-    if cli.resume.as_deref().is_none_or(str::is_empty) && !cli.continue_session {
+    // Issue #453: a bare `-r` is not "no resume" - it falls through
+    // to `resolve_session`, which resumes the latest session like `-c`.
+    if cli.resume.is_none() && !cli.continue_session {
         return Ok(None);
     }
     // Like /resume, -r also accepts a session name (title).
@@ -993,7 +995,9 @@ fn resolve_session(
     let mut resumed: Option<std::path::PathBuf> = if let Some(h) = &home_path {
         if let Some(r) = &cli.resume {
             if r.is_empty() {
-                None
+                // Issue #453: bare `-r` resumes the latest session,
+                // like `-c` - the help text promises it.
+                session::latest_session_for_cwd(h, &session::encode_cwd(cwd))
             } else {
                 Some(session::find_session_path(h, r).ok_or_else(|| {
                     // Issue #261: an unknown -r session is a not-found
@@ -1010,7 +1014,9 @@ fn resolve_session(
             None
         }
     } else {
-        if cli.resume.as_deref().is_some_and(|r| !r.is_empty()) {
+        // Issue #453: bare `-r` also needs a home directory to
+        // locate the latest session, exactly like `--continue`.
+        if cli.resume.is_some() {
             anyhow::bail!("--resume needs a home directory to locate the session");
         }
         if cli.continue_session {
@@ -2046,6 +2052,77 @@ mod tests {
         );
         let bad = Cli::parse_from(["zen", "-r", "no-such-session"]);
         assert!(resolve_session_for_repl(&bad, &dir, Some(&dir)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn issue_453_bare_resume_resumes_latest_headless() {
+        // Issue #453: bare `-r` must resume the latest session, like
+        // `-c` - the help text promises it, but `resolve_session`
+        // treated an empty `-r` as "no resume" and started fresh.
+        let dir = repl_sess_dir("453h");
+        let proj = session::ensure_session_dir(&dir, &dir, "orig").unwrap();
+        let p = session::session_path(&proj, "orig");
+        session::append_typed(&p, "user", "orig", "cwd", "u", None, None, None).unwrap();
+        let cli = Cli::parse_from(["zen", "-r", "-p", "hi"]);
+        let (got_id, path, src) = resolve_session(&cli, &dir, Some(&dir)).unwrap();
+        assert_eq!(got_id, "orig");
+        assert_eq!(path, Some(p.clone()));
+        assert_eq!(src, Some(p), "bare -r must resume the latest history");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn issue_453_bare_resume_resumes_latest_repl() {
+        // Issue #453: the REPL path early-returned None for a bare
+        // `-r` before `resolve_session` ever ran.
+        let dir = repl_sess_dir("453r");
+        let proj = session::ensure_session_dir(&dir, &dir, "orig").unwrap();
+        let p = session::session_path(&proj, "orig");
+        session::append_typed(&p, "user", "orig", "cwd", "u", None, None, None).unwrap();
+        let cli = Cli::parse_from(["zen", "-r"]);
+        assert_eq!(
+            resolve_session_for_repl(&cli, &dir, Some(&dir)).unwrap(),
+            Some(p)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn issue_453_continue_resumes_latest_repl() {
+        // Issue #453 / PR #534: `-c` must resume the latest session
+        // in the REPL. Deleting the `!` in the early-return guard
+        // makes `-c` fall into the fresh-start branch and return
+        // None instead of the latest transcript.
+        let dir = repl_sess_dir("453c");
+        let proj = session::ensure_session_dir(&dir, &dir, "orig").unwrap();
+        let p = session::session_path(&proj, "orig");
+        session::append_typed(&p, "user", "orig", "cwd", "u", None, None, None).unwrap();
+        let cli = Cli::parse_from(["zen", "-c"]);
+        assert_eq!(
+            resolve_session_for_repl(&cli, &dir, Some(&dir)).unwrap(),
+            Some(p)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn issue_453_bare_resume_with_no_sessions_starts_fresh() {
+        // No session exists yet: bare `-r` starts fresh, no error.
+        let dir = repl_sess_dir("453f");
+        let cli = Cli::parse_from(["zen", "-r", "-p", "hi"]);
+        let (_, _, src) = resolve_session(&cli, &dir, Some(&dir)).unwrap();
+        assert_eq!(src, None, "nothing to resume must not error");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn issue_453_bare_resume_without_home_errors() {
+        // Bare `-r` needs a home directory to locate the latest
+        // session, exactly like `--continue`.
+        let dir = repl_sess_dir("453n");
+        let cli = Cli::parse_from(["zen", "-r", "-p", "hi"]);
+        assert!(resolve_session(&cli, &dir, None).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
