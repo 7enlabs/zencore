@@ -645,4 +645,26 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&scratch).unwrap(), "not a dir");
     }
+
+    #[test]
+    fn issue_454_relative_path_must_not_skip_session_id_lookup() {
+        // A relative path that exists in the test process working
+        // directory (the crate root, where Cargo.toml lives) must not
+        // short-circuit the session-id lookup: find_managed_session
+        // only treats absolute paths as paths, and a relative string
+        // still falls through to the id loop. Replacing `&&` with
+        // `||` in the absolute-path guard enters that branch for the
+        // relative path and returns None before the id loop runs.
+        assert!(
+            std::path::Path::new("Cargo.toml").exists(),
+            "test assumes cargo runs unit tests with the crate root as CWD"
+        );
+        let home = tmp_home("454rel");
+        let cwd = home.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        make_session(&home, &cwd, "Cargo.toml");
+
+        let found = find_managed_session(&home, "Cargo.toml");
+        assert!(found.is_some(), "session id must still resolve");
+    }
 }
