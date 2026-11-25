@@ -3759,8 +3759,10 @@ dependencies = [
  "async-trait",
  "chrono",
  "fs2",
+ "globset",
  "serde",
  "serde_json",
+ "walkdir",
 ]
 
 [[package]]

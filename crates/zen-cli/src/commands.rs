@@ -576,17 +576,46 @@ fn expand_file_refs(body: &str, base: &Path) -> Result<String> {
 }
 
 fn read_ref(path: &str, base: &Path) -> Option<String> {
-    let p = base.join(path);
-    let p = if p.is_file() {
-        p
-    } else {
-        Path::new(path).to_path_buf()
-    };
-    if p.is_file() {
-        std::fs::read_to_string(p).ok()
-    } else {
-        None
+    // Issue #444: confine the reference to the project directory and
+    // apply the gitignore rules. The old code fell back to the path as
+    // given, so an absolute path or a `..` escape inlined any readable
+    // file into the expanded command. Canonicalizing both sides also
+    // stops symlinks from escaping the project; an absolute path that
+    // stays inside the project still resolves.
+    let candidate = base.join(path);
+    let root = std::fs::canonicalize(base).ok()?;
+    let canon = std::fs::canonicalize(&candidate).ok()?;
+    if !canon.starts_with(&root) || !canon.is_file() {
+        return None;
     }
+    let rules = zen_core::gitignore::load_ignore_rules(&root);
+    if zen_core::gitignore::is_ignored(&rules, &canon, false) {
+        return None;
+    }
+    read_ref_file(&canon)
+}
+
+/// Read a file for `@ref` inlining, capped at the 512 KiB mention cap
+/// (issue #444). Reads at most cap + 1 bytes, so a huge file never lands
+/// fully in memory.
+fn read_ref_file(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(crate::mentions::MAX_MENTION_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if bytes.len() as u64 > crate::mentions::MAX_MENTION_FILE_BYTES {
+        let keep = crate::mentions::MAX_MENTION_FILE_BYTES as usize;
+        let mut end = keep.min(text.len());
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("\n[truncated: file exceeds the 512 KiB mention cap]");
+    }
+    Some(text)
 }
 
 fn custom_commands_dirs(cwd: &Path, home: Option<&Path>) -> Vec<std::path::PathBuf> {
@@ -1490,6 +1519,74 @@ mod tests {
         let cmd = CustomCommand::parse("show", "data: @data.txt").unwrap();
         let out = cmd.expand_in("", &tmp).unwrap();
         assert!(out.contains("data: inline-content"));
+    }
+
+    fn read_ref_tmp(tag: &str) -> std::path::PathBuf {
+        let tmp = std::env::temp_dir().join(format!(
+            "zen_cmd_readref_{}_{}_{}",
+            tag,
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn read_ref_rejects_absolute_path_outside_project() {
+        // Issue #444: an absolute path outside the project must not inline.
+        let tmp = read_ref_tmp("abs");
+        let secret = tmp.join("secret.txt");
+        fs::write(&secret, "top-secret").unwrap();
+        let proj = tmp.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        assert_eq!(read_ref(secret.to_str().unwrap(), &proj), None);
+    }
+
+    #[test]
+    fn read_ref_rejects_dotdot_escape() {
+        // Issue #444: `..` must not escape the project directory.
+        let tmp = read_ref_tmp("dotdot");
+        fs::write(tmp.join("secret.txt"), "top-secret").unwrap();
+        let proj = tmp.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        assert_eq!(read_ref("../secret.txt", &proj), None);
+    }
+
+    #[test]
+    fn read_ref_respects_gitignore() {
+        // Issue #444: gitignored files must not inline.
+        let tmp = read_ref_tmp("ignore");
+        fs::write(tmp.join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(tmp.join("ignored.txt"), "nope").unwrap();
+        fs::write(tmp.join("kept.txt"), "yes").unwrap();
+        assert_eq!(read_ref("ignored.txt", &tmp), None);
+        assert_eq!(read_ref("kept.txt", &tmp).as_deref(), Some("yes"));
+    }
+
+    #[test]
+    fn read_ref_caps_large_file() {
+        // Issue #444: the inlined size is capped like mentions.
+        let tmp = read_ref_tmp("cap");
+        let big = "x".repeat(crate::mentions::MAX_MENTION_FILE_BYTES as usize + 1000);
+        fs::write(tmp.join("big.txt"), &big).unwrap();
+        let out = read_ref("big.txt", &tmp).expect("in-project file must inline");
+        assert!(out.ends_with("[truncated: file exceeds the 512 KiB mention cap]"));
+        assert!(out.len() < crate::mentions::MAX_MENTION_FILE_BYTES as usize + 100);
+    }
+
+    #[test]
+    fn read_ref_allows_absolute_path_inside_project() {
+        // Containment, not a blanket ban: an absolute path that stays
+        // inside the project still inlines.
+        let tmp = read_ref_tmp("inside");
+        let p = tmp.join("data.txt");
+        fs::write(&p, "inside-content").unwrap();
+        assert_eq!(
+            read_ref(p.to_str().unwrap(), &tmp).as_deref(),
+            Some("inside-content")
+        );
     }
 
     #[test]

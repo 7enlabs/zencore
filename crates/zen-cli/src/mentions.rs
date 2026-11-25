@@ -152,7 +152,7 @@ fn read_mention_file(path: &Path) -> String {
 
 fn expand_pattern(pattern: &str, cwd: &Path) -> Result<Vec<PathBuf>, NoMatchError> {
     let norm = normalize_pattern(pattern);
-    let ignore_rules = zen_tools::gitignore::load_ignore_rules(cwd);
+    let ignore_rules = zen_core::gitignore::load_ignore_rules(cwd);
 
     if !has_glob_meta(&norm) {
         let abs = if Path::new(&norm).is_absolute() {
@@ -170,7 +170,7 @@ fn expand_pattern(pattern: &str, cwd: &Path) -> Result<Vec<PathBuf>, NoMatchErro
         if !abs.is_file() {
             return Err(NoMatchError(pattern.to_string()));
         }
-        if zen_tools::gitignore::is_ignored(&ignore_rules, &abs, false) {
+        if zen_core::gitignore::is_ignored(&ignore_rules, &abs, false) {
             return Err(NoMatchError(format!(
                 "{} is ignored by .gitignore",
                 pattern
@@ -192,7 +192,7 @@ fn expand_pattern(pattern: &str, cwd: &Path) -> Result<Vec<PathBuf>, NoMatchErro
         }
 
         if e.file_type().is_dir() && e.depth() > 0 {
-            return !zen_tools::gitignore::is_ignored(&ignore_rules, e.path(), true);
+            return !zen_core::gitignore::is_ignored(&ignore_rules, e.path(), true);
         }
         true
     });
@@ -208,7 +208,7 @@ fn expand_pattern(pattern: &str, cwd: &Path) -> Result<Vec<PathBuf>, NoMatchErro
         if !matcher.is_match(&rel_str) {
             continue;
         }
-        if zen_tools::gitignore::is_ignored(&ignore_rules, path, false) {
+        if zen_core::gitignore::is_ignored(&ignore_rules, path, false) {
             continue;
         }
         hits.push(path.to_path_buf());

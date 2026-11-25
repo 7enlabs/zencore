@@ -297,7 +297,21 @@ fn resolve_ref(raw: &str, base: &Path) -> Option<PathBuf> {
         let p = PathBuf::from(raw);
         if p.is_absolute() { p } else { base.join(p) }
     };
-    p.is_file().then_some(p)
+    // Issue #444: confine the resolved file to the project directory and
+    // apply the gitignore rules. The old code returned any readable file:
+    // an absolute path, a `..` escape or `~/` could pull secrets from
+    // outside the project into the model context. Canonicalizing both
+    // sides also stops symlinks from escaping the project.
+    let root = std::fs::canonicalize(base).ok()?;
+    let canon = std::fs::canonicalize(&p).ok()?;
+    if !canon.starts_with(&root) || !canon.is_file() {
+        return None;
+    }
+    let rules = zen_core::gitignore::load_ignore_rules(&root);
+    if zen_core::gitignore::is_ignored(&rules, &canon, false) {
+        return None;
+    }
+    Some(canon)
 }
 
 /// Default timeout for `!`...`` shell blocks in slash commands, in seconds.
@@ -663,6 +677,68 @@ mod tests {
         assert_eq!(
             expand_command(&cmd("Fix $ARGUMENTS"), "@notes/a.txt", &c),
             "Fix ALPHA"
+        );
+    }
+
+    #[test]
+    fn resolve_ref_rejects_absolute_path_outside_project() {
+        // Issue #444: an absolute path outside the project must not inline.
+        let t = TempDir::new();
+        let secret = t.path().join("secret.txt");
+        write(&secret, "top-secret");
+        let proj = t.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        assert_eq!(resolve_ref(secret.to_str().unwrap(), &proj), None);
+    }
+
+    #[test]
+    fn resolve_ref_rejects_dotdot_escape() {
+        // Issue #444: `..` must not escape the project directory.
+        let t = TempDir::new();
+        write(&t.path().join("secret.txt"), "top-secret");
+        let proj = t.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        assert_eq!(resolve_ref("../secret.txt", &proj), None);
+    }
+
+    #[test]
+    fn resolve_ref_rejects_home_escape() {
+        // Issue #444: `~/` and absolute home paths must not reach outside
+        // the project. The test binary itself is an existing file outside
+        // any temp project, so it stands in for `~/.ssh/id_rsa`.
+        let t = TempDir::new();
+        let proj = t.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let exe = std::env::current_exe().expect("test binary path");
+        assert_eq!(resolve_ref(exe.to_str().unwrap(), &proj), None);
+        let home = dirs::home_dir().expect("test needs a home directory");
+        if let Ok(rel) = exe.strip_prefix(&home) {
+            let tilde = format!("~/{}", rel.to_string_lossy().replace('\\', "/"));
+            assert_eq!(resolve_ref(&tilde, &proj), None);
+        }
+    }
+
+    #[test]
+    fn resolve_ref_respects_gitignore() {
+        // Issue #444: gitignored files must not inline.
+        let t = TempDir::new();
+        write(&t.path().join(".gitignore"), "ignored.txt\n");
+        write(&t.path().join("ignored.txt"), "nope");
+        write(&t.path().join("kept.txt"), "yes");
+        assert_eq!(resolve_ref("ignored.txt", t.path()), None);
+        assert!(resolve_ref("kept.txt", t.path()).is_some());
+    }
+
+    #[test]
+    fn resolve_ref_allows_absolute_path_inside_project() {
+        // Containment, not a blanket ban: an absolute path that stays
+        // inside the project still resolves.
+        let t = TempDir::new();
+        let p = t.path().join("data.txt");
+        write(&p, "inside-content");
+        assert_eq!(
+            resolve_ref(p.to_str().unwrap(), t.path()),
+            Some(std::fs::canonicalize(&p).unwrap())
         );
     }
 
