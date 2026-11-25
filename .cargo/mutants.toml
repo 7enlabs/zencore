@@ -504,4 +504,21 @@ exclude_re = [
   # stops returning ChildSpend::default()), this mutant stops being
   # equivalent: remove this exclusion and kill it with a test.
   "lib\\.rs:1453:9: replace SubAgentRunner::take_child_spend -> ChildSpend with Default::default\\(\\)",
+  # PR #521 (issue #387), lsp.rs LspManager::check_respawn_backoff
+  # (line 1194, col 32): replace match guard `!remaining.is_zero()`
+  # with true.
+  # EQUIVALENT (waived by ZC Leader, 2026-11-25; verified by reading
+  # check_respawn_backoff): `remaining` is
+  # `RESPAWN_COOLDOWN.checked_sub(elapsed)`, so it is zero only when
+  # the last failure happened exactly one cooldown (30s) ago, to the
+  # nanosecond. At that single instant the original allows the respawn
+  # and the mutant refuses it; one nanosecond earlier or later both
+  # versions agree, and the next call after the instant also agrees
+  # (elapsed > cooldown gives None). No test can hit a single
+  # nanosecond reliably, so no test can kill this mutant.
+  # EXPIRY: if the cooldown check stops comparing against an exact
+  # instant (for example it rounds the elapsed time, or the guard is
+  # rewritten to compare seconds), this mutant stops being equivalent:
+  # remove this exclusion and kill it with a test.
+  "lsp\\.rs:1194:32: replace match guard !remaining\\.is_zero\\(\\) with true in LspManager::check_respawn_backoff",
 ]

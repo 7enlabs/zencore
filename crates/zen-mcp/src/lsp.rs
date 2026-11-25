@@ -1060,7 +1060,7 @@ pub(crate) fn is_lsp_transport_error(e: &anyhow::Error) -> bool {
 
 /// Cache key for the server covering `path`: its language plus the
 /// project root the server was started in.
-fn server_key(path: &Path) -> anyhow::Result<ServerKey> {
+pub(crate) fn server_key(path: &Path) -> anyhow::Result<ServerKey> {
     let lang = detect_language(path).ok_or_else(|| {
         let ext = path
             .extension()
@@ -1079,7 +1079,11 @@ fn server_key(path: &Path) -> anyhow::Result<ServerKey> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ServerKey {
+/// Cache key for one language server: the language plus the project
+/// root it serves. pub(crate) so the mutant-killer tests in lsp_tests
+/// can name the key type when evicting a specific connection (#387,
+/// PR #521).
+pub(crate) struct ServerKey {
     language: LspLanguage,
     root: PathBuf,
 }
@@ -1144,7 +1148,9 @@ impl LspManager {
     /// evicted by a stale failure (same guard as `Transport::evict`
     /// in `transport.rs` #375). The evicted server's child process
     /// is killed so no orphan survives the cache removal.
-    fn evict(&self, key: &ServerKey, dead: &Arc<LspConnection>) {
+    // pub(crate) so the mutant-killer tests in lsp_tests can evict a
+    // specific (possibly stale) connection directly (#387, PR #521).
+    pub(crate) fn evict(&self, key: &ServerKey, dead: &Arc<LspConnection>) {
         let removed = {
             let mut servers = lock_or_recover(&self.servers, "servers");
             match servers.get(key) {
@@ -1289,7 +1295,17 @@ impl LspManager {
 
     pub(crate) async fn connection_for(&self, path: &Path) -> anyhow::Result<Arc<LspConnection>> {
         let key = server_key(path)?;
-        if let Some(conn) = lock_or_recover(&self.servers, "servers").get(&key).cloned() {
+        // Take the cached connection out of the lock first: the evict
+        // below re-locks `servers`, so holding the guard from the `if
+        // let` scrutinee across it would deadlock the thread. Found by
+        // the `is_alive -> false` mutant (#387, PR #521): the probe
+        // normally returns true for a live server, which hid the fact
+        // that a dead server seen by the probe deadlocks here instead of
+        // respawning (the mock's child usually has not finished exiting
+        // yet, so the probe races true and the retry path evicts
+        // without the lock held).
+        let cached = lock_or_recover(&self.servers, "servers").get(&key).cloned();
+        if let Some(conn) = cached {
             if conn.is_alive() {
                 return Ok(conn);
             }
