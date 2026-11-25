@@ -59,12 +59,7 @@ fn resolved_fd_path(file: &File) -> Option<PathBuf> {
     }
     let mut buf = vec![0u16; 32768];
     let n = unsafe {
-        GetFinalPathNameByHandleW(
-            file.as_raw_handle() as *mut std::ffi::c_void,
-            buf.as_mut_ptr(),
-            buf.len() as u32,
-            0,
-        )
+        GetFinalPathNameByHandleW(file.as_raw_handle(), buf.as_mut_ptr(), buf.len() as u32, 0)
     };
     if n == 0 || n as usize >= buf.len() {
         return None;
