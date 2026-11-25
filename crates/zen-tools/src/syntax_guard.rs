@@ -430,4 +430,26 @@ mod tests {
             );
         }
     }
+
+    // The refusal message is the only thing the agent sees when the guard
+    // cannot run: it must name the file, carry the reason, and say the
+    // change was not applied. (Kills the mutants that replace the whole
+    // message with an empty or arbitrary string.)
+    #[test]
+    fn refusal_unavailable_names_file_reason_and_refusal() {
+        let msg = refusal_unavailable(Path::new("m.py"), "checker 'python3' timed out");
+        assert!(msg.contains("m.py"), "message must name the file: {msg}");
+        assert!(
+            msg.contains("timed out"),
+            "message must carry the reason: {msg}"
+        );
+        assert!(
+            msg.contains("NOT applied"),
+            "message must say the change was not applied: {msg}"
+        );
+        assert!(
+            msg.contains("ZEN_NO_SYNTAX_GUARD=1"),
+            "message must point at the bypass: {msg}"
+        );
+    }
 }
