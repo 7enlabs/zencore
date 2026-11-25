@@ -150,18 +150,78 @@ pub fn git_diff(cwd: &Path, mode: DiffMode, color: bool) -> Option<String> {
     run_git(cwd, &args, GIT_DIFF_TIMEOUT)
 }
 
+/// Unquote a git-quoted path (C-style quoting used by `status --porcelain`
+/// when `core.quotepath` is on): handles `\n`, `\t`, `\"`, `\\` and octal
+/// byte escapes (`\303\251` for the UTF-8 bytes of `é`). Octal escapes are
+/// accumulated as bytes and decoded as UTF-8 (lossy if invalid), so a
+/// multi-byte character split across escapes decodes as one character.
+/// Unquoted input is returned unchanged.
+pub(crate) fn unquote_path(p: &str) -> String {
+    let p = p.trim();
+    if p.len() < 2 || !p.starts_with('"') || !p.ends_with('"') {
+        return p.to_string();
+    }
+    let inner = &p.as_bytes()[1..p.len() - 1];
+    let mut bytes = Vec::with_capacity(inner.len());
+    let mut i = 0;
+    while i < inner.len() {
+        if inner[i] == b'\\' && i + 1 < inner.len() {
+            match inner[i + 1] {
+                b'n' => {
+                    bytes.push(b'\n');
+                    i += 2;
+                }
+                b't' => {
+                    bytes.push(b'\t');
+                    i += 2;
+                }
+                b'"' => {
+                    bytes.push(b'"');
+                    i += 2;
+                }
+                b'\\' => {
+                    bytes.push(b'\\');
+                    i += 2;
+                }
+                b'0'..=b'7' => {
+                    let mut value: u32 = 0;
+                    let mut count = 0;
+                    while count < 3 && i + 1 + count < inner.len() {
+                        let d = inner[i + 1 + count];
+                        if !matches!(d, b'0'..=b'7') {
+                            break;
+                        }
+                        value = value * 8 + (d - b'0') as u32;
+                        count += 1;
+                    }
+                    if value > 0o377 {
+                        // Not a byte value: keep the backslash literally and
+                        // let the digits through on later iterations.
+                        bytes.push(b'\\');
+                        i += 1;
+                    } else {
+                        bytes.push(value as u8);
+                        i += 1 + count;
+                    }
+                }
+                _ => {
+                    bytes.push(b'\\');
+                    i += 1;
+                }
+            }
+        } else {
+            bytes.push(inner[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 fn parse_untracked(porcelain: &str) -> Vec<String> {
     porcelain
         .lines()
         .filter_map(|l| l.strip_prefix("?? "))
-        .map(|p| {
-            let p = p.trim();
-            if p.len() >= 2 && p.starts_with('"') && p.ends_with('"') {
-                p[1..p.len() - 1].to_string()
-            } else {
-                p.to_string()
-            }
-        })
+        .map(unquote_path)
         .collect()
 }
 
@@ -779,6 +839,15 @@ mod tests {
         assert_eq!(
             parse_untracked(out),
             vec!["plain.txt".to_string(), "with space.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_untracked_decodes_git_octal_escapes() {
+        let out = "?? plain.txt\n?? \"caf\\303\\251.txt\"\n";
+        assert_eq!(
+            parse_untracked(out),
+            vec!["plain.txt".to_string(), "café.txt".to_string()]
         );
     }
 
