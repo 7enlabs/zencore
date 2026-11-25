@@ -18,6 +18,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -968,6 +969,42 @@ class EvidenceConfinementTests(Base):
             with self.assertRaises(ZtaskError) as cm:
                 ztask.check_evidence(ev, d)
             self.assertIn("too large", str(cm.exception))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_symlink_swapped_in_after_resolve_rejected(self):
+        # TOCTOU (#533): the artifact is a regular file when its path is
+        # resolved, but a concurrent writer swaps it for a symlink pointing
+        # outside base_dir before it is opened. The open must refuse the
+        # symlink (O_NOFOLLOW), not follow it to the outside file whose
+        # hash matches. The swap is injected by wrapping os.open, the way
+        # the reviewer's controlled interleaving probe did it.
+        d = tempfile.mkdtemp()
+        try:
+            base = os.path.join(d, "base")
+            os.mkdir(base)
+            outside = os.path.join(d, "outside.txt")
+            Path(outside).write_bytes(b"secret")
+            art_path = os.path.join(base, "art.txt")
+            Path(art_path).write_bytes(b"secret")
+            art = self._art("art.txt", b"secret")
+            ev = self._ev([art])
+            real_open = os.open
+            swapped = []
+
+            def swapping_open(path, *args, **kwargs):
+                if not swapped and os.path.abspath(path) == art_path:
+                    os.unlink(path)
+                    os.symlink(outside, path)
+                    swapped.append(True)
+                return real_open(path, *args, **kwargs)
+
+            with mock.patch.object(os, "open", swapping_open):
+                with self.assertRaises(ZtaskError):
+                    ztask.check_evidence(ev, base)
+                self.assertTrue(swapped, "the swap never ran")
+                out = ztask.verify_evidence(ev, base, repo=REPO)
+                self.assertNotEqual(out["verdict"], "verified")
         finally:
             shutil.rmtree(d, ignore_errors=True)
 

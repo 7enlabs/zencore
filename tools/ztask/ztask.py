@@ -14,6 +14,7 @@ QUEUED -> CLAIMED -> DOING -> BLOCKED -> REVIEW -> DONE -> DROPPED.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -160,28 +161,52 @@ def _resolve_artifact_path(base_dir, path):
 
 
 def _hash_artifact_file(full):
-    """SHA-256 of a regular file (#424). Refuses non-regular files (device,
-    FIFO, directory, socket) and files over EVIDENCE_MAX_ARTIFACT_BYTES
-    before any byte is read, so /dev/zero and FIFOs cannot hang verification
-    or exhaust memory. The byte count is also checked while reading, in case
-    the file grows between stat and read. Raises ValueError on refusal and
-    lets FileNotFoundError / OSError from stat / open propagate."""
-    st = os.stat(full)
-    if not stat.S_ISREG(st.st_mode):
-        raise ValueError("artifact is not a regular file")
-    if st.st_size > EVIDENCE_MAX_ARTIFACT_BYTES:
-        raise ValueError("artifact too large: exceeds %d bytes"
-                         % EVIDENCE_MAX_ARTIFACT_BYTES)
-    h = hashlib.sha256()
-    total = 0
-    with open(full, "rb") as f:
-        for chunk in iter(lambda: f.read(_EVIDENCE_HASH_CHUNK), b""):
+    """SHA-256 of a regular file (#424, #533). Opens the file first with
+    O_NOFOLLOW (where the platform has it) so a symlink swapped in after
+    the path was resolved is refused instead of followed, then fstats the
+    opened fd: the regularity and size checks run on the file actually
+    read, never on a path that could name a different file by the time
+    it is opened. Refuses non-regular files (device, FIFO, directory,
+    socket) and files over EVIDENCE_MAX_ARTIFACT_BYTES before any byte
+    is read, so /dev/zero and FIFOs cannot hang verification or exhaust
+    memory. The byte count is also checked while reading, in case the
+    file grows. Raises ValueError on refusal and lets FileNotFoundError /
+    OSError from open propagate (a symlink refused by O_NOFOLLOW surfaces
+    as ELOOP and is turned into ValueError). The open also sets
+    O_NONBLOCK (where the platform has it) so opening a FIFO never
+    blocks waiting for a writer: the fstat right after the open refuses
+    it as non-regular before any byte is read. The bytes are then read
+    with os.read on the fd, which is safe for a regular file even with
+    O_NONBLOCK set."""
+    flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_NONBLOCK", 0))
+    try:
+        fd = os.open(full, flags)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise ValueError("artifact is a symlink")
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError("artifact is not a regular file")
+        if st.st_size > EVIDENCE_MAX_ARTIFACT_BYTES:
+            raise ValueError("artifact too large: exceeds %d bytes"
+                             % EVIDENCE_MAX_ARTIFACT_BYTES)
+        h = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = os.read(fd, _EVIDENCE_HASH_CHUNK)
+            if not chunk:
+                break
             total += len(chunk)
             if total > EVIDENCE_MAX_ARTIFACT_BYTES:
                 raise ValueError("artifact too large: exceeds %d bytes"
                                  % EVIDENCE_MAX_ARTIFACT_BYTES)
             h.update(chunk)
-    return h.hexdigest()
+        return h.hexdigest()
+    finally:
+        os.close(fd)
 
 
 def check_evidence(evidence, base_dir="."):
