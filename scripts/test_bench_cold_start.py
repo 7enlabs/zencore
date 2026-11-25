@@ -64,6 +64,9 @@ TOKEN_CHILD = (
 # Exits at once without printing anything (EOF, no prompt).
 EXIT_CHILD = "import sys\n"
 
+# Echoes stdin back to stdout.
+ECHO_CHILD = "import sys; sys.stdout.write(sys.stdin.read())"
+
 
 @contextlib.contextmanager
 def force_non_posix():
@@ -151,6 +154,25 @@ class RunTimedNonPosix(unittest.TestCase):
                     [sys.executable, "-c", SLEEP], dict(os.environ), timeout=1
                 )
 
+    def test_non_posix_stdin_data_is_delivered(self):
+        """Non-POSIX branch delivers stdin_data to the child (#525).
+
+        Fails on the unfixed code: run_timed writes stdin_data and closes
+        stdin itself, then communicate() with no input tries to flush the
+        closed stdin and raises ValueError: flush of closed file.
+        """
+        with force_non_posix():
+            _, rc, out, err, rss = bcs.run_timed(
+                [sys.executable, "-c", ECHO_CHILD],
+                dict(os.environ),
+                stdin_data=b"hello\n",
+                timeout=30,
+            )
+        self.assertEqual(rc, 0)
+        self.assertIsNone(rss)
+        self.assertEqual(out, b"hello\n")
+        self.assertEqual(err, b"")
+
 
 class RunTimedPosix(unittest.TestCase):
     def test_posix_returns_complete_output_and_rss(self):
@@ -165,6 +187,20 @@ class RunTimedPosix(unittest.TestCase):
         self.assertEqual(err, ERR_PAYLOAD)
         self.assertIsNotNone(rss)
         self.assertGreater(rss, 0)
+
+    def test_posix_stdin_data_is_delivered(self):
+        """POSIX branch (write + close stdin, drain threads + wait4)."""
+        if not hasattr(os, "wait4"):
+            self.skipTest("no os.wait4 on this platform")
+        _, rc, out, err, _ = bcs.run_timed(
+            [sys.executable, "-c", ECHO_CHILD],
+            dict(os.environ),
+            stdin_data=b"hello\n",
+            timeout=30,
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, b"hello\n")
+        self.assertEqual(err, b"")
 
 
 class PipeReaderTests(unittest.TestCase):
