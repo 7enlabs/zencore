@@ -2089,6 +2089,24 @@ mod tests {
     }
 
     #[test]
+    fn issue_453_continue_resumes_latest_repl() {
+        // Issue #453 / PR #534: `-c` must resume the latest session
+        // in the REPL. Deleting the `!` in the early-return guard
+        // makes `-c` fall into the fresh-start branch and return
+        // None instead of the latest transcript.
+        let dir = repl_sess_dir("453c");
+        let proj = session::ensure_session_dir(&dir, &dir, "orig").unwrap();
+        let p = session::session_path(&proj, "orig");
+        session::append_typed(&p, "user", "orig", "cwd", "u", None, None, None).unwrap();
+        let cli = Cli::parse_from(["zen", "-c"]);
+        assert_eq!(
+            resolve_session_for_repl(&cli, &dir, Some(&dir)).unwrap(),
+            Some(p)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn issue_453_bare_resume_with_no_sessions_starts_fresh() {
         // No session exists yet: bare `-r` starts fresh, no error.
         let dir = repl_sess_dir("453f");
