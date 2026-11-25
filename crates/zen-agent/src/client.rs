@@ -335,12 +335,49 @@ struct WireChoice {
 #[derive(Debug, Default, Deserialize)]
 struct WireMsg {
     #[serde(default)]
-    content: Option<String>,
+    content: Option<WireContent>,
 
     #[serde(default)]
     refusal: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<WireCall>>,
+}
+
+/// Message `content` as sent by OpenAI-compatible gateways: either a
+/// plain string or an array of content parts (issue #339). Only `text`
+/// parts carry message text; other parts (e.g. `reasoning`) are skipped.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WireContent {
+    Text(String),
+    Parts(Vec<WirePart>),
+}
+
+/// One element of array-form message content.
+#[derive(Debug, Deserialize)]
+struct WirePart {
+    /// `{"type":"text",...}` carries message text; other types do not.
+    /// A part without `type` is treated as text (lenient for gateways
+    /// that send bare `{"text": "..."}` parts).
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+impl WireContent {
+    /// Plain-text view: the string itself, or the `text` parts joined
+    /// in order (empty when there is no text part).
+    fn text(&self) -> String {
+        match self {
+            WireContent::Text(s) => s.clone(),
+            WireContent::Parts(parts) => parts
+                .iter()
+                .filter(|p| p.kind.as_deref().is_none_or(|t| t == "text"))
+                .filter_map(|p| p.text.as_deref())
+                .collect(),
+        }
+    }
 }
 #[derive(Debug, Deserialize)]
 struct WireCall {
@@ -810,6 +847,24 @@ impl LlmBackend for OpenAiClient {
     }
 }
 
+/// True when an OpenAI message `content` value carries non-blank text,
+/// whether it is a plain string or an array of content parts (issue
+/// #339). Mirrors `WireContent::text`: only `text` parts count.
+fn message_has_text(content: Option<&Value>) -> bool {
+    match content {
+        Some(Value::String(t)) => !t.trim().is_empty(),
+        Some(Value::Array(parts)) => parts.iter().any(|p| {
+            p.get("type")
+                .and_then(Value::as_str)
+                .is_none_or(|t| t == "text")
+                && p.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| !t.trim().is_empty())
+        }),
+        _ => false,
+    }
+}
+
 pub(crate) fn transient_completion(body: &str) -> Option<String> {
     let v: Value = first_json_value(body)?;
     if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
@@ -836,10 +891,7 @@ pub(crate) fn transient_completion(body: &str) -> Option<String> {
         return None;
     }
     let msg = first.get("message")?;
-    let has_text = msg
-        .get("content")
-        .and_then(Value::as_str)
-        .is_some_and(|t| !t.trim().is_empty());
+    let has_text = message_has_text(msg.get("content"));
     let has_calls = msg
         .get("tool_calls")
         .and_then(Value::as_array)
@@ -931,7 +983,7 @@ pub(crate) fn parse_completion(body: &str) -> anyhow::Result<ChatResponse> {
             })
             .collect::<Vec<_>>()
     });
-    let content = match choice.message.content {
+    let content = match choice.message.content.map(|c| c.text()) {
         Some(s) if s.is_empty() && tool_calls.is_some() => None,
         other => other,
     };
@@ -3567,6 +3619,54 @@ mod anthropic_tests {
         assert!(
             elapsed.as_millis() < 5_000,
             "gave up at once, elapsed: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn parse_completion_accepts_array_form_content() {
+        // Issue #339: some gateways return message content as an array of
+        // content parts instead of a plain string; the completion is valid
+        // text and must parse, not fail as "invalid type: sequence".
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":[{"type":"text","text":"hi"}]},"finish_reason":"stop"}]}"#;
+        let r = parse_completion(body).unwrap();
+        assert_eq!(r.message.text_ref(), Some("hi"));
+    }
+
+    #[test]
+    fn parse_completion_joins_multiple_array_text_parts() {
+        // Issue #339: several text parts join in order; non-text parts
+        // (e.g. reasoning) are skipped, not surfaced as message text.
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":[{"type":"text","text":"hel"},{"type":"reasoning","text":"think"},{"type":"text","text":"lo"}]},"finish_reason":"stop"}]}"#;
+        let r = parse_completion(body).unwrap();
+        assert_eq!(r.message.text_ref(), Some("hello"));
+    }
+
+    #[test]
+    fn parse_completion_array_form_empty_content_with_tool_calls() {
+        // Issue #339: array content joining to empty text follows the
+        // same rule as an empty string: None when tool calls are present.
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":[{"type":"text","text":""}],"tool_calls":[{"id":"c1","function":{"name":"f","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#;
+        let r = parse_completion(body).unwrap();
+        assert_eq!(r.message.content, None);
+        assert!(r.message.tool_calls.is_some());
+    }
+
+    #[test]
+    fn transient_completion_array_form_content_is_not_empty() {
+        // Issue #339: array text must count as has_text, so a valid
+        // completion is not retried as "model returned an empty message".
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":[{"type":"text","text":"hi"}]},"finish_reason":"stop"}]}"#;
+        assert_eq!(transient_completion(body), None);
+    }
+
+    #[test]
+    fn transient_completion_array_form_empty_text_is_empty() {
+        // Issue #339: array content with no usable text is still empty.
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":[{"type":"text","text":"  "}]},"finish_reason":"stop"}]}"#;
+        assert!(
+            transient_completion(body)
+                .unwrap()
+                .contains("empty message")
         );
     }
 }
