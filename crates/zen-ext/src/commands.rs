@@ -374,13 +374,9 @@ fn spawn_drain<R: std::io::Read + Send + 'static>(
                 Ok(0) => break,
                 Ok(n) => {
                     let room = CAPPED_READ_LIMIT.saturating_sub(kept.len());
-                    if room > 0 {
-                        let take = n.min(room);
-                        kept.extend_from_slice(&buf[..take]);
-                        if take < n {
-                            cut_short = true;
-                        }
-                    } else {
+                    let take = n.min(room);
+                    kept.extend_from_slice(&buf[..take]);
+                    if take < n {
                         cut_short = true;
                     }
                 }
@@ -993,5 +989,133 @@ mod tests {
             "capped inlined file must stay near the limit, got {} chars",
             out.chars().count()
         );
+    }
+
+    /// Mutant kill (#392 follow-up, PR #535): a file well under the byte
+    /// cap must be inlined whole. Kills `*` -> `/` at `CAPPED_READ_LIMIT`
+    /// (the `/ 4` mutant caps the read at 2_500 bytes and truncates).
+    #[test]
+    fn issue_392_mutant_inline_file_under_byte_limit_kept_whole() {
+        let t = TempDir::new();
+        let content = "a".repeat(5_000);
+        write(&t.path().join("mid.txt"), &content);
+        let out = read_inline_file(&t.path().join("mid.txt")).unwrap();
+        assert!(
+            !out.contains("truncated"),
+            "5_000-char file must inline whole, got: {out:.200}"
+        );
+        assert!(out.contains(&content), "inlined content must be complete");
+    }
+
+    /// Mutant kill: a file over the char limit must report its exact total
+    /// ("of N chars shown"), which only happens when the whole file was
+    /// read first. Kills `*` -> `+` at `CAPPED_READ_LIMIT` (the `+ 4`
+    /// mutant reads only ~10k bytes, so the total is unknown).
+    #[test]
+    fn issue_392_mutant_inline_file_reports_exact_total() {
+        let t = TempDir::new();
+        let content = "a".repeat(20_000);
+        write(&t.path().join("big2.txt"), &content);
+        let out = read_inline_file(&t.path().join("big2.txt")).unwrap();
+        assert!(
+            out.contains("of 20000 chars shown"),
+            "over-limit file must report its exact total, got: {out:.200}"
+        );
+    }
+
+    /// Mutant kill: a file of exactly `CAPPED_READ_LIMIT` bytes is read
+    /// whole (`len > limit` is false at the boundary). Kills `+` -> `-`
+    /// in `.take(limit + 1)` (reads one byte short, total becomes 39999)
+    /// and `>` -> `>=` in `hit_byte_limit` (wrongly flags the boundary).
+    #[test]
+    fn issue_392_mutant_inline_file_at_byte_limit_is_exact() {
+        let t = TempDir::new();
+        let content = "a".repeat(CAPPED_READ_LIMIT);
+        write(&t.path().join("exact.txt"), &content);
+        let out = read_inline_file(&t.path().join("exact.txt")).unwrap();
+        assert!(
+            out.contains(&format!("of {CAPPED_READ_LIMIT} chars shown")),
+            "file at the byte limit must report its exact total, got: {out:.200}"
+        );
+    }
+
+    /// Mutant kill: a file one byte past `CAPPED_READ_LIMIT` hits the byte
+    /// limit, so the true total is unknown ("first N chars shown"). Kills
+    /// `+` -> `*` in `.take(limit + 1)` (reads exactly `limit` bytes, so
+    /// the limit is never hit) and `>` -> `==` in `hit_byte_limit`.
+    #[test]
+    fn issue_392_mutant_inline_file_past_byte_limit_unknown_total() {
+        let t = TempDir::new();
+        let content = "a".repeat(CAPPED_READ_LIMIT + 1);
+        write(&t.path().join("over.txt"), &content);
+        let out = read_inline_file(&t.path().join("over.txt")).unwrap();
+        assert!(
+            out.contains(&format!("first {} chars shown", crate::HOOK_OUTPUT_LIMIT)),
+            "file past the byte limit must not claim an exact total, got: {out:.200}"
+        );
+    }
+
+    /// Mutant kill: a trailing invalid UTF-8 byte becomes a replacement
+    /// char that must be kept when the byte limit was not hit. Kills
+    /// `&&` -> `||` in the `hit_byte_limit && ends_with(FFFD)` guard (the
+    /// mutant pops the replacement char even without a byte cut).
+    #[test]
+    fn issue_392_mutant_inline_file_keeps_trailing_replacement_char() {
+        let t = TempDir::new();
+        let p = t.path().join("bad.txt");
+        fs::write(&p, [b'a', b'b', 0xFF]).unwrap();
+        let out = read_inline_file(&p).unwrap();
+        assert!(
+            out.contains('\u{FFFD}'),
+            "trailing invalid byte must survive as a replacement char, got: {out:?}"
+        );
+    }
+
+    /// Mutant kill: shell output past the byte cap must report an unknown
+    /// total ("first N chars shown"): the drain really did cut bytes short
+    /// and at least one stream was cut. Kills `<` -> `>` in `spawn_drain`
+    /// (`cut_short` never set) and `&&` -> `||` in `exact` (claims an
+    /// exact total when stdout was cut).
+    #[test]
+    fn issue_392_mutant_shell_output_past_byte_cap_unknown_total() {
+        let t = TempDir::new();
+        let c = ctx(t.path());
+        // `seq 1 10000` prints ~48_894 bytes, past CAPPED_READ_LIMIT.
+        let out = run_shell_block("seq 1 10000", &c, std::time::Duration::from_secs(30));
+        assert!(
+            out.contains(&format!("first {} chars shown", crate::HOOK_OUTPUT_LIMIT)),
+            "over-cap shell output must not claim an exact total, got: {out:.200}"
+        );
+    }
+
+    /// Mutant kill: a failing block with empty stdout and stderr must not
+    /// gain a leading newline before the stderr text. Kills `delete !` on
+    /// `!s.is_empty()` and `&&` -> `||` in the newline guard.
+    #[test]
+    fn issue_392_mutant_shell_failure_empty_stdout_no_leading_newline() {
+        let t = TempDir::new();
+        let c = ctx(t.path());
+        let out = run_shell_block(
+            "echo oops >&2; exit 3",
+            &c,
+            std::time::Duration::from_secs(10),
+        );
+        assert_eq!(out, "oops\n(exit 3)");
+    }
+
+    /// Mutant kill: a failing block whose stdout already ends with a
+    /// newline must not get a second one before the stderr text. Kills
+    /// `delete !` on `!s.ends_with('\n')` and `&&` -> `||` in the
+    /// newline guard.
+    #[test]
+    fn issue_392_mutant_shell_failure_stdout_newline_not_doubled() {
+        let t = TempDir::new();
+        let c = ctx(t.path());
+        let out = run_shell_block(
+            "printf 'out\n'; echo err >&2; exit 3",
+            &c,
+            std::time::Duration::from_secs(10),
+        );
+        assert_eq!(out, "out\nerr\n(exit 3)");
     }
 }
