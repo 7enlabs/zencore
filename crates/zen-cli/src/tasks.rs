@@ -268,14 +268,43 @@ impl Drop for RegistryLock {
     }
 }
 
+/// Whether a failed lock-file creation means "another writer holds
+/// the lock, retry until the timeout" rather than "creating the lock
+/// failed, report at once".
+///
+/// `AlreadyExists` is the contention signal on every OS: the lock
+/// file is there, so poll until it disappears. On Windows only, the
+/// same situation can also surface as `PermissionDenied`: a file
+/// Windows is still deleting (delete pending - the previous
+/// holder's `remove_file` landed while another handle was still
+/// open on the lock file) reports access denied instead of "already
+/// exists", so that case retries too - but only when the lock file
+/// is really there (`is_file`), so a genuine permission failure
+/// (unwritable directory, no lock file) still fails at once with
+/// its own context instead of turning into a misleading timeout
+/// after five seconds. Any other error kind is never contention:
+/// it fails at once, which is what the mutant at the old guard
+/// (PR #538, mutants job 5) would have hidden.
+fn registry_lock_error_is_transient(e: &std::io::Error, lock_path: &Path) -> bool {
+    match e.kind() {
+        std::io::ErrorKind::AlreadyExists => true,
+        std::io::ErrorKind::PermissionDenied => lock_path.is_file(),
+        _ => false,
+    }
+}
+
 /// Hold the registry lock across a load-check-append: creating the
 /// lock file with `create_new` is atomic, so exactly one contender
 /// wins, and the losers poll until the file disappears or the
-/// timeout expires. A lock only one writer honours cannot make the
-/// CAS atomic, so every writer to the registry goes through this
-/// lock - `claim_task`, `heartbeat_task`, `revive_task` and
-/// `sweep_tasks` all acquire it before they load, and the guarded
-/// branch of `claim_task_cas` acquires it before its check.
+/// timeout expires. On Windows a contender can also see
+/// `PermissionDenied` for a lock file that is there (delete pending);
+/// that is treated as contention too (see
+/// `registry_lock_error_is_transient`). A lock only one writer
+/// honours cannot make the CAS atomic, so every writer to the
+/// registry goes through this lock - `claim_task`, `heartbeat_task`,
+/// `revive_task` and `sweep_tasks` all acquire it before they load,
+/// and the guarded branch of `claim_task_cas` acquires it before its
+/// check.
 ///
 /// A lock left behind by a process killed mid-claim is not released
 /// by the OS (this is a plain file, not an `flock`); the timeout
@@ -298,7 +327,7 @@ fn acquire_registry_lock(path: &Path, timeout: std::time::Duration) -> Result<Re
                 let _ = writeln!(file, "{}", std::process::id());
                 return Ok(RegistryLock { path: lock_path });
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(e) if registry_lock_error_is_transient(&e, &lock_path) => {
                 if std::time::Instant::now() >= deadline {
                     return Err(anyhow::anyhow!(
                         "timed out after {}s waiting for the task registry lock {}; \
@@ -1396,7 +1425,9 @@ mod tests {
                     handles.push(scope.spawn(move || {
                         barrier.wait();
                         claim_task_cas(path, "B-4", &format!("seat-{seat}"), Some(0), fixed_now())
-                            .unwrap()
+                            .unwrap_or_else(|err| {
+                                panic!("round {round} seat-{seat} claim failed: {err:#}")
+                            })
                             .expect("task exists")
                     }));
                 }
@@ -1450,6 +1481,83 @@ mod tests {
             "dropping the lock removes the lock file"
         );
         let _held = acquire_registry_lock(&path, std::time::Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn registry_lock_propagates_a_non_already_exists_error_at_once() {
+        // Kills the mutant at the old guard (PR #538, mutants job 5):
+        // replacing the `AlreadyExists` guard with `true` treats every
+        // creation error as "lock held" and retries until the timeout,
+        // so a genuine error comes back seconds late as a misleading
+        // "timed out waiting for the lock". A registry filename over
+        // the 255-byte component limit fails the lock creation with
+        // `InvalidFilename` (ENAMETOOLONG, os error 36) - neither
+        // `AlreadyExists` nor a lock file that exists - so the call
+        // must fail at once with its own "creating task registry
+        // lock" context, not a timeout. Run against a copy with the
+        // guard replaced by `true` this test fails (it waits out the
+        // whole 2s timeout and reports the timeout instead); on the
+        // unmutated code it passes, because the gap was coverage of
+        // the catch-all arm, not its behaviour.
+        let dir = std::env::temp_dir().join(format!("zen_tasks_longname_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.jsonl", "a".repeat(300)));
+        let started = std::time::Instant::now();
+        let err = match acquire_registry_lock(&path, std::time::Duration::from_secs(2)) {
+            Ok(_) => panic!("an overlong lock filename must fail, not lock"),
+            Err(err) => err,
+        };
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "a genuine lock-creation error must fail at once, took {:?}",
+            started.elapsed()
+        );
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("creating task registry lock"),
+            "the original creation error must surface, got: {text}"
+        );
+        assert!(
+            !text.contains("timed out"),
+            "a genuine error must not be reported as a lock timeout, got: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn registry_lock_transient_error_table() {
+        // Post-fix only: pins the retry decision
+        // `acquire_registry_lock` makes for each creation failure,
+        // including the Windows-only case. Linux `create_new` never
+        // reports `PermissionDenied` for a lock file that exists -
+        // an existing file is always `AlreadyExists` there, verified
+        // with a standalone probe (read-only dir + existing lock
+        // file still yields `AlreadyExists`, os error 17) - so the
+        // Windows arm has no filesystem-level test on Linux; the
+        // decision table below is the Linux-runnable pin, and the
+        // Windows CI run of the race test is the live check.
+        let registry = temp_registry("lock_transient");
+        let dir = registry.parent().unwrap();
+        let missing = dir.join("absent.jsonl.lock");
+        let present = dir.join("present.jsonl.lock");
+        std::fs::write(&present, "1").unwrap();
+        let already_exists = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+        assert!(registry_lock_error_is_transient(&already_exists, &missing));
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(
+            registry_lock_error_is_transient(&denied, &present),
+            "PermissionDenied with a lock file present is contention on Windows"
+        );
+        assert!(
+            !registry_lock_error_is_transient(&denied, &missing),
+            "PermissionDenied with no lock file is a genuine failure"
+        );
+        let invalid = std::io::Error::from(std::io::ErrorKind::InvalidFilename);
+        assert!(!registry_lock_error_is_transient(&invalid, &present));
+        assert!(!registry_lock_error_is_transient(&invalid, &missing));
+        let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(!registry_lock_error_is_transient(&not_found, &present));
     }
 
     #[test]
