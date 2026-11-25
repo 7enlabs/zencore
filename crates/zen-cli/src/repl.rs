@@ -888,7 +888,7 @@ fn print_turn(result: Option<RunResult>) {
 }
 
 fn init_prompt_with_import_offer(cwd: &std::path::Path) -> String {
-    let candidates = zen_ext::detect_import_candidates(cwd);
+    let candidates = zen_ext::detect_import_candidates_with_root(cwd, cwd);
     if candidates.is_empty() {
         return commands::init_prompt();
     }
@@ -2017,7 +2017,7 @@ async fn handle_slash(
             "{}",
             commands::context_report(
                 &agent.config.system_prompt,
-                &zen_ext::memory_prompt(cwd, home, cfg.folder_trusted),
+                &zen_ext::memory_prompt_with_root(cwd, home, cwd, cfg.folder_trusted),
                 &agent.tools_for_request(),
                 agent.messages(),
                 agent.config.context_window,
@@ -2557,14 +2557,14 @@ async fn handle_slash(
             }
         }
         "/memory" => {
-            for (p, _) in zen_ext::memory_files(cwd, home, cfg.folder_trusted) {
+            for (p, _) in zen_ext::memory_files_with_root(cwd, home, cwd, cfg.folder_trusted) {
                 println!("{}", p.display());
             }
         }
         "/memories" => {
             println!(
                 "{}",
-                zen_ext::memories_report(cwd, home, cfg.folder_trusted)
+                zen_ext::memories_report_with_root(cwd, home, cwd, cfg.folder_trusted)
             );
         }
         "/todos" => {

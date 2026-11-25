@@ -164,8 +164,9 @@ Answering "always" in the REPL appends a rule to `.zen/settings.local.json`.
   Objects merge deeply, arrays concatenate with de-duplication, scalars are overridden. Broken files
   produce warnings and are skipped. CLI flags and env vars (`--model`, `ZEN_MODEL`) are applied on top
   by zen-cli.
-* **ZEN.md memory** (`memory.rs`) - `~/.zen/ZEN.md`, then every `ZEN.md` / `.zen/ZEN.md` from the filesystem root
+* **ZEN.md memory** (`memory.rs`) - `~/.zen/ZEN.md`, then every `ZEN.md` / `.zen/ZEN.md` from the project root (the session working directory)
   down to the cwd, then `ZEN.local.md`; `@path` lines import other files (depth-limited, cycle-safe).
+  The ancestor walk stops at the project root; memory files above it never load (issue #395).
   **AGENTS.md fallback (C4.4)** is decided per directory: a directory with no ZEN file loads its
   `AGENTS.md` then `.zen/AGENTS.md` instead (never both kinds), and `~/.zen/AGENTS.md` stands in for a
   missing `~/.zen/ZEN.md`. The result is a system-prompt section with path headers.

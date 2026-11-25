@@ -16,6 +16,13 @@ pub struct MemoryFile {
     pub content: String,
 }
 
+/// Unbounded memory load: walks every ancestor of `cwd` up to `/`.
+/// Kept for tests and compatibility only (issue #253 documents the
+/// difference). Production callers must use `memory_files_with_root`
+/// with the session working directory (the project root) as `root`
+/// (issue #395), so memory files above the project never reach the
+/// system prompt. The user's own `~/.zen` files and the managed
+/// `/etc/zen/ZEN.md` are loaded separately, not via the ancestor walk.
 pub fn memory_files(cwd: &Path, home: Option<&Path>, trusted: bool) -> Vec<(PathBuf, String)> {
     memory_files_with_managed(
         cwd,
@@ -27,10 +34,15 @@ pub fn memory_files(cwd: &Path, home: Option<&Path>, trusted: bool) -> Vec<(Path
 }
 
 /// Load memory files, stopping the ancestor walk at `root` (inclusive).
-/// The unbounded `memory_files` keeps walking all the way to `/`, which
-/// is the production behaviour. Tests pass the fixture root so a real
-/// `AGENTS.md` sitting above the temp dir (e.g. in an ancestor of
-/// `TMPDIR`) cannot leak in.
+/// This is the production variant (issue #395): `root` is the project
+/// root, i.e. the session working directory, so `AGENTS.md` / `ZEN.md`
+/// / `CLAUDE.md` from any directory above the project never load. The
+/// user's own `~/.zen` files and the managed `/etc/zen/ZEN.md` still
+/// load; they are read directly, not found by the ancestor walk. There
+/// is no opt-in for walking to `/`: use the unbounded `memory_files`
+/// only in tests. Tests pass the fixture root so a real `AGENTS.md`
+/// sitting above the temp dir (e.g. in an ancestor of `TMPDIR`) cannot
+/// leak in.
 pub fn memory_files_with_root(
     cwd: &Path,
     home: Option<&Path>,
@@ -475,10 +487,16 @@ fn render_memory_section(path: &Path, content: &str) -> String {
     format!("# Memory: {}\n\n{}\n\n", path.display(), content.trim_end())
 }
 
+/// Render the loaded memory files as a system-prompt section.
+/// Unbounded (walks to `/`); production callers use
+/// `memory_prompt_with_root` with the project root (issue #395).
 pub fn memory_prompt(cwd: &Path, home: Option<&Path>, trusted: bool) -> String {
     memory_prompt_with_root_impl(cwd, home, None, trusted)
 }
 
+/// Render the loaded memory files as a system-prompt section,
+/// stopping the ancestor walk at `root` (inclusive). This is the
+/// production variant (issue #395).
 pub fn memory_prompt_with_root(
     cwd: &Path,
     home: Option<&Path>,
@@ -538,10 +556,16 @@ fn display_path(path: &Path, home: Option<&Path>) -> String {
     slash(path)
 }
 
+/// List the loaded memory files with token counts.
+/// Unbounded (walks to `/`); production callers use
+/// `memories_report_with_root` with the project root (issue #395).
 pub fn memories_report(cwd: &Path, home: Option<&Path>, trusted: bool) -> String {
     memories_report_with_root_impl(cwd, home, None, trusted)
 }
 
+/// List the loaded memory files with token counts, stopping the
+/// ancestor walk at `root` (inclusive). This is the production
+/// variant (issue #395).
 pub fn memories_report_with_root(
     cwd: &Path,
     home: Option<&Path>,
@@ -589,10 +613,17 @@ fn memories_report_with_root_impl(
     out
 }
 
+/// Find existing `CLAUDE.md` / `AGENTS.md` files to offer for import.
+/// Unbounded (walks to `/`); production callers use
+/// `detect_import_candidates_with_root` with the project root
+/// (issue #395).
 pub fn detect_import_candidates(cwd: &Path) -> Vec<PathBuf> {
     detect_import_candidates_with_root_impl(cwd, None)
 }
 
+/// Find existing `CLAUDE.md` / `AGENTS.md` files to offer for import,
+/// stopping the ancestor walk at `root` (inclusive). This is the
+/// production variant (issue #395).
 pub fn detect_import_candidates_with_root(cwd: &Path, root: &Path) -> Vec<PathBuf> {
     detect_import_candidates_with_root_impl(cwd, Some(root))
 }
@@ -1125,8 +1156,9 @@ mod tests {
     }
 
     // #253: an AGENTS.md sitting above the fixture root (e.g. in an
-    // ancestor of TMPDIR) must not leak into the bounded load, while the
-    // unbounded load keeps the production behaviour of walking to "/".
+    // ancestor of TMPDIR) must not leak into the bounded load. The
+    // unbounded load is kept only for tests (issue #395 moved
+    // production onto the bounded variant).
     #[test]
     fn memory_files_with_root_stops_at_root() {
         let tmp = TempDir::new();
@@ -1171,12 +1203,12 @@ mod tests {
         assert!(bounded[0].ends_with("CLAUDE.md"));
     }
 
-    // The unbounded memory_prompt / memories_report wrappers are the
-    // production entry points (system prompt, /memory report). They must
-    // stay covered: the assertions only require the fixture content to
-    // be present, so a stray AGENTS.md above TMPDIR (issue #253) can add
-    // sections without breaking them, while a mutant returning "" or
-    // "xyzzy" fails.
+    // The unbounded memory_prompt / memories_report wrappers are kept
+    // for tests and compatibility (production uses the _with_root
+    // variants, issue #395). They must stay covered: the assertions
+    // only require the fixture content to be present, so a stray
+    // AGENTS.md above TMPDIR (issue #253) can add sections without
+    // breaking them, while a mutant returning "" or "xyzzy" fails.
     #[test]
     fn memory_prompt_unbounded_returns_fixture_content() {
         let tmp = TempDir::new();

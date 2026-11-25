@@ -935,7 +935,7 @@ pub(crate) async fn run_agent_with_result(args: AgentRunArgs<'_>) -> Result<(i32
     let (prompt, slash_cmd) = match &builtin {
         Some((name, args)) if name == "review" => (commands::review_prompt(args), None),
         Some((name, _)) if name == "init" => {
-            let candidates = zen_ext::detect_import_candidates(cwd);
+            let candidates = zen_ext::detect_import_candidates_with_root(cwd, cwd);
             let prompt = if candidates.is_empty() {
                 commands::init_prompt()
             } else {
@@ -1138,7 +1138,7 @@ pub(crate) async fn run_agent_with_result(args: AgentRunArgs<'_>) -> Result<(i32
             "mcp" => Some(commands::mcp_report(&assembly.mcp_status)),
             "context" => Some(commands::context_report(
                 &agent.config.system_prompt,
-                &zen_ext::memory_prompt(cwd, home, cfg.folder_trusted),
+                &zen_ext::memory_prompt_with_root(cwd, home, cwd, cfg.folder_trusted),
                 &agent.tools_for_request(),
                 agent.messages(),
                 agent.config.context_window,
@@ -1729,7 +1729,7 @@ pub(crate) async fn run_session_start(
     // `InstructionsLoaded`: one event per memory file (ZEN.md / AGENTS.md
     // / rules) loaded into context at session start. The matcher filters
     // on the load reason (`session_start` here).
-    for (path, _) in zen_ext::memory_files(cwd, None, cfg.folder_trusted) {
+    for (path, _) in zen_ext::memory_files_with_root(cwd, None, cwd, cfg.folder_trusted) {
         let _ = hooks
             .run(
                 HookEvent::InstructionsLoaded,
