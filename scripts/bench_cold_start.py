@@ -133,9 +133,10 @@ def run_timed(argv, env, stdin_data=None, timeout=60):
         t2 = threading.Thread(target=drain, args=(proc.stderr, err_chunks))
         t1.start()
         t2.start()
-    if stdin_cfg == subprocess.PIPE:
-        # The child may exit before consuming stdin; a broken pipe
-        # here means there is nothing left to feed, not a bench error.
+    if posix and stdin_cfg == subprocess.PIPE:
+        # POSIX only: the drain threads + wait4 reap the child, so stdin
+        # is fed here. The child may exit before consuming stdin; a broken
+        # pipe here means there is nothing left to feed, not a bench error.
         with suppress(BrokenPipeError):
             proc.stdin.write(stdin_data)
             proc.stdin.close()
@@ -144,8 +145,11 @@ def run_timed(argv, env, stdin_data=None, timeout=60):
     ru = None
     status = None
     if not posix:
+        # Non-POSIX: communicate() feeds stdin itself. Writing + closing
+        # stdin above would make communicate() flush a closed file and
+        # raise ValueError: flush of closed file (#525).
         try:
-            out_b, err_b = proc.communicate(timeout=timeout)
+            out_b, err_b = proc.communicate(input=stdin_data, timeout=timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
             raise RuntimeError(f"timeout running {' '.join(argv)}")
