@@ -237,18 +237,40 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {
         .stderr(Stdio::piped())
         .spawn()
         .context("failed to spawn git (is git installed?)")?;
+    // Issue #456: drain stdout/stderr on reader threads while the
+    // parent polls try_wait. A child whose output exceeds the pipe
+    // buffer (~64 KiB) blocks on write until someone reads; polling
+    // try_wait without draining deadlocked every large diff into the
+    // 15s timeout.
+    let stdout_thread = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut out, &mut buf);
+            buf
+        })
+    });
+    let stderr_thread = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut err, &mut buf);
+            buf
+        })
+    });
     let deadline = Instant::now() + REVIEW_GIT_TIMEOUT;
     loop {
         match child.try_wait().context("failed to poll git")? {
             Some(status) => {
-                let out = child
-                    .wait_with_output()
-                    .context("failed to read git output")?;
+                let out = stdout_thread
+                    .map(|t| t.join().unwrap_or_default())
+                    .unwrap_or_default();
+                let err = stderr_thread
+                    .map(|t| t.join().unwrap_or_default())
+                    .unwrap_or_default();
                 if !status.success() {
-                    let err = String::from_utf8_lossy(&out.stderr);
+                    let err = String::from_utf8_lossy(&err);
                     anyhow::bail!("git {} failed: {}", args.join(" "), err.trim());
                 }
-                return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+                return Ok(String::from_utf8_lossy(&out).into_owned());
             }
             None if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(5));
@@ -1095,6 +1117,22 @@ mod tests {
         let diff = collect_diff(&dir, &ReviewScope::Uncommitted, 100).unwrap();
         assert!(diff.truncated);
         assert!(diff.diff_text.contains("truncated"));
+    }
+
+    #[test]
+    fn issue_456_large_diff_does_not_deadlock() {
+        // Issue #456: `run_git` polled `try_wait` while nobody
+        // drained the pipes, so a diff over the ~64 KiB pipe buffer
+        // blocked git on write and `zen review` died with a spurious
+        // 15s timeout. A ~210 KiB diff must return, not time out.
+        let dir = git_repo();
+        let big = "line of changed text\n".repeat(10_000);
+        std::fs::write(dir.join("a.txt"), format!("hello\n{big}")).unwrap();
+        let diff = collect_diff(&dir, &ReviewScope::Uncommitted, 10_000_000)
+            .expect("large diff must return instead of timing out");
+        assert!(diff.diff_text.len() > 64 * 1024);
+        assert!(diff.diff_text.contains("line of changed text"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
