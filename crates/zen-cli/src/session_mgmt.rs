@@ -622,4 +622,27 @@ mod tests {
             "outside dir behind a scratch symlink must survive"
         );
     }
+
+    #[test]
+    fn issue_454_scratch_file_not_removed_on_delete() {
+        // A stem-sibling scratch that is a regular file (not a
+        // directory) inside the managed tree must not make the delete
+        // fail: the guard only removes scratch *directories* inside
+        // the tree. Replacing `&&` with `||` in the guard calls
+        // remove_dir_all on the file and delete_session errors out.
+        let home = tmp_home("454scrf");
+        let cwd = home.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        let path = make_session(&home, &cwd, "sess-sf");
+        let scratch = path.with_extension("");
+        fs::write(&scratch, "not a dir").unwrap();
+
+        delete_session(&home, "sess-sf").unwrap();
+        assert!(!path.exists(), "transcript must be deleted");
+        assert!(
+            scratch.exists(),
+            "scratch file must survive: only scratch dirs are removed"
+        );
+        assert_eq!(fs::read_to_string(&scratch).unwrap(), "not a dir");
+    }
 }
