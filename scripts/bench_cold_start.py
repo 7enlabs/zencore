@@ -90,7 +90,9 @@ def run_timed(argv, env, stdin_data=None, timeout=60):
 
     Peak RSS via os.wait4 on POSIX; None where unsupported. NOTE: we must reap
     the child with wait4 ourselves (not via communicate(), which reaps first and
-    makes rusage unavailable) - stdout/stderr are drained on threads.
+    makes rusage unavailable) - stdout/stderr are drained on threads. Where
+    wait4 is unavailable (Windows) there is no rusage anyway, so communicate()
+    is used alone and no drain threads are started (#423).
     """
     import threading
 
@@ -117,10 +119,19 @@ def run_timed(argv, env, stdin_data=None, timeout=60):
             # that is EOF, so there is nothing left to read.
             return
 
-    t1 = threading.Thread(target=drain, args=(proc.stdout, out_chunks))
-    t2 = threading.Thread(target=drain, args=(proc.stderr, err_chunks))
-    t1.start()
-    t2.start()
+    # POSIX only: drain threads exist so the child can be reaped with wait4
+    # (communicate() reaps first and makes rusage unavailable). On non-POSIX
+    # (no os.wait4, e.g. Windows) there is no rusage to preserve, so no drain
+    # threads are started: communicate() below is the only reader of
+    # stdout/stderr. Starting drain threads there would race communicate()
+    # for the same pipes and tear the output (#423).
+    posix = hasattr(os, "wait4")
+    t1 = t2 = None
+    if posix:
+        t1 = threading.Thread(target=drain, args=(proc.stdout, out_chunks))
+        t2 = threading.Thread(target=drain, args=(proc.stderr, err_chunks))
+        t1.start()
+        t2.start()
     if stdin_cfg == subprocess.PIPE:
         # The child may exit before consuming stdin; a broken pipe
         # here means there is nothing left to feed, not a bench error.
@@ -131,7 +142,7 @@ def run_timed(argv, env, stdin_data=None, timeout=60):
     deadline = start + timeout
     ru = None
     status = None
-    if not hasattr(os, "wait4"):
+    if not posix:
         try:
             out_b, err_b = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
