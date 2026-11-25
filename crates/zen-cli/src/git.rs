@@ -158,10 +158,15 @@ pub fn git_diff(cwd: &Path, mode: DiffMode, color: bool) -> Option<String> {
 /// Unquoted input is returned unchanged.
 pub(crate) fn unquote_path(p: &str) -> String {
     let p = p.trim();
-    if p.len() < 2 || !p.starts_with('"') || !p.ends_with('"') {
+    // Strip one pair of surrounding quotes; anything else (too short,
+    // missing an opening or closing quote) is returned unchanged.
+    // (strip_prefix/strip_suffix also removes the old `len() < 2`
+    // guard, whose `<` -> `<=` mutant was behaviourally equivalent
+    // and therefore unkillable by any test.)
+    let Some(inner) = p.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
         return p.to_string();
-    }
-    let inner = &p.as_bytes()[1..p.len() - 1];
+    };
+    let inner = inner.as_bytes();
     let mut bytes = Vec::with_capacity(inner.len());
     let mut i = 0;
     while i < inner.len() {
@@ -1145,5 +1150,67 @@ mod tests {
         let Some(dir) = init_repo() else { return };
         assert!(!is_registered_worktree(&dir, &dir.join("no-such-wt")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    // Mutant-killer tests for unquote_path (#438). Each case pins one
+    // behaviour so a mutation of it changes the output (or panics):
+    // every escape arm, the octal digit cap, the >0o377 fallback,
+    // the unknown-escape arm and the index steps after each escape.
+    #[test]
+    fn unquote_path_passthrough() {
+        assert_eq!(unquote_path("abc"), "abc");
+        assert_eq!(unquote_path(""), "");
+        assert_eq!(unquote_path("\""), "\"");
+        assert_eq!(unquote_path("\"ab"), "\"ab");
+        assert_eq!(unquote_path("ab\""), "ab\"");
+        assert_eq!(unquote_path("a\"b\""), "a\"b\"");
+        assert_eq!(unquote_path("  abc  "), "abc");
+    }
+
+    #[test]
+    fn unquote_path_empty_quoted() {
+        assert_eq!(unquote_path("\"\""), "");
+    }
+
+    #[test]
+    fn unquote_path_simple_escapes() {
+        assert_eq!(unquote_path("\"\\n\""), "\n");
+        assert_eq!(unquote_path("\"\\t\""), "\t");
+        assert_eq!(unquote_path("\"\\\"\""), "\"");
+        assert_eq!(unquote_path("\"\\\\\""), "\\");
+        // Escape followed by more content pins the i += 2 step.
+        assert_eq!(unquote_path("\"\\nX\""), "\nX");
+        assert_eq!(unquote_path("\"a\\tb\""), "a\tb");
+        assert_eq!(unquote_path("\"\\\"x\""), "\"x");
+        assert_eq!(unquote_path("\"\\\\y\""), "\\y");
+    }
+
+    #[test]
+    fn unquote_path_unknown_escape_and_trailing_backslash() {
+        assert_eq!(unquote_path("\"\\q\""), "\\q");
+        assert_eq!(unquote_path("\"\\qZ\""), "\\qZ");
+        assert_eq!(unquote_path("\"\\8\""), "\\8");
+        assert_eq!(unquote_path("\"a\\\""), "a\\");
+    }
+
+    #[test]
+    fn unquote_path_octal() {
+        assert_eq!(unquote_path("\"\\101\""), "A");
+        assert_eq!(unquote_path("\"\\4\""), "\u{4}");
+        assert_eq!(unquote_path("\"\\04\""), "\u{4}");
+        assert_eq!(unquote_path("\"\\004\""), "\u{4}");
+        assert_eq!(unquote_path("\"\\0\""), "\u{0}");
+        assert_eq!(unquote_path("\"\\303\\251\""), "é");
+        assert_eq!(unquote_path("\"\\303\\251x\""), "éx");
+        // Four digits: only the first three form one byte; the fourth
+        // stays literal (pins count < 3). The lone 0xC3 byte is
+        // invalid UTF-8 on its own, so it decodes lossy.
+        assert_eq!(unquote_path("\"\\3031\""), "\u{fffd}1");
+    }
+
+    #[test]
+    fn unquote_path_octal_overflow_stays_literal() {
+        assert_eq!(unquote_path("\"\\400\""), "\\400");
+        assert_eq!(unquote_path("\"\\777\""), "\\777");
+        assert_eq!(unquote_path("\"\\400X\""), "\\400X");
     }
 }
