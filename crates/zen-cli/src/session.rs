@@ -754,6 +754,21 @@ mod tests {
     use super::*;
     use std::fs;
 
+    // The pre-#458 dash encoding, replicated here (not via
+    // `legacy_encode_cwd`, so the migration test also runs against the
+    // unfixed code and fails there). It must replicate the old encoder
+    // faithfully: `canonicalize()` returns a verbatim `\\?\...` path on
+    // Windows, and the old encoder stripped that prefix before the dash
+    // mapping. Replicating the mapping without the strip builds a legacy
+    // directory name (`----C--...`) production code never creates and
+    // never looks up, so on Windows the migration test's lookup misses
+    // and panics unwrapping `None` (PR #537 windows-check, session.rs:939).
+    fn legacy_encode(p: &Path) -> String {
+        strip_verbatim_prefix(&p.canonicalize().unwrap_or_else(|_| p.to_path_buf()))
+            .to_string_lossy()
+            .replace(['/', '\\', ':', '.', '?', '*', '"', '<', '>', '|'], "-")
+    }
+
     #[test]
     fn p0b_1_session_scratch_dir_sits_next_to_the_transcript() {
         let t = Path::new("/h/.zen/projects/-p/abc-123.jsonl");
@@ -899,14 +914,8 @@ mod tests {
         for d in [&cwd_dot, &cwd_slash] {
             fs::create_dir_all(d).unwrap();
         }
-        // The old dash mapping, replicated here (not via legacy_encode_cwd,
-        // so this test also runs against the unfixed code and fails there).
-        fn legacy_encode(p: &Path) -> String {
-            p.canonicalize()
-                .unwrap_or_else(|_| p.to_path_buf())
-                .to_string_lossy()
-                .replace(['/', '\\', ':', '.', '?', '*', '"', '<', '>', '|'], "-")
-        }
+        // The old dash mapping (see `legacy_encode` above): the legacy
+        // directory both colliding projects share.
         let legacy_dir = home
             .join(".zen")
             .join("projects")
@@ -958,6 +967,26 @@ mod tests {
                 .exists()
         );
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn legacy_encode_matches_production_for_verbatim_windows_paths() {
+        // Regression test for the PR #537 windows-check failure: on
+        // Windows `canonicalize()` returns verbatim paths
+        // (`\\?\C:\...`, `\\?\UNC\server\share\...`), and the pre-#458
+        // encoder stripped that prefix before the dash mapping, so a
+        // real legacy directory is named `C--...`, never `----C--...`.
+        // These are pure string paths (nothing on disk), so the test
+        // runs on every OS: `canonicalize()` falls back to the path
+        // itself for them and the strip is a pure string transform.
+        // With the old helper (no strip) this fails; with the fix it passes.
+        for p in [
+            r"\\?\C:\Users\runner\work\a\b.c",
+            r"\\?\UNC\server\share\a\b",
+            r"C:\a\b.c",
+        ] {
+            assert_eq!(legacy_encode(Path::new(p)), legacy_encode_cwd(Path::new(p)));
+        }
     }
 
     #[test]
