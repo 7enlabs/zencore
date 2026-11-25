@@ -1,4 +1,5 @@
 use crate::skills::{Frontmatter, discover_skill_entries, split_frontmatter};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,7 +70,46 @@ fn parse_bool(v: &str) -> Option<bool> {
     }
 }
 
+/// Maximum directory depth `collect_md` descends into a commands tree.
+/// Bounds session-start discovery against absurdly deep (non-cyclic)
+/// directory trees; see issue #388.
+const COLLECT_MD_MAX_DEPTH: usize = 16;
+
 fn collect_md(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
+    let mut visited = HashSet::new();
+    // Canonical root: the walk must never escape it through a symlink
+    // (issue #388 follow-up: `loop -> ..` used to let `.zen/*.md` leak
+    // in as commands named `loop/<name>`).
+    let root_key = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    collect_md_inner(root, &root_key, dir, out, &mut visited, 0);
+}
+
+fn collect_md_inner(
+    root: &Path,
+    root_key: &Path,
+    dir: &Path,
+    out: &mut Vec<(String, PathBuf)>,
+    visited: &mut HashSet<PathBuf>,
+    depth: usize,
+) {
+    if depth > COLLECT_MD_MAX_DEPTH {
+        return;
+    }
+    // A directory reached through different symlinks canonicalizes to the
+    // same path, so a symlink cycle revisits an already-seen directory
+    // instead of recursing forever (issue #388: `loop -> ..` inside
+    // `.zen/commands` used to overflow the stack at session start).
+    // Fall back to the raw path when canonicalization fails; `read_dir`
+    // below then fails the same way it did before this change.
+    let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    // Never walk outside the commands tree: a symlink to a parent (or
+    // anywhere else) is skipped, so sibling files cannot leak in.
+    if !key.starts_with(root_key) {
+        return;
+    }
+    if !visited.insert(key) {
+        return;
+    }
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
@@ -77,7 +117,7 @@ fn collect_md(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
     paths.sort();
     for p in paths {
         if p.is_dir() {
-            collect_md(root, &p, out);
+            collect_md_inner(root, root_key, &p, out, visited, depth + 1);
         } else if p.extension().is_some_and(|x| x == "md") {
             let rel = p.strip_prefix(root).unwrap_or(&p).with_extension("");
             let name = rel
@@ -637,5 +677,109 @@ mod tests {
             expand_slash_prompt("/greet Bob", &proj, Some(&home), true, &c).is_some(),
             "project command expands once the folder is trusted"
         );
+    }
+
+    #[cfg(unix)]
+    fn symlink(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    /// Issue #388: `.zen/commands/loop -> ..` used to recurse forever and
+    /// overflow the stack at session start. Discovery must terminate and
+    /// still find the real commands next to the cycle.
+    #[test]
+    #[cfg(unix)]
+    fn issue_388_symlink_cycle_to_parent_terminates() {
+        let tmp = TempDir::new();
+        let proj = tmp.path().join("proj");
+        write(&proj.join(".zen/commands/real.md"), "real");
+        symlink(Path::new(".."), &proj.join(".zen/commands/loop"));
+        let all = discover_custom_commands(&proj, Some(&tmp.path().join("home")), true);
+        let names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["real"]);
+    }
+
+    /// Issue #388 follow-up (Leader): the same `loop -> ..` cycle must
+    /// not let a sibling `.md` under `.zen` leak in as a command
+    /// (before the root-escape guard it was collected as `loop/<name>`).
+    #[test]
+    #[cfg(unix)]
+    fn issue_388_symlink_cycle_to_parent_does_not_leak_sibling_md() {
+        let tmp = TempDir::new();
+        let proj = tmp.path().join("proj");
+        write(&proj.join(".zen/commands/real.md"), "real");
+        write(&proj.join(".zen/extra.md"), "extra");
+        symlink(Path::new(".."), &proj.join(".zen/commands/loop"));
+        let all = discover_custom_commands(&proj, Some(&tmp.path().join("home")), true);
+        let names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["real"]);
+    }
+
+    /// Issue #388: two directories linked to each other (`a/link -> ../b`,
+    /// `b/link -> ../a`) must not recurse forever, and a directory reached
+    /// through a symlinked alias must be walked only once.
+    #[test]
+    #[cfg(unix)]
+    fn issue_388_mutual_symlink_cycle_and_alias_visited_once() {
+        let tmp = TempDir::new();
+        let proj = tmp.path().join("proj");
+        let base = proj.join(".zen/commands");
+        write(&base.join("cycle-a/one.md"), "one");
+        write(&base.join("cycle-b/two.md"), "two");
+        write(&base.join("shared/three.md"), "three");
+        symlink(Path::new("../cycle-b"), &base.join("cycle-a/link"));
+        symlink(Path::new("../cycle-a"), &base.join("cycle-b/link"));
+        symlink(Path::new("shared"), &base.join("alias"));
+        let all = discover_custom_commands(&proj, Some(&tmp.path().join("home")), true);
+        let names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
+        // Each real file exactly once; the alias walk must not duplicate
+        // `shared/three.md`, whichever alias wins the sorted walk order.
+        assert_eq!(names.len(), 3);
+        assert!(names.iter().any(|n| n.ends_with("one")));
+        assert!(names.iter().any(|n| n.ends_with("two")));
+        assert_eq!(names.iter().filter(|n| n.ends_with("three")).count(), 1);
+    }
+
+    /// Issue #388: the depth cap bounds discovery in a non-cyclic but
+    /// absurdly deep tree, so a deep tree cannot blow the stack either.
+    #[test]
+    fn issue_388_deep_tree_bounded_by_depth_cap() {
+        let tmp = TempDir::new();
+        let proj = tmp.path().join("proj");
+        write(&proj.join(".zen/commands/shallow.md"), "shallow");
+        let mut dir = proj.join(".zen/commands");
+        for i in 0..20 {
+            dir = dir.join(format!("d{i}"));
+        }
+        write(&dir.join("deep.md"), "deep");
+        let all = discover_custom_commands(&proj, Some(&tmp.path().join("home")), true);
+        let names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["shallow"]);
+    }
+
+    /// Issue #388 follow-up (Leader): the depth cap is `depth > MAX`,
+    /// so a file exactly at depth 16 is collected and one at depth 17
+    /// is not. The deep-tree test above cannot tell `>` from `>=` or
+    /// `==` (both missed mutants at commands.rs:95), because it only
+    /// places files at depth 0 and depth 20; this test pins the exact
+    /// boundary. Kills: `>` -> `==` and `>` -> `>=` in collect_md_inner.
+    #[test]
+    fn issue_388_depth_cap_boundary_is_exact() {
+        let tmp = TempDir::new();
+        let proj = tmp.path().join("proj");
+        let mut dir = proj.join(".zen/commands");
+        for i in 0..16 {
+            dir = dir.join(format!("d{i}"));
+        }
+        write(&dir.join("at_cap.md"), "at cap");
+        write(&dir.join("d16").join("past_cap.md"), "past cap");
+        let all = discover_custom_commands(&proj, Some(&tmp.path().join("home")), true);
+        let names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
+        let expected = (0..16)
+            .map(|i| format!("d{i}"))
+            .chain(std::iter::once("at_cap".to_string()))
+            .collect::<Vec<_>>()
+            .join(":");
+        assert_eq!(names, vec![expected.as_str()]);
     }
 }
