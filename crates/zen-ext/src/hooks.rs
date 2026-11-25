@@ -394,12 +394,29 @@ async fn run_one(
         }
     };
 
+    let timeout = Duration::from_secs(spec.timeout_secs);
+
+    // #396: the stdin write is covered by the same timeout as the wait
+    // below. Without it a hook that never reads stdin blocks `write_all`
+    // forever (the pipe buffer is 64 KiB, the payload can be larger)
+    // and the turn never reaches the timed wait.
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(stdin_json.as_bytes()).await;
-        let _ = stdin.shutdown().await;
+        let write_stdin = async {
+            let _ = stdin.write_all(stdin_json.as_bytes()).await;
+            let _ = stdin.shutdown().await;
+        };
+        if tokio::time::timeout(timeout, write_stdin).await.is_err() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return failure(format!(
+                "hook timed out after {}s: {} [hook-diag] {}",
+                spec.timeout_secs,
+                spec.command,
+                hook_diag(spec, &cmd_display, cwd)
+            ));
+        }
     }
 
-    let timeout = Duration::from_secs(spec.timeout_secs);
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Err(_) => failure(format!(
             "hook timed out after {}s: {} [hook-diag] {}",
@@ -1017,6 +1034,32 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(5));
         assert!(!out.blocked);
         assert!(out.feedback.is_none());
+    }
+
+    // #396: a hook that never reads stdin must fail on the timeout
+    // instead of hanging the turn forever. The payload is far larger
+    // than the 64 KiB pipe buffer, so the stdin write can only finish
+    // if the hook actually reads it; `sleep` never does.
+    #[tokio::test]
+    async fn test_stdin_write_timeout_when_hook_ignores_stdin() {
+        let tmp = TempDir::new();
+        let big = "x".repeat(200_000);
+        let hooks = hooks_with("UserPromptSubmit", None, "sleep 30", 1);
+        let r = runner(hooks, tmp.path());
+        let start = std::time::Instant::now();
+        let out = tokio::time::timeout(
+            Duration::from_secs(10),
+            r.run(HookEvent::UserPromptSubmit, "", json!({"prompt": big})),
+        )
+        .await
+        .expect("hook run must return within the outer guard");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "hook run took {:?}: the stdin write is not covered by the timeout",
+            start.elapsed()
+        );
+        assert!(!out.blocked);
+        assert!(out.failed, "timed-out stdin write must be a hook failure");
     }
 
     #[tokio::test]
