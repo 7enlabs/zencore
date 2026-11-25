@@ -1210,6 +1210,24 @@ mod tests {
     }
 
     #[test]
+    fn issue_545_join_reader_until_returns_value_when_thread_finishes_before_deadline() {
+        // Mutants shard 5 on PR #546: replacing `>=` with `<` in the
+        // deadline check makes join_reader_until return None at once
+        // whenever the thread is still running, even though the
+        // deadline is far away. A thread that finishes before the
+        // deadline must have its value returned, not a timeout.
+        let handle = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(100));
+            vec![1, 2, 3]
+        });
+        let deadline = Instant::now() + Duration::from_secs(15);
+        assert_eq!(
+            join_reader_until(Some(handle), deadline),
+            Some(vec![1, 2, 3])
+        );
+    }
+
+    #[test]
     fn collect_diff_outside_repo_errors() {
         let dir = std::env::temp_dir().join(format!("zen_review_norepo_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
