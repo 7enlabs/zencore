@@ -2221,8 +2221,8 @@ pub(crate) fn anthropic_request_body(req: &ChatRequest) -> Value {
                     blocks.push(serde_json::json!({"type": "text", "text": text}));
                 }
                 for tc in m.tool_calls.iter().flatten() {
-                    let input: Value =
-                        serde_json::from_str(&tc.function.arguments).unwrap_or(Value::Null);
+                    let input: Value = serde_json::from_str(&tc.function.arguments)
+                        .unwrap_or(serde_json::json!({}));
                     blocks.push(serde_json::json!({
                         "type": "tool_use",
                         "id": tc.id,
@@ -2829,6 +2829,44 @@ mod anthropic_tests {
         assert_eq!(blocks[0]["tool_use_id"], "toolu_1");
         assert_eq!(blocks[1]["type"], "tool_result");
         assert_eq!(blocks[1]["tool_use_id"], "toolu_2");
+    }
+
+    #[test]
+    fn request_body_tool_use_input_defaults_to_empty_object() {
+        // Issue #340: empty or invalid tool arguments became JSON null,
+        // which the Messages API rejects (input must be an object).
+        let mut r = req();
+        r.messages.push(ChatMessage::assistant(
+            Some("checking".to_string()),
+            Some(vec![
+                ToolCall {
+                    id: "toolu_empty".to_string(),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "Read".to_string(),
+                        arguments: "".to_string(),
+                    },
+                },
+                ToolCall {
+                    id: "toolu_invalid".to_string(),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "Bash".to_string(),
+                        arguments: "not json".to_string(),
+                    },
+                },
+            ]),
+        ));
+        let body = anthropic_request_body(&r);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        let blocks = msgs[1]["content"].as_array().unwrap();
+        let uses: Vec<&Value> = blocks.iter().filter(|b| b["type"] == "tool_use").collect();
+        assert_eq!(uses.len(), 2);
+        assert_eq!(uses[0]["id"], "toolu_empty");
+        assert_eq!(uses[0]["input"], serde_json::json!({}));
+        assert_eq!(uses[1]["id"], "toolu_invalid");
+        assert_eq!(uses[1]["input"], serde_json::json!({}));
     }
 
     #[test]
