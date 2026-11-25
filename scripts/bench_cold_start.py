@@ -32,6 +32,7 @@ import argparse
 import json
 import math
 import os
+import queue
 import shutil
 import statistics
 import subprocess
@@ -223,6 +224,47 @@ def start_mock_server():
     return server, port
 
 
+class _PipeReader(threading.Thread):
+    """Read pipe bytes on a background thread so reads can time out.
+
+    A blocking ``pipe.read(1)`` on the calling thread never returns while
+    the child is alive but silent, so a deadline checked between reads is
+    never reached and the bench hangs forever (issue #422). This thread
+    blocks in ``read(1)`` instead and hands each byte to a queue; callers
+    wait on the queue with the time left before the deadline. Daemon
+    thread: it exits when the pipe closes (child killed / exited) and
+    never blocks interpreter shutdown.
+    """
+
+    def __init__(self, pipe):
+        super().__init__(daemon=True)
+        self._pipe = pipe
+        self._queue = queue.Queue()
+
+    def run(self):
+        try:
+            while True:
+                chunk = self._pipe.read(1)
+                self._queue.put(chunk)
+                if not chunk:
+                    return
+        except ValueError:
+            # The pipe was closed under the read: for a reader thread
+            # that is EOF, so there is nothing left to read.
+            self._queue.put(b"")
+
+    def read_byte(self, timeout):
+        """Return the next byte, ``b""`` on EOF.
+
+        Raises ``TimeoutError`` if no byte arrives within ``timeout``
+        seconds - the child may still be alive, just silent.
+        """
+        try:
+            return self._queue.get(timeout=timeout)
+        except queue.Empty:
+            raise TimeoutError("no stdout byte within timeout") from None
+
+
 def measure_cold_startup(zen, runs):
     """Fresh copy per iteration -> page cache cold."""
     samples = []
@@ -272,27 +314,46 @@ def measure_repl_prompt(zen, runs):
         marker_at = None
         buf = b""
         deadline = start + REPL_TIMEOUT_S
+        timed_out = False
+        reader = _PipeReader(proc.stdout)
+        reader.start()
         try:
-            while time.perf_counter() < deadline:
-                chunk = proc.stdout.read(1)
+            while True:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    timed_out = True
+                    raise RuntimeError("REPL prompt not seen within timeout")
+                try:
+                    chunk = reader.read_byte(timeout=remaining)
+                except TimeoutError:
+                    # Silent-but-alive child: the deadline is honoured even
+                    # when the child produces no output (issue #422).
+                    timed_out = True
+                    raise RuntimeError("REPL prompt not seen within timeout")
                 if not chunk:
                     break
                 buf += chunk
                 if buf.endswith(PROMPT_MARKER) or PROMPT_MARKER in buf[-8:]:
                     marker_at = time.perf_counter()
                     break
-            else:
-                raise RuntimeError("REPL prompt not seen within timeout")
         finally:
-            # Best-effort /quit: if the REPL already died, the pipe is
-            # broken and there is nothing left to shut down gracefully.
-            with suppress(BrokenPipeError):
-                proc.stdin.write(b"/quit\n")
-                proc.stdin.flush()
-            try:
-                proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            if timed_out:
+                # A graceful /quit would wait up to 15 s for a reply from
+                # a hung child that never comes, so kill at once.
+                with suppress(ProcessLookupError):
+                    proc.kill()
+                with suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=5)
+            else:
+                # Best-effort /quit: if the REPL already died, the pipe is
+                # broken and there is nothing left to shut down gracefully.
+                with suppress(BrokenPipeError):
+                    proc.stdin.write(b"/quit\n")
+                    proc.stdin.flush()
+                try:
+                    proc.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
         if marker_at is None:
             raise RuntimeError(
                 f"REPL exited without printing a prompt (out={buf[-200:]!r})"
@@ -327,8 +388,22 @@ def measure_first_token(zen, runs):
                 stderr=subprocess.DEVNULL,
             )
             first_at = None
+            reader = _PipeReader(proc.stdout)
+            reader.start()
             try:
-                chunk = proc.stdout.read(1)
+                try:
+                    chunk = reader.read_byte(timeout=TOKEN_TIMEOUT_S)
+                except TimeoutError:
+                    # Silent-but-alive child: the token deadline is
+                    # honoured even when the child produces no output
+                    # (issue #422). The finally block below kills the
+                    # child; wait briefly here so it is reaped, not left
+                    # as a zombie.
+                    with suppress(ProcessLookupError):
+                        proc.kill()
+                    with suppress(subprocess.TimeoutExpired):
+                        proc.wait(timeout=5)
+                    raise RuntimeError("zen -p timed out against mock server")
                 if chunk:
                     first_at = time.perf_counter()
                 proc.wait(timeout=TOKEN_TIMEOUT_S)
