@@ -1,3 +1,4 @@
+use crate::HOOK_OUTPUT_LIMIT;
 use crate::skills::{Frontmatter, discover_skill_entries, split_frontmatter};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -299,6 +300,168 @@ fn resolve_ref(raw: &str, base: &Path) -> Option<PathBuf> {
     p.is_file().then_some(p)
 }
 
+/// Default timeout for `!`...`` shell blocks in slash commands, in seconds.
+/// Matches the hook default timeout (`hooks.rs`, issue #392): a shell block
+/// must never hang the turn forever.
+const SLASH_SHELL_TIMEOUT_SECS: u64 = 60;
+
+/// Grace period for an output-reader thread to deliver what a finished
+/// shell block wrote. Bounds the wait when a background grandchild keeps
+/// the pipes open after the direct child exits.
+const SHELL_READER_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Max bytes read for one output stream of a shell block, or for an inlined
+/// `@path` file: enough to hold `HOOK_OUTPUT_LIMIT` chars of any UTF-8 text
+/// (4 bytes per char at most). Anything past this is drained and discarded
+/// so a streaming command cannot grow memory without bound.
+const CAPPED_READ_LIMIT: usize = HOOK_OUTPUT_LIMIT * 4;
+
+/// Truncate `s` to `HOOK_OUTPUT_LIMIT` chars, appending a note when anything
+/// was dropped. `exact` says whether `s` holds the complete input: when
+/// false the true total is unknown (the input was cut short while reading),
+/// so the note omits the total instead of stating a wrong one.
+fn cap_text(s: &str, label: &str, exact: bool) -> String {
+    let count = s.chars().count();
+    if count <= HOOK_OUTPUT_LIMIT && exact {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(HOOK_OUTPUT_LIMIT).collect();
+    if exact {
+        format!("{head}\n[{label} truncated: {HOOK_OUTPUT_LIMIT} of {count} chars shown]")
+    } else {
+        format!("{head}\n[{label} truncated: first {HOOK_OUTPUT_LIMIT} chars shown]")
+    }
+}
+
+/// Read a file for `@path` inlining, capped at `HOOK_OUTPUT_LIMIT` chars
+/// (issue #392). Reads at most `CAPPED_READ_LIMIT + 1` bytes, so a huge file
+/// never lands fully in memory.
+fn read_inline_file(p: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(p).ok()?;
+    let mut buf = Vec::new();
+    file.by_ref()
+        .take(CAPPED_READ_LIMIT as u64 + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    let hit_byte_limit = buf.len() > CAPPED_READ_LIMIT;
+    if hit_byte_limit {
+        buf.truncate(CAPPED_READ_LIMIT);
+    }
+    let mut text = String::from_utf8_lossy(&buf).into_owned();
+    if hit_byte_limit && text.ends_with('\u{FFFD}') {
+        // The byte cut split a multi-byte char; drop the replacement char so
+        // the kept text ends on a real char boundary.
+        text.pop();
+    }
+    Some(cap_text(&text, "file content", !hit_byte_limit))
+}
+
+/// Drain one piped stream on a thread, keeping at most `CAPPED_READ_LIMIT`
+/// bytes; further bytes are read and discarded so the child never blocks on
+/// a full pipe. The kept bytes and whether any bytes were discarded arrive
+/// on the returned channel when the stream reaches EOF.
+fn spawn_drain<R: std::io::Read + Send + 'static>(
+    mut pipe: R,
+) -> std::sync::mpsc::Receiver<(Vec<u8>, bool)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut buf = [0u8; 8192];
+        let mut cut_short = false;
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let room = CAPPED_READ_LIMIT.saturating_sub(kept.len());
+                    let take = n.min(room);
+                    kept.extend_from_slice(&buf[..take]);
+                    if take < n {
+                        cut_short = true;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = tx.send((kept, cut_short));
+    });
+    rx
+}
+
+/// Collect one drained stream, waiting at most the grace period. A stream
+/// whose reader is still blocked (a background grandchild holding the pipe
+/// open) yields empty output instead of hanging the turn; the returned flag
+/// is true when the stream was cut short or may be incomplete.
+fn collect_drain(rx: std::sync::mpsc::Receiver<(Vec<u8>, bool)>) -> (String, bool) {
+    match rx.recv_timeout(SHELL_READER_GRACE) {
+        Ok((bytes, cut_short)) => (String::from_utf8_lossy(&bytes).into_owned(), cut_short),
+        Err(_) => (String::new(), true),
+    }
+}
+
+/// Run one `!`...`` shell block with a timeout and a bounded capture (issue
+/// #392). Returns the block's replacement text: stdout (plus stderr and the
+/// exit code on failure), capped at `HOOK_OUTPUT_LIMIT` chars, or a timeout
+/// / spawn-failure note. Killing the child on timeout only kills the direct
+/// `sh` process; a compound command's grandchildren may linger until they
+/// exit on their own (same as hooks).
+fn run_shell_block(cmd: &str, ctx: &ExpandContext<'_>, timeout: std::time::Duration) -> String {
+    use std::process::{Command, Stdio};
+    let mut child = match Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(&ctx.project_dir)
+        .env("ZEN_PROJECT_DIR", &ctx.project_dir)
+        .env("ZEN_SESSION_ID", &ctx.session_id)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return format!("(failed to run `{cmd}`: {e})"),
+    };
+    let stdout_rx = child.stdout.take().map(spawn_drain);
+    let stderr_rx = child.stderr.take().map(spawn_drain);
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    // Reader threads are left detached: they exit when the
+                    // pipes close, or stay blocked if a grandchild holds
+                    // the pipes open; either way the turn is not stuck.
+                    return format!("(timed out after {}s: `{cmd}`)", timeout.as_secs());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return format!("(failed to run `{cmd}`: {e})");
+            }
+        }
+    };
+    let (mut s, stdout_cut) = stdout_rx.map(collect_drain).unwrap_or_default();
+    let (err, stderr_cut) = stderr_rx.map(collect_drain).unwrap_or_default();
+    if !status.success() {
+        if !err.trim().is_empty() {
+            if !s.is_empty() && !s.ends_with('\n') {
+                s.push('\n');
+            }
+            s.push_str(err.trim_end());
+        }
+        s.push_str(&format!("\n(exit {})", status.code().unwrap_or(-1)));
+    }
+    let exact = !stdout_cut && !stderr_cut;
+    cap_text(&s, "shell output", exact)
+        .trim_end_matches('\n')
+        .to_string()
+}
+
 fn inline_files(text: &str, base: &Path) -> String {
     let mut out = String::with_capacity(text.len());
     let mut prev_ws = true;
@@ -317,8 +480,7 @@ fn inline_files(text: &str, base: &Path) -> String {
 
             let trimmed = token.trim_end_matches([',', '.', ';', ':', ')', '!', '?']);
             if !trimmed.is_empty()
-                && let Some(content) =
-                    resolve_ref(trimmed, base).and_then(|p| std::fs::read_to_string(p).ok())
+                && let Some(content) = resolve_ref(trimmed, base).and_then(|p| read_inline_file(&p))
             {
                 out.push_str(content.trim_end_matches('\n'));
                 out.push_str(&token[trimmed.len()..]);
@@ -348,31 +510,8 @@ fn run_shell_blocks(text: &str, ctx: &ExpandContext<'_>) -> String {
         } else if !allowed {
             out.push_str(&format!("!`{}` (not run: permission denied)", cmd));
         } else {
-            match std::process::Command::new("sh")
-                .arg("-c")
-                .arg(cmd)
-                .current_dir(&ctx.project_dir)
-                .env("ZEN_PROJECT_DIR", &ctx.project_dir)
-                .env("ZEN_SESSION_ID", &ctx.session_id)
-                .stdin(std::process::Stdio::null())
-                .output()
-            {
-                Ok(o) => {
-                    let mut s = String::from_utf8_lossy(&o.stdout).to_string();
-                    if !o.status.success() {
-                        let err = String::from_utf8_lossy(&o.stderr);
-                        if !err.trim().is_empty() {
-                            if !s.is_empty() && !s.ends_with('\n') {
-                                s.push('\n');
-                            }
-                            s.push_str(err.trim_end());
-                        }
-                        s.push_str(&format!("\n(exit {})", o.status.code().unwrap_or(-1)));
-                    }
-                    out.push_str(s.trim_end_matches('\n'));
-                }
-                Err(e) => out.push_str(&format!("(failed to run `{}`: {})", cmd, e)),
-            }
+            let timeout = std::time::Duration::from_secs(SLASH_SHELL_TIMEOUT_SECS);
+            out.push_str(&run_shell_block(cmd, ctx, timeout));
         }
         rest = &after[close + 1..];
     }
@@ -781,5 +920,202 @@ mod tests {
             .collect::<Vec<_>>()
             .join(":");
         assert_eq!(names, vec![expected.as_str()]);
+    }
+
+    /// Issue #392: a shell block that streams a lot of output must not
+    /// buffer it unboundedly into the turn; captured output is capped at
+    /// HOOK_OUTPUT_LIMIT chars and reports truncation.
+    #[test]
+    #[cfg(unix)]
+    fn issue_392_shell_output_is_capped() {
+        let t = TempDir::new();
+        let allow = |_: &str| true;
+        let c = ExpandContext {
+            project_dir: t.path().to_path_buf(),
+            session_id: "s392".into(),
+            allow_shell: Some(&allow),
+        };
+        // `seq 1 3000` prints ~13_893 chars, past HOOK_OUTPUT_LIMIT.
+        let out = expand_command(&cmd("!`seq 1 3000`"), "", &c);
+        assert!(
+            out.contains("truncated"),
+            "over-limit shell output must report truncation, got {} chars: {:.200}",
+            out.chars().count(),
+            out
+        );
+        assert!(
+            out.chars().count() <= crate::HOOK_OUTPUT_LIMIT + 120,
+            "capped shell output must stay near the limit, got {} chars",
+            out.chars().count()
+        );
+    }
+
+    /// Issue #392: a shell block that never exits must time out instead of
+    /// hanging the turn forever.
+    #[test]
+    #[cfg(unix)]
+    fn issue_392_shell_block_times_out() {
+        let t = TempDir::new();
+        let c = ctx(t.path());
+        let start = std::time::Instant::now();
+        let out = run_shell_block("sleep 30", &c, std::time::Duration::from_secs(1));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "timed-out shell block must return promptly, took {:?}",
+            start.elapsed()
+        );
+        assert!(
+            out.contains("timed out"),
+            "timed-out shell block must say so, got: {out}"
+        );
+    }
+
+    /// Issue #392: `@path` inlining must cap file content at the same
+    /// limit instead of reading whole files without bound.
+    #[test]
+    fn issue_392_inline_file_is_capped() {
+        let t = TempDir::new();
+        let big = "a".repeat(crate::HOOK_OUTPUT_LIMIT + 5_000);
+        write(&t.path().join("big.txt"), &big);
+        let c = ctx(t.path());
+        let out = expand_command(&cmd("see @big.txt"), "", &c);
+        assert!(
+            out.contains("truncated"),
+            "over-limit inlined file must report truncation, got {} chars",
+            out.chars().count()
+        );
+        assert!(
+            out.chars().count() <= crate::HOOK_OUTPUT_LIMIT + 120,
+            "capped inlined file must stay near the limit, got {} chars",
+            out.chars().count()
+        );
+    }
+
+    /// Mutant kill (#392 follow-up, PR #535): a file well under the byte
+    /// cap must be inlined whole. Kills `*` -> `/` at `CAPPED_READ_LIMIT`
+    /// (the `/ 4` mutant caps the read at 2_500 bytes and truncates).
+    #[test]
+    fn issue_392_mutant_inline_file_under_byte_limit_kept_whole() {
+        let t = TempDir::new();
+        let content = "a".repeat(5_000);
+        write(&t.path().join("mid.txt"), &content);
+        let out = read_inline_file(&t.path().join("mid.txt")).unwrap();
+        assert!(
+            !out.contains("truncated"),
+            "5_000-char file must inline whole, got: {out:.200}"
+        );
+        assert!(out.contains(&content), "inlined content must be complete");
+    }
+
+    /// Mutant kill: a file over the char limit must report its exact total
+    /// ("of N chars shown"), which only happens when the whole file was
+    /// read first. Kills `*` -> `+` at `CAPPED_READ_LIMIT` (the `+ 4`
+    /// mutant reads only ~10k bytes, so the total is unknown).
+    #[test]
+    fn issue_392_mutant_inline_file_reports_exact_total() {
+        let t = TempDir::new();
+        let content = "a".repeat(20_000);
+        write(&t.path().join("big2.txt"), &content);
+        let out = read_inline_file(&t.path().join("big2.txt")).unwrap();
+        assert!(
+            out.contains("of 20000 chars shown"),
+            "over-limit file must report its exact total, got: {out:.200}"
+        );
+    }
+
+    /// Mutant kill: a file of exactly `CAPPED_READ_LIMIT` bytes is read
+    /// whole (`len > limit` is false at the boundary). Kills `+` -> `-`
+    /// in `.take(limit + 1)` (reads one byte short, total becomes 39999)
+    /// and `>` -> `>=` in `hit_byte_limit` (wrongly flags the boundary).
+    #[test]
+    fn issue_392_mutant_inline_file_at_byte_limit_is_exact() {
+        let t = TempDir::new();
+        let content = "a".repeat(CAPPED_READ_LIMIT);
+        write(&t.path().join("exact.txt"), &content);
+        let out = read_inline_file(&t.path().join("exact.txt")).unwrap();
+        assert!(
+            out.contains(&format!("of {CAPPED_READ_LIMIT} chars shown")),
+            "file at the byte limit must report its exact total, got: {out:.200}"
+        );
+    }
+
+    /// Mutant kill: a file one byte past `CAPPED_READ_LIMIT` hits the byte
+    /// limit, so the true total is unknown ("first N chars shown"). Kills
+    /// `+` -> `*` in `.take(limit + 1)` (reads exactly `limit` bytes, so
+    /// the limit is never hit) and `>` -> `==` in `hit_byte_limit`.
+    #[test]
+    fn issue_392_mutant_inline_file_past_byte_limit_unknown_total() {
+        let t = TempDir::new();
+        let content = "a".repeat(CAPPED_READ_LIMIT + 1);
+        write(&t.path().join("over.txt"), &content);
+        let out = read_inline_file(&t.path().join("over.txt")).unwrap();
+        assert!(
+            out.contains(&format!("first {} chars shown", crate::HOOK_OUTPUT_LIMIT)),
+            "file past the byte limit must not claim an exact total, got: {out:.200}"
+        );
+    }
+
+    /// Mutant kill: a trailing invalid UTF-8 byte becomes a replacement
+    /// char that must be kept when the byte limit was not hit. Kills
+    /// `&&` -> `||` in the `hit_byte_limit && ends_with(FFFD)` guard (the
+    /// mutant pops the replacement char even without a byte cut).
+    #[test]
+    fn issue_392_mutant_inline_file_keeps_trailing_replacement_char() {
+        let t = TempDir::new();
+        let p = t.path().join("bad.txt");
+        fs::write(&p, [b'a', b'b', 0xFF]).unwrap();
+        let out = read_inline_file(&p).unwrap();
+        assert!(
+            out.contains('\u{FFFD}'),
+            "trailing invalid byte must survive as a replacement char, got: {out:?}"
+        );
+    }
+
+    /// Mutant kill: shell output past the byte cap must report an unknown
+    /// total ("first N chars shown"): the drain really did cut bytes short
+    /// and at least one stream was cut. Kills `<` -> `>` in `spawn_drain`
+    /// (`cut_short` never set) and `&&` -> `||` in `exact` (claims an
+    /// exact total when stdout was cut).
+    #[test]
+    fn issue_392_mutant_shell_output_past_byte_cap_unknown_total() {
+        let t = TempDir::new();
+        let c = ctx(t.path());
+        // `seq 1 10000` prints ~48_894 bytes, past CAPPED_READ_LIMIT.
+        let out = run_shell_block("seq 1 10000", &c, std::time::Duration::from_secs(30));
+        assert!(
+            out.contains(&format!("first {} chars shown", crate::HOOK_OUTPUT_LIMIT)),
+            "over-cap shell output must not claim an exact total, got: {out:.200}"
+        );
+    }
+
+    /// Mutant kill: a failing block with empty stdout and stderr must not
+    /// gain a leading newline before the stderr text. Kills `delete !` on
+    /// `!s.is_empty()` and `&&` -> `||` in the newline guard.
+    #[test]
+    fn issue_392_mutant_shell_failure_empty_stdout_no_leading_newline() {
+        let t = TempDir::new();
+        let c = ctx(t.path());
+        let out = run_shell_block(
+            "echo oops >&2; exit 3",
+            &c,
+            std::time::Duration::from_secs(10),
+        );
+        assert_eq!(out, "oops\n(exit 3)");
+    }
+
+    /// Mutant kill: a failing block whose stdout already ends with a
+    /// newline must not get a second one before the stderr text. Kills
+    /// `delete !` on `!s.ends_with('\n')` and `&&` -> `||` in the
+    /// newline guard.
+    #[test]
+    fn issue_392_mutant_shell_failure_stdout_newline_not_doubled() {
+        let t = TempDir::new();
+        let c = ctx(t.path());
+        let out = run_shell_block(
+            "printf 'out\n'; echo err >&2; exit 3",
+            &c,
+            std::time::Duration::from_secs(10),
+        );
+        assert_eq!(out, "out\nerr\n(exit 3)");
     }
 }
