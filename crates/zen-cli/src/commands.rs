@@ -505,7 +505,7 @@ fn split_frontmatter(raw: &str) -> (HashMap<String, Value>, &str) {
     }
     if let Some(end_idx) = find_closing_delim(trimmed) {
         let fm_text = &trimmed[4..end_idx];
-        let body = trimmed[end_idx + 4..].trim_start();
+        let body = trimmed[end_idx + 3..].trim_start();
         let fm = parse_yaml_frontmatter(fm_text);
         return (fm, body);
     }
@@ -1504,6 +1504,39 @@ mod tests {
         assert_eq!(
             cmd.frontmatter.get("model"),
             Some(&Value::String("gpt-4".to_string()))
+        );
+    }
+
+    #[test]
+    fn issue_440_closing_delim_at_eof_without_trailing_newline() {
+        let raw = "---\ndescription: Run tests\n---";
+        let cmd = CustomCommand::parse("test", raw).unwrap();
+        assert_eq!(cmd.body, "");
+        assert_eq!(
+            cmd.frontmatter.get("description"),
+            Some(&Value::String("Run tests".to_string()))
+        );
+    }
+
+    #[test]
+    fn issue_440_closing_delim_at_eof_with_trailing_newline_only() {
+        let raw = "---\ndescription: Run tests\n---\n";
+        let cmd = CustomCommand::parse("test", raw).unwrap();
+        assert_eq!(cmd.body, "");
+        assert_eq!(
+            cmd.frontmatter.get("description"),
+            Some(&Value::String("Run tests".to_string()))
+        );
+    }
+
+    #[test]
+    fn issue_440_closing_delim_at_eof_crlf_without_trailing_newline() {
+        let raw = "---\r\ndescription: Run tests\r\n---";
+        let cmd = CustomCommand::parse("test", raw).unwrap();
+        assert_eq!(cmd.body, "");
+        assert_eq!(
+            cmd.frontmatter.get("description"),
+            Some(&Value::String("Run tests".to_string()))
         );
     }
 
