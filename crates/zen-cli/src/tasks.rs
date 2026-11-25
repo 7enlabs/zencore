@@ -293,13 +293,40 @@ fn registry_lock_error_is_transient(e: &std::io::Error, lock_path: &Path) -> boo
     }
 }
 
+/// How long a `PermissionDenied` lock creation with no visible lock
+/// file is retried before it is reported as a genuine failure.
+///
+/// On Windows the delete-pending case is invisible to the `is_file`
+/// check in `registry_lock_error_is_transient`: metadata on a file
+/// Windows is still deleting fails with access denied, so the lock
+/// file looks absent at the exact moment `create_new` reports
+/// `PermissionDenied` for it. That is the hole the `is_file` retry
+/// (PR #538, head 47ccd0d7) could not close - the concurrent-claims
+/// test still failed on Windows with os error 5 even though the
+/// mutants were green. A genuinely unwritable directory gives the
+/// same error, so the denial is retried only for this short grace
+/// and then surfaces with its own "creating task registry lock"
+/// context, never as a misleading timeout; the grace is a tenth of
+/// the lock timeout, so a real permission failure still fails fast.
+const REGISTRY_LOCK_DENIED_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Whether a `PermissionDenied` first seen `elapsed` ago is still
+/// inside the delete-pending grace window. Pure so the boundary is
+/// unit-testable: at exactly the grace the window is over.
+fn permission_denied_in_grace(elapsed: std::time::Duration) -> bool {
+    elapsed < REGISTRY_LOCK_DENIED_GRACE
+}
+
 /// Hold the registry lock across a load-check-append: creating the
 /// lock file with `create_new` is atomic, so exactly one contender
 /// wins, and the losers poll until the file disappears or the
 /// timeout expires. On Windows a contender can also see
 /// `PermissionDenied` for a lock file that is there (delete pending);
 /// that is treated as contention too (see
-/// `registry_lock_error_is_transient`). A lock only one writer
+/// `registry_lock_error_is_transient`), and when the file is
+/// delete-pending it is invisible to `is_file`, so a `PermissionDenied`
+/// with no visible lock file is retried for a short grace instead of
+/// failing at once (see `REGISTRY_LOCK_DENIED_GRACE`). A lock only one writer
 /// honours cannot make the CAS atomic, so every writer to the
 /// registry goes through this lock - `claim_task`, `heartbeat_task`,
 /// `revive_task` and `sweep_tasks` all acquire it before they load,
@@ -317,6 +344,7 @@ fn acquire_registry_lock(path: &Path, timeout: std::time::Duration) -> Result<Re
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let deadline = std::time::Instant::now() + timeout;
+    let mut denied_since: Option<std::time::Instant> = None;
     loop {
         match OpenOptions::new()
             .create_new(true)
@@ -328,6 +356,7 @@ fn acquire_registry_lock(path: &Path, timeout: std::time::Duration) -> Result<Re
                 return Ok(RegistryLock { path: lock_path });
             }
             Err(e) if registry_lock_error_is_transient(&e, &lock_path) => {
+                denied_since = None;
                 if std::time::Instant::now() >= deadline {
                     return Err(anyhow::anyhow!(
                         "timed out after {}s waiting for the task registry lock {}; \
@@ -337,6 +366,31 @@ fn acquire_registry_lock(path: &Path, timeout: std::time::Duration) -> Result<Re
                     ));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                // The grace must never outlive the caller's timeout:
+                // without this a stuck denial retried forever, and a
+                // mutant forcing the grace open hangs the test run.
+                if std::time::Instant::now() >= deadline {
+                    return Err(anyhow::anyhow!(
+                        "timed out after {}s waiting for the task registry lock {}; \
+                         if no `zen task` command is running, remove the lock file and retry",
+                        timeout.as_secs(),
+                        lock_path.display()
+                    ));
+                }
+                // The lock file may be delete-pending on Windows and
+                // therefore invisible to `is_file` (see
+                // `REGISTRY_LOCK_DENIED_GRACE`): retry briefly, then
+                // report the original error with its own context.
+                let since = *denied_since.get_or_insert_with(std::time::Instant::now);
+                if permission_denied_in_grace(since.elapsed()) {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                return Err(e).with_context(|| {
+                    format!("creating task registry lock {}", lock_path.display())
+                });
             }
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -1508,8 +1562,11 @@ mod tests {
             Ok(_) => panic!("an overlong lock filename must fail, not lock"),
             Err(err) => err,
         };
+        // Under 400ms, not just under a second: a non-PermissionDenied
+        // error must never wait out the 500ms denial grace, so
+        // widening the grace guard to every error fails here.
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
+            started.elapsed() < std::time::Duration::from_millis(400),
             "a genuine lock-creation error must fail at once, took {:?}",
             started.elapsed()
         );
@@ -1558,6 +1615,71 @@ mod tests {
         assert!(!registry_lock_error_is_transient(&invalid, &missing));
         let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
         assert!(!registry_lock_error_is_transient(&not_found, &present));
+    }
+
+    #[test]
+    fn permission_denied_grace_boundary() {
+        // Pins the delete-pending grace window (PR #538): at exactly
+        // the grace the window is over, so a `<=` mutant fails here.
+        let grace = REGISTRY_LOCK_DENIED_GRACE;
+        assert!(permission_denied_in_grace(
+            std::time::Duration::from_millis(0)
+        ));
+        assert!(permission_denied_in_grace(
+            grace - std::time::Duration::from_millis(1)
+        ));
+        assert!(!permission_denied_in_grace(grace));
+        assert!(!permission_denied_in_grace(
+            grace + std::time::Duration::from_millis(1)
+        ));
+        assert!(!permission_denied_in_grace(std::time::Duration::from_secs(
+            5
+        )));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn registry_lock_permission_denied_without_lock_file_fails_fast_with_context() {
+        // A genuinely unwritable directory must still fail with the
+        // lock-creation context, not a lock timeout - and bounded by
+        // the grace, not the full 5s lock timeout. The lower bound
+        // pins that the grace actually waits (removing the grace arm
+        // makes this fail in ~0ms); the upper bound pins that the
+        // wait is the grace, not the timeout. A read-only directory
+        // cannot produce PermissionDenied on Windows (the attribute
+        // does not block creating files), so this is unix-only; the
+        // concurrent-claims race test is the live Windows check.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("zen_tasks_denied_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let path = dir.join("tasks.jsonl");
+        let started = std::time::Instant::now();
+        let err = match acquire_registry_lock(&path, std::time::Duration::from_secs(2)) {
+            Ok(_) => panic!("an unwritable registry directory must fail, not lock"),
+            Err(err) => err,
+        };
+        let elapsed = started.elapsed();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("creating task registry lock"),
+            "the original creation error must surface, got: {text}"
+        );
+        assert!(
+            !text.contains("timed out"),
+            "a genuine error must not be reported as a lock timeout, got: {text}"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(400),
+            "the delete-pending grace must actually wait, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "a genuine error must fail fast, took {elapsed:?}"
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
