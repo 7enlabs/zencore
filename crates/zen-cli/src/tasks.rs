@@ -245,6 +245,79 @@ pub fn append_snapshot(path: &Path, card: &TaskCard) -> Result<()> {
     Ok(())
 }
 
+/// How long a writer waits for the registry lock before giving up.
+/// Claims are short-lived CLI runs, so five seconds is ample; a
+/// longer wait would only mean another `zen task` process is stuck.
+const REGISTRY_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The lock file next to a registry file: `<registry>.lock`
+/// (`tasks.jsonl.lock` for `tasks.jsonl`, issue #459).
+pub fn registry_lock_path(path: &Path) -> PathBuf {
+    path.with_extension("jsonl.lock")
+}
+
+/// One held registry lock. Dropping it removes the lock file, so a
+/// claim that finishes (or fails) never leaves the registry locked.
+struct RegistryLock {
+    path: PathBuf,
+}
+
+impl Drop for RegistryLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Hold the registry lock across a load-check-append: creating the
+/// lock file with `create_new` is atomic, so exactly one contender
+/// wins, and the losers poll until the file disappears or the
+/// timeout expires. A lock only one writer honours cannot make the
+/// CAS atomic, so every writer to the registry goes through this
+/// lock - `claim_task`, `heartbeat_task`, `revive_task` and
+/// `sweep_tasks` all acquire it before they load, and the guarded
+/// branch of `claim_task_cas` acquires it before its check.
+///
+/// A lock left behind by a process killed mid-claim is not released
+/// by the OS (this is a plain file, not an `flock`); the timeout
+/// turns that into a clear error naming the lock file to remove
+/// once no `zen task` command is running, instead of waiting forever.
+fn acquire_registry_lock(path: &Path, timeout: std::time::Duration) -> Result<RegistryLock> {
+    let lock_path = registry_lock_path(path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                let _ = writeln!(file, "{}", std::process::id());
+                return Ok(RegistryLock { path: lock_path });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(anyhow::anyhow!(
+                        "timed out after {}s waiting for the task registry lock {}; \
+                         if no `zen task` command is running, remove the lock file and retry",
+                        timeout.as_secs(),
+                        lock_path.display()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("creating task registry lock {}", lock_path.display())
+                });
+            }
+        }
+    }
+}
+
 pub fn find_task<'a>(cards: &'a [TaskCard], id: &str) -> Option<&'a TaskCard> {
     cards.iter().find(|c| c.id == id)
 }
@@ -305,6 +378,7 @@ pub fn claim_task(
     by: &str,
     now: DateTime<Utc>,
 ) -> Result<Option<ClaimOutcome>> {
+    let _lock = acquire_registry_lock(path, REGISTRY_LOCK_TIMEOUT)?;
     let cards = load_registry(path)?;
     let Some(existing) = find_task(&cards, id) else {
         return Ok(None);
@@ -366,6 +440,13 @@ pub fn claim_task(
 ///   lease live again while the flag stays set, and such a card must
 ///   still never replay (review of PR #68, ZD Developer, 08/11/2026).
 ///
+/// The guarded load-check-append runs under the registry lock
+/// (issue #459): two concurrent claims with the same expected
+/// version cannot both record - the second loads after the first
+/// appends, sees the bumped version, and is refused as `Conflict`.
+/// The lock is advisory, so every other writer to this file takes
+/// the same lock before it loads (see `acquire_registry_lock`).
+///
 /// Returns `None` when the registry has no task with `id`; in that
 /// case nothing is written.
 pub fn claim_task_cas(
@@ -378,6 +459,10 @@ pub fn claim_task_cas(
     let Some(expected) = expected_version else {
         return Ok(claim_task(path, id, by, now)?.map(CasClaim::Recorded));
     };
+    // Issue #459: the version check and the append below must be
+    // one atomic step - hold the lock from this load until the
+    // snapshot is appended (or the claim is refused).
+    let _lock = acquire_registry_lock(path, REGISTRY_LOCK_TIMEOUT)?;
     let cards = load_registry(path)?;
     let Some(existing) = find_task(&cards, id) else {
         return Ok(None);
@@ -491,6 +576,7 @@ pub fn heartbeat_task(
     by: &str,
     now: DateTime<Utc>,
 ) -> Result<Option<HeartbeatOutcome>> {
+    let _lock = acquire_registry_lock(path, REGISTRY_LOCK_TIMEOUT)?;
     let cards = load_registry(path)?;
     let Some(existing) = find_task(&cards, id) else {
         return Ok(None);
@@ -556,6 +642,7 @@ pub fn revive_task(
     by: &str,
     now: DateTime<Utc>,
 ) -> Result<Option<ReviveOutcome>> {
+    let _lock = acquire_registry_lock(path, REGISTRY_LOCK_TIMEOUT)?;
     let cards = load_registry(path)?;
     let Some(existing) = find_task(&cards, id) else {
         return Ok(None);
@@ -654,6 +741,13 @@ pub struct SweepOutcome {
 /// registry, or one with nothing expired, yields zero entries and
 /// writes nothing.
 pub fn sweep_tasks(path: &Path, now: DateTime<Utc>, dry_run: bool) -> Result<SweepOutcome> {
+    // A dry run writes nothing, so it takes no lock; a real sweep
+    // appends, so it holds the lock for the whole pass.
+    let _lock = if dry_run {
+        None
+    } else {
+        Some(acquire_registry_lock(path, REGISTRY_LOCK_TIMEOUT)?)
+    };
     let cards = load_registry(path)?;
     let mut outcome = SweepOutcome {
         entries: Vec::new(),
@@ -1281,6 +1375,81 @@ mod tests {
         let cards = load_registry(&path).unwrap();
         assert_eq!(cards[0].owner.as_deref(), Some("zc-developer"));
         assert_eq!(cards[0].lease.as_ref().unwrap().version, 1);
+    }
+
+    #[test]
+    fn cas_concurrent_claims_with_same_expected_version_have_exactly_one_winner() {
+        // Issue #459: without the registry lock, two claims with the
+        // same expected version both pass the version check and both
+        // append, so both are told Recorded. Ten rounds of sixteen
+        // seats released at once through a barrier make the lost
+        // update near-certain on the unlocked code.
+        for round in 0..10 {
+            let path = temp_registry(&format!("cas_race_{round}"));
+            append_snapshot(&path, &card("B-4", "fix install")).unwrap();
+            let barrier = std::sync::Barrier::new(16);
+            let winners = std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for seat in 0..16 {
+                    let path = &path;
+                    let barrier = &barrier;
+                    handles.push(scope.spawn(move || {
+                        barrier.wait();
+                        claim_task_cas(path, "B-4", &format!("seat-{seat}"), Some(0), fixed_now())
+                            .unwrap()
+                            .expect("task exists")
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .filter(|cas| matches!(cas, CasClaim::Recorded(_)))
+                    .count()
+            });
+            assert_eq!(
+                winners, 1,
+                "round {round}: exactly one claim may win, the rest are conflicts"
+            );
+            let cards = load_registry(&path).unwrap();
+            assert_eq!(cards[0].lease.as_ref().unwrap().version, 1);
+        }
+    }
+
+    #[test]
+    fn cas_claim_blocked_by_an_existing_lock_file_times_out_without_writing() {
+        // A lock file left by another writer must block the claim:
+        // the claim fails after the timeout instead of recording
+        // over the other writer. On the unlocked code this records.
+        let path = temp_registry("cas_lock_held");
+        append_snapshot(&path, &card("B-4", "fix install")).unwrap();
+        let lock_path = path.with_extension("jsonl.lock");
+        std::fs::write(&lock_path, "99999").unwrap();
+        let cas = claim_task_cas(&path, "B-4", "zc-developer", Some(0), fixed_now());
+        assert!(
+            cas.is_err(),
+            "a claim blocked by the lock must fail, not record"
+        );
+        assert_eq!(registry_lines(&path), 1, "a blocked claim writes nothing");
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    #[test]
+    fn registry_lock_is_exclusive_and_released_on_drop() {
+        // Post-fix only: this test calls the lock directly, so it
+        // does not compile on the unlocked code. It pins the two
+        // properties the CAS fix relies on: a held lock blocks a
+        // second acquirer, and dropping the guard removes the file.
+        let path = temp_registry("lock_exclusive");
+        let lock = acquire_registry_lock(&path, std::time::Duration::from_secs(5)).unwrap();
+        assert!(registry_lock_path(&path).exists());
+        let second = acquire_registry_lock(&path, std::time::Duration::from_millis(50));
+        assert!(second.is_err(), "a second lock while one is held must fail");
+        drop(lock);
+        assert!(
+            !registry_lock_path(&path).exists(),
+            "dropping the lock removes the lock file"
+        );
+        let _held = acquire_registry_lock(&path, std::time::Duration::from_secs(5)).unwrap();
     }
 
     #[test]
