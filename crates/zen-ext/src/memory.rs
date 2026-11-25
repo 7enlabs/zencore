@@ -387,17 +387,50 @@ fn split_rule_frontmatter(raw: &str) -> (bool, &str) {
     (false, raw)
 }
 
+/// Maximum directory depth `rule_files` descends. A symlink cycle
+/// is caught by the visited set (issue #398); the cap bounds
+/// discovery in a non-cyclic but absurdly deep tree, mirroring
+/// `COLLECT_MD_MAX_DEPTH` for commands.
+const RULE_FILES_MAX_DEPTH: usize = 16;
+
 fn rule_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
+    let mut visited = HashSet::new();
+    // Issue #398 (Leader decision, tin 23164): only entries whose
+    // canonical path lies inside the rules root are read. A symlink
+    // pointing outside the root is skipped, never followed.
+    let root = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut stack = vec![(dir.to_path_buf(), 0usize)];
+    while let Some((d, depth)) = stack.pop() {
+        if depth > RULE_FILES_MAX_DEPTH {
+            continue;
+        }
+        // A directory reached through different symlinks canonicalizes
+        // to the same path, so a symlink cycle revisits an
+        // already-seen directory instead of looping forever (issue
+        // #398). Fall back to the raw path when canonicalization
+        // fails; `read_dir` below then fails the same way it did
+        // before this change.
+        let key = std::fs::canonicalize(&d).unwrap_or_else(|_| d.clone());
+        if !visited.insert(key) {
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(&d) else {
             continue;
         };
         for entry in entries.flatten() {
             let p = entry.path();
+            // A symlink escape must not be followed: an entry that
+            // does not resolve inside the rules root is skipped,
+            // whether it is a file or a directory.
+            let Ok(canon) = std::fs::canonicalize(&p) else {
+                continue;
+            };
+            if !canon.starts_with(&root) {
+                continue;
+            }
             if p.is_dir() {
-                stack.push(p);
+                stack.push((p, depth + 1));
             } else if p.extension().and_then(|e| e.to_str()) == Some("md") {
                 out.push(p);
             }
@@ -1437,5 +1470,128 @@ mod tests {
             "symlinked import still works in a trusted folder: {}",
             top.1
         );
+    }
+
+    // Issue #398: a symlink cycle inside the rules directory
+    // (`loop -> ..`) must terminate instead of hanging session start,
+    // and must not walk the parent directory's other files as rules.
+    #[test]
+    #[cfg(unix)]
+    fn issue_398_symlink_cycle_to_parent_terminates() {
+        let tmp = TempDir::new();
+        let rules = tmp.path().join("proj").join(".zen").join("rules");
+        fs::create_dir_all(&rules).unwrap();
+        fs::write(rules.join("real.md"), "real").unwrap();
+        std::os::unix::fs::symlink(Path::new(".."), rules.join("loop")).unwrap();
+        let files = rule_files(&rules);
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["real.md"]);
+    }
+
+    // Issue #398 (Leader decision, tin 23164): a symlink cycle to
+    // the parent must not read files outside the rules root. With
+    // `outside.md` in the parent directory, the walk through `loop
+    // -> ..` must not collect it.
+    #[test]
+    #[cfg(unix)]
+    fn issue_398_symlink_cycle_does_not_read_outside_rules() {
+        let tmp = TempDir::new();
+        let rules = tmp.path().join("proj").join(".zen").join("rules");
+        fs::create_dir_all(&rules).unwrap();
+        fs::write(rules.join("real.md"), "real").unwrap();
+        fs::write(
+            tmp.path().join("proj").join(".zen").join("outside.md"),
+            "outside",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(Path::new(".."), rules.join("loop")).unwrap();
+        let files = rule_files(&rules);
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["real.md"]);
+    }
+
+    // Issue #398: two directories linked to each other (`a/link ->
+    // ../b`, `b/link -> ../a`) must not recurse forever, and a
+    // directory reached through a symlinked alias must be walked only
+    // once, so each rule file is collected exactly once.
+    #[test]
+    #[cfg(unix)]
+    fn issue_398_mutual_symlink_cycle_and_alias_visited_once() {
+        let tmp = TempDir::new();
+        let rules = tmp.path().join("proj").join(".zen").join("rules");
+        fs::create_dir_all(rules.join("cycle-a")).unwrap();
+        fs::create_dir_all(rules.join("cycle-b")).unwrap();
+        fs::create_dir_all(rules.join("shared")).unwrap();
+        fs::write(rules.join("cycle-a/one.md"), "one").unwrap();
+        fs::write(rules.join("cycle-b/two.md"), "two").unwrap();
+        fs::write(rules.join("shared/three.md"), "three").unwrap();
+        std::os::unix::fs::symlink(Path::new("../cycle-b"), rules.join("cycle-a/link")).unwrap();
+        std::os::unix::fs::symlink(Path::new("../cycle-a"), rules.join("cycle-b/link")).unwrap();
+        std::os::unix::fs::symlink(Path::new("shared"), rules.join("alias")).unwrap();
+        let files = rule_files(&rules);
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        // Each real file exactly once; the alias walk must not duplicate
+        // `shared/three.md`. Order is by full path, which can run
+        // through a symlink alias, so assert the multiset, not order.
+        assert_eq!(names.len(), 3);
+        assert!(names.contains(&"one.md".to_string()));
+        assert!(names.contains(&"two.md".to_string()));
+        assert_eq!(names.iter().filter(|n| *n == "three.md").count(), 1);
+    }
+
+    // Issue #398: the depth cap bounds discovery in a non-cyclic but
+    // absurdly deep tree, so a deep tree cannot loop or blow the
+    // stack either.
+    #[test]
+    fn issue_398_deep_tree_bounded_by_depth_cap() {
+        let tmp = TempDir::new();
+        let rules = tmp.path().join("proj").join(".zen").join("rules");
+        fs::create_dir_all(&rules).unwrap();
+        fs::write(rules.join("shallow.md"), "shallow").unwrap();
+        let mut dir = rules.clone();
+        for i in 0..20 {
+            dir = dir.join(format!("d{i}"));
+        }
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("deep.md"), "deep").unwrap();
+        let files = rule_files(&rules);
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["shallow.md"]);
+    }
+
+    // Issue #398: the depth cap is `depth > MAX`, so a file exactly
+    // at depth 16 is collected and one at depth 17 is not. The
+    // deep-tree test above cannot tell `>` from `>=` or `==`.
+    #[test]
+    fn issue_398_depth_cap_boundary_is_exact() {
+        assert_eq!(RULE_FILES_MAX_DEPTH, 16);
+        let tmp = TempDir::new();
+        let rules = tmp.path().join("proj").join(".zen").join("rules");
+        let mut dir = rules.clone();
+        for i in 0..16 {
+            dir = dir.join(format!("d{i}"));
+        }
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("at_cap.md"), "at cap").unwrap();
+        fs::create_dir_all(dir.join("d16")).unwrap();
+        fs::write(dir.join("d16").join("past_cap.md"), "past cap").unwrap();
+        let files = rule_files(&rules);
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["at_cap.md"]);
     }
 }
