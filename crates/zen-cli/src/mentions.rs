@@ -116,10 +116,23 @@ fn display_path(path: &Path, cwd: &Path) -> String {
 }
 
 fn read_mention_file(path: &Path) -> String {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
+    // Issue #442: read at most the cap + 1 bytes, so the allocation is
+    // bounded by the cap. The old code loaded the whole file with
+    // `std::fs::read` and only truncated afterwards, so mentioning a
+    // multi-gigabyte file OOMed the process before the cap ever applied.
+    // The extra byte tells us the file exceeds the cap without metadata.
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
         Err(e) => return format!("[could not read file: {}]", e),
     };
+    let mut bytes = Vec::new();
+    if let Err(e) = file
+        .take(MAX_MENTION_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+    {
+        return format!("[could not read file: {}]", e);
+    }
     if bytes.iter().take(BINARY_SNIFF_BYTES).any(|b| *b == 0) {
         return "[binary file - contents not included]".to_string();
     }
@@ -684,5 +697,66 @@ mod tests {
             ));
         let d = decide_shell(&perms, None, &test_ctx(&cwd), "echo hi");
         assert_eq!(d, ShellDecision::Run);
+    }
+
+    #[test]
+    fn read_mention_file_truncates_over_cap() {
+        // Issue #442: a file over the 512 KiB cap is truncated with the
+        // same suffix as before.
+        let cwd = tmpdir("cap1");
+        let big = "x".repeat(MAX_MENTION_FILE_BYTES as usize + 100_000);
+        let p = write(&cwd, "big.txt", &big);
+        let out = read_mention_file(&p);
+        assert!(out.ends_with("[truncated: file exceeds the 512 KiB mention cap]"));
+        assert!(out.starts_with(&"x".repeat(MAX_MENTION_FILE_BYTES as usize)));
+        assert!(out.len() < MAX_MENTION_FILE_BYTES as usize + 100);
+    }
+
+    #[test]
+    fn read_mention_file_exact_cap_not_truncated() {
+        let cwd = tmpdir("cap2");
+        let exact = "y".repeat(MAX_MENTION_FILE_BYTES as usize);
+        let p = write(&cwd, "exact.txt", &exact);
+        let out = read_mention_file(&p);
+        assert_eq!(out, exact);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_mention_file_returns_without_eof() {
+        // Issue #442: the cap must bound the *read*, not just the text
+        // sent to the model. A pipe that stays open past the cap must not
+        // block the reader waiting for EOF.
+        use std::io::Write;
+        use std::sync::mpsc;
+        let cwd = tmpdir("cap3");
+        let fifo = cwd.join("pipe");
+        let ok = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "mkfifo failed");
+        let writer_path = fifo.clone();
+        std::thread::spawn(move || {
+            // Write more than the cap, then hold the pipe open without EOF.
+            let mut f = std::fs::File::create(&writer_path).unwrap();
+            let chunk = vec![b'x'; 64 * 1024];
+            for _ in 0..10 {
+                f.write_all(&chunk).unwrap();
+            }
+            f.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        });
+        let (tx, rx) = mpsc::channel::<String>();
+        let fifo2 = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_mention_file(&fifo2));
+        });
+        let out = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("read_mention_file blocked waiting for EOF past the cap");
+        assert!(out.ends_with("[truncated: file exceeds the 512 KiB mention cap]"));
+        assert!(out.starts_with(&"x".repeat(MAX_MENTION_FILE_BYTES as usize)));
     }
 }
