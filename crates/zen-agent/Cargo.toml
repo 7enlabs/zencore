@@ -12,5 +12,6 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 dirs.workspace = true
+fs2.workspace = true
 reqwest.workspace = true
 uuid.workspace = true

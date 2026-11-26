@@ -3713,6 +3713,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "dirs",
+ "fs2",
  "reqwest",
  "serde",
  "serde_json",
