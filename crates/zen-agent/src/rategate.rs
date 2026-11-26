@@ -354,7 +354,8 @@ impl KeyQuota {
 
 pub async fn fetch_key_quota(key_url: &str, api_key: Option<&str>) -> anyhow::Result<KeyQuota> {
     let timeouts = crate::client::HttpTimeouts::from_secs(key_url, Some(15), None);
-    let http = crate::client::build_http(key_url, &timeouts, true);
+    let http = crate::client::build_http(key_url, &timeouts, true)
+        .map_err(|e| anyhow::anyhow!("quota lookup failed: failed to build HTTP client: {e}"))?;
     let mut rb = http.get(key_url);
     if let Some(k) = api_key.filter(|k| !k.is_empty()) {
         rb = rb.header(reqwest::header::AUTHORIZATION, format!("Bearer {k}"));
