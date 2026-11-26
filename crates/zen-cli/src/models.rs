@@ -715,21 +715,42 @@ pub struct ProbeClient {
 }
 
 impl ProbeClient {
-    pub fn new(base_url: &str, api_key: Option<String>) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(PROBE_TIMEOUT_SECS))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        Self {
+    pub fn new(base_url: &str, api_key: Option<String>) -> Result<Self, reqwest::Error> {
+        Self::with_extra_roots(base_url, api_key, zen_core::extra_root_pem().as_deref())
+    }
+
+    fn with_extra_roots(
+        base_url: &str,
+        api_key: Option<String>,
+        extra_roots: Option<&[u8]>,
+    ) -> Result<Self, reqwest::Error> {
+        let http = build_probe_http(extra_roots)?;
+        Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             http,
-        }
+        })
     }
 
     fn endpoint(&self) -> String {
         format!("{}/chat/completions", self.base_url)
     }
+}
+
+/// Build the probe HTTP client. Extra roots are applied the same way as
+/// in `zen-agent`'s `build_http_with_roots`: a PEM bundle that does not
+/// parse is ignored, but a parsed certificate the TLS backend rejects
+/// fails the build instead of silently falling back to a default client.
+fn build_probe_http(extra_roots: Option<&[u8]>) -> Result<reqwest::Client, reqwest::Error> {
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(PROBE_TIMEOUT_SECS));
+    if let Some(pem) = extra_roots
+        && let Ok(certs) = reqwest::Certificate::from_pem_bundle(pem)
+    {
+        for c in certs {
+            builder = builder.add_root_certificate(c);
+        }
+    }
+    builder.build()
 }
 
 #[derive(Deserialize)]
@@ -941,7 +962,8 @@ pub async fn models_command(
                 "no candidate free models found (static catalog is empty and /models discovery failed)"
             );
         }
-        let backend = ProbeClient::new(&cfg.base_url, cfg.api_key.clone());
+        let backend = ProbeClient::new(&cfg.base_url, cfg.api_key.clone())
+            .with_context(|| format!("failed to build probe HTTP client for {}", cfg.base_url))?;
         let mut results = Vec::with_capacity(candidates.len());
         for (i, cand) in candidates.iter().enumerate() {
             if !args.best {
@@ -1957,5 +1979,25 @@ mod tests {
             128_000
         );
         assert_eq!(effective_context_window(None, "auto"), 128_000);
+    }
+
+    #[test]
+    fn issue_561_probe_client_propagates_invalid_root_cert_error() {
+        // Issue #561: a PEM bundle that parses but holds no valid X.509
+        // certificate used to make ProbeClient::new silently fall back to
+        // reqwest::Client::new(), discarding the probe timeout, so a probe
+        // could hang instead of failing fast. The build error must surface.
+        let bad_pem = b"-----BEGIN CERTIFICATE-----\naGVsbG8=\n-----END CERTIFICATE-----\n";
+        let err = match ProbeClient::with_extra_roots("https://example.com", None, Some(bad_pem)) {
+            Ok(_) => panic!("invalid extra root PEM must fail probe client construction"),
+            Err(e) => e,
+        };
+        assert!(err.is_builder(), "expected a builder error, got: {err}");
+    }
+
+    #[test]
+    fn issue_561_probe_client_succeeds_without_extra_roots() {
+        assert!(ProbeClient::with_extra_roots("https://example.com", None, None).is_ok());
+        assert!(ProbeClient::with_extra_roots("http://localhost:11434/v1", None, None).is_ok());
     }
 }
