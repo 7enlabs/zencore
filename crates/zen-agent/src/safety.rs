@@ -52,7 +52,9 @@ impl ErrorClass {
 ///
 /// The status decides first: a 429 is a rate limit and stays retryable
 /// unless the body carries an explicit quota code (`insufficient_quota`
-/// / `exceeded your current quota`). The old body-first scan matched
+/// / `exceeded your current quota`). A 408 Request Timeout is the one
+/// 4xx that is inherently transient (issue #357), so it retries like a
+/// 5xx instead of falling into the blanket 400-499 Fatal arm. The old body-first scan matched
 /// the broad substrings `billing` / `out of credit` on any status, so
 /// a 429 saying "Rate limit exceeded. See billing to upgrade your plan"
 /// was misclassified as non-retryable quota exhaustion and the run
@@ -71,6 +73,7 @@ pub fn classify_error(status: Option<u16>, body: &str) -> ErrorClass {
         Some(429) if explicit_quota => ErrorClass::QuotaExhausted,
         Some(429) => ErrorClass::RateLimit,
         Some(402) => ErrorClass::QuotaExhausted,
+        Some(408) => ErrorClass::Transient,
         Some(code) if (400..500).contains(&code) => ErrorClass::Fatal,
         Some(code) if (500..600).contains(&code) => ErrorClass::Transient,
 
@@ -476,6 +479,23 @@ mod tests {
         let c = classify_error(Some(529), r#"{"error":{"type":"overloaded_error"}}"#);
         assert_eq!(c, ErrorClass::Overloaded);
         assert!(c.is_retryable());
+    }
+
+    #[test]
+    fn classify_408_is_transient_retryable() {
+        // Issue #357: HTTP 408 Request Timeout is the one 4xx that is
+        // inherently transient - the server timed out waiting for the
+        // request - so it must retry instead of falling into the
+        // blanket 400-499 Fatal arm.
+        let c = classify_error(Some(408), "{}");
+        assert_eq!(c, ErrorClass::Transient);
+        assert!(c.is_retryable());
+        // A 408 keeps its status-based class even when the body
+        // mentions billing, like a 5xx does.
+        assert_eq!(
+            classify_error(Some(408), "Billing issue: out of credit"),
+            ErrorClass::Transient
+        );
     }
 
     #[test]

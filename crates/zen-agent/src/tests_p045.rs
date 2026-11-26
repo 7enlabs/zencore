@@ -272,6 +272,22 @@ async fn p0_4_402_in_flight_budget_with_retry_after_is_retried() {
     assert_eq!(served.load(Ordering::SeqCst), 2);
 }
 
+#[tokio::test]
+async fn p0_4_408_request_timeout_is_retried() {
+    // Issue #357: a 408 from safety::classify_error must be Transient
+    // (retryable), so the client retries once and succeeds instead of
+    // failing on the first server-side timeout.
+    let (base, served, _) = fake_server(vec![
+        answer(408, "", r#"{"error":{"message":"Request Timeout"}}"#),
+        answer(200, "", OK_BODY),
+    ])
+    .await;
+    let mut c = OpenAiClient::new(base, None, Arc::new(CollectSink::default()));
+    c.base_retry_delay_ms = 1;
+    assert_eq!(c.chat(req()).await.unwrap().message.text_ref(), Some("ok"));
+    assert_eq!(served.load(Ordering::SeqCst), 2);
+}
+
 #[test]
 fn p0_5_mid_response_error_classification() {
     let e = mid_response_error(&mid_error(
