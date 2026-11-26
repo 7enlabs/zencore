@@ -1178,6 +1178,39 @@ async fn c10_auto_compact_triggers_over_threshold() {
 }
 
 #[tokio::test]
+async fn c10_auto_compact_failure_is_reported_not_swallowed() {
+    // Issue #370: a failed auto-compact was discarded with `let _ =`, so
+    // nothing surfaced it. The model answers the summarization call with
+    // an empty summary, which makes `compact_impl` bail; the turn itself
+    // must still complete, but the failure must reach the event sink.
+    let llm = MockLlm::new(vec![resp("one"), resp(""), resp("two")]);
+    let cfg = AgentConfig {
+        auto_compact_threshold: Some(5),
+        keep_after_compact: 1,
+        ..base_cfg()
+    };
+    let (mut agent, sink, _h) = build_agent(llm.clone(), ToolRegistry::new(), allow(), cfg);
+    agent.run_turn("first").await;
+    let r = agent.run_turn("second").await;
+    assert_eq!(
+        r.result, "two",
+        "a failed auto-compact must not fail the turn"
+    );
+    assert!(
+        !sink.events.lock().unwrap().iter().any(|e| matches!(e,
+            AgentEvent::CompactBoundary { trigger, .. } if trigger == "auto")),
+        "no compaction happened, so no CompactBoundary may be emitted"
+    );
+    let events = sink.events.lock().unwrap();
+    assert!(
+        events.iter().any(|e| matches!(e,
+            AgentEvent::SystemMessage { event, text }
+                if event == "AutoCompact" && text.contains("empty summary"))),
+        "expected an AutoCompact SystemMessage reporting the failure, got: {events:?}"
+    );
+}
+
+#[tokio::test]
 async fn set_messages_replaces_history_for_resume() {
     let llm = MockLlm::new(vec![resp("cont")]);
     let (mut agent, _s, _h) = build_agent(llm.clone(), ToolRegistry::new(), allow(), base_cfg());
