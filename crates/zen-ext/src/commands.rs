@@ -805,6 +805,49 @@ mod tests {
         let _ = swapper.join();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn inline_files_swapped_to_ignored_symlink_never_leaks() {
+        // Issue #444 (Z Tester BLOCKED #554): same gitignore race on the
+        // `@path` flow - `resolve_ref` checked the ignore rules on the
+        // path, `read_inline_file` opened it later. A swapper thread
+        // flips the victim between a regular file and a symlink to the
+        // ignored secret while `inline_files` loops; the secret must
+        // never appear in the output. Fails on the pre-fix code (the
+        // swap lands in the check-then-open window) and passes with the
+        // descriptor-bound ignore check.
+        let t = TempDir::new();
+        let proj = t.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        write(&proj.join(".gitignore"), "secret.txt\n");
+        write(&proj.join("secret.txt"), "IGNORED-SECRET-444");
+        let victim = proj.join("victim.txt");
+        write(&victim, "inside");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let swapper = {
+            let stop = std::sync::Arc::clone(&stop);
+            let victim = victim.clone();
+            let secret = proj.join("secret.txt");
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = fs::remove_file(&victim);
+                    let _ = std::os::unix::fs::symlink(&secret, &victim);
+                    let _ = fs::remove_file(&victim);
+                    let _ = fs::write(&victim, "inside");
+                }
+            })
+        };
+        for _ in 0..300 {
+            let out = inline_files("@victim.txt", &proj);
+            assert!(
+                !out.contains("IGNORED-SECRET-444"),
+                "gitignore race leak: swapped symlink read the ignored file"
+            );
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = swapper.join();
+    }
+
     #[test]
     fn c5_2_shell_pre_execution_is_permission_gated() {
         let t = TempDir::new();

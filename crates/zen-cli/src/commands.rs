@@ -576,27 +576,18 @@ fn expand_file_refs(body: &str, base: &Path) -> Result<String> {
 }
 
 fn read_ref(path: &str, base: &Path) -> Option<String> {
-    // Issue #444: confine the reference to the project directory and
-    // apply the gitignore rules. The old code fell back to the path as
-    // given, so an absolute path or a `..` escape inlined any readable
-    // file into the expanded command. Canonicalizing both sides also
-    // stops symlinks from escaping the project; an absolute path that
-    // stays inside the project still resolves.
+    // Issue #444: every check used to run on the path before the open, so
+    // a swap in between could redirect the read outside the project, to a
+    // FIFO (which hangs the open), or to a gitignored file. All three
+    // checks now run inside `open_file_inside_project` on the descriptor
+    // that was actually opened, so a swap before the open is caught and a
+    // swap after it cannot affect the pinned descriptor. There is
+    // deliberately no pre-open check left here: the descriptor-bound check
+    // is the single enforcement point, and a redundant early check would
+    // only re-introduce the check-then-open window (and its `||` could
+    // not be killed by a mutant test, see the #554 review).
     let candidate = base.join(path);
-    let root = std::fs::canonicalize(base).ok()?;
-    let canon = std::fs::canonicalize(&candidate).ok()?;
-    if !canon.starts_with(&root) || !canon.is_file() {
-        return None;
-    }
-    let rules = zen_core::gitignore::load_ignore_rules(&root);
-    if zen_core::gitignore::is_ignored(&rules, &canon, false) {
-        return None;
-    }
-    // TOCTOU (issue #444): the checks above read the path, but the file
-    // could be replaced by a symlink to outside before the open below.
-    // `open_file_inside_project` binds the containment check to the
-    // descriptor that is actually read, so a swap in between is caught.
-    let file = zen_core::fs::open_file_inside_project(&canon, &root)?;
+    let file = zen_core::fs::open_file_inside_project(&candidate, base)?;
     read_ref_file(file)
 }
 
@@ -1711,6 +1702,71 @@ mod tests {
                 assert!(
                     !content.contains("TOP-SECRET-444"),
                     "TOCTOU leak: swapped symlink read the outside file"
+                );
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = swapper.join();
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_ref_rejects_fifo_without_hanging() {
+        // Issue #444 (Z Tester BLOCKED #554): a FIFO must not inline and
+        // must not hang the reader. Guards the restructured `read_ref`,
+        // which now relies on the descriptor-bound open instead of its
+        // own pre-open type check.
+        let tmp = read_ref_tmp("fifo");
+        let fifo = tmp.join("pipe");
+        let cpath = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        let start = std::time::Instant::now();
+        assert_eq!(read_ref("pipe", &tmp), None);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "read_ref blocked on a FIFO"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_ref_swapped_to_ignored_symlink_never_leaks() {
+        // Issue #444 (Z Tester BLOCKED #554): the gitignore check used to
+        // run on the path before the open, so a swap to a symlink
+        // pointing at an ignored file in between leaked the ignored
+        // content. A swapper thread flips the victim between a regular
+        // file and a symlink to the ignored secret while the reader
+        // loops; the secret must never come back. Fails on the pre-fix
+        // code (the swap lands in the check-then-open window) and passes
+        // with the descriptor-bound ignore check.
+        let tmp = read_ref_tmp("ignoreref");
+        let proj = tmp.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join(".gitignore"), "secret.txt\n").unwrap();
+        fs::write(proj.join("secret.txt"), "IGNORED-SECRET-444").unwrap();
+        let victim = proj.join("victim.txt");
+        fs::write(&victim, "inside").unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let swapper = {
+            let stop = std::sync::Arc::clone(&stop);
+            let victim = victim.clone();
+            let secret = proj.join("secret.txt");
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = fs::remove_file(&victim);
+                    let _ = std::os::unix::fs::symlink(&secret, &victim);
+                    let _ = fs::remove_file(&victim);
+                    let _ = fs::write(&victim, "inside");
+                }
+            })
+        };
+        for _ in 0..300 {
+            if let Some(content) = read_ref("victim.txt", &proj) {
+                assert!(
+                    !content.contains("IGNORED-SECRET-444"),
+                    "gitignore race leak: swapped symlink read the ignored file"
                 );
             }
         }

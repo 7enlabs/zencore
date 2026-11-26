@@ -3760,6 +3760,7 @@ dependencies = [
  "chrono",
  "fs2",
  "globset",
+ "libc",
  "serde",
  "serde_json",
  "walkdir",
