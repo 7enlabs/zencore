@@ -13,10 +13,13 @@
 //! The open itself must never block: opening a FIFO blocks until a
 //! writer appears, so a file swapped for a FIFO in the check-then-open
 //! window would hang the reader. On Unix the open uses O_NONBLOCK and
-//! the descriptor is re-checked after the open; on Windows there is no
-//! open flag that both avoids the block and keeps synchronous reads
-//! working, so non-regular files are rejected before the open instead
-//! (a swap to a pipe in that window could still block there).
+//! the descriptor is re-checked after the open. On Windows the open
+//! uses CreateFileW with FILE_FLAG_OVERLAPPED, which returns at once
+//! even for a named pipe; the handle's type is then checked, and a
+//! regular file is reopened without the flag through ReOpenFile, which
+//! returns a handle to the same file object without going through the
+//! path again, so synchronous reads keep working and the swap window
+//! has no consequence.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -37,15 +40,6 @@ use std::path::{Path, PathBuf};
 /// the TOCTOU window this helper closes, and a redundant early check
 /// would only re-introduce it.
 pub fn open_file_inside_project(path: &Path, root: &Path) -> Option<File> {
-    // FIFO guard (issue #444): on Windows the open below can block on a
-    // named pipe, so non-regular files are rejected before the open.
-    // On Unix this check is compiled out: the non-blocking open plus the
-    // post-open fstat below already cover a FIFO swapped in at any point,
-    // and a redundant layer here could not be killed by a mutant test.
-    #[cfg(not(unix))]
-    if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
-        return None;
-    }
     let file = open_nonblocking(path).ok()?;
     if !file.metadata().is_ok_and(|m| m.is_file()) {
         return None;
@@ -68,10 +62,13 @@ pub fn open_file_inside_project(path: &Path, root: &Path) -> Option<File> {
 /// On Unix the open uses O_NONBLOCK: a FIFO swapped in after any
 /// earlier type check still opens at once, and the post-open fstat in
 /// `open_file_inside_project` rejects it. O_NONBLOCK is ignored for
-/// regular files, so reads behave normally. On Windows there is no
-/// equivalent flag that keeps synchronous reads working, so the open is
-/// plain and the pre-open type check in `open_file_inside_project` is
-/// the only guard against a named pipe.
+/// regular files, so reads behave normally. On Windows the open uses
+/// CreateFileW with FILE_FLAG_OVERLAPPED, which returns at once even
+/// for a named pipe; the handle's type is checked, and a regular file
+/// is reopened without the flag through ReOpenFile, so the returned
+/// handle supports the synchronous reads `std::fs::File` performs.
+/// A non-regular file is rejected here (the caller maps the error to
+/// None), so the open never blocks on a pipe.
 #[cfg(unix)]
 fn open_nonblocking(path: &Path) -> std::io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -83,8 +80,121 @@ fn open_nonblocking(path: &Path) -> std::io::Result<File> {
 
 #[cfg(not(unix))]
 fn open_nonblocking(path: &Path) -> std::io::Result<File> {
-    File::open(path)
+    use std::os::windows::io::AsRawHandle;
+    // Probe open with FILE_FLAG_OVERLAPPED: CreateFileW returns at
+    // once even when the path is a named pipe, so a swap to a pipe in
+    // the check-then-open window cannot hang the reader. The probe
+    // handle cannot be read synchronously (std reads use a NULL
+    // OVERLAPPED), so a regular file is reopened without the flag
+    // through ReOpenFile, which returns a handle to the same file
+    // object without going through the path again. The probe handle
+    // is closed when it drops at the end of this function.
+    let probe = open_overlapped(path)?;
+    if get_file_type(probe.as_raw_handle()) != FILE_TYPE_DISK {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let sync = reopen_without_overlapped(probe.as_raw_handle())?;
+    Ok(sync)
 }
+
+/// Open `path` with FILE_FLAG_OVERLAPPED so the open returns at once
+/// even when the path is a named pipe. The returned handle is a probe:
+/// it is never read from, only type-checked and reopened.
+#[cfg(windows)]
+fn open_overlapped(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED | FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+/// Return the Win32 file type of `handle`: FILE_TYPE_DISK for a
+/// regular file, FILE_TYPE_PIPE for a named pipe, and so on.
+#[cfg(windows)]
+fn get_file_type(handle: *mut std::ffi::c_void) -> u32 {
+    unsafe { GetFileType(handle) }
+}
+
+/// Reopen the file behind `handle` without FILE_FLAG_OVERLAPPED, so
+/// the returned handle supports synchronous reads. ReOpenFile returns
+/// a handle to the same file object, so no path is consulted and the
+/// swap window cannot intervene.
+#[cfg(windows)]
+fn reopen_without_overlapped(handle: *mut std::ffi::c_void) -> std::io::Result<File> {
+    use std::os::windows::io::FromRawHandle;
+    let new = unsafe {
+        ReOpenFile(
+            handle,
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_ATTRIBUTE_NORMAL,
+        )
+    };
+    if new.is_null() || new == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_handle(new) })
+}
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn CreateFileW(
+        file_name: *const u16,
+        desired_access: u32,
+        share_mode: u32,
+        security_attributes: *mut std::ffi::c_void,
+        creation_disposition: u32,
+        flags_and_attributes: u32,
+        template_file: *mut std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
+    fn GetFileType(handle: *mut std::ffi::c_void) -> u32;
+    fn ReOpenFile(
+        original_file: *mut std::ffi::c_void,
+        desired_access: u32,
+        share_mode: u32,
+        flags: u32,
+    ) -> *mut std::ffi::c_void;
+}
+
+#[cfg(windows)]
+const GENERIC_READ: u32 = 0x8000_0000;
+#[cfg(windows)]
+const FILE_SHARE_READ: u32 = 0x0000_0001;
+#[cfg(windows)]
+const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+#[cfg(windows)]
+const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+#[cfg(windows)]
+const OPEN_EXISTING: u32 = 3;
+#[cfg(windows)]
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+#[cfg(windows)]
+const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+#[cfg(windows)]
+const FILE_TYPE_DISK: u32 = 1;
+#[cfg(windows)]
+const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
 
 /// Resolve the path of the file behind an open descriptor.
 ///
@@ -308,5 +418,207 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = swapper.join();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- Windows named-pipe race tests (issue #444, Z Tester BLOCKED #554)
+    //
+    // On Windows the pre-open metadata check in open_file_inside_project
+    // is the only guard against a named pipe: there is no open flag that
+    // both avoids the block and keeps synchronous reads working, so a
+    // file swapped for a pipe in the check-then-open window can still
+    // block the plain File::open. These tests exercise that window with
+    // a symlink to a never-connected named pipe, the Windows analogue
+    // of the Unix FIFO.
+
+    #[cfg(windows)]
+    fn wide_null(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    #[cfg(windows)]
+    unsafe extern "system" {
+        fn CreateNamedPipeW(
+            name: *const u16,
+            open_mode: u32,
+            pipe_mode: u32,
+            max_instances: u32,
+            out_buffer_size: u32,
+            in_buffer_size: u32,
+            default_timeout: u32,
+            security_attributes: *mut std::ffi::c_void,
+        ) -> *mut std::ffi::c_void;
+        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+    }
+
+    #[cfg(windows)]
+    const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
+    #[cfg(windows)]
+    const PIPE_TYPE_BYTE: u32 = 0x0000_0000;
+    #[cfg(windows)]
+    const PIPE_READMODE_BYTE: u32 = 0x0000_0000;
+    #[cfg(windows)]
+    const PIPE_WAIT: u32 = 0x0000_0000;
+    // INVALID_HANDLE_VALUE is defined at the parent module level and
+    // reached here through `use super::*`.
+
+    /// Create a named-pipe server that never accepts a client: no
+    /// ConnectNamedPipe call is ever made, so a client open blocks
+    /// until the server handle is closed. Returns the server handle
+    /// (kept alive by the caller) and the pipe path.
+    #[cfg(windows)]
+    fn create_listening_pipe(tag: &str) -> (*mut std::ffi::c_void, String) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let name = format!(r"\\.\pipe\zen_fs_{}_{}_{}", tag, std::process::id(), nanos);
+        let wname = wide_null(&name);
+        let handle = unsafe {
+            CreateNamedPipeW(
+                wname.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                1,
+                4096,
+                4096,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(
+            !handle.is_null() && handle != INVALID_HANDLE_VALUE,
+            "CreateNamedPipeW failed for {name}"
+        );
+        (handle, name)
+    }
+
+    #[cfg(windows)]
+    fn close_pipe(handle: *mut std::ffi::c_void) {
+        if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+            unsafe {
+                CloseHandle(handle);
+            }
+        }
+    }
+
+    /// Run open_file_inside_project on a worker thread and wait at most
+    /// `timeout` for it. Returns Some(result) when the open returned in
+    /// time, None when it blocked past the timeout (the worker thread is
+    /// left blocked; it exits with the test process).
+    #[cfg(windows)]
+    fn open_with_timeout(
+        path: &Path,
+        root: &Path,
+        timeout: std::time::Duration,
+    ) -> Option<Option<std::fs::File>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = path.to_path_buf();
+        let root = root.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(open_file_inside_project(&path, &root));
+        });
+        rx.recv_timeout(timeout).ok()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_pipe_symlink_without_blocking() {
+        // Issue #444 (Z Tester BLOCKED #554): the victim is a symlink
+        // to a never-connected named pipe at check time. The overlapped
+        // probe open returns at once and the type check rejects the
+        // pipe, so this returns None promptly. Run through the
+        // timeout wrapper so a broken probe (an open that blocks on a
+        // pipe) fails the test instead of hanging it.
+        let dir = tmp("winpipe");
+        let (pipe, pipe_name) = create_listening_pipe("static");
+        let victim = dir.join("victim.txt");
+        std::os::windows::fs::symlink_file(&pipe_name, &victim).unwrap();
+        let result = open_with_timeout(&victim, &dir, std::time::Duration::from_secs(5));
+        close_pipe(pipe);
+        let _ = std::fs::remove_dir_all(&dir);
+        match result {
+            Some(None) => {}
+            Some(Some(_)) => panic!("pipe symlink was opened as a regular file"),
+            None => panic!("open blocked on a pipe symlink (pre-open check did not reject it)"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn swapped_pipe_mid_open_never_blocks() {
+        // Issue #444 (Z Tester BLOCKED #554, head 6085da34): the
+        // Windows open must never block on a named pipe. A swapper
+        // thread flips the victim between a regular file and a symlink
+        // to a never-connected named pipe on a fixed alternating
+        // schedule while the reader loops; every open runs on a worker
+        // thread with a 5s watchdog, so a hang fails the test at the
+        // iteration that hit the window instead of hanging the suite.
+        // The premise (a symlink to a never-connected pipe blocks a
+        // plain open) is checked first: if it returns promptly, the
+        // race test could pass vacuously, so the test fails loudly
+        // instead. Fails on the pre-fix code (plain File::open blocks
+        // on the swapped-in pipe), passes with the overlapped probe.
+        let dir = tmp("winpiperace");
+        let (race_pipe, race_name) = create_listening_pipe("race");
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, "inside").unwrap();
+
+        // Premise check on a separate pipe, so the blocked premise
+        // thread never occupies the race pipe's single instance.
+        let (premise_pipe, premise_name) = create_listening_pipe("premise");
+        let premise_link = dir.join("premise.txt");
+        std::os::windows::fs::symlink_file(&premise_name, &premise_link).unwrap();
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let premise_link = premise_link.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(std::fs::File::open(&premise_link));
+            });
+            match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                _ => {
+                    close_pipe(premise_pipe);
+                    close_pipe(race_pipe);
+                    let _ = std::fs::remove_dir_all(&dir);
+                    panic!(
+                        "premise broken: opening a symlink to a never-connected named pipe did not block"
+                    );
+                }
+            }
+        }
+        // The premise thread stays blocked on the premise pipe for the
+        // rest of the test; closing the pipe handle below unblocks it.
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let swapper = {
+            let stop = std::sync::Arc::clone(&stop);
+            let victim = victim.clone();
+            let race_name = race_name.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = std::fs::remove_file(&victim);
+                    let _ = std::os::windows::fs::symlink_file(&race_name, &victim);
+                    let _ = std::fs::remove_file(&victim);
+                    let _ = std::fs::write(&victim, "inside");
+                }
+            })
+        };
+        let mut blocked_at = None;
+        for i in 0..2000 {
+            if open_with_timeout(&victim, &dir, std::time::Duration::from_secs(5)).is_none() {
+                blocked_at = Some(i);
+                break;
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = swapper.join();
+        close_pipe(premise_pipe);
+        close_pipe(race_pipe);
+        let _ = std::fs::remove_dir_all(&dir);
+        if let Some(i) = blocked_at {
+            panic!(
+                "open blocked on a swapped-in pipe at iteration {i} (Windows hang gap, issue #444)"
+            );
+        }
     }
 }

@@ -618,28 +618,20 @@ exclude_re = [
   # point, so the mutant no longer exists and the exclusion is deleted
   # instead of re-waived.
   # PR #554 (issue #444), fs.rs open_file_inside_project (Windows
-  # pre-open FIFO guard, line 46, col 8): delete `!` in
-  # `if !std::fs::metadata(path).is_ok_and(|m| m.is_file())`.
-  # EQUIVALENT on Linux (same shape as the sandbox.rs:194 non-unix
-  # fallback, waived 2026-11-21): the whole check is #[cfg(not(unix))],
-  # so on Linux this code is never compiled and the mutant cannot change
-  # anything the Linux build observes; the Windows CI job (windows-check)
-  # verifies the guard itself. No Linux test can kill this mutant.
-  # Verified by hand 2026-11-26: applying the mutant leaves all 7
-  # zen-core fs tests passing, because the mutated code is compiled out.
-  # EXPIRY: if the mutants job runs on a non-unix platform, this mutant
-  # stops being equivalent: remove this exclusion and kill it with a
-  # test where a regular file passes the guard and a FIFO does not.
-  "fs\\.rs:46:8: delete ! in open_file_inside_project",
+  # pre-open FIFO guard) - REMOVED 2026-11-26 (overlapped rework,
+  # Leader tin 24130): the pre-open metadata check is gone; the
+  # overlapped probe plus the type check is the single guard now, so
+  # the `delete !` mutant at the old line 46 no longer exists and the
+  # exclusion is deleted instead of re-waived.
   # PR #554 (issue #444), fs.rs open_nonblocking (non-unix variant,
-  # line 86, col 5): replace the body with Ok(Default::default()).
+  # line 83, col 5): replace the body with Ok(Default::default()).
   # EQUIVALENT on Linux (same shape as the sandbox.rs:194 non-unix
   # fallback, waived 2026-11-21): the whole function is #[cfg(not(unix))],
   # so on Linux this code is never compiled and the mutant cannot change
   # anything the Linux build observes; the Windows CI job (windows-check)
   # verifies the function itself. No Linux test can kill this mutant:
   # verified by hand 2026-11-26, applying the mutant leaves all 7
-  # zen-core fs tests passing. The Unix twin at fs.rs:77 is UNVIABLE
+  # zen-core fs tests passing. The Unix twin at fs.rs:73 is UNVIABLE
   # (File has no Default impl, so Ok(Default::default()) does not
   # compile there) and needs no exclusion. NOTE: this replaces the
   # killing test asked for in Leader tin 24069 ("code Unix that" was a
@@ -650,9 +642,49 @@ exclude_re = [
   # stops being equivalent: remove this exclusion and kill it with a
   # test that opens a real file through open_file_inside_project and
   # reads its content.
-  "fs\\.rs:86:5: replace open_nonblocking -> std::io::Result<File> with Ok\\(Default::default\\(\\)\\)",
+  # NOTE (2026-11-26): the overlapped rework (Leader tin 24130) moved
+  # this mutant from line 86 to line 83; the exclusion number was
+  # corrected to match, equivalence argument unchanged.
+  "fs\\.rs:83:5: replace open_nonblocking -> std::io::Result<File> with Ok\\(Default::default\\(\\)\\)",
+  # PR #554 (issue #444), fs.rs Windows overlapped open (Leader tin
+  # 24130: fix the mechanism, do not accept the limitation by comment).
+  # The non-unix open_nonblocking probes with CreateFileW +
+  # FILE_FLAG_OVERLAPPED (open_overlapped), checks the handle type
+  # (get_file_type), and reopens a regular file without the flag
+  # (reopen_without_overlapped); INVALID_HANDLE_VALUE is the shared
+  # sentinel. All of it is #[cfg(windows)] / #[cfg(not(unix))], so on
+  # Linux this code is never compiled and the mutants cannot change
+  # anything the Linux build observes; the Windows CI job
+  # (windows-check) runs the pipe regression tests that kill these
+  # mutants on Windows (a wrong share mode, a missing OVERLAPPED
+  # flag, an inverted type check, or a broken sentinel check makes
+  # the pipe tests hang or fail there). No Linux test can kill them.
+  # EXPIRY: if the mutants job runs on Windows, these mutants stop
+  # being equivalent: remove these exclusions and kill them with the
+  # fs.rs pipe tests (swapped_pipe_mid_open_never_blocks and
+  # rejects_pipe_symlink_without_blocking).
+  "fs\\.rs:93:45: replace != with == in open_nonblocking",
+  "fs\\.rs:108:5: replace open_overlapped -> std::io::Result<File> with Ok\\(Default::default\\(\\)\\)",
+  "fs\\.rs:119:29: replace \\| with & in open_overlapped",
+  "fs\\.rs:119:29: replace \\| with \\^ in open_overlapped",
+  "fs\\.rs:119:48: replace \\| with & in open_overlapped",
+  "fs\\.rs:119:48: replace \\| with \\^ in open_overlapped",
+  "fs\\.rs:122:34: replace \\| with & in open_overlapped",
+  "fs\\.rs:122:34: replace \\| with \\^ in open_overlapped",
+  "fs\\.rs:126:25: replace \\|\\| with && in open_overlapped",
+  "fs\\.rs:126:35: replace == with != in open_overlapped",
+  "fs\\.rs:136:5: replace get_file_type -> u32 with 0",
+  "fs\\.rs:136:5: replace get_file_type -> u32 with 1",
+  "fs\\.rs:145:5: replace reopen_without_overlapped -> std::io::Result<File> with Ok\\(Default::default\\(\\)\\)",
+  "fs\\.rs:150:29: replace \\| with & in reopen_without_overlapped",
+  "fs\\.rs:150:29: replace \\| with \\^ in reopen_without_overlapped",
+  "fs\\.rs:150:48: replace \\| with & in reopen_without_overlapped",
+  "fs\\.rs:150:48: replace \\| with \\^ in reopen_without_overlapped",
+  "fs\\.rs:154:22: replace \\|\\| with && in reopen_without_overlapped",
+  "fs\\.rs:154:29: replace == with != in reopen_without_overlapped",
+  "fs\\.rs:197:53: delete -",
   # PR #554 (issue #444), fs.rs resolved_fd_path (Windows)
-  # (line 104, col 5): replace the body with None / with
+  # (line 214, col 5): replace the body with None / with
   # Some(Default::default()).
   # EQUIVALENT on Linux (waived by ZC Leader, 2026-11-26; same shape
   # as the sandbox.rs:194 non-unix fallback, waived 2026-11-21): the
@@ -660,20 +692,21 @@ exclude_re = [
   # compiled and the mutant cannot change anything the Linux build
   # observes; the Windows CI job (windows-check) verifies the code
   # itself. No Linux test can kill these mutants. The Unix twin at
-  # fs.rs:97 is live on Linux and its mutants are caught by the
+  # fs.rs:207 is live on Linux and its mutants are caught by the
   # zen-core fs unit tests.
   # EXPIRY: if the mutants job runs on Windows, these mutants stop
   # being equivalent: remove these exclusions and kill them with
   # tests that call open_file_inside_project on Windows.
   # NOTE (2026-11-26): cargo-mutants reports the body-replacement
-  # mutant at the first statement of the body (the `use` at line 104),
-  # not the fn line (103); the exclusion numbers were corrected to
-  # match, equivalence argument unchanged.
-  "fs\\.rs:104:5: replace resolved_fd_path -> Option<PathBuf> with None",
-  "fs\\.rs:104:5: replace resolved_fd_path -> Option<PathBuf> with Some\\(Default::default\\(\\)\\)",
+  # mutant at the first statement of the body (the `use` at line 214),
+  # not the fn line (213); the exclusion numbers were corrected to
+  # match, equivalence argument unchanged. The overlapped rework
+  # (Leader tin 24130) moved this mutant from line 104 to line 214.
+  "fs\\.rs:214:5: replace resolved_fd_path -> Option<PathBuf> with None",
+  "fs\\.rs:214:5: replace resolved_fd_path -> Option<PathBuf> with Some\\(Default::default\\(\\)\\)",
   # PR #554 (issue #444), fs.rs resolved_fd_path (Windows)
-  # (line 117, col 10): replace `==` with `!=` in
-  # `if n == 0 || n as usize >= buf.len()`, and (line 64, col 15)
+  # (line 227, col 10): replace `==` with `!=` in
+  # `if n == 0 || n as usize >= buf.len()`, and (line 227, col 15)
   # replace `||` with `&&` in the same guard.
   # EQUIVALENT on Linux (waived by ZC Leader, 2026-11-26; same shape
   # as the sandbox.rs:194 non-unix fallback): the whole function is
@@ -685,15 +718,18 @@ exclude_re = [
   # being equivalent: remove these exclusions and kill them with
   # tests where GetFinalPathNameByHandleW returns 0 and where it
   # returns a full buffer.
-  "fs\\.rs:117:10: replace == with != in resolved_fd_path",
-  "fs\\.rs:117:15: replace \\|\\| with && in resolved_fd_path",
+  # NOTE (2026-11-26): the overlapped rework (Leader tin 24130)
+  # moved these mutants from lines 117:10 / 117:15 to 227:10 /
+  # 227:15; the exclusion numbers were corrected to match.
+  "fs\\.rs:227:10: replace == with != in resolved_fd_path",
+  "fs\\.rs:227:15: replace \\|\\| with && in resolved_fd_path",
   # PR #554 (issue #444), fs.rs normalize_verbatim_prefix (Windows)
-  # (line 131, col 5): replace the body with Default::default().
+  # (line 241, col 5): replace the body with Default::default().
   # EQUIVALENT on Linux (waived by ZC Leader, 2026-11-26; same shape
   # as the sandbox.rs:194 non-unix fallback): the whole function is
   # #[cfg(windows)], so on Linux this code is never compiled and the
   # mutant cannot change anything the Linux build observes. The
-  # non-Windows twin at fs.rs:140 is the identity function and is live
+  # non-Windows twin at fs.rs:250 is the identity function and is live
   # on Linux. No Linux test can kill this mutant; the Windows CI job
   # verifies the function itself.
   # EXPIRY: if the mutants job runs on Windows, this mutant stops
@@ -701,9 +737,10 @@ exclude_re = [
   # where the path carries the `\\?\` or `\\?\UNC\` prefix.
   # NOTE (2026-11-26): cargo-mutants reports the body-replacement
   # mutant at the first statement of the body (the `let text` at line
-  # 131), not the fn line (130); the exclusion number was corrected
-  # to match, equivalence argument unchanged.
-  "fs\\.rs:131:5: replace normalize_verbatim_prefix -> PathBuf with Default::default\\(\\)",
+  # 241), not the fn line (240); the exclusion number was corrected
+  # to match, equivalence argument unchanged. The overlapped rework
+  # (Leader tin 24130) moved this mutant from line 131 to line 241.
+  "fs\\.rs:241:5: replace normalize_verbatim_prefix -> PathBuf with Default::default\\(\\)",
   # PR #554 (issue #444), mentions.rs expand_pattern
   # (line 194, col 48): replace `>` with `>=` in
   # `if e.file_type().is_dir() && e.depth() > 0`.
