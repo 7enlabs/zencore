@@ -2407,6 +2407,30 @@ pub(crate) fn parse_anthropic_response(body: &str) -> anyhow::Result<ChatRespons
     })
 }
 
+/// Classify an Anthropic HTTP error the way the OpenAI client does
+/// (issue #341): route through safety::classify_error so 402 becomes
+/// QuotaExhausted with the shared quota wording instead of a raw
+/// HTTP 402 error, and 429/5xx stay retryable. HTTP 408 is transient
+/// by definition, so it retries here even though the shared classifier
+/// still calls it Fatal (separate issue #357).
+///
+/// Returns (retryable, err_text); quota errors never retry.
+fn classify_anthropic_http_error(
+    code: u16,
+    body: &str,
+    detail: String,
+    rid: Option<&str>,
+    provider: &str,
+) -> (bool, String) {
+    let class = safety::classify_error(Some(code), body);
+    let text = with_request_id(format!("HTTP {code}: {detail}"), rid);
+    if class == ErrorClass::QuotaExhausted {
+        return (false, safety::quota_exhausted_error(provider, &text));
+    }
+    let retryable = code == 408 || class.is_retryable();
+    (retryable, text)
+}
+
 #[async_trait]
 impl LlmBackend for AnthropicClient {
     async fn chat(&self, req: ChatRequest) -> anyhow::Result<ChatResponse> {
@@ -2458,13 +2482,14 @@ impl LlmBackend for AnthropicClient {
                             .err()
                             .map(|e| e.to_string())
                             .unwrap_or_else(|| first_chars(&resp_body, ERROR_BODY_CHARS));
-                        let retryable = matches!(code, 429 | 500 | 502 | 503 | 504 | 529);
-                        (
-                            retryable,
-                            retryable,
-                            Some(code),
-                            with_request_id(format!("HTTP {}: {}", code, msg), rid.as_deref()),
-                        )
+                        let (retryable, err_text) = classify_anthropic_http_error(
+                            code,
+                            &resp_body,
+                            msg,
+                            rid.as_deref(),
+                            &provider_name_for_url(&self.base_url),
+                        );
+                        (retryable, retryable, Some(code), err_text)
                     } else if (200..300).contains(&code) {
                         // Mirror the OpenAI path (issue #336): an empty
                         // 200 with no tool call, or a provider-reported
@@ -2493,20 +2518,14 @@ impl LlmBackend for AnthropicClient {
                             },
                         }
                     } else {
-                        let retryable = matches!(code, 429 | 500 | 502 | 503 | 504 | 529);
-                        (
-                            retryable,
-                            retryable,
-                            Some(code),
-                            with_request_id(
-                                format!(
-                                    "HTTP {}: {}",
-                                    code,
-                                    first_chars(&resp_body, ERROR_BODY_CHARS)
-                                ),
-                                rid.as_deref(),
-                            ),
-                        )
+                        let (retryable, err_text) = classify_anthropic_http_error(
+                            code,
+                            &resp_body,
+                            first_chars(&resp_body, ERROR_BODY_CHARS),
+                            rid.as_deref(),
+                            &provider_name_for_url(&self.base_url),
+                        );
+                        (retryable, retryable, Some(code), err_text)
                     }
                 }
                 Err(e) => (true, false, None, timeout_text(&e)),
@@ -3706,5 +3725,183 @@ mod anthropic_tests {
                 .unwrap()
                 .contains("empty message")
         );
+    }
+    const ANTHROPIC_OK_BODY: &str = r#"{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":5}}"#;
+
+    fn anthropic_error_body(message: &str) -> String {
+        serde_json::json!({
+            "type": "error",
+            "error": {"type": "api_error", "message": message}
+        })
+        .to_string()
+    }
+
+    async fn spawn_scripted_server(
+        responses: Vec<(u16, String)>,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count2 = count.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 65536];
+                let mut got = Vec::new();
+                while let Ok(n) = sock.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(&buf[..n]);
+                    let txt = String::from_utf8_lossy(&got);
+                    if let Some(h) = txt.find("\r\n\r\n") {
+                        let len = txt[..h]
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if got.len() >= h + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let n = count2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (status, body) = responses
+                    .get(n)
+                    .or_else(|| responses.last())
+                    .cloned()
+                    .unwrap_or((500, "no scripted response".to_string()));
+                let reason = match status {
+                    200 => "OK",
+                    401 => "Unauthorized",
+                    402 => "Payment Required",
+                    408 => "Request Timeout",
+                    429 => "Too Many Requests",
+                    _ => "Error",
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        (addr, count, handle)
+    }
+
+    fn anthropic_test_client(addr: std::net::SocketAddr) -> AnthropicClient {
+        let sink: Arc<dyn EventSink> = Arc::new(crate::testutil::CollectSink::default());
+        let mut c = AnthropicClient::new(format!("http://{addr}"), None, sink);
+        c.base_retry_delay_ms = 1;
+        c
+    }
+
+    #[tokio::test]
+    async fn anthropic_408_error_payload_is_retried() {
+        // Issue 341: 408 is transient by definition; the old
+        // hardcoded retry set never retried it.
+        let (addr, count, server) = spawn_scripted_server(vec![
+            (408, anthropic_error_body("Request timed out")),
+            (200, ANTHROPIC_OK_BODY.to_string()),
+        ])
+        .await;
+        let c = anthropic_test_client(addr);
+        let r = c.chat(req()).await.unwrap();
+        assert_eq!(r.message.text_ref(), Some("ok"));
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_408_plain_body_is_retried() {
+        // Issue 341: the non-error-payload branch had the same
+        // hardcoded retry set, so a plain 408 body never retried.
+        let (addr, count, server) = spawn_scripted_server(vec![
+            (408, "Request Timeout".to_string()),
+            (200, ANTHROPIC_OK_BODY.to_string()),
+        ])
+        .await;
+        let c = anthropic_test_client(addr);
+        let r = c.chat(req()).await.unwrap();
+        assert_eq!(r.message.text_ref(), Some("ok"));
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_402_returns_quota_error_without_retry() {
+        // Issue 341: 402 must surface the shared quota wording
+        // (like the OpenAI client) and must not retry.
+        let (addr, count, server) =
+            spawn_scripted_server(vec![(402, anthropic_error_body("Payment required"))]).await;
+        let c = anthropic_test_client(addr);
+        let err = c.chat(req()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Out of quota / billing issue"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_401_is_not_retried() {
+        // Issue 341: routing through the shared classifier keeps
+        // 401 Fatal, so it still returns at once, unretried.
+        let (addr, count, server) =
+            spawn_scripted_server(vec![(401, anthropic_error_body("Invalid API key"))]).await;
+        let c = anthropic_test_client(addr);
+        let err = c.chat(req()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("HTTP 401"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[test]
+    fn classify_anthropic_http_error_routes_through_shared_classifier() {
+        // Issue 341: 408 retries, 402 gets quota wording, 429/5xx
+        // retry, 401/403 do not.
+        let (retryable, text) = classify_anthropic_http_error(
+            408,
+            "{}",
+            "Request timed out".to_string(),
+            None,
+            "anthropic",
+        );
+        assert!(retryable);
+        assert!(text.contains("HTTP 408"));
+        let (retryable, text) = classify_anthropic_http_error(
+            402,
+            "{}",
+            "Payment required".to_string(),
+            None,
+            "anthropic",
+        );
+        assert!(!retryable);
+        assert!(text.contains("Out of quota / billing issue"));
+        for code in [429, 500, 502, 503, 504, 529] {
+            let (retryable, _) =
+                classify_anthropic_http_error(code, "{}", "boom".to_string(), None, "anthropic");
+            assert!(retryable, "code {code} should retry");
+        }
+        for code in [400, 401, 403, 404] {
+            let (retryable, _) =
+                classify_anthropic_http_error(code, "{}", "boom".to_string(), None, "anthropic");
+            assert!(!retryable, "code {code} should not retry");
+        }
     }
 }
