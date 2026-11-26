@@ -468,9 +468,12 @@ mod tests {
     // reached here through `use super::*`.
 
     /// Create a named-pipe server that never accepts a client: no
-    /// ConnectNamedPipe call is ever made, so a client open blocks
-    /// until the server handle is closed. Returns the server handle
-    /// (kept alive by the caller) and the pipe path.
+    /// ConnectNamedPipe call is ever made. A client open still
+    /// connects at once (MSDN, Named Pipe Operations: an available
+    /// instance yields a handle immediately); the blocking hazard is
+    /// reading from the pipe, which waits forever for data that never
+    /// comes. Returns the server handle (kept alive by the caller)
+    /// and the pipe path.
     #[cfg(windows)]
     fn create_listening_pipe(tag: &str) -> (*mut std::ffi::c_void, String) {
         let nanos = std::time::SystemTime::now()
@@ -553,47 +556,71 @@ mod tests {
     #[test]
     fn swapped_pipe_mid_open_never_blocks() {
         // Issue #444 (Z Tester BLOCKED #554, head 6085da34): the
-        // Windows open must never block on a named pipe. A swapper
-        // thread flips the victim between a regular file and a symlink
-        // to a never-connected named pipe on a fixed alternating
-        // schedule while the reader loops; every open runs on a worker
-        // thread with a 5s watchdog, so a hang fails the test at the
-        // iteration that hit the window instead of hanging the suite.
-        // The premise (a symlink to a never-connected pipe blocks a
-        // plain open) is checked first: if it returns promptly, the
-        // race test could pass vacuously, so the test fails loudly
-        // instead. Fails on the pre-fix code (plain File::open blocks
-        // on the swapped-in pipe), passes with the overlapped probe.
+        // Windows helper must never hand the caller a named pipe. A
+        // swapper thread flips the victim between a regular file and
+        // a symlink to a never-connected named pipe on a fixed
+        // alternating schedule while the reader loops; every open runs
+        // on a worker thread with a 5s watchdog, so a hang fails the
+        // test at the iteration that hit the window instead of
+        // hanging the suite. The premise (a read from a naive-opened
+        // pipe blocks) is checked first: a plain client open connects
+        // to an available instance at once, so the hang gap is the
+        // read, not the open. If the read did not block, the race
+        // test could pass vacuously, so the test fails loudly
+        // instead.
         let dir = tmp("winpiperace");
         let (race_pipe, race_name) = create_listening_pipe("race");
         let victim = dir.join("victim.txt");
         std::fs::write(&victim, "inside").unwrap();
 
-        // Premise check on a separate pipe, so the blocked premise
-        // thread never occupies the race pipe's single instance.
+        // Premise check on a separate pipe, so the premise open never
+        // occupies the race pipe's single instance. A naive open of
+        // the pipe symlink returns promptly with a live pipe handle;
+        // a read from that handle must block (the server never
+        // writes), which is the real hang gap. If the read returned
+        // instead, the race test could pass vacuously, so the test
+        // fails loudly instead.
         let (premise_pipe, premise_name) = create_listening_pipe("premise");
         let premise_link = dir.join("premise.txt");
         std::os::windows::fs::symlink_file(&premise_name, &premise_link).unwrap();
+        let premise_file = match std::fs::File::open(&premise_link) {
+            Ok(file) => file,
+            Err(e) => {
+                close_pipe(premise_pipe);
+                close_pipe(race_pipe);
+                let _ = std::fs::remove_dir_all(&dir);
+                panic!("premise broken: naive open of the pipe symlink failed: {e}");
+            }
+        };
         {
+            use std::io::Read;
             let (tx, rx) = std::sync::mpsc::channel();
-            let premise_link = premise_link.clone();
             std::thread::spawn(move || {
-                let _ = tx.send(std::fs::File::open(&premise_link));
+                let mut file = premise_file;
+                let mut buf = [0u8; 1];
+                let _ = tx.send(file.read(&mut buf));
             });
             match rx.recv_timeout(std::time::Duration::from_secs(2)) {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                _ => {
+                Ok(_) => {
                     close_pipe(premise_pipe);
                     close_pipe(race_pipe);
                     let _ = std::fs::remove_dir_all(&dir);
                     panic!(
-                        "premise broken: opening a symlink to a never-connected named pipe did not block"
+                        "premise broken: reading from a never-connected named pipe did not block"
                     );
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    close_pipe(premise_pipe);
+                    close_pipe(race_pipe);
+                    let _ = std::fs::remove_dir_all(&dir);
+                    panic!("premise broken: premise thread ended without sending");
                 }
             }
         }
-        // The premise thread stays blocked on the premise pipe for the
-        // rest of the test; closing the pipe handle below unblocks it.
+        // The premise thread stays blocked reading from the premise
+        // pipe for the rest of the test; closing the server handle
+        // below unblocks it.
 
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let swapper = {
