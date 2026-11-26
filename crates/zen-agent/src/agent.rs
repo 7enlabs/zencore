@@ -942,7 +942,17 @@ impl Agent {
             if let Some(threshold) = self.config.auto_compact_threshold {
                 let used = compaction::context_tokens(self);
                 if used > threshold && !self.messages.is_empty() {
-                    let _ = compaction::compact_impl(self, None, "auto").await;
+                    // Issue #370: a failed auto-compact must be reported,
+                    // not swallowed. The turn continues with the uncompacted
+                    // context (compaction retries on the next turn); the
+                    // failure is surfaced as an event so it is visible in
+                    // the CLI output and the stream-json event stream.
+                    if let Err(err) = compaction::compact_impl(self, None, "auto").await {
+                        self.sink.emit(AgentEvent::SystemMessage {
+                            event: "AutoCompact".to_string(),
+                            text: format!("auto-compact failed: {err:#}"),
+                        });
+                    }
                 }
             }
 
