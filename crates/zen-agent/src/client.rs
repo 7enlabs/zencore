@@ -47,8 +47,7 @@ impl HttpTimeouts {
     }
 
     pub fn from_secs(base_url: &str, request_secs: Option<u64>, idle_secs: Option<u64>) -> Self {
-        let default = if is_local_url(base_url) || base_url.to_ascii_lowercase().contains("ollama")
-        {
+        let default = if is_local_url(base_url) || is_ollama_host(base_url) {
             LOCAL_REQUEST_TIMEOUT_SECS
         } else {
             DEFAULT_REQUEST_TIMEOUT_SECS
@@ -197,18 +196,41 @@ fn with_extra_roots(mut b: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     b
 }
 
+/// Exact host of a base URL, lowercased, or `None` when the URL does not
+/// parse. `Url::parse` lowercases the host; one surrounding `[]` pair on
+/// an IPv6 literal (`host_str()` keeps it in url 2.5) is stripped here, so
+/// `[::1]` and `::1` compare equal.
+fn url_host(url: &str) -> Option<String> {
+    reqwest::Url::parse(url).ok().and_then(|u| {
+        u.host_str().map(|h| {
+            h.strip_prefix('[')
+                .and_then(|inner| inner.strip_suffix(']'))
+                .unwrap_or(h)
+                .to_ascii_lowercase()
+        })
+    })
+}
+
 fn is_local_url(url: &str) -> bool {
-    let b = url.to_ascii_lowercase();
-    b.contains("://127.0.0.1") || b.contains("://localhost") || b.contains("://[::1]")
+    matches!(
+        url_host(url).as_deref(),
+        Some("localhost") | Some("127.0.0.1") | Some("::1")
+    )
+}
+
+/// Bare `ollama` hostname (e.g. a Docker service name): the host is exactly
+/// `ollama`, not merely a domain that contains the word.
+fn is_ollama_host(url: &str) -> bool {
+    url_host(url).as_deref() == Some("ollama")
 }
 
 /// Display label for rate-limit/quota messages: the configured base
 /// URL's host, never a hardcoded provider name.
 fn provider_name_for_url(url: &str) -> String {
-    let lower = url.to_ascii_lowercase();
-    if lower.contains("ollama") || is_local_url(url) {
+    if is_ollama_host(url) || is_local_url(url) {
         return "local".to_string();
     }
+    let lower = url.to_ascii_lowercase();
     let host = lower
         .rsplit("://")
         .next()
@@ -1560,6 +1582,39 @@ mod tests {
         assert!(is_local_url("http://LOCALHOST:1234"));
         assert!(is_local_url("http://[::1]:5/v1"));
         assert!(!is_local_url("https://api.example.com"));
+        // #343: a public host that merely contains a local marker is not local.
+        assert!(!is_local_url("https://localhost.evil.com/v1"));
+        assert!(!is_local_url("https://127.0.0.1.evil.com/v1"));
+        assert!(!is_local_url("https://[::1].evil.com/v1"));
+        assert!(!is_local_url(
+            "https://evil.com/?next=http://localhost:11434"
+        ));
+    }
+
+    #[test]
+    fn http_timeouts_local_vs_remote() {
+        // #343: a lookalike public host gets the 300 s remote timeout,
+        // not the 900 s local one.
+        assert_eq!(
+            HttpTimeouts::for_url("http://localhost:11434").request,
+            Some(Duration::from_secs(900))
+        );
+        assert_eq!(
+            HttpTimeouts::for_url("http://ollama:11434").request,
+            Some(Duration::from_secs(900))
+        );
+        assert_eq!(
+            HttpTimeouts::for_url("https://localhost.evil.com/v1").request,
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(
+            HttpTimeouts::for_url("https://ollama.example.com/api").request,
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(
+            HttpTimeouts::for_url("https://api.openai.com/v1").request,
+            Some(Duration::from_secs(300))
+        );
     }
 
     #[test]
@@ -1995,7 +2050,7 @@ mod tests {
 
     #[test]
     fn provider_name_for_url_returns_exact_host() {
-        // PR #271 mutant kills (client.rs:208): the `-> String` mutant
+        // PR #271 mutant kills (client.rs:224): the `-> String` mutant
         // returning String::new() and the one returning "xyzzy" both die
         // on these exact-value asserts.
         assert_eq!(
@@ -2015,17 +2070,31 @@ mod tests {
 
     #[test]
     fn provider_name_for_url_local_on_either_condition() {
-        // PR #271 mutant kill (client.rs:209): the `||` -> `&&` mutant
-        // dies because each URL here satisfies exactly one of the two
-        // conditions, so only `||` returns "local" for all of them.
+        // PR #271 mutant kill: the `||` -> `&&` mutant dies because each
+        // URL here satisfies exactly one of the two conditions, so only
+        // `||` returns "local" for all of them.
         // Ollama name, not a local URL.
-        assert_eq!(
-            provider_name_for_url("https://ollama.example.com/api"),
-            "local"
-        );
+        assert_eq!(provider_name_for_url("http://ollama:11434"), "local");
         // Local URL, no ollama name.
         assert_eq!(provider_name_for_url("http://localhost:11434"), "local");
         assert_eq!(provider_name_for_url("http://127.0.0.1:8080/v1"), "local");
+    }
+
+    #[test]
+    fn provider_name_for_url_evil_lookalike_hosts_are_not_local() {
+        // #343: substring matching treated these public hosts as local.
+        assert_eq!(
+            provider_name_for_url("https://localhost.evil.com/v1"),
+            "localhost.evil.com"
+        );
+        assert_eq!(
+            provider_name_for_url("https://ollama.example.com/api"),
+            "ollama.example.com"
+        );
+        assert_eq!(
+            provider_name_for_url("https://127.0.0.1.evil.com/v1"),
+            "127.0.0.1.evil.com"
+        );
     }
 
     #[test]
