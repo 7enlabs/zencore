@@ -140,6 +140,12 @@ fn get_file_type(handle: *mut std::ffi::c_void) -> u32 {
 /// the returned handle supports synchronous reads. ReOpenFile returns
 /// a handle to the same file object, so no path is consulted and the
 /// swap window cannot intervene.
+///
+/// The flags argument must carry no FILE_ATTRIBUTE_* bits: MSDN states
+/// that ReOpenFile's dwFlags "cannot contain any of the file attribute
+/// flags (FILE_ATTRIBUTE_*)", so passing FILE_ATTRIBUTE_NORMAL here
+/// made every reopen fail and regular files unreadable on Windows.
+/// Pass 0 for a plain synchronous handle.
 #[cfg(windows)]
 fn reopen_without_overlapped(handle: *mut std::ffi::c_void) -> std::io::Result<File> {
     use std::os::windows::io::FromRawHandle;
@@ -148,7 +154,7 @@ fn reopen_without_overlapped(handle: *mut std::ffi::c_void) -> std::io::Result<F
             handle,
             GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_ATTRIBUTE_NORMAL,
+            0,
         )
     };
     if new.is_null() || new == INVALID_HANDLE_VALUE {

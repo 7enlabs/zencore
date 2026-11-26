@@ -663,6 +663,11 @@ exclude_re = [
   # being equivalent: remove these exclusions and kill them with the
   # fs.rs pipe tests (swapped_pipe_mid_open_never_blocks and
   # rejects_pipe_symlink_without_blocking).
+  # NOTE (2026-11-26): the ReOpenFile-flags fix added a 6-line doc
+  # comment above reopen_without_overlapped, moving its mutants from
+  # 145:5 / 150:29 / 150:48 / 154:22 / 154:29 / 197:53 to 151:5 /
+  # 156:29 / 156:48 / 160:22 / 160:29 / 203:53; the exclusion
+  # numbers were corrected to match, equivalence argument unchanged.
   "fs\\.rs:93:45: replace != with == in open_nonblocking",
   "fs\\.rs:108:5: replace open_overlapped -> std::io::Result<File> with Ok\\(Default::default\\(\\)\\)",
   "fs\\.rs:119:29: replace \\| with & in open_overlapped",
@@ -675,16 +680,16 @@ exclude_re = [
   "fs\\.rs:126:35: replace == with != in open_overlapped",
   "fs\\.rs:136:5: replace get_file_type -> u32 with 0",
   "fs\\.rs:136:5: replace get_file_type -> u32 with 1",
-  "fs\\.rs:145:5: replace reopen_without_overlapped -> std::io::Result<File> with Ok\\(Default::default\\(\\)\\)",
-  "fs\\.rs:150:29: replace \\| with & in reopen_without_overlapped",
-  "fs\\.rs:150:29: replace \\| with \\^ in reopen_without_overlapped",
-  "fs\\.rs:150:48: replace \\| with & in reopen_without_overlapped",
-  "fs\\.rs:150:48: replace \\| with \\^ in reopen_without_overlapped",
-  "fs\\.rs:154:22: replace \\|\\| with && in reopen_without_overlapped",
-  "fs\\.rs:154:29: replace == with != in reopen_without_overlapped",
-  "fs\\.rs:197:53: delete -",
+  "fs\\.rs:151:5: replace reopen_without_overlapped -> std::io::Result<File> with Ok\\(Default::default\\(\\)\\)",
+  "fs\\.rs:156:29: replace \\| with & in reopen_without_overlapped",
+  "fs\\.rs:156:29: replace \\| with \\^ in reopen_without_overlapped",
+  "fs\\.rs:156:48: replace \\| with & in reopen_without_overlapped",
+  "fs\\.rs:156:48: replace \\| with \\^ in reopen_without_overlapped",
+  "fs\\.rs:160:22: replace \\|\\| with && in reopen_without_overlapped",
+  "fs\\.rs:160:29: replace == with != in reopen_without_overlapped",
+  "fs\\.rs:203:53: delete -",
   # PR #554 (issue #444), fs.rs resolved_fd_path (Windows)
-  # (line 214, col 5): replace the body with None / with
+  # (line 220, col 5): replace the body with None / with
   # Some(Default::default()).
   # EQUIVALENT on Linux (waived by ZC Leader, 2026-11-26; same shape
   # as the sandbox.rs:194 non-unix fallback, waived 2026-11-21): the
@@ -692,21 +697,22 @@ exclude_re = [
   # compiled and the mutant cannot change anything the Linux build
   # observes; the Windows CI job (windows-check) verifies the code
   # itself. No Linux test can kill these mutants. The Unix twin at
-  # fs.rs:207 is live on Linux and its mutants are caught by the
+  # fs.rs:213 is live on Linux and its mutants are caught by the
   # zen-core fs unit tests.
   # EXPIRY: if the mutants job runs on Windows, these mutants stop
   # being equivalent: remove these exclusions and kill them with
   # tests that call open_file_inside_project on Windows.
   # NOTE (2026-11-26): cargo-mutants reports the body-replacement
-  # mutant at the first statement of the body (the `use` at line 214),
-  # not the fn line (213); the exclusion numbers were corrected to
+  # mutant at the first statement of the body (the `use` at line 220),
+  # not the fn line (219); the exclusion numbers were corrected to
   # match, equivalence argument unchanged. The overlapped rework
-  # (Leader tin 24130) moved this mutant from line 104 to line 214.
-  "fs\\.rs:214:5: replace resolved_fd_path -> Option<PathBuf> with None",
-  "fs\\.rs:214:5: replace resolved_fd_path -> Option<PathBuf> with Some\\(Default::default\\(\\)\\)",
+  # (Leader tin 24130) moved this mutant from line 104 to line 214,
+  # and the ReOpenFile-flags fix (2026-11-26) moved it to line 220.
+  "fs\\.rs:220:5: replace resolved_fd_path -> Option<PathBuf> with None",
+  "fs\\.rs:220:5: replace resolved_fd_path -> Option<PathBuf> with Some\\(Default::default\\(\\)\\)",
   # PR #554 (issue #444), fs.rs resolved_fd_path (Windows)
-  # (line 227, col 10): replace `==` with `!=` in
-  # `if n == 0 || n as usize >= buf.len()`, and (line 227, col 15)
+  # (line 233, col 10): replace `==` with `!=` in
+  # `if n == 0 || n as usize >= buf.len()`, and (line 233, col 15)
   # replace `||` with `&&` in the same guard.
   # EQUIVALENT on Linux (waived by ZC Leader, 2026-11-26; same shape
   # as the sandbox.rs:194 non-unix fallback): the whole function is
@@ -720,16 +726,17 @@ exclude_re = [
   # returns a full buffer.
   # NOTE (2026-11-26): the overlapped rework (Leader tin 24130)
   # moved these mutants from lines 117:10 / 117:15 to 227:10 /
-  # 227:15; the exclusion numbers were corrected to match.
-  "fs\\.rs:227:10: replace == with != in resolved_fd_path",
-  "fs\\.rs:227:15: replace \\|\\| with && in resolved_fd_path",
+  # 227:15, and the ReOpenFile-flags fix (2026-11-26) moved them to
+  # 233:10 / 233:15; the exclusion numbers were corrected to match.
+  "fs\\.rs:233:10: replace == with != in resolved_fd_path",
+  "fs\\.rs:233:15: replace \\|\\| with && in resolved_fd_path",
   # PR #554 (issue #444), fs.rs normalize_verbatim_prefix (Windows)
-  # (line 241, col 5): replace the body with Default::default().
+  # (line 247, col 5): replace the body with Default::default().
   # EQUIVALENT on Linux (waived by ZC Leader, 2026-11-26; same shape
   # as the sandbox.rs:194 non-unix fallback): the whole function is
   # #[cfg(windows)], so on Linux this code is never compiled and the
   # mutant cannot change anything the Linux build observes. The
-  # non-Windows twin at fs.rs:250 is the identity function and is live
+  # non-Windows twin at fs.rs:256 is the identity function and is live
   # on Linux. No Linux test can kill this mutant; the Windows CI job
   # verifies the function itself.
   # EXPIRY: if the mutants job runs on Windows, this mutant stops
@@ -737,10 +744,11 @@ exclude_re = [
   # where the path carries the `\\?\` or `\\?\UNC\` prefix.
   # NOTE (2026-11-26): cargo-mutants reports the body-replacement
   # mutant at the first statement of the body (the `let text` at line
-  # 241), not the fn line (240); the exclusion number was corrected
+  # 247), not the fn line (246); the exclusion number was corrected
   # to match, equivalence argument unchanged. The overlapped rework
-  # (Leader tin 24130) moved this mutant from line 131 to line 241.
-  "fs\\.rs:241:5: replace normalize_verbatim_prefix -> PathBuf with Default::default\\(\\)",
+  # (Leader tin 24130) moved this mutant from line 131 to line 241,
+  # and the ReOpenFile-flags fix (2026-11-26) moved it to line 247.
+  "fs\\.rs:247:5: replace normalize_verbatim_prefix -> PathBuf with Default::default\\(\\)",
   # PR #554 (issue #444), mentions.rs expand_pattern
   # (line 194, col 48): replace `>` with `>=` in
   # `if e.file_type().is_dir() && e.depth() > 0`.
