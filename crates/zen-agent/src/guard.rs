@@ -62,7 +62,28 @@ impl TurnGuard {
         } else {
             p.to_path_buf()
         };
-        rel.to_string_lossy().replace('\\', "/")
+        // Lexically resolve `.` and `..` segments (#359): without this,
+        // `src/../other/x.rs` matches a `src/**` scope because `**`
+        // swallows the `..`, even though the file actually written is
+        // `other/x.rs`, outside the scope. A `..` with nothing left to
+        // pop is kept, so the path stays visibly outside the stripped
+        // root instead of silently collapsing into scope.
+        let s = rel.to_string_lossy().replace('\\', "/");
+        let mut out: Vec<&str> = Vec::new();
+        for seg in s.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    if out.is_empty() || out.last() == Some(&"..") {
+                        out.push("..");
+                    } else {
+                        out.pop();
+                    }
+                }
+                _ => out.push(seg),
+            }
+        }
+        out.join("/")
     }
 
     fn check_scope(&mut self, tool: &str, args: &Value) -> Option<String> {
@@ -282,6 +303,62 @@ mod tests {
             g.observe("Edit", &abs_in, &ok()).is_none(),
             "absolute in-scope path is quiet"
         );
+    }
+
+    #[test]
+    fn scope_check_normalizes_dotdot_before_glob_match() {
+        // Regression test for #359: `src/../other/x.rs` is really
+        // `other/x.rs`, outside a `src/**` scope, so the scope nudge
+        // must fire; before the fix `**` swallowed the `..` and the
+        // edit stayed silent.
+        let mut g = TurnGuard::default();
+        g.set_cwd(PathBuf::from("/repo"));
+        g.set_scope(vec!["src/**".into()]);
+        let sneaky = json!({"file_path": "/repo/src/../other/x.rs"});
+        let n = g
+            .observe("Edit", &sneaky, &ok())
+            .expect("dotdot escape out of scope nudges");
+        assert!(
+            n.contains("outside your declared task scope") && n.contains("other/x.rs"),
+            "{n}"
+        );
+        // The same trick resolving back inside the scope stays quiet.
+        let back_inside = json!({"file_path": "/repo/src/../src/main.rs"});
+        assert!(
+            g.observe("Edit", &back_inside, &ok()).is_none(),
+            "path normalising back inside scope is quiet"
+        );
+        // Relative form: the cwd strip does not apply, the normaliser
+        // still resolves the `..`.
+        let rel_sneaky = json!({"file_path": "src/../other/z.rs"});
+        assert!(
+            g.observe("Edit", &rel_sneaky, &ok())
+                .unwrap()
+                .contains("other/z.rs"),
+            "relative dotdot escape nudges"
+        );
+    }
+
+    #[test]
+    fn normalize_resolves_dot_and_dotdot_segments() {
+        // Pins the two arms the mutants CI found on PR #565:
+        // deleting the `"" | "."` arm and flipping the `||` that keeps
+        // a leading `..` both change these outputs.
+        let mut g = TurnGuard::default();
+        g.set_cwd(PathBuf::from("/repo"));
+        let cases = [
+            ("src/./main.rs", "src/main.rs"),
+            ("src//main.rs", "src/main.rs"),
+            ("src/../other/x.rs", "other/x.rs"),
+            ("src/../src/main.rs", "src/main.rs"),
+            ("../other/x.rs", "../other/x.rs"),
+            ("src/../../x.rs", "../x.rs"),
+            ("/repo/src/./main.rs", "src/main.rs"),
+            ("/repo/src/../../x.rs", "../x.rs"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(g.normalize(input), expected, "normalize({input:?})");
+        }
     }
 
     #[test]
