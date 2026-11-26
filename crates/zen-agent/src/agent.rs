@@ -217,6 +217,20 @@ async fn run_tool_once(
 
 const TOOL_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Aborts the heartbeat task when dropped, so a panic in the tool call still
+/// cancels it: the panic unwinds past the normal return path, and without
+/// this guard the spawned task would keep emitting `ToolProgress` forever
+/// (#367).
+struct HeartbeatGuard {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // floor-guard: params-struct refactor deferred
 pub(crate) async fn run_tool_with_heartbeat(
     tool: Arc<dyn Tool>,
@@ -230,21 +244,23 @@ pub(crate) async fn run_tool_with_heartbeat(
 ) -> ToolOutput {
     let hb_sink = sink.clone();
     let start = std::time::Instant::now();
-    let heartbeat = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
+    let heartbeat = HeartbeatGuard {
+        handle: tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
 
-        ticker.tick().await;
-        loop {
             ticker.tick().await;
-            hb_sink.emit(AgentEvent::ToolProgress {
-                tool_use_id: tool_use_id.clone(),
-                tool_name: tool_name.clone(),
-                elapsed_ms: start.elapsed().as_millis() as u64,
-            });
-        }
-    });
+            loop {
+                ticker.tick().await;
+                hb_sink.emit(AgentEvent::ToolProgress {
+                    tool_use_id: tool_use_id.clone(),
+                    tool_name: tool_name.clone(),
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        }),
+    };
     let out = run_tool(tool, args, ctx, timeout_ms).await;
-    heartbeat.abort();
+    drop(heartbeat);
     out
 }
 
