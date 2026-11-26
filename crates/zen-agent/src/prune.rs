@@ -277,9 +277,13 @@ pub fn prune_messages(
                 summarize_pruned(&label, identifier.as_deref(), tokens, age),
                 first_line(&original, 200)
             );
+            // Count only what was actually saved (#362): the summary
+            // itself still costs tokens, so the saving is the original
+            // minus the summary, not the whole original.
+            let saved = tokens.saturating_sub(est_tokens(&summary));
             messages[i].content = Some(summary.into());
             stats.pruned += 1;
-            stats.pruned_tokens += tokens;
+            stats.pruned_tokens += saved;
         }
     }
     stats
@@ -440,6 +444,36 @@ mod tests {
             }
         }
         (messages, turn_starts)
+    }
+
+    #[test]
+    fn pruned_tokens_counts_only_what_was_saved() {
+        // Regression test for #362: pruned_tokens added the whole
+        // original result, not the saving (original - summary).
+        let (mut messages, turn_starts) = fixture_15_turns();
+        let current_turn = turn_starts.len() - 1;
+        let before: Vec<u64> = messages
+            .iter()
+            .map(|m| m.text_ref().map(est_tokens).unwrap_or(0))
+            .collect();
+
+        let stats = prune_messages(&mut messages, &turn_starts, current_turn, &cfg(), "");
+
+        assert_eq!(stats.pruned, 10);
+        let mut actual_saved: u64 = 0;
+        for (i, m) in messages.iter().enumerate() {
+            if m.text().starts_with(PRUNE_MARKER) {
+                actual_saved += before[i].saturating_sub(est_tokens(&m.text()));
+            }
+        }
+        assert_eq!(
+            stats.pruned_tokens, actual_saved,
+            "pruned_tokens must be the saving, not the whole original"
+        );
+        assert!(
+            actual_saved > 0 && actual_saved < before.iter().sum::<u64>(),
+            "saving is a strict part of the original: {actual_saved}"
+        );
     }
 
     #[test]
