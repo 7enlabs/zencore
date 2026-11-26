@@ -983,6 +983,11 @@ mod tests {
         // WouldBlock, Windows lock violation is raw OS error 33. Kills
         // the || -> && and == -> != mutants on both comparisons.
         use std::io::{Error, ErrorKind};
+        // Raw 11 is EAGAIN (WouldBlock) only on Unix. On Windows it is
+        // ERROR_BAD_FORMAT, which classifies as GiveUp, so this assert
+        // is Unix-only; the WouldBlock-kind assert below covers Retry
+        // on every platform.
+        #[cfg(unix)]
         assert!(matches!(
             classify_lock_error(&Error::from_raw_os_error(11)),
             LockWait::Retry
