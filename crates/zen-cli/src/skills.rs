@@ -233,6 +233,12 @@ pub const ZENCORE_SIGNING_PUBKEY_HEX: &str =
 
 fn hex_decode(s: &str) -> Result<Vec<u8>> {
     let s = s.trim();
+    // Fail closed: hex is ASCII-only, and slicing `s` by bytes below is only
+    // sound on a char boundary. Reject non-ASCII input up front instead of
+    // panicking when a multi-byte character lands on an odd byte offset.
+    if !s.is_ascii() {
+        return Err(anyhow!("non-ASCII hex string"));
+    }
     if !s.len().is_multiple_of(2) {
         return Err(anyhow!("odd-length hex string"));
     }
@@ -1973,6 +1979,20 @@ mod tests {
         assert!(!verify_signature(b"hello", "zz"));
         assert!(!verify_signature(b"hello", "00".repeat(64).as_str()));
         assert!(!verify_signature(b"hello", "ff".repeat(63).as_str()));
+    }
+
+    #[test]
+    fn hex_decode_non_ascii_returns_err_instead_of_panicking() {
+        // "a\u{20ac}" is 4 bytes (even length) but slicing [0..2] would cut
+        // the 3-byte euro sign and panic on the unfixed code.
+        assert!(hex_decode("a\u{20ac}").is_err());
+        assert!(hex_decode("\u{20ac}\u{20ac}").is_err());
+        assert_eq!(hex_decode("00ff").unwrap(), vec![0x00, 0xff]);
+        assert!(!verify_signature(b"hello", "a\u{20ac}"));
+        assert!(!verify_signature(
+            b"hello",
+            "00\u{20ac}00".repeat(16).as_str()
+        ));
     }
 
     #[test]
