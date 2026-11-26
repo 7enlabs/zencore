@@ -748,12 +748,10 @@ impl Agent {
     /// a hook blocks a creation or a completion.
     async fn check_task_hooks(&self, args: &Value) -> Option<String> {
         let new_list = args.get("todos").and_then(|v| v.as_array())?;
-        let old = {
-            let Ok(guard) = self.ctx.todos.lock() else {
-                return None;
-            };
-            guard.clone()
-        };
+        // Recover a poisoned lock (#369): failing open here would skip
+        // the TaskCreated/TaskCompleted hooks and any veto, exactly the
+        // condition the hooks exist for.
+        let old = lock_or_recover(&self.ctx.todos, "ctx.todos").clone();
         for (i, item) in new_list.iter().enumerate() {
             let content = item.get("content").and_then(|v| v.as_str()).unwrap_or("");
             if content.trim().is_empty() {
@@ -2482,6 +2480,49 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn check_task_hooks_recovers_from_poisoned_todos_lock() {
+        // Regression test for #369: with a poisoned `todos` lock the
+        // old code returned None without firing TaskCreated or applying
+        // a hook veto. With lock_or_recover the old list is recovered,
+        // the hook still fires, and a veto still blocks.
+        let (agent, hooks) = agent_with_hooks();
+        // Poison the lock the way the #354 regression test does: lock
+        // it in a thread that panics while holding the guard.
+        let todos_mutex = agent.ctx.todos.clone();
+        let handle = std::thread::spawn(move || {
+            let _guard = todos_mutex.lock().unwrap();
+            panic!("deliberate poison for the #369 regression test");
+        });
+        let _ = handle.join();
+        assert!(agent.ctx.todos.is_poisoned());
+        hooks.push(
+            HookEvent::TaskCreated,
+            HookOutcome {
+                blocked: true,
+                feedback: Some("hook vetoes this task".into()),
+                ..Default::default()
+            },
+        );
+        let veto = agent
+            .check_task_hooks(
+                &json!({ "todos": [{ "content": "Write tests", "status": "pending" }] }),
+            )
+            .await;
+        assert_eq!(veto.as_deref(), Some("hook vetoes this task"));
+        let fired: Vec<HookEvent> = hooks
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(ev, _, _)| *ev)
+            .collect();
+        assert!(
+            fired.contains(&HookEvent::TaskCreated),
+            "poisoned lock must not swallow TaskCreated, got {fired:?}"
+        );
     }
 
     #[tokio::test]
