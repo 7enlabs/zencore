@@ -153,15 +153,29 @@ pub(crate) fn build_http(
     base_url: &str,
     timeouts: &HttpTimeouts,
     user_agent: bool,
-) -> reqwest::Client {
-    let mut builder = timeouts.apply(with_extra_roots(reqwest::Client::builder()));
+) -> Result<reqwest::Client, reqwest::Error> {
+    build_http_with_roots(
+        base_url,
+        timeouts,
+        user_agent,
+        zen_core::extra_root_pem().as_deref(),
+    )
+}
+
+fn build_http_with_roots(
+    base_url: &str,
+    timeouts: &HttpTimeouts,
+    user_agent: bool,
+    extra_roots: Option<&[u8]>,
+) -> Result<reqwest::Client, reqwest::Error> {
+    let mut builder = timeouts.apply(with_extra_roots(reqwest::Client::builder(), extra_roots));
     if user_agent {
         builder = builder.user_agent(safety::user_agent());
     }
     if is_local_url(base_url) {
         builder = builder.no_proxy();
     }
-    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+    builder.build()
 }
 
 pub struct OpenAiClient {
@@ -186,9 +200,9 @@ pub struct OpenAiClient {
     provider_name: String,
 }
 
-fn with_extra_roots(mut b: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-    if let Some(pem) = zen_core::extra_root_pem()
-        && let Ok(certs) = reqwest::Certificate::from_pem_bundle(&pem)
+fn with_extra_roots(mut b: reqwest::ClientBuilder, pem: Option<&[u8]>) -> reqwest::ClientBuilder {
+    if let Some(pem) = pem
+        && let Ok(certs) = reqwest::Certificate::from_pem_bundle(pem)
     {
         for c in certs {
             b = b.add_root_certificate(c);
@@ -234,7 +248,10 @@ impl OpenAiClient {
     ) -> Self {
         let base_url = base_url.into();
         let timeouts = HttpTimeouts::for_url(&base_url);
-        let http = build_http(&base_url, &timeouts, true);
+        let http = match build_http(&base_url, &timeouts, true) {
+            Ok(http) => http,
+            Err(e) => panic!("failed to build HTTP client for {base_url}: {e}"),
+        };
 
         let pacer = RateLimiter::for_provider(&base_url);
         let provider_name = provider_name_for_url(&base_url);
@@ -254,7 +271,10 @@ impl OpenAiClient {
     }
 
     pub fn set_timeouts(&mut self, timeouts: HttpTimeouts) {
-        self.http = build_http(&self.base_url, &timeouts, true);
+        self.http = match build_http(&self.base_url, &timeouts, true) {
+            Ok(http) => http,
+            Err(e) => panic!("failed to rebuild HTTP client for {}: {e}", self.base_url),
+        };
         self.timeouts = timeouts;
     }
 
@@ -2033,6 +2053,26 @@ mod tests {
         assert_eq!(provider_name_for_url(""), "provider");
         assert_eq!(provider_name_for_url("https://"), "provider");
     }
+
+    #[test]
+    fn issue_342_build_http_propagates_invalid_root_cert_error() {
+        // Issue #342: a PEM bundle that parses but holds no valid X.509
+        // certificate used to make build_http silently fall back to
+        // reqwest::Client::new(), discarding timeouts, no_proxy, the
+        // user-agent and the extra roots. The build error must surface.
+        let bad_pem = b"-----BEGIN CERTIFICATE-----\naGVsbG8=\n-----END CERTIFICATE-----\n";
+        let timeouts = HttpTimeouts::for_url("https://example.com");
+        let err = build_http_with_roots("https://example.com", &timeouts, true, Some(bad_pem))
+            .expect_err("invalid extra root PEM must fail client construction");
+        assert!(err.is_builder(), "expected a builder error, got: {err}");
+    }
+
+    #[test]
+    fn issue_342_build_http_succeeds_without_extra_roots() {
+        let timeouts = HttpTimeouts::for_url("https://example.com");
+        assert!(build_http_with_roots("https://example.com", &timeouts, true, None).is_ok());
+        assert!(build_http_with_roots("http://localhost:11434/v1", &timeouts, true, None).is_ok());
+    }
 }
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -2092,7 +2132,10 @@ impl AnthropicClient {
     ) -> Self {
         let base_url = base_url.into();
         let timeouts = HttpTimeouts::for_url(&base_url);
-        let http = build_http(&base_url, &timeouts, false);
+        let http = match build_http(&base_url, &timeouts, false) {
+            Ok(http) => http,
+            Err(e) => panic!("failed to build HTTP client for {base_url}: {e}"),
+        };
         Self {
             base_url,
             api_key: api_key.filter(|k| !k.is_empty()),
@@ -2106,7 +2149,10 @@ impl AnthropicClient {
     }
 
     pub fn set_timeouts(&mut self, timeouts: HttpTimeouts) {
-        self.http = build_http(&self.base_url, &timeouts, false);
+        self.http = match build_http(&self.base_url, &timeouts, false) {
+            Ok(http) => http,
+            Err(e) => panic!("failed to rebuild HTTP client for {}: {e}", self.base_url),
+        };
         self.timeouts = timeouts;
     }
 
