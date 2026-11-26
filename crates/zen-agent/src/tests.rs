@@ -2148,6 +2148,72 @@ async fn tool_progress_no_heartbeat_for_fast_tool() {
     );
 }
 
+struct PanickingTool;
+
+#[async_trait::async_trait]
+impl Tool for PanickingTool {
+    fn name(&self) -> &str {
+        "Panicking"
+    }
+    fn description(&self) -> &str {
+        "fake tool that panics"
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+    fn is_read_only(&self) -> bool {
+        true
+    }
+    async fn call(&self, _args: Value, _ctx: &ToolContext) -> ToolOutput {
+        panic!("deliberate panic for the #367 regression test");
+    }
+}
+
+fn count_progress(sink: &CollectSink) -> usize {
+    sink.events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ToolProgress { .. }))
+        .count()
+}
+
+#[tokio::test]
+async fn heartbeat_aborted_when_tool_panics() {
+    use crate::agent::run_tool_with_heartbeat;
+    let sink = Arc::new(CollectSink::default());
+    let tool: Arc<dyn Tool> = Arc::new(PanickingTool);
+    let sink_clone = sink.clone();
+    let handle = tokio::spawn(async move {
+        run_tool_with_heartbeat(
+            tool,
+            json!({}),
+            temp_ctx(),
+            (None, crate::agent::TimeoutSource::None),
+            sink_clone,
+            "call_panic_1".into(),
+            "Panicking".into(),
+            std::time::Duration::from_millis(50),
+        )
+        .await
+    });
+    let joined = handle.await;
+    assert!(
+        joined.is_err() && joined.unwrap_err().is_panic(),
+        "expected run_tool_with_heartbeat to propagate the tool panic"
+    );
+    // The heartbeat must stop once the tool panics: the ToolProgress count
+    // must be stable across two windows after the panic.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let first = count_progress(&sink);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let second = count_progress(&sink);
+    assert_eq!(
+        first, second,
+        "heartbeat kept emitting ToolProgress after the tool panicked (leaked task): {first} then {second}"
+    );
+}
+
 #[tokio::test]
 async fn budget_cap_blocks_before_first_call_when_tiny() {
     use crate::budget::BudgetPolicy;
