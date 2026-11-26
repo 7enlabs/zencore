@@ -340,6 +340,28 @@ mod tests {
     }
 
     #[test]
+    fn normalize_resolves_dot_and_dotdot_segments() {
+        // Pins the two arms the mutants CI found on PR #565:
+        // deleting the `"" | "."` arm and flipping the `||` that keeps
+        // a leading `..` both change these outputs.
+        let mut g = TurnGuard::default();
+        g.set_cwd(PathBuf::from("/repo"));
+        let cases = [
+            ("src/./main.rs", "src/main.rs"),
+            ("src//main.rs", "src/main.rs"),
+            ("src/../other/x.rs", "other/x.rs"),
+            ("src/../src/main.rs", "src/main.rs"),
+            ("../other/x.rs", "../other/x.rs"),
+            ("src/../../x.rs", "../x.rs"),
+            ("/repo/src/./main.rs", "src/main.rs"),
+            ("/repo/src/../../x.rs", "../x.rs"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(g.normalize(input), expected, "normalize({input:?})");
+        }
+    }
+
+    #[test]
     fn no_scope_means_no_scope_nudge() {
         let mut g = TurnGuard::default();
         assert!(
