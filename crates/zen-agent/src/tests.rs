@@ -1178,6 +1178,44 @@ async fn c10_auto_compact_triggers_over_threshold() {
 }
 
 #[tokio::test]
+async fn c10_auto_compact_does_not_trigger_at_exact_threshold() {
+    // The auto-compact guard is a strict `used > threshold`: when the
+    // context is exactly at the threshold nothing is over budget yet, so
+    // no compaction may run. The scripted mock reports prompt_tokens 10
+    // for every reply, so after the first turn `used` is 10; a threshold
+    // of exactly 10 puts the second turn on the boundary. The third
+    // scripted reply exists only so a `>=` mutant (which would compact
+    // and consume "two" as the summary) fails loudly on the result
+    // instead of on mock exhaustion.
+    let llm = MockLlm::new(vec![resp("one"), resp("two"), resp("three")]);
+    let cfg = AgentConfig {
+        auto_compact_threshold: Some(10),
+        keep_after_compact: 1,
+        ..base_cfg()
+    };
+    let (mut agent, sink, _h) = build_agent(llm.clone(), ToolRegistry::new(), allow(), cfg);
+    agent.run_turn("first").await;
+    let r = agent.run_turn("second").await;
+    assert_eq!(r.result, "two");
+    assert!(
+        !sink.events.lock().unwrap().iter().any(|e| matches!(e,
+            AgentEvent::CompactBoundary { trigger, .. } if trigger == "auto")),
+        "used == threshold must not compact, so no CompactBoundary may be emitted"
+    );
+    assert_eq!(
+        llm.requests().len(),
+        2,
+        "no summarization call may happen at the exact threshold"
+    );
+    let last = llm.requests().last().cloned().unwrap();
+    let joined = serde_json::to_string(&last.messages).unwrap();
+    assert!(
+        joined.contains("\"one\""),
+        "uncompacted history must still be sent verbatim"
+    );
+}
+
+#[tokio::test]
 async fn c10_auto_compact_failure_is_reported_not_swallowed() {
     // Issue #370: a failed auto-compact was discarded with `let _ =`, so
     // nothing surfaced it. The model answers the summarization call with
