@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -198,6 +198,80 @@ impl RateLimiter {
     }
 }
 
+/// How long a registration waits for the registry lock before giving
+/// up and skipping the save. Registrations are short, so ten seconds
+/// is ample; waiting forever would hang session startup behind a stuck
+/// peer. Same bound as the secret-store lock (zen-core `lock_store`).
+const REGISTRY_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The lock file next to the registry file: `session-registry.lock`.
+/// It only carries the flock; its content is never read or written, and
+/// it is never renamed or removed, so the lock stays valid across
+/// registry rewrites and a crashed holder releases it with the process.
+fn registry_lock_path(path: &Path) -> PathBuf {
+    path.with_extension("lock")
+}
+
+/// One held registry lock. Dropping it closes the file, which releases
+/// the flock.
+struct RegistryLock {
+    _file: std::fs::File,
+}
+
+/// Whether a lock error means another process holds the lock (retry
+/// until the deadline) or something else is wrong (give up at once).
+/// Kept as a tiny pure function so tests can feed it synthetic errors:
+/// Unix reports contention as WouldBlock, Windows as ERROR_LOCK_VIOLATION
+/// (raw OS error 33), which std maps to ErrorKind::Other (issue #319).
+enum LockWait {
+    Retry,
+    GiveUp,
+}
+
+fn classify_lock_error(e: &std::io::Error) -> LockWait {
+    if e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(33) {
+        LockWait::Retry
+    } else {
+        LockWait::GiveUp
+    }
+}
+
+/// Acquire the registry lock, waiting a bounded time. Returns `None` on
+/// timeout or when the lock file cannot be opened, so the caller can
+/// fail closed instead of hanging session startup.
+fn acquire_registry_lock(path: &Path) -> Option<RegistryLock> {
+    use fs2::FileExt;
+    let lock_path = registry_lock_path(path);
+    if let Some(parent) = lock_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        // The file only carries the flock; its content is never read
+        // or written, so it must not be truncated on open.
+        .truncate(false)
+        .open(&lock_path)
+        .ok()?;
+    let deadline = Instant::now() + REGISTRY_LOCK_TIMEOUT;
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Some(RegistryLock { _file: file }),
+            // Contention means retry until the deadline; any other
+            // error gives up at once (see `classify_lock_error`).
+            Err(e) => match classify_lock_error(&e) {
+                LockWait::Retry => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                LockWait::GiveUp => return None,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SessionRegistry {
     #[serde(default)]
@@ -214,6 +288,18 @@ impl SessionRegistry {
     }
 
     pub fn register(&mut self, provider: &str, key_fingerprint: &str, session_id: &str) -> usize {
+        // Hold the lock across the whole read-modify-write: reload under
+        // it first, because another process may have registered since
+        // this instance was loaded (issue #356). Without the reload the
+        // second save overwrites the first registration.
+        // If the lock cannot be acquired, do NOT save: persisting the
+        // stale in-memory snapshot would wipe a concurrent registration
+        // (the exact lost update #356 fixed). The session simply goes
+        // untracked this once; no other process's data is harmed.
+        let Some(_lock) = acquire_registry_lock(&registry_path()) else {
+            return self.count_others(provider, key_fingerprint, session_id);
+        };
+        *self = Self::load();
         self.prune_stale();
         let now = now_unix();
         let others = {
@@ -229,6 +315,15 @@ impl SessionRegistry {
     }
 
     pub fn unregister(&mut self, provider: &str, key_fingerprint: &str, session_id: &str) {
+        // Same lock + reload as `register`: an unregister racing a
+        // register in another process must not drop that registration.
+        // If the lock cannot be acquired, do nothing: removing from a
+        // stale snapshot and saving it would wipe a concurrent
+        // registration.
+        let Some(_lock) = acquire_registry_lock(&registry_path()) else {
+            return;
+        };
+        *self = Self::load();
         if let Some(key_map) = self.entries.get_mut(provider)
             && let Some(sessions) = key_map.get_mut(key_fingerprint)
         {
@@ -246,15 +341,56 @@ impl SessionRegistry {
         }
     }
 
+    /// How many sessions other than `session_id` are registered under
+    /// this provider + key in the in-memory snapshot. Used for the
+    /// fail-closed return when the lock cannot be acquired.
+    fn count_others(&self, provider: &str, key_fingerprint: &str, session_id: &str) -> usize {
+        let Some(sessions) = self
+            .entries
+            .get(provider)
+            .and_then(|key_map| key_map.get(key_fingerprint))
+        else {
+            return 0;
+        };
+        let total = sessions.len();
+        if sessions.iter().any(|(id, _)| id == session_id) {
+            total.saturating_sub(1)
+        } else {
+            total
+        }
+    }
+
     fn save(&self) {
+        // Atomic write like `RateGate::write_store`: write a temp file in
+        // the same directory, then rename over the registry, so a reader
+        // never sees a torn file and a crash cannot leave a half-written
+        // registry behind. The temp file is unique per save (pid +
+        // counter), never the fixed `session-registry.json.tmp` shared
+        // by all processes: two writers without the lock used to
+        // interleave writes into the same temp file and publish a torn
+        // registry through the rename.
         let path = registry_path();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Ok(data) = serde_json::to_vec_pretty(self) {
-            let _ = std::fs::write(&path, data);
+        let Ok(data) = serde_json::to_vec_pretty(self) else {
+            return;
+        };
+        let tmp = unique_tmp_path(&path);
+        if std::fs::write(&tmp, data).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        } else {
+            let _ = std::fs::remove_file(&tmp);
         }
     }
+}
+
+/// A temp path private to this save: the process id plus a per-process
+/// counter, so two processes (or two threads) never share one temp file.
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.with_extension(format!("json.tmp.{}-{n}", std::process::id()))
 }
 
 pub fn key_fingerprint(api_key: &str) -> String {
@@ -277,7 +413,17 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Test hook: point the registry at a temp file so two-process tests do
+/// not touch the real `~/.zen/session-registry.json`. Production never
+/// sets this variable.
+const REGISTRY_PATH_ENV: &str = "ZEN_SESSION_REGISTRY_PATH";
+
 fn registry_path() -> PathBuf {
+    if let Ok(path) = std::env::var(REGISTRY_PATH_ENV)
+        && !path.is_empty()
+    {
+        return PathBuf::from(path);
+    }
     let base = dirs::data_dir()
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."));
@@ -594,5 +740,405 @@ mod tests {
             sessions.len().saturating_sub(1)
         };
         assert_eq!(o2, 1);
+    }
+
+    /// Serialises the registry tests that point `REGISTRY_PATH_ENV` at a
+    /// temp file: the env var is process-global, so two such tests on
+    /// different threads would otherwise steal each other's path.
+    static REGISTRY_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A fresh temp dir for one registry test, removed by the caller.
+    fn temp_registry_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "zen-reg-356-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// RAII guard restoring one env var's previous value on drop
+    /// (panic-safe). Same shape as the TestEnvGuard in zen-mcp tests.
+    struct TestEnvGuard {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl TestEnvGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let old = std::env::var_os(key);
+            // SAFETY: the var is unique to this test; no other test reads
+            // it, and the old value is restored on drop.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, old }
+        }
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: same as `set` above.
+            unsafe {
+                match self.old.take() {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    /// Child entry point for
+    /// `registry_concurrent_registrations_from_two_processes_keep_both`:
+    /// when `ZEN_REGISTRY_CHILD_SESSION` is set, load the registry, wait
+    /// so the sibling process loads the same snapshot, then register.
+    /// Not a real test on its own - without the env var it does nothing.
+    #[test]
+    fn registry_child_register() {
+        let Ok(session) = std::env::var("ZEN_REGISTRY_CHILD_SESSION") else {
+            return;
+        };
+        let mut reg = SessionRegistry::load();
+        // Let the sibling load the same snapshot before either saves, so
+        // the lost-registration race is deterministic, not timing luck.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        reg.register("test-provider", "test-key", &session);
+    }
+
+    #[test]
+    fn registry_concurrent_registrations_from_two_processes_keep_both() {
+        let _test_lock = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Issue #356: two processes registering at the same time must not
+        // lose each other's session. On the old code both children load
+        // the same (empty) snapshot and the last save wins, so one
+        // registration is lost.
+        let dir = std::env::temp_dir().join(format!(
+            "zen-reg-356-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session-registry.json");
+        let _guard = TestEnvGuard::set(REGISTRY_PATH_ENV, &path);
+
+        let exe = std::env::current_exe().unwrap();
+        let mut children = Vec::new();
+        for session in ["s1", "s2"] {
+            let child = std::process::Command::new(&exe)
+                .arg("--exact")
+                .arg("safety::tests::registry_child_register")
+                .env(REGISTRY_PATH_ENV, &path)
+                .env("ZEN_REGISTRY_CHILD_SESSION", session)
+                .spawn()
+                .unwrap();
+            children.push(child);
+        }
+        for mut child in children {
+            assert!(child.wait().unwrap().success(), "child process failed");
+        }
+
+        let reg = SessionRegistry::load();
+        let sessions = reg
+            .entries
+            .get("test-provider")
+            .and_then(|m| m.get("test-key"))
+            .cloned()
+            .unwrap_or_default();
+        let ids: Vec<&str> = sessions.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "both concurrent registrations must survive, got {ids:?}"
+        );
+        assert!(ids.contains(&"s1"), "s1 lost: {ids:?}");
+        assert!(ids.contains(&"s2"), "s2 lost: {ids:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn registry_register_returns_other_session_count() {
+        // Kills the whole-body -> 0 / -> 1 mutants on `register`: the
+        // return is the number of OTHER sessions under the same
+        // provider + key, not a constant.
+        let _test_lock = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = temp_registry_dir("count");
+        let path = dir.join("session-registry.json");
+        let _guard = TestEnvGuard::set(REGISTRY_PATH_ENV, &path);
+        let mut reg = SessionRegistry::load();
+        assert_eq!(reg.register("p", "k", "s1"), 0);
+        assert_eq!(reg.register("p", "k", "s2"), 1);
+        assert_eq!(reg.register("p", "k", "s1"), 1);
+        assert_eq!(reg.register("p", "k2", "s3"), 0);
+        let reg2 = SessionRegistry::load();
+        let sessions = reg2
+            .entries
+            .get("p")
+            .and_then(|m| m.get("k"))
+            .cloned()
+            .unwrap_or_default();
+        let ids: Vec<&str> = sessions.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"s1") && ids.contains(&"s2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn registry_unregister_removes_only_that_session() {
+        // Kills the whole-body -> () mutant on `unregister`: without
+        // it, the session stays registered.
+        let _test_lock = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = temp_registry_dir("unreg");
+        let path = dir.join("session-registry.json");
+        let _guard = TestEnvGuard::set(REGISTRY_PATH_ENV, &path);
+        let mut reg = SessionRegistry::load();
+        reg.register("p", "k", "s1");
+        reg.register("p", "k", "s2");
+        reg.unregister("p", "k", "s1");
+        let reg2 = SessionRegistry::load();
+        let sessions = reg2
+            .entries
+            .get("p")
+            .and_then(|m| m.get("k"))
+            .cloned()
+            .unwrap_or_default();
+        let ids: Vec<&str> = sessions.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["s2"], "only s1 must go, got {ids:?}");
+        // Unregistering a missing session changes nothing.
+        let mut reg3 = SessionRegistry::load();
+        reg3.unregister("p", "k", "nope");
+        let reg4 = SessionRegistry::load();
+        let sessions4 = reg4
+            .entries
+            .get("p")
+            .and_then(|m| m.get("k"))
+            .cloned()
+            .unwrap_or_default();
+        let ids4: Vec<&str> = sessions4.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids4, vec!["s2"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn registry_count_others_counts_without_persisting() {
+        // Direct unit test for the fail-closed return of `register`:
+        // counts others in the in-memory snapshot, without touching disk.
+        let mut reg = SessionRegistry::default();
+        assert_eq!(reg.count_others("p", "k", "s1"), 0);
+        reg.entries
+            .entry("p".to_string())
+            .or_default()
+            .entry("k".to_string())
+            .or_default()
+            .push(("s1".to_string(), now_unix()));
+        assert_eq!(reg.count_others("p", "k", "s1"), 0);
+        assert_eq!(reg.count_others("p", "k", "s2"), 1);
+        reg.entries
+            .get_mut("p")
+            .unwrap()
+            .get_mut("k")
+            .unwrap()
+            .push(("s2".to_string(), now_unix()));
+        assert_eq!(reg.count_others("p", "k", "s1"), 1);
+        assert_eq!(reg.count_others("p", "k", "s3"), 2);
+        assert_eq!(reg.count_others("p", "missing", "s1"), 0);
+    }
+
+    #[test]
+    fn registry_register_writes_to_configured_path() {
+        // Issue #356 follow-up: `registry_path` must honour
+        // ZEN_SESSION_REGISTRY_PATH. Kills the `delete !` mutant,
+        // which makes a set-but-non-empty path fall through to the
+        // default location.
+        let _test_lock = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = temp_registry_dir("path");
+        let path = dir.join("session-registry.json");
+        let _guard = TestEnvGuard::set(REGISTRY_PATH_ENV, &path);
+        let mut reg = SessionRegistry::load();
+        reg.register("p", "k", "s1");
+        let data = std::fs::read_to_string(&path)
+            .expect("registry file must exist at the configured path");
+        assert!(
+            data.contains("s1"),
+            "configured registry file must contain the session, got: {data}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lock_contention_classifies_errors() {
+        // Direct unit test for the lock-error guard: Unix contention is
+        // WouldBlock, Windows lock violation is raw OS error 33. Kills
+        // the || -> && and == -> != mutants on both comparisons.
+        use std::io::{Error, ErrorKind};
+        assert!(matches!(
+            classify_lock_error(&Error::from_raw_os_error(11)),
+            LockWait::Retry
+        ));
+        assert!(matches!(
+            classify_lock_error(&Error::from_raw_os_error(33)),
+            LockWait::Retry
+        ));
+        assert!(matches!(
+            classify_lock_error(&Error::new(ErrorKind::WouldBlock, "busy")),
+            LockWait::Retry
+        ));
+        assert!(matches!(
+            classify_lock_error(&Error::from_raw_os_error(13)),
+            LockWait::GiveUp
+        ));
+        assert!(matches!(
+            classify_lock_error(&Error::new(ErrorKind::PermissionDenied, "denied")),
+            LockWait::GiveUp
+        ));
+    }
+
+    #[test]
+    fn registry_save_uses_unique_temp_paths() {
+        // The temp file of one save must never be another save's temp
+        // file: kills the whole-body -> Default mutant on
+        // `unique_tmp_path` (both calls would return the same empty path).
+        let dir = temp_registry_dir("tmp");
+        let path = dir.join("session-registry.json");
+        let first = unique_tmp_path(&path);
+        let second = unique_tmp_path(&path);
+        assert_ne!(first, second, "two saves must not share a temp file");
+        assert_ne!(
+            first.file_name().map(|n| n.to_string_lossy().into_owned()),
+            Some("session-registry.json.tmp".to_string()),
+            "temp file must not be the old fixed shared name"
+        );
+        assert!(first.starts_with(&dir) && second.starts_with(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #356 follow-up: when the registry lock is held by another
+    /// process, register must fail closed after the bounded wait instead
+    /// of saving a stale snapshot (which would wipe the other process's
+    /// registration). Mirrors `locked_store_fails_closed_after_bounded_wait`
+    /// in zen-core (issue #319).
+    #[test]
+    fn registry_locked_register_fails_closed_after_bounded_wait() {
+        use fs2::FileExt;
+        let _test_lock = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = temp_registry_dir("locked");
+        let path = dir.join("session-registry.json");
+        let _guard = TestEnvGuard::set(REGISTRY_PATH_ENV, &path);
+        // Seed a peer registration while the lock is free.
+        let mut peer = SessionRegistry::load();
+        peer.register("test-provider", "test-key", "peer");
+        // A stale snapshot taken before the peer registered: this is the
+        // snapshot a racing process would save on the old fallback.
+        let mut stale = SessionRegistry::default();
+        // Hold the lock from outside the registry API, as another
+        // process would.
+        let lock_path = registry_lock_path(&path);
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        held.lock_exclusive().unwrap();
+        let start = std::time::Instant::now();
+        let others = stale.register("test-provider", "test-key", "ours");
+        // The wait is bounded (10s) and actually waited, not instant.
+        assert!(start.elapsed() >= std::time::Duration::from_secs(9));
+        drop(held);
+        // Fail closed: our session was NOT persisted, and the peer survived.
+        assert_eq!(others, 0, "stale snapshot has no others to count");
+        let reg = SessionRegistry::load();
+        let sessions = reg
+            .entries
+            .get("test-provider")
+            .and_then(|m| m.get("test-key"))
+            .cloned()
+            .unwrap_or_default();
+        let ids: Vec<&str> = sessions.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(
+            ids.contains(&"peer"),
+            "peer registration must survive a lock-timeout register, got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"ours"),
+            "timed-out register must not persist, got {ids:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #356 follow-up: two processes registering while the lock
+    /// is held must not corrupt the registry: both time out, neither
+    /// persists, and the peer registration plus a parseable file survive.
+    #[test]
+    fn registry_concurrent_fallback_registrations_keep_peer_and_valid_file() {
+        use fs2::FileExt;
+        let _test_lock = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = temp_registry_dir("fallback");
+        let path = dir.join("session-registry.json");
+        let _guard = TestEnvGuard::set(REGISTRY_PATH_ENV, &path);
+        let mut peer = SessionRegistry::load();
+        peer.register("test-provider", "test-key", "peer");
+        // Hold the lock so both children time out in register.
+        let lock_path = registry_lock_path(&path);
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        held.lock_exclusive().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let mut children = Vec::new();
+        for session in ["s1", "s2"] {
+            let child = std::process::Command::new(&exe)
+                .arg("--exact")
+                .arg("safety::tests::registry_child_register")
+                .env(REGISTRY_PATH_ENV, &path)
+                .env("ZEN_REGISTRY_CHILD_SESSION", session)
+                .spawn()
+                .unwrap();
+            children.push(child);
+        }
+        for mut child in children {
+            assert!(child.wait().unwrap().success(), "child process failed");
+        }
+        drop(held);
+        // The file must still parse and still hold the peer; neither
+        // timed-out child persisted.
+        let data = std::fs::read_to_string(&path).expect("registry file must still exist");
+        let reg: SessionRegistry =
+            serde_json::from_str(&data).expect("registry file must still be valid JSON");
+        let sessions = reg
+            .entries
+            .get("test-provider")
+            .and_then(|m| m.get("test-key"))
+            .cloned()
+            .unwrap_or_default();
+        let ids: Vec<&str> = sessions.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(
+            ids.contains(&"peer"),
+            "peer must survive concurrent fallback registers, got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"s1") && !ids.contains(&"s2"),
+            "timed-out registers must not persist, got {ids:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
