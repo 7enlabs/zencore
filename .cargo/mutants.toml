@@ -525,45 +525,4 @@ exclude_re = [
   # CI shard mutants (10) on head 5ce94973 failed on this mutant
   # because the stale 1194 number did not match.
   "lsp\\.rs:1200:32: replace match guard !remaining\\.is_zero\\(\\) with true in LspManager::check_respawn_backoff",
-  # PR #574 (issue #469), repl.rs lock_local_settings (line 2790,
-  # col 20): replace match guard
-  # `e.kind() == WouldBlock || e.raw_os_error() == Some(33)` with true.
-  # EQUIVALENT ON LINUX (CI run 45918465343, mutants shard 3, missed.txt):
-  # the real guard and the mutant agree on every error
-  # try_lock_exclusive can return on Linux. The guard differs from
-  # `true` only for an error whose kind is not WouldBlock, and flock
-  # on Linux fails that way for no input this function can produce:
-  # a just-opened O_WRONLY regular file fails only with EWOULDBLOCK
-  # (kind WouldBlock, raw 11) when contended; EBADF needs a closed
-  # fd, EINTR needs a blocking wait (LOCK_NB returns at once), and
-  # EINVAL/ENOLCK need a filesystem without flock support (NFS/FUSE),
-  # none of which the lock file can be on in CI. Raw error 33 is
-  # EDOM on Linux, which flock never returns; the `== Some(33)` arm
-  # exists only for Windows ERROR_LOCK_VIOLATION (issue #319).
-  # Evidence: flock probe on the dev box (regular file ext4/tmpfs/
-  # overlay, /dev/null, /dev/full, /dev/zero, /dev/ptmx, pipes,
-  # sockets - all either lock or fail EWOULDBLOCK/11 when contended)
-  # plus the test `lock_contention_on_linux_is_would_block_with_raw_
-  # error_11` in repl.rs, which pins the Linux premise.
-  # EXPIRY: if mutants CI ever runs on Windows, or the lock
-  # implementation changes so try_lock_exclusive can return a
-  # non-WouldBlock error on Linux, this mutant stops being
-  # equivalent: remove this exclusion and kill it with a test that
-  # holds the lock and expects the "locked by another process" bail
-  # (on Windows that test also kills the shard-7 mutant below).
-  "repl\\.rs:2790:20: replace match guard .* with true in lock_local_settings",
-  # PR #574 (issue #469), repl.rs lock_local_settings (line 2790,
-  # col 83): replace `==` with `!=` in `e.raw_os_error() == Some(33)`.
-  # EQUIVALENT ON LINUX (CI run 45918465343, mutants shard 7, missed.txt):
-  # the mutant differs from the real guard only for an error whose
-  # kind is not WouldBlock (then the two sides of the `||` swap).
-  # Same argument as above: on Linux every flock failure this
-  # function can produce is WouldBlock/raw 11, for which both
-  # versions retry, so no test can kill this mutant on Linux.
-  # EXPIRY: if mutants CI ever runs on Windows, this mutant stops
-  # being equivalent - Windows contention reports raw 33 with kind
-  # Other, so the real guard retries while the mutant errors out
-  # at once: remove this exclusion and kill it with a test that
-  # holds the lock and expects the "locked by another process" bail.
-  "repl\\.rs:2790:83: replace == with != in lock_local_settings",
 ]

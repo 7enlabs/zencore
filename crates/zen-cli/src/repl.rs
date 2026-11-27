@@ -2767,6 +2767,19 @@ struct SettingsLock {
     _file: std::fs::File,
 }
 
+/// Whether a failed `try_lock_exclusive` means the lock is held by
+/// another process (retry until the deadline) rather than a hard error
+/// (fail at once). Unix reports contention as WouldBlock; Windows
+/// reports it as ERROR_LOCK_VIOLATION (raw OS error 33), which std
+/// maps to ErrorKind::Other instead of WouldBlock (issue #319).
+/// A pure function so the classification itself is unit-testable with
+/// synthetic errors (PR #574): the two mutants on this guard are
+/// killed by the `is_lock_contention_*` tests, not by an exclusion
+/// in .cargo/mutants.toml.
+fn is_lock_contention(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(33)
+}
+
 /// Acquire the settings lock, waiting a bounded time.
 fn lock_local_settings(parent: &Path) -> Result<SettingsLock> {
     use fs2::FileExt;
@@ -2782,13 +2795,9 @@ fn lock_local_settings(parent: &Path) -> Result<SettingsLock> {
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(SettingsLock { _file: file }),
-            // Contention means retry until the deadline: Unix reports
-            // it as WouldBlock, Windows as ERROR_LOCK_VIOLATION
-            // (raw OS error 33), which std maps to ErrorKind::Other
-            // instead of WouldBlock (issue #319).
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(33) =>
-            {
+            // Contention means retry until the deadline; anything else
+            // is a hard error (see is_lock_contention).
+            Err(e) if is_lock_contention(&e) => {
                 if std::time::Instant::now() >= deadline {
                     anyhow::bail!("settings.local.json is locked by another process; try again");
                 }
@@ -4592,11 +4601,10 @@ mod model_picker_tests {
         // raw OS error of 33 (Windows ERROR_LOCK_VIOLATION, which std
         // maps to ErrorKind::Other - issue #319). On Linux, flock
         // contention is always WouldBlock with raw error 11 (EAGAIN),
-        // never 33 (EDOM on Linux, which flock never returns), so the
-        // two mutants on that guard are equivalent on Linux - see the
-        // exclusions in .cargo/mutants.toml. This test pins the Linux
-        // premise the exclusion rests on: if it ever fails, the
-        // exclusion must be revisited.
+        // never 33 (EDOM on Linux, which flock never returns). This
+        // test pins that Linux premise. The two mutants on the guard
+        // itself are killed by the is_lock_contention_* tests below,
+        // not by an exclusion in .cargo/mutants.toml.
         use fs2::FileExt;
         let dir =
             std::env::temp_dir().join(format!("zen_lock_contention_kind_{}", uuid::Uuid::new_v4()));
@@ -4621,6 +4629,42 @@ mod model_picker_tests {
         assert_ne!(err.raw_os_error(), Some(33));
         drop(holder);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn is_lock_contention_accepts_contention_errors() {
+        // PR #574 (Z Tester fault injection): a non-WouldBlock error
+        // must fail at once instead of retrying for 10 s. The guard
+        // is classified here with synthetic errors so both mutants
+        // on it are killed deterministically on every platform.
+        // WouldBlock (any raw error) is contention.
+        assert!(is_lock_contention(&std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "contended"
+        )));
+        // Raw 33 is Windows ERROR_LOCK_VIOLATION (issue #319):
+        // contention even though std maps it to a non-WouldBlock kind.
+        assert!(is_lock_contention(&std::io::Error::from_raw_os_error(33)));
+    }
+
+    #[test]
+    fn is_lock_contention_rejects_other_errors() {
+        // PR #574: kills both mutants on the guard. Replacing the
+        // guard with true, or == with != in the raw-33 check, makes
+        // these errors classify as contention (retry 10 s) instead
+        // of failing at once.
+        assert!(!is_lock_contention(&std::io::Error::other("other failure")));
+        assert!(!is_lock_contention(&std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "missing"
+        )));
+        // Raw 22 (EINVAL on Linux) is not contention and not 33.
+        assert!(!is_lock_contention(&std::io::Error::from_raw_os_error(22)));
+        // Raw 11 is deliberately NOT asserted here: on Linux it maps
+        // to WouldBlock (covered above) while on Windows it is a
+        // different error, so a raw-11 assertion cannot be portable.
+        // The Linux flock behaviour is pinned by
+        // lock_contention_on_linux_is_would_block_with_raw_error_11.
     }
 
     #[test]
