@@ -338,16 +338,20 @@ fn unquote_git_path(token: &str) -> Option<String> {
     let inner = token.strip_prefix('"')?.strip_suffix('"')?;
     let bytes = inner.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'\\' {
-            out.push(bytes[i]);
-            i += 1;
+    // The scan consumes the input through an iterator, never through a
+    // hand-rolled index: every `next()` moves forward by construction,
+    // so no single arithmetic step can stall the loop. (The previous
+    // index version hung forever under the `i += 1` -> `i -= 1` mutant
+    // at the plain-byte step whenever an escape was followed by a plain
+    // byte, e.g. `"\1234"`: the index walked back onto the backslash
+    // and re-decoded the same escape on every pass.)
+    let mut iter = bytes.iter().copied().peekable();
+    while let Some(byte) = iter.next() {
+        if byte != b'\\' {
+            out.push(byte);
             continue;
         }
-        i += 1;
-        let esc = *bytes.get(i)?;
-        i += 1;
+        let esc = iter.next()?;
         match esc {
             b'a' => out.push(0x07),
             b'b' => out.push(0x08),
@@ -360,15 +364,13 @@ fn unquote_git_path(token: &str) -> Option<String> {
             b'"' => out.push(b'"'),
             b'0'..=b'7' => {
                 let mut value: u16 = (esc - b'0') as u16;
-                let mut count = 1;
-                while count < 3 {
-                    let Some(&digit) = bytes.get(i) else { break };
+                for _ in 0..2 {
+                    let Some(&digit) = iter.peek() else { break };
                     if !(b'0'..=b'7').contains(&digit) {
                         break;
                     }
                     value = value * 8 + (digit - b'0') as u16;
-                    i += 1;
-                    count += 1;
+                    iter.next();
                 }
                 if value > u8::MAX as u16 {
                     return None;
@@ -435,14 +437,18 @@ fn split_diff_git_header(rest: &str) -> Option<(String, String)> {
 /// value is unquoted when git C-style quoted it. Returns `None` when
 /// the section has no rename.
 fn rename_to_path(lines: &[&str], header: usize) -> Option<String> {
-    let mut i = header + 1;
-    while i < lines.len() && !lines[i].starts_with("diff --git ") {
-        if let Some(path) = lines[i].strip_prefix("rename to ") {
-            return Some(unquote_git_path(path).unwrap_or_else(|| path.to_string()));
-        }
-        i += 1;
-    }
-    None
+    // The section is scanned with iterators, never with a hand-rolled
+    // index: `skip` + `take_while` bound the scan by construction, so
+    // no single arithmetic step can stall the loop. (The previous
+    // `while` version hung forever under the `i += 1` -> `i *= 1`
+    // mutant on any section line that is neither `rename to` nor the
+    // next `diff --git` header, e.g. `similarity index 100%`.)
+    lines
+        .iter()
+        .skip(header + 1)
+        .take_while(|line| !line.starts_with("diff --git "))
+        .find_map(|line| line.strip_prefix("rename to "))
+        .map(|path| unquote_git_path(path).unwrap_or_else(|| path.to_string()))
 }
 
 fn changed_files_from_diff(diff: &str) -> Vec<String> {
@@ -1692,7 +1698,7 @@ mod tests {
 
     // Octal escapes: the exact accumulated value matters. `\101` is
     // 'A' only when `value * 8 + digit` is computed exactly, so this
-    // kills both `+` -> `-` and `+` -> `*` on line 369.
+    // kills both `+` -> `-` and `+` -> `*` on the accumulation step.
     #[test]
     fn unquote_git_path_octal_101_is_capital_a() {
         assert_eq!(unquote_git_path("\"\\101\""), Some("A".to_string()));
@@ -1762,5 +1768,44 @@ mod tests {
              rename from \"old b/caf\\303\\251.rs\"\n\
              rename to \"new caf\\303\\251.rs\"\n";
         assert_eq!(changed_files_from_diff(diff), vec!["new café.rs"]);
+    }
+
+    // Timeout-mutant regressions (PR #575, CI shards 4 and 7). The
+    // old index loops hung forever instead of failing when a single
+    // increment was mutated, so these inputs are the regression net:
+    // they complete in milliseconds on the iterator scan, and they
+    // hang the old code (verified by fault injection with `timeout`).
+    #[test]
+    fn unquote_git_path_escape_followed_by_plain_bytes() {
+        // `i += 1` -> `i -= 1` at the plain-byte step walked the index
+        // back onto the backslash and re-decoded the same escape.
+        assert_eq!(unquote_git_path("\"\\tAB\""), Some("\tAB".to_string()));
+        assert_eq!(unquote_git_path("\"\\101b\""), Some("Ab".to_string()));
+    }
+
+    #[test]
+    fn changed_files_from_diff_non_rename_section_with_body_lines() {
+        // `i += 1` -> `i *= 1` in `rename_to_path` stalled on the
+        // first body line (`index ...`), which is neither `rename to`
+        // nor the next header.
+        let diff = "diff --git a/a.rs b/a.rs\n\
+             index 1111111..2222222 100644\n\
+             --- a/a.rs\n\
+             +++ b/a.rs\n\
+             @@ -1 +1 @@\n\
+             -old\n\
+             +new\n";
+        assert_eq!(changed_files_from_diff(diff), vec!["a.rs"]);
+    }
+
+    #[test]
+    fn changed_files_from_diff_rename_section_without_rename_to() {
+        // A rename header with no `rename to` line: the scan must reach
+        // the end of the section and fall back to the header's b-side
+        // instead of stalling on `similarity index`.
+        let diff = "diff --git a/old.rs b/new.rs\n\
+             similarity index 100%\n\
+             rename from old.rs\n";
+        assert_eq!(changed_files_from_diff(diff), vec!["new.rs"]);
     }
 }
