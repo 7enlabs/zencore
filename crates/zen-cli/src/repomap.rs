@@ -90,8 +90,11 @@ const SKIP_DIRS: &[&str] = &[
     "coverage",
 ];
 
-fn collect_rust_files(cwd: &Path) -> Vec<PathBuf> {
+/// Collects `.rs` files under `cwd`, capped at `MAX_FILES`.
+/// Returns the files and whether the cap cut off further `.rs` files.
+fn collect_rust_files(cwd: &Path) -> (Vec<PathBuf>, bool) {
     let mut files = Vec::new();
+    let mut truncated = false;
     let walker = walkdir::WalkDir::new(cwd)
         .follow_links(false)
         .into_iter()
@@ -106,16 +109,17 @@ fn collect_rust_files(cwd: &Path) -> Vec<PathBuf> {
             true
         });
     for entry in walker.filter_map(|e| e.ok()) {
-        if files.len() >= MAX_FILES {
-            break;
-        }
         let p = entry.path();
         if p.is_file() && p.extension().map(|e| e == "rs").unwrap_or(false) {
+            if files.len() >= MAX_FILES {
+                truncated = true;
+                break;
+            }
             files.push(p.to_path_buf());
         }
     }
     files.sort();
-    files
+    (files, truncated)
 }
 
 fn strip_noise(line: &str) -> String {
@@ -283,10 +287,13 @@ fn is_mod_tests_decl(clean: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn extract_symbols(path: &Path) -> Vec<Symbol> {
+/// Extracts top-level symbols from the first `MAX_LINES_PER_FILE` lines.
+/// Returns the symbols and whether the file has more lines than the cap.
+fn extract_symbols(path: &Path) -> (Vec<Symbol>, bool) {
     let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
+    let truncated = text.lines().count() > MAX_LINES_PER_FILE;
 
     let mut symbols = Vec::new();
     let mut in_test_mod = false;
@@ -385,7 +392,7 @@ fn extract_symbols(path: &Path) -> Vec<Symbol> {
             });
         }
     }
-    symbols
+    (symbols, truncated)
 }
 
 fn rank_symbols(entries: &mut [(PathBuf, Vec<Symbol>)]) {
@@ -520,14 +527,18 @@ pub fn repo_map(cwd: &Path, map_tokens: usize) -> Option<RepoMap> {
     if map_tokens == 0 {
         return None;
     }
-    let files = collect_rust_files(cwd);
+    let (files, files_truncated) = collect_rust_files(cwd);
     if files.is_empty() {
         return None;
     }
+    let mut lines_truncated = false;
     let mut entries: Vec<(PathBuf, Vec<Symbol>)> = files
         .into_iter()
         .map(|p| {
-            let syms = extract_symbols(&p);
+            let (syms, capped) = extract_symbols(&p);
+            if capped {
+                lines_truncated = true;
+            }
             (p, syms)
         })
         .filter(|(_, syms)| !syms.is_empty())
@@ -545,7 +556,19 @@ pub fn repo_map(cwd: &Path, map_tokens: usize) -> Option<RepoMap> {
 
     let mut map = RepoMap::default();
     let trunc_marker = "[map truncated: token budget exhausted]\n";
-    let marker_tokens = trunc_marker.chars().count().div_ceil(4);
+    let files_marker = format!("[map truncated: file limit reached (max {MAX_FILES} files)]\n");
+    let lines_marker = format!("[map truncated: file exceeds {MAX_LINES_PER_FILE} lines]\n");
+    // Reserve room for every marker that will be appended, so the map
+    // stays within budget even when a cap (not just the token budget)
+    // truncated it.
+    let mut marker_tokens = trunc_marker.chars().count().div_ceil(4);
+    if files_truncated {
+        marker_tokens += files_marker.chars().count().div_ceil(4);
+    }
+    if lines_truncated {
+        marker_tokens += lines_marker.chars().count().div_ceil(4);
+    }
+    let mut token_truncated = false;
     let mut used = 0usize;
     let header = format!(
         "Repository map (top Rust symbols by cross-file references, {}-token budget):\n",
@@ -562,7 +585,7 @@ pub fn repo_map(cwd: &Path, map_tokens: usize) -> Option<RepoMap> {
             .replace('\\', "/");
         let file_line = format!("{}\n", rel);
         if used + file_line.chars().count().div_ceil(4) + marker_tokens > map_tokens {
-            map.truncated = true;
+            token_truncated = true;
             break;
         }
         used += file_line.chars().count().div_ceil(4);
@@ -583,7 +606,7 @@ pub fn repo_map(cwd: &Path, map_tokens: usize) -> Option<RepoMap> {
                 sym.ref_files
             );
             if used + line.chars().count().div_ceil(4) + marker_tokens > map_tokens {
-                map.truncated = true;
+                token_truncated = true;
                 break 'files;
             }
             used += line.chars().count().div_ceil(4);
@@ -593,8 +616,15 @@ pub fn repo_map(cwd: &Path, map_tokens: usize) -> Option<RepoMap> {
         map.files.push(file_entry);
     }
 
-    if map.truncated {
+    map.truncated = token_truncated || files_truncated || lines_truncated;
+    if token_truncated {
         out.push_str(trunc_marker);
+    }
+    if files_truncated {
+        out.push_str(&files_marker);
+    }
+    if lines_truncated {
+        out.push_str(&lines_marker);
     }
     map.rendered = Some(out.trim_end().to_string());
     Some(map)
@@ -626,7 +656,7 @@ mod tests {
             "a.rs",
             "pub fn hello() {}\nfn private_fn() {}\npub struct Config {}\nenum Hidden {}\nimpl Config {}\nmod inner {}\n",
         );
-        let syms = extract_symbols(&p);
+        let (syms, _) = extract_symbols(&p);
         let names: Vec<(&str, bool)> = syms.iter().map(|s| (s.name.as_str(), s.is_pub)).collect();
         assert!(names.contains(&("hello", true)));
         assert!(names.contains(&("private_fn", false)));
@@ -645,7 +675,7 @@ mod tests {
             "b.rs",
             "pub fn real() {}\n#[cfg(test)]\nmod tests {\n    fn fake_helper() {}\n}\n",
         );
-        let syms = extract_symbols(&p);
+        let (syms, _) = extract_symbols(&p);
         assert!(syms.iter().any(|s| s.name == "real"));
         assert!(!syms.iter().any(|s| s.name == "fake_helper"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -663,9 +693,10 @@ mod tests {
         );
         write_file(&dir, "b.rs", "fn y() { popular(); }\n");
         let mut entries: Vec<(PathBuf, Vec<Symbol>)> = collect_rust_files(&dir)
+            .0
             .into_iter()
             .map(|p| {
-                let s = extract_symbols(&p);
+                let (s, _) = extract_symbols(&p);
                 (p, s)
             })
             .filter(|(_, s)| !s.is_empty())
@@ -708,13 +739,128 @@ mod tests {
     }
 
     #[test]
+    fn file_cap_marks_map_truncated() {
+        let dir = unique_dir("filecap");
+        let _ = std::fs::remove_dir_all(&dir);
+        for i in 0..=MAX_FILES {
+            write_file(
+                &dir,
+                &format!("f{i:03}.rs"),
+                &format!("pub fn func_{i}() {{}}\n"),
+            );
+        }
+        let map = repo_map(&dir, 100_000).expect("map");
+        assert_eq!(map.files.len(), MAX_FILES, "only MAX_FILES files kept");
+        assert!(map.truncated, "file cap hit must mark the map truncated");
+        assert!(
+            map.text().contains("file limit"),
+            "file cap must emit a marker, got:\n{}",
+            map.text()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn line_cap_marks_map_truncated() {
+        let dir = unique_dir("linecap");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut src = String::from("pub fn first() {}\n");
+        for _ in 1..MAX_LINES_PER_FILE {
+            src.push_str("// filler\n");
+        }
+        src.push_str("pub fn beyond_cap() {}\n");
+        write_file(&dir, "long.rs", &src);
+        let map = repo_map(&dir, 100_000).expect("map");
+        assert!(map.truncated, "line cap hit must mark the map truncated");
+        assert!(
+            map.text().contains("4000 lines"),
+            "line cap must emit a marker, got:\n{}",
+            map.text()
+        );
+        let names: Vec<&str> = map.files[0]
+            .symbols
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(names.contains(&"first"), "{names:?}");
+        assert!(
+            !names.contains(&"beyond_cap"),
+            "symbol past the line cap must be missing: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_symbols_reports_line_cap() {
+        let dir = unique_dir("extractcap");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut src = String::new();
+        for i in 0..MAX_LINES_PER_FILE {
+            src.push_str(&format!("pub fn func_{i}() {{}}\n"));
+        }
+        src.push_str("pub fn beyond_cap() {}\n");
+        let p = write_file(&dir, "long.rs", &src);
+        let (syms, truncated) = extract_symbols(&p);
+        assert!(truncated, "file over the line cap must report truncation");
+        assert!(!syms.iter().any(|s| s.name == "beyond_cap"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_symbols_exactly_at_line_cap_is_not_truncated() {
+        let dir = unique_dir("extractexact");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut src = String::new();
+        for i in 0..MAX_LINES_PER_FILE {
+            src.push_str(&format!("pub fn func_{i}() {{}}\n"));
+        }
+        let p = write_file(&dir, "exact.rs", &src);
+        let (syms, truncated) = extract_symbols(&p);
+        assert!(
+            !truncated,
+            "a file with exactly MAX_LINES_PER_FILE lines is whole"
+        );
+        assert_eq!(syms.len(), MAX_LINES_PER_FILE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collect_rust_files_reports_file_cap() {
+        let dir = unique_dir("collectcap");
+        let _ = std::fs::remove_dir_all(&dir);
+        for i in 0..=MAX_FILES {
+            write_file(&dir, &format!("f{i:03}.rs"), "pub fn f() {}\n");
+        }
+        let (files, truncated) = collect_rust_files(&dir);
+        assert_eq!(files.len(), MAX_FILES);
+        assert!(truncated, "one file over the cap must report truncation");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collect_rust_files_exactly_at_file_cap_is_not_truncated() {
+        let dir = unique_dir("collectexact");
+        let _ = std::fs::remove_dir_all(&dir);
+        for i in 0..MAX_FILES {
+            write_file(&dir, &format!("f{i:03}.rs"), "pub fn f() {}\n");
+        }
+        let (files, truncated) = collect_rust_files(&dir);
+        assert_eq!(files.len(), MAX_FILES);
+        assert!(
+            !truncated,
+            "exactly MAX_FILES files fit the cap, nothing is cut"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn hidden_files_kept_hidden_dirs_skipped() {
         let dir = unique_dir("hidden");
         let _ = std::fs::remove_dir_all(&dir);
         write_file(&dir, ".hidden.rs", "pub fn hidden_fn() {}\n");
         write_file(&dir, ".hiddendir/x.rs", "pub fn concealed() {}\n");
         write_file(&dir, "visible.rs", "pub fn visible_fn() {}\n");
-        let files = collect_rust_files(&dir);
+        let (files, _) = collect_rust_files(&dir);
         let names: Vec<String> = files
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
@@ -758,7 +904,7 @@ mod tests {
             "d.rs",
             "pub fn before() {}\n#[cfg(test)]\nfn test_only() {}\npub fn after() {}\n",
         );
-        let syms = extract_symbols(&p);
+        let (syms, _) = extract_symbols(&p);
         let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"before"), "{names:?}");
         assert!(names.contains(&"test_only"), "{names:?}");
@@ -771,7 +917,7 @@ mod tests {
         let dir = unique_dir("moddecl");
         let _ = std::fs::remove_dir_all(&dir);
         let p = write_file(&dir, "e.rs", "mod tests;\npub fn after_decl() {}\n");
-        let syms = extract_symbols(&p);
+        let (syms, _) = extract_symbols(&p);
         assert!(
             syms.iter().any(|s| s.name == "after_decl"),
             "code after `mod tests;` must not be skipped"
@@ -789,7 +935,7 @@ mod tests {
             "f.rs",
             "pub fn first() {}\nmod tests {\n    fn helper() {}\n}\npub fn last() {}\n",
         );
-        let syms = extract_symbols(&p);
+        let (syms, _) = extract_symbols(&p);
         let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"first"), "{names:?}");
         assert!(names.contains(&"last"), "{names:?}");
@@ -844,9 +990,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         write_file(&dir, "solo.rs", "fn only_here() {}\n");
         let mut entries: Vec<(PathBuf, Vec<Symbol>)> = collect_rust_files(&dir)
+            .0
             .into_iter()
             .map(|p| {
-                let s = extract_symbols(&p);
+                let (s, _) = extract_symbols(&p);
                 (p, s)
             })
             .filter(|(_, s)| !s.is_empty())
