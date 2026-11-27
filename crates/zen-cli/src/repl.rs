@@ -4562,6 +4562,63 @@ mod model_picker_tests {
     }
 
     #[test]
+    fn lock_local_settings_acquires_and_releases() {
+        // Issue #469 / PR #574: the settings lock itself had no direct
+        // test - it was only exercised indirectly through
+        // save_local_settings. Acquiring twice in a row (with a drop
+        // between) pins the happy path the contention guard protects.
+        let dir = std::env::temp_dir().join(format!("zen_lock_acquire_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let parent = dir.join(".zen");
+        std::fs::create_dir_all(&parent).unwrap();
+        {
+            let _lock = lock_local_settings(&parent).unwrap();
+            assert!(parent.join("settings.local.lock").exists());
+        }
+        // Dropped: the flock is released with the guard, so a second
+        // acquire in the same process must succeed immediately.
+        let _lock = lock_local_settings(&parent).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lock_contention_on_linux_is_would_block_with_raw_error_11() {
+        // PR #574, repl.rs:2790: the contention guard also accepts a
+        // raw OS error of 33 (Windows ERROR_LOCK_VIOLATION, which std
+        // maps to ErrorKind::Other - issue #319). On Linux, flock
+        // contention is always WouldBlock with raw error 11 (EAGAIN),
+        // never 33 (EDOM on Linux, which flock never returns), so the
+        // two mutants on that guard are equivalent on Linux - see the
+        // exclusions in .cargo/mutants.toml. This test pins the Linux
+        // premise the exclusion rests on: if it ever fails, the
+        // exclusion must be revisited.
+        use fs2::FileExt;
+        let dir =
+            std::env::temp_dir().join(format!("zen_lock_contention_kind_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let parent = dir.join(".zen");
+        std::fs::create_dir_all(&parent).unwrap();
+        let lock_path = parent.join("settings.local.lock");
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        holder.lock_exclusive().unwrap();
+        let contender = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        let err = contender.try_lock_exclusive().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(err.raw_os_error(), Some(11));
+        assert_ne!(err.raw_os_error(), Some(33));
+        drop(holder);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn route_moves_free_pool_model_to_its_service() {
         // The free pool IS the default service now, so routing a
         // free-pool model keeps it on the default base and must not
