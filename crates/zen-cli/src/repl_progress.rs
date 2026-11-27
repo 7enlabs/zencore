@@ -58,8 +58,12 @@ impl ReplProgressSink {
     }
 
     fn attach_result(&self, id: &str, content: &str, is_error: bool) -> Option<usize> {
-        let idx = *lock_or_recover(&self.by_id, "repl progress by-id").get(id)?;
+        // Lock order (#468): cards before by_id, same as register_card.
+        // Taking by_id first inverts the order (AB-BA) and can deadlock
+        // against a concurrent register_card.
         let mut cards = lock_or_recover(&self.cards, "repl progress cards");
+        let by_id = lock_or_recover(&self.by_id, "repl progress by-id");
+        let idx = *by_id.get(id)?;
         let card = cards.get_mut(idx)?;
         card.result = Some(store_result(content));
         card.is_error = is_error;
@@ -538,5 +542,33 @@ mod tests {
     #[test]
     fn text_delta_is_not_echoed() {
         assert!(render(&AgentEvent::TextDelta { text: "x".into() }).is_empty());
+    }
+    /// Regression test for #468 (AB-BA lock-order inversion): `register_card`
+    /// takes `cards` then `by_id`, so `attach_result` must take them in the
+    /// same order. Probed by holding `by_id` from this thread: while
+    /// `attach_result` waits for `by_id` it must already hold `cards`.
+    #[test]
+    fn attach_result_acquires_cards_before_by_id() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let sink = Arc::new(ReplProgressSink::new());
+        sink.register_card("id-1", "tool", "arg".to_string());
+        // Hold by_id so attach_result blocks on it from another thread.
+        let by_id = lock_or_recover(&sink.by_id, "test by-id");
+        let sink2 = Arc::clone(&sink);
+        let handle = std::thread::spawn(move || {
+            sink2.attach_result("id-1", "ok", false);
+        });
+        // Give the spawned thread time to reach the by_id wait.
+        std::thread::sleep(Duration::from_millis(500));
+        // Cards-first order: attach_result holds cards while waiting for by_id.
+        let cards_held = sink.cards.try_lock().is_err();
+        drop(by_id);
+        handle.join().expect("attach_result thread finished");
+        assert!(
+            cards_held,
+            "attach_result must acquire cards before by_id (lock order cards -> by_id, #468)"
+        );
     }
 }
