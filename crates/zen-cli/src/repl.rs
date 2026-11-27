@@ -2780,21 +2780,22 @@ fn is_lock_contention(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(33)
 }
 
-/// Acquire the settings lock, waiting a bounded time.
-fn lock_local_settings(parent: &Path) -> Result<SettingsLock> {
-    use fs2::FileExt;
-    let lock_path = parent.join("settings.local.lock");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        // The file only carries the flock; its content is never read
-        // or written, so it must not be truncated on open.
-        .truncate(false)
-        .open(&lock_path)?;
+/// Acquire the settings lock, retrying contention until the deadline
+/// and failing at once on a hard error. The lock attempt is a closure
+/// so the retry decision itself is unit-testable with synthetic errors
+/// (PR #574): the `lock_with_retry_*` tests inject a hard error and a
+/// contended-then-free sequence, which pins the call-site guard
+/// `is_lock_contention(&e)` - a mutant replacing that guard with
+/// `true` survives the `is_lock_contention_*` tests, because those
+/// only classify the error and never reach the call site.
+fn lock_with_retry(
+    mut attempt: impl FnMut() -> std::io::Result<()>,
+    lock_path: &Path,
+) -> Result<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        match file.try_lock_exclusive() {
-            Ok(()) => return Ok(SettingsLock { _file: file }),
+        match attempt() {
+            Ok(()) => return Ok(()),
             // Contention means retry until the deadline; anything else
             // is a hard error (see is_lock_contention).
             Err(e) if is_lock_contention(&e) => {
@@ -2808,6 +2809,21 @@ fn lock_local_settings(parent: &Path) -> Result<SettingsLock> {
             }
         }
     }
+}
+
+/// Acquire the settings lock, waiting a bounded time.
+fn lock_local_settings(parent: &Path) -> Result<SettingsLock> {
+    use fs2::FileExt;
+    let lock_path = parent.join("settings.local.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        // The file only carries the flock; its content is never read
+        // or written, so it must not be truncated on open.
+        .truncate(false)
+        .open(&lock_path)?;
+    lock_with_retry(|| file.try_lock_exclusive(), &lock_path)?;
+    Ok(SettingsLock { _file: file })
 }
 
 fn save_local_setting(cwd: &Path, key: &str, value: &str) -> Result<std::path::PathBuf> {
@@ -4665,6 +4681,56 @@ mod model_picker_tests {
         // different error, so a raw-11 assertion cannot be portable.
         // The Linux flock behaviour is pinned by
         // lock_contention_on_linux_is_would_block_with_raw_error_11.
+    }
+
+    #[test]
+    fn lock_with_retry_fails_at_once_on_hard_error() {
+        // PR #574, repl.rs:2800: the mutant replacing the call-site
+        // guard `is_lock_contention(&e)` with `true` survives the
+        // `is_lock_contention_*` tests - those only classify the
+        // error, they never reach the guard. A hard error injected
+        // here must fail at once with "cannot lock" instead of
+        // retrying until the 10 s deadline and bailing "locked by
+        // another process" (which is what the mutant does).
+        let lock_path = std::path::Path::new("settings.local.lock");
+        let start = std::time::Instant::now();
+        let err =
+            lock_with_retry(|| Err(std::io::Error::other("other failure")), lock_path).unwrap_err();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "hard error must fail at once, took {:?}",
+            start.elapsed()
+        );
+        assert!(
+            err.to_string().starts_with("cannot lock"),
+            "hard error must fail with 'cannot lock', got: {err}"
+        );
+    }
+
+    #[test]
+    fn lock_with_retry_retries_contention_then_succeeds() {
+        // PR #574: the other half of the guard - contention must be
+        // retried, not failed at once. A closure that contends twice
+        // and then succeeds pins the retry branch of lock_with_retry.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = AtomicUsize::new(0);
+        let lock_path = std::path::Path::new("settings.local.lock");
+        lock_with_retry(
+            || {
+                let n = attempts.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "contended",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+            lock_path,
+        )
+        .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 
     #[test]
