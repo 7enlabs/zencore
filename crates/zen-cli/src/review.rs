@@ -331,17 +331,109 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {
     }
 }
 
+/// Unquote a git C-style quoted path (`core.quotePath`, on by default):
+/// `"caf\303\251.rs"` is `café.rs`. Returns `None` when the token is not
+/// a well-formed quoted string.
+fn unquote_git_path(token: &str) -> Option<String> {
+    let inner = token.strip_prefix('"')?.strip_suffix('"')?;
+    let bytes = inner.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let esc = *bytes.get(i)?;
+        i += 1;
+        match esc {
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(0x0b),
+            b'\\' => out.push(b'\\'),
+            b'"' => out.push(b'"'),
+            b'0'..=b'7' => {
+                let mut value: u16 = (esc - b'0') as u16;
+                let mut count = 1;
+                while count < 3 {
+                    let Some(&digit) = bytes.get(i) else { break };
+                    if !(b'0'..=b'7').contains(&digit) {
+                        break;
+                    }
+                    value = value * 8 + (digit - b'0') as u16;
+                    i += 1;
+                    count += 1;
+                }
+                if value > u8::MAX as u16 {
+                    return None;
+                }
+                out.push(value as u8);
+            }
+            _ => return None,
+        }
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Strip the `a/` or `b/` prefix from one side of a `diff --git` header,
+/// unquoting first when the side is C-style quoted. Returns `None` when
+/// the side is malformed.
+fn diff_git_side_path(side: &str, prefix: &str) -> Option<String> {
+    if side.starts_with('"') {
+        unquote_git_path(side)?
+            .strip_prefix(prefix)
+            .map(str::to_string)
+    } else {
+        side.strip_prefix(prefix).map(str::to_string)
+    }
+}
+
+/// Split the remainder of a `diff --git` header line into its a-side and
+/// b-side paths.
+///
+/// Issue #464: splitting the header on spaces silently dropped filenames
+/// with spaces and kept git-quoted non-ASCII filenames verbatim (quotes
+/// and octal escapes included). The separator between the two sides is
+/// ` b/` for plain paths and ` "b/` when the b-side is quoted. For the
+/// common non-rename case both sides are the same path, so the split
+/// where the two sides agree is exact even when a side contains spaces
+/// or a literal ` b/`; otherwise the first plausible separator is the
+/// rename split. (A rename whose a-side itself contains ` b/` stays
+/// ambiguous in git's non-`-z` format.)
+fn split_diff_git_header(rest: &str) -> Option<(String, String)> {
+    let mut separators: Vec<usize> = rest.match_indices(" b/").map(|(i, _)| i).collect();
+    separators.extend(rest.match_indices(" \"b/").map(|(i, _)| i));
+    separators.sort_unstable();
+    separators.dedup();
+    let mut fallback = None;
+    for i in separators {
+        let a = diff_git_side_path(&rest[..i], "a/");
+        let b = diff_git_side_path(&rest[i + 1..], "b/");
+        let Some((a, b)) = a.zip(b) else { continue };
+        if a == b {
+            return Some((a, b));
+        }
+        if fallback.is_none() {
+            fallback = Some((a, b));
+        }
+    }
+    fallback
+}
+
 fn changed_files_from_diff(diff: &str) -> Vec<String> {
     let mut files = Vec::new();
     for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git ") {
-            let parts: Vec<&str> = rest.split(' ').collect();
-            if parts.len() == 2 {
-                let b = parts[1].strip_prefix("b/").unwrap_or(parts[1]);
-                if !files.contains(&b.to_string()) {
-                    files.push(b.to_string());
-                }
-            }
+        if let Some(rest) = line.strip_prefix("diff --git ")
+            && let Some((_, b)) = split_diff_git_header(rest)
+            && !files.contains(&b)
+        {
+            files.push(b);
         }
     }
     files
@@ -1503,5 +1595,25 @@ mod tests {
         let p = build_review_prompt(&diff);
         assert!(p.contains("a.rs"));
         assert!(p.contains("```diff"));
+    }
+
+    // Issue #464: filenames with spaces and git-quoted non-ASCII
+    // filenames must not be silently dropped from the file list.
+    #[test]
+    fn changed_files_from_diff_keeps_spaced_and_quoted_paths() {
+        let diff = "diff --git a/my file.rs b/my file.rs\n--- a/my file.rs\n+++ b/my file.rs\n\
+             diff --git \"a/caf\\303\\251.rs\" \"b/caf\\303\\251.rs\"\n\
+             diff --git \"a/my caf\\303\\251.rs\" \"b/my caf\\303\\251.rs\"\n\
+             diff --git a/plain.rs b/plain.rs\n";
+        assert_eq!(
+            changed_files_from_diff(diff),
+            vec!["my file.rs", "café.rs", "my café.rs", "plain.rs"]
+        );
+    }
+
+    #[test]
+    fn changed_files_from_diff_uses_b_side_on_rename_with_spaces() {
+        let diff = "diff --git a/old name.rs b/new name.rs\n";
+        assert_eq!(changed_files_from_diff(diff), vec!["new name.rs"]);
     }
 }
