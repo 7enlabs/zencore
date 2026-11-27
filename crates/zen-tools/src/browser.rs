@@ -2071,7 +2071,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore] // floor-guard: live test needs system Chromium + network; run explicitly with --ignored
     async fn live_navigate_content_screenshot() {
         // Needs system Chromium + network. Run:
         // cargo test -p zen-tools --lib browser::tests::live_ -- --ignored
