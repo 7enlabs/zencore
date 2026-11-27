@@ -4372,6 +4372,26 @@ mod model_picker_tests {
     }
 
     #[test]
+    fn build_repl_config_carries_fallback_models_and_system_prompt() {
+        // Issue #397 (mutant killers): build_repl_config must carry
+        // the resolved fallback models and the built system prompt
+        // into the agent config. A mutant dropping either field falls
+        // back to the AgentConfig default (empty vec / empty string)
+        // and must fail here.
+        use clap::Parser;
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cli = crate::cli::Cli::parse_from(["zen"]);
+        let mut cfg = test_cfg();
+        cfg.fallback_models = vec!["fb-model".into()];
+        let config = build_repl_config(&cli, &cfg, &std::env::temp_dir());
+        assert_eq!(config.fallback_models, vec!["fb-model".to_string()]);
+        assert!(
+            !config.system_prompt.is_empty(),
+            "system prompt must be carried into the agent config"
+        );
+    }
+
+    #[test]
     fn loop_stuck_k_flows_into_agent_config() {
         use clap::Parser;
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

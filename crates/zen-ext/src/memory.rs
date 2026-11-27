@@ -1890,4 +1890,104 @@ mod tests {
             files.iter().map(|(p, _)| p).collect::<Vec<_>>()
         );
     }
+
+    // Issue #397 (mutant killers): the _with_excludes and
+    // _with_root_and_excludes wrappers are thin delegations to the
+    // impls, so only a test calling each wrapper directly and
+    // asserting on its output kills a mutant replacing the whole
+    // return value with "" / "xyzzy" / vec![]. The assertions only
+    // require the fixture content to be present, so a stray
+    // AGENTS.md above TMPDIR (issue #253) can add sections without
+    // breaking them.
+    #[test]
+    fn issue_397_memory_files_with_root_and_excludes_returns_fixture() {
+        let tmp = TempDir::new();
+        let proj = tmp.path().join("proj");
+        let sub = proj.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(proj.join("ZEN.md"), "inside-root").unwrap();
+        let nohome = tmp.path().join("nohome");
+
+        let files = memory_files_with_root_and_excludes(&sub, Some(&nohome), tmp.path(), &[], true);
+        assert!(
+            files.iter().any(|(_, c)| c.contains("inside-root")),
+            "root+excludes load should return the fixture: {:?}",
+            files.iter().map(|(p, _)| p).collect::<Vec<_>>()
+        );
+
+        let excludes = vec![proj.join("ZEN.md").to_string_lossy().to_string()];
+        let files =
+            memory_files_with_root_and_excludes(&sub, Some(&nohome), tmp.path(), &excludes, true);
+        assert!(
+            !files.iter().any(|(_, c)| c.contains("inside-root")),
+            "excluded fixture still loaded: {:?}",
+            files.iter().map(|(p, _)| p).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn issue_397_memory_prompt_with_excludes_returns_fixture_content() {
+        let tmp = TempDir::new();
+        let proj = tmp.path().join("proj");
+        let sub = proj.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(proj.join("ZEN.md"), "inside-root").unwrap();
+        let nohome = tmp.path().join("nohome");
+
+        let prompt = memory_prompt_with_excludes(&sub, Some(&nohome), &[], true);
+        assert!(
+            prompt.contains("inside-root"),
+            "excludes prompt should contain the fixture memory: {prompt}"
+        );
+    }
+
+    #[test]
+    fn issue_397_memory_prompt_with_root_and_excludes_returns_fixture_content() {
+        let tmp = TempDir::new();
+        let proj = tmp.path().join("proj");
+        let sub = proj.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(proj.join("ZEN.md"), "inside-root").unwrap();
+        let nohome = tmp.path().join("nohome");
+
+        let prompt =
+            memory_prompt_with_root_and_excludes(&sub, Some(&nohome), tmp.path(), &[], true);
+        assert!(
+            prompt.contains("inside-root"),
+            "root+excludes prompt should contain the fixture memory: {prompt}"
+        );
+    }
+
+    #[test]
+    fn issue_397_memories_report_with_excludes_lists_fixture() {
+        let tmp = TempDir::new();
+        let proj = tmp.path().join("proj");
+        let sub = proj.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(proj.join("ZEN.md"), "inside-root").unwrap();
+        let nohome = tmp.path().join("nohome");
+
+        let report = memories_report_with_excludes(&sub, Some(&nohome), &[], true);
+        assert!(
+            report.contains("ZEN.md"),
+            "excludes report should list the fixture memory: {report}"
+        );
+    }
+
+    #[test]
+    fn issue_397_memories_report_with_root_and_excludes_lists_fixture() {
+        let tmp = TempDir::new();
+        let proj = tmp.path().join("proj");
+        let sub = proj.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(proj.join("ZEN.md"), "inside-root").unwrap();
+        let nohome = tmp.path().join("nohome");
+
+        let report =
+            memories_report_with_root_and_excludes(&sub, Some(&nohome), tmp.path(), &[], true);
+        assert!(
+            report.contains("ZEN.md"),
+            "root+excludes report should list the fixture memory: {report}"
+        );
+    }
 }
