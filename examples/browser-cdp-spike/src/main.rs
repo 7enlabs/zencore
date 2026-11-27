@@ -78,7 +78,9 @@ async fn wait_for_version(client: &reqwest::Client, port: u16) -> Result<Value> 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         match client.get(&url).send().await {
-            Ok(r) if r.status().is_success() => return r.json().await.context("parse /json/version"),
+            Ok(r) if r.status().is_success() => {
+                return r.json().await.context("parse /json/version")
+            }
             _ => {
                 if tokio::time::Instant::now() >= deadline {
                     bail!("Chromium did not answer {url} within 30s");
@@ -107,9 +109,8 @@ async fn create_target(client: &reqwest::Client, port: u16) -> Result<String> {
         .ok_or_else(|| anyhow!("no webSocketDebuggerUrl in /json/new response: {target}"))
 }
 
-type Ws = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 struct Cdp {
     ws: Ws,
@@ -122,7 +123,11 @@ impl Cdp {
         let (ws, _) = tokio_tungstenite::connect_async(ws_url)
             .await
             .context("connect CDP websocket")?;
-        Ok(Self { ws, next_id: 1, events: VecDeque::new() })
+        Ok(Self {
+            ws,
+            next_id: 1,
+            events: VecDeque::new(),
+        })
     }
 
     async fn next_msg(&mut self, dur: Duration) -> Result<Value> {
@@ -163,7 +168,11 @@ impl Cdp {
     async fn wait_event(&mut self, method: &str, dur: Duration) -> Result<()> {
         let deadline = tokio::time::Instant::now() + dur;
         loop {
-            if let Some(pos) = self.events.iter().position(|e| e.get("method").and_then(Value::as_str) == Some(method)) {
+            if let Some(pos) = self
+                .events
+                .iter()
+                .position(|e| e.get("method").and_then(Value::as_str) == Some(method))
+            {
                 self.events.remove(pos);
                 return Ok(());
             }
@@ -184,7 +193,10 @@ impl Cdp {
     /// Evaluate JS in the page, return the value (returnByValue).
     async fn eval(&mut self, expr: &str) -> Result<Value> {
         let r = self
-            .call("Runtime.evaluate", json!({"expression": expr, "returnByValue": true}))
+            .call(
+                "Runtime.evaluate",
+                json!({"expression": expr, "returnByValue": true}),
+            )
             .await?;
         // call() already returns msg["result"], so the value lives at
         // result.result.value (Runtime.evaluate result object -> remote object).
@@ -206,7 +218,9 @@ async fn run(url: &str, out: &std::path::Path) -> Result<()> {
         .arg("--version")
         .output()
         .context("chromium --version")?;
-    let chromium_version = String::from_utf8_lossy(&version_out.stdout).trim().to_string();
+    let chromium_version = String::from_utf8_lossy(&version_out.stdout)
+        .trim()
+        .to_string();
     println!("chromium: {chromium} ({chromium_version})");
 
     let port = free_port().await?;
@@ -221,9 +235,18 @@ async fn run(url: &str, out: &std::path::Path) -> Result<()> {
         let version = wait_for_version(&client, port).await?;
         println!(
             "CDP: browser={} protocol={} v8={}",
-            version.get("Browser").and_then(Value::as_str).unwrap_or("?"),
-            version.get("Protocol-Version").and_then(Value::as_str).unwrap_or("?"),
-            version.get("V8-Version").and_then(Value::as_str).unwrap_or("?")
+            version
+                .get("Browser")
+                .and_then(Value::as_str)
+                .unwrap_or("?"),
+            version
+                .get("Protocol-Version")
+                .and_then(Value::as_str)
+                .unwrap_or("?"),
+            version
+                .get("V8-Version")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
         );
         let ws_url = create_target(&client, port).await?;
         let mut cdp = Cdp::connect(&ws_url).await?;
@@ -251,7 +274,9 @@ async fn run(url: &str, out: &std::path::Path) -> Result<()> {
         // Diagnostics if the page did not render: they show whether JS ran at all.
         let ready = cdp.eval("document.readyState").await?;
         let has_jquery = cdp.eval("typeof jQuery").await?;
-        let body_len = cdp.eval("document.body ? document.body.innerText.length : -1").await?;
+        let body_len = cdp
+            .eval("document.body ? document.body.innerText.length : -1")
+            .await?;
         println!("diagnostics: readyState={ready} jQuery={has_jquery} innerText_len={body_len}");
         println!("JS-rendered quotes found: {quotes}");
         if quotes == 0 {
@@ -266,7 +291,10 @@ async fn run(url: &str, out: &std::path::Path) -> Result<()> {
             .to_string();
         println!("--- innerText (first 500 chars) ---");
         println!("{}", text.chars().take(500).collect::<String>());
-        println!("--- end innerText, total {} chars ---", text.chars().count());
+        println!(
+            "--- end innerText, total {} chars ---",
+            text.chars().count()
+        );
         if text.trim().is_empty() {
             bail!("innerText is empty after JS ran");
         }

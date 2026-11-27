@@ -63,3 +63,43 @@ OK: navigate + JS text + screenshot all worked
    Sửa thành `result.result.value` thì đếm được 10 quote.
 2. `grep -c "class=.quote."` trên HTML thô trả 1 — đó là chuỗi JS, không phải element
    đã render (đã đối chiếu ở trên).
+
+## Chạy lại sau review (27/11/2026 ~21:26 Asia/Saigon, 14:26 UTC)
+
+Sửa theo review Z Tester (tin Telegram 25382) / Leader giao sửa (tin 25385):
+`cargo fmt` cho `src/main.rs`, chạy lại spike, ghi rõ Chromium.
+
+## Lệnh
+
+```sh
+cd examples/browser-cdp-spike
+cargo fmt && cargo fmt --check
+cargo build --release
+./target/release/browser-cdp-spike
+./target/release/browser-cdp-spike   # chạy lần 2, kiểm tra tái tạo
+```
+
+## Kết quả chạy lại (exit 0, cả 2 lần giống hệt nhau)
+
+```text
+chromium: /usr/bin/chromium (Chromium 155.0.8059.79 built on Debian GNU/Linux 13 (trixie))
+launched headless Chromium, remote-debugging-port=45099
+CDP: browser=Chrome/155.0.8059.79 protocol=1.3 v8=15.5.35.23
+navigated to https://quotes.toscrape.com/js/
+page load event fired
+diagnostics: readyState="complete" jQuery="function" innerText_len=1499
+JS-rendered quotes found: 10
+screenshot: screenshot.png (75878 bytes)
+OK: navigate + JS text + screenshot all worked
+```
+
+- Chromium lúc chạy lại: `155.0.8059.79` (gói `155.0.8059.79-1~deb13u1`, chưa nâng;
+  `chromium --version` + dòng `CDP: browser=Chrome/155.0.8059.79` khớp nhau).
+- Screenshot tái tạo: **75878 bytes**, SHA256
+  `e03d93385e708c609110fb4f9c6380f656b0478a81e7e842467b44feb1f6b33d` — khớp ảnh đã
+  commit, chạy 2 lần đều giống. Không có ảnh mới để commit: ảnh trong commit đã đúng
+  với Chromium này.
+- Z Tester chạy lại ra 77077 byte, SHA256
+  `5988988d1a6b2cbf34c4b881f785eef4b7ea77273ff24379e5ff5b4b2ca3708e`, với Chromium
+  `154.0.8037.57` (máy khác): ảnh chụp phụ thuộc phiên bản Chromium, SHA chỉ có nghĩa
+  khi đi kèm đúng phiên bản. Nâng Chromium thì chạy lại spike và cập nhật SHA mới.

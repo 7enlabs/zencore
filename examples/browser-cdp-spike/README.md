@@ -18,6 +18,10 @@ Mặc định: url `https://quotes.toscrape.com/js/`, ảnh `./screenshot.png`.
 
 - Chromium hệ thống `155.0.8059.79` (gói Debian `155.0.8059.79-1~deb13u1`,
   `sudo apt install chromium`), CDP protocol 1.3, V8 15.5.35.23.
+- SHA screenshot gắn với đúng phiên bản Chromium này: chạy lại 27/11/2026 trên box
+  (vẫn `155.0.8059.79`) tái tạo đúng 75878 byte, SHA256 `e03d9338...`; Z Tester chạy
+  trên Chromium `154.0.8037.57` ra 77077 byte, SHA256 `5988988d...` — khác phiên
+  bản thì ảnh khác, không phải ảnh commit sai. Xem `RUN_LOG.md`.
 - cargo 1.99.0, rustc 1.99.0.
 - Crate độc lập (`[workspace]` riêng), không thuộc workspace ZenCore.
 

@@ -5,6 +5,9 @@
 - Giao việc: ZC Leader tin Telegram 25353, 13:13:20 UTC 27/11/2026.
 - Thứ tự Zen đã chốt: **browser agent trước, computer-use sau**.
 - Spike kèm theo: `examples/browser-cdp-spike/` (chạy được trên box, xem mục 8).
+- Sửa sau review: Z Tester review độc lập (tin Telegram 25382), Leader giao sửa
+  (tin 25385) — fmt spike, chạy lại spike, ghi rõ Chromium, bổ sung kiểm soát
+  mạng toàn phiên + duyệt riêng submit/phá hủy + serialize selector an toàn.
 
 ## 1. Hiện trạng
 
@@ -32,7 +35,9 @@ Sáu tool mới, đặt trong `zen-tools` cạnh WebFetch/WebSearch, cùng imple
 | `wait_until` | string | không | `load` (mặc định) hoặc `networkidle`. Hết `load` thì trả ngay; `networkidle` chờ thêm tới khi 500ms không còn request mạng. |
 | `timeout_ms` | integer | không | Mặc định 30000, tối đa 120000. |
 
-Trả về: URL cuối sau redirect, HTTP status, `title`, độ dài `innerText`. Lỗi: URL
+Trả về: URL cuối sau redirect, HTTP status, `title`, độ dài `innerText`. Mỗi hop
+redirect đều kiểm tra lại bằng `check_fetch_target` như URL ban đầu (mục 6,
+điểm 9): redirect tới mạng riêng thì chặn, không navigate tiếp. Lỗi: URL
 không hợp lệ, timeout, trang trả lỗi HTTP, target đóng.
 
 ### 2.2 `browser_click` — đổi trạng thái (mutating)
@@ -154,6 +159,31 @@ Nguồn: `docs.rs/crate/chromiumoxide_cdp/0.7.0` (mô tả API, fetcher, generat
 - Dọn dẹp: đóng WebSocket, kill tiến trình, xóa `--user-data-dir` tạm khi session kết thúc.
 - Một session chỉ nói chuyện với `127.0.0.1`; không mở remote-debugging ra ngoài.
 
+### 3.4 Serialize selector an toàn khi gọi `Runtime.evaluate`
+
+- **Cấm ghép chuỗi JS**: không bao giờ làm
+  `format!("document.querySelector('{selector}')")` hay nối chuỗi tương tự với
+  selector/text do agent cung cấp — selector chứa `'` sẽ phá cú pháp, và dữ liệu
+  agent có thể thành mã JS tùy ý chạy trên trang.
+- **Cách đúng (duy nhất)**: truyền dữ liệu qua tham số JSON của CDP, để JSON
+  encoder lo việc escape:
+  - `Runtime.callFunctionOn` với `functionDeclaration` là chuỗi cố định trong code
+    (`function(sel) { return document.querySelector(sel); }`, không chứa dữ liệu
+    agent) và `arguments: [{"value": selector}]` — selector đi trong JSON value,
+    không đi trong mã.
+  - Hoặc `Runtime.evaluate` với `expression` là template cố định + chuỗi literal
+    đã JSON-encode bằng `serde_json::to_string(selector)` (tự escape quote,
+    backslash, dấu xuống dòng), không dùng `format!` trực tiếp lên dữ liệu thô.
+- **Kiểm tra selector trước**: validate cú pháp CSS selector ở phía Rust trước khi
+  gửi xuống CDP (selector sai thì trả lỗi ngay, mục 2.7); `querySelector` trả `null`
+  thì báo "không tìm thấy element", không đánh giá tiếp.
+- **Text gõ vào cũng là dữ liệu**: `browser_type` truyền text qua `Input.insertText`
+  (`text` là tham số JSON), không nhúng text vào `Runtime.evaluate`.
+- Spike `examples/browser-cdp-spike/` hiện chỉ evaluate chuỗi cố định trong code
+  (`document.querySelectorAll('.quote').length`, `document.readyState`, ...) nên
+  không mắc lỗi này; quy tắc trên bắt buộc khi implement tool thật nhận selector
+  từ agent.
+
 ## 4. Mô hình permissions: nối vào cổng permissions đang làm
 
 Cổng hiện có: `PermissionMode` 6 chế độ (`crates/zen-core/src/lib.rs` dòng 347):
@@ -172,18 +202,22 @@ Phân loại 6 tool mới:
 | `browser_content` | true | cho phép (allow) | Chỉ đọc text đã render |
 | `browser_screenshot` | true | cho phép (allow) | Chỉ ghi file PNG trong thư mục phiên |
 | `browser_wait` | true | cho phép (allow) | Chỉ chờ, không đổi trạng thái |
-| `browser_click` | false | hỏi (ask) | Có thể kích hoạt hành động trên trang (mua, xóa, gửi) |
-| `browser_type` | false | hỏi (ask) | Đưa dữ liệu vào trang; đặc biệt nhạy với field mật khẩu |
+| `browser_click` | false | hỏi (ask) ở mọi mode, không tự cho phép | Có thể kích hoạt hành động trên trang (mua, xóa, gửi); submit hoặc hành động phá hủy cần duyệt riêng (điểm 9) |
+| `browser_type` | false | hỏi (ask) ở mọi mode, không tự cho phép | Đưa dữ liệu vào trang; đặc biệt nhạy với field mật khẩu; submit cần duyệt riêng (điểm 9) |
 
 Quy tắc chi tiết:
 
 1. **Mode `Plan`**: mọi tool browser (kể cả read-only) bị chặn — plan mode không cho
    chạy tool đổi trạng thái hay đọc ngoài, giống quy tắc ở `permissions.rs` dòng ~735.
 2. **Mode `AskAll`**: mọi tool browser đều hỏi, kể cả read-only.
-3. **Mode `AcceptEdits`**: `browser_click`/`browser_type` được cho phép không hỏi
-   (tương đương edit đã chấp nhận), trừ thao tác đăng nhập (điểm 5 dưới đây).
-4. **`BypassPermissions` / `DontAsk`**: không bao giờ tự động cho phép thao tác đăng
-   nhập hay submit form có credential; các tool khác theo luật chung của cổng.
+3. **Mode `AcceptEdits`**: `browser_click`/`browser_type` KHÔNG được tự cho phép —
+   vẫn hỏi như ở mode `Default` (điểm 9 dưới đây). `AcceptEdits` chỉ miễn hỏi cho
+   thao tác sửa file, không áp cho thao tác trên trình duyệt; thao tác đăng nhập
+   vẫn qua gate riêng (điểm 5 dưới đây).
+4. **`BypassPermissions` / `DontAsk`**: không bao giờ tự động cho phép
+   `browser_click`/`browser_type` — kể cả khi mode này bỏ qua hỏi cho tool khác;
+   đăng nhập hay submit form có credential cũng vậy. Các tool browser khác
+   (read-only) theo luật chung của cổng.
 5. **Rule gợi ý** (`suggested_rule`/`suggested_rules` trong `permissions.rs`):
    thêm `BrowserClick`, `BrowserType`, `BrowserLogin` để người dùng ghi rule
    `allow`/`ask`/`deny` trong settings, ví dụ `deny BrowserLogin` chặn mọi đăng nhập.
@@ -195,6 +229,15 @@ Quy tắc chi tiết:
    prompt xin quyền: tool, selector, host, hành động.
 8. **Audit**: mỗi lần tool browser chạy qua cổng quyền đều ghi log: tool, host,
    quyết định (allow/ask/deny), mode — không ghi nội dung đã gõ hay cookie.
+9. **Submit và hành động phá hủy cần duyệt riêng**: `browser_click`/`browser_type`
+   không được tự cho phép ở bất kỳ permission mode nào — kể cả `AcceptEdits`,
+   `BypassPermissions`, `DontAsk` (xem điểm 3, 4 trên). Riêng hai trường hợp sau
+   luôn cần một lượt duyệt riêng của người dùng, không gộp vào lượt duyệt của
+   tool call trước đó: (a) submit form (`browser_type` với `submit: true`, hoặc
+   click nút submit); (b) hành động phá hủy hoặc không đảo ngược được (xóa, hủy,
+   mua, gửi tiền, gửi dữ liệu ra ngoài). Prompt xin quyền phải nêu rõ hành động
+   cụ thể (submit form nào, xóa/mua/gửi cái gì, tới đâu) để người dùng duyệt
+   đúng việc, không duyệt mù.
 
 ## 5. Đăng nhập và submit form (thao tác đổi trạng thái nhạy cảm)
 
@@ -209,8 +252,9 @@ Quy tắc chi tiết:
   mới xem xét sâu hơn — ngoài phạm vi spec này).
 - Không lưu cookie/session đăng nhập ra đĩa ngoài `--user-data-dir` tạm của session;
   thư mục này bị xóa khi session kết thúc. Không export cookie sang tool result.
-- Submit form không chứa credential (tìm kiếm, lọc, gửi feedback): theo luật
-  `browser_click`/`browser_type` ở mục 4 (ask mặc định, allow theo rule).
+- Submit form không chứa credential (tìm kiếm, lọc, gửi feedback): vẫn cần duyệt
+  riêng theo mục 4 điểm 9 — hỏi ở mọi mode, không allow theo rule. Chỉ khác
+  submit có credential ở chỗ không qua gate `BrowserLogin`.
 
 ## 6. Chính sách an toàn
 
@@ -235,6 +279,17 @@ Quy tắc chi tiết:
    đó là quyết định riêng của Leader vì JS tùy ý = thực thi mã trên trang.)
 8. **CDP chỉ loopback**: remote-debugging bind `127.0.0.1`, port ngẫu nhiên, không
    expose.
+9. **Kiểm soát request mạng toàn phiên**: chỉ kiểm tra URL ban đầu ở
+   `browser_navigate` là chưa đủ — redirect và request phụ (script, XHR/fetch,
+   ảnh) vẫn có thể đi tới mạng riêng. Bật chặn ở tầng CDP cho toàn bộ phiên ngay
+   khi session mở: dùng `Fetch.enable` (pattern `*`, `requestStage: Request`)
+   hoặc `Network.setRequestInterception`, chặn (abort) mọi request mà
+   `check_fetch_target` của WebFetch từ chối (localhost/IP riêng/metadata
+   endpoint), kể cả request phát sinh sau redirect. Request bị chặn thì tool trả
+   lỗi rõ ràng, ghi log host + lý do chặn, không thử lại bằng đường khác. Khi
+   `navigate` gặp redirect, mỗi URL đích đều kiểm tra lại trước khi theo.
+10. **Serialize selector an toàn** (xem mục 3.4): không bao giờ ghép chuỗi
+    JavaScript với dữ liệu agent cung cấp.
 
 ## 7. Lộ trình implement (để Leader giao sau)
 
@@ -245,10 +300,13 @@ Quy tắc chi tiết:
 3. 2 tool mutating (`click`, `type`) + nối cổng permissions theo mục 4 + test xin quyền.
 4. `BrowserLogin` gate + redaction log (mục 5, 6) + test regression: gõ vào field
    password không lọt vào log.
-5. Docs tool (`docs/tools/browser-*.md`) theo mẫu `docs/tools/webfetch.md`.
+5. Kiểm soát request mạng toàn phiên (mục 6 điểm 9) + serialize selector an toàn
+   (mục 3.4) + test regression: request tới IP riêng bị abort, selector chứa
+   quote không phá được expression.
+6. Docs tool (`docs/tools/browser-*.md`) theo mẫu `docs/tools/webfetch.md`.
 
 Ngoài phạm vi chặng này: computer-use (điều khiển desktop), lưu session đăng nhập
-lâu dài, multi-tab, network interception, chạy JS tùy ý.
+lâu dài, multi-tab, chạy JS tùy ý.
 
 ## 8. Môi trường kiểm chứng + spike
 
@@ -260,6 +318,19 @@ lâu dài, multi-tab, network interception, chạy JS tùy ý.
   Cài trên box: `sudo apt install chromium` (gói `chromium`, không phải snap,
   không phải `chromium-browser`). `/json/version` trả `Protocol-Version: 1.3`,
   `V8-Version: 15.5.35.23`.
+- **Chạy lại sau review (27/11/2026 ~21:26 Asia/Saigon)**: cùng Chromium
+  `155.0.8059.79` (box `zencode`, chưa nâng), spike chạy lại exit 0, screenshot tái
+  tạo đúng **75878 bytes**, SHA256
+  `e03d93385e708c609110fb4f9c6380f656b0478a81e7e842467b44feb1f6b33d` (khớp ảnh đã
+  commit, chạy lại 2 lần đều giống) — xem `RUN_LOG.md`. Z Tester chạy lại trên máy
+  khác ra 77077 byte, SHA256
+  `5988988d1a6b2cbf34c4b881f785eef4b7ea77273ff24379e5ff5b4b2ca3708e`, với Chromium
+  `154.0.8037.57`: ảnh chụp **phụ thuộc phiên bản Chromium** (render khác nhau
+  giữa các bản), nên SHA screenshot chỉ có nghĩa khi đi kèm đúng phiên bản
+  Chromium. **Cách xác minh phiên bản** (ghi cả ba vào `RUN_LOG.md` mỗi lần chạy
+  lại): `chromium --version`, dòng `CDP: browser=Chrome/<ver>` trong log chạy, và
+  `apt-cache policy chromium` (gói Debian đã cài). Nâng Chromium thì chạy lại
+  spike và cập nhật SHA mới — không giữ SHA cũ.
 - Rust: cargo 1.99.0, rustc 1.99.0.
 - Spike: `examples/browser-cdp-spike/` — crate độc lập (có `[workspace]` riêng để
   tách khỏi workspace chính), dùng `tokio-tungstenite 0.26.2` + `serde_json` +
