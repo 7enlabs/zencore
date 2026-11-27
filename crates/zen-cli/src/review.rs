@@ -405,7 +405,8 @@ fn diff_git_side_path(side: &str, prefix: &str) -> Option<String> {
 /// where the two sides agree is exact even when a side contains spaces
 /// or a literal ` b/`; otherwise the first plausible separator is the
 /// rename split. (A rename whose a-side itself contains ` b/` stays
-/// ambiguous in git's non-`-z` format.)
+/// ambiguous in the header alone; `changed_files_from_diff` resolves
+/// it from the `rename to` line instead.)
 fn split_diff_git_header(rest: &str) -> Option<(String, String)> {
     let mut separators: Vec<usize> = rest.match_indices(" b/").map(|(i, _)| i).collect();
     separators.extend(rest.match_indices(" \"b/").map(|(i, _)| i));
@@ -426,14 +427,37 @@ fn split_diff_git_header(rest: &str) -> Option<(String, String)> {
     fallback
 }
 
+/// Read the destination of a rename from the `rename to` line git emits
+/// under a `diff --git` header. The header alone is ambiguous when the
+/// old path itself contains ` b/` (for example renaming
+/// `old b/part.rs` to `name.rs`), but the `rename to` line carries the
+/// destination path verbatim, so it is the unambiguous source. The
+/// value is unquoted when git C-style quoted it. Returns `None` when
+/// the section has no rename.
+fn rename_to_path(lines: &[&str], header: usize) -> Option<String> {
+    let mut i = header + 1;
+    while i < lines.len() && !lines[i].starts_with("diff --git ") {
+        if let Some(path) = lines[i].strip_prefix("rename to ") {
+            return Some(unquote_git_path(path).unwrap_or_else(|| path.to_string()));
+        }
+        i += 1;
+    }
+    None
+}
+
 fn changed_files_from_diff(diff: &str) -> Vec<String> {
     let mut files = Vec::new();
-    for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git ")
-            && let Some((_, b)) = split_diff_git_header(rest)
-            && !files.contains(&b)
+    let lines: Vec<&str> = diff.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(rest) = line.strip_prefix("diff --git ") else {
+            continue;
+        };
+        let file =
+            rename_to_path(&lines, i).or_else(|| split_diff_git_header(rest).map(|(_, b)| b));
+        if let Some(file) = file
+            && !files.contains(&file)
         {
-            files.push(b);
+            files.push(file);
         }
     }
     files
@@ -1715,5 +1739,28 @@ mod tests {
             split_diff_git_header("a/my b/file.rs b/my b/file.rs"),
             Some(("my b/file.rs".to_string(), "my b/file.rs".to_string()))
         );
+    }
+
+    // Z Tester review of PR #575 (P2): renaming `old b/part.rs` to
+    // `name.rs` returned "part.rs b/name.rs" because the first " b/"
+    // inside the old path was taken as the header separator. The
+    // `rename to` line carries the destination verbatim, so it is the
+    // unambiguous source for the renamed file.
+    #[test]
+    fn changed_files_from_diff_uses_rename_to_when_old_path_contains_b_slash() {
+        let diff = "diff --git a/old b/part.rs b/name.rs\n\
+             similarity index 100%\n\
+             rename from old b/part.rs\n\
+             rename to name.rs\n";
+        assert_eq!(changed_files_from_diff(diff), vec!["name.rs"]);
+    }
+
+    #[test]
+    fn changed_files_from_diff_unquotes_rename_to_path() {
+        let diff = "diff --git \"a/old b/caf\\303\\251.rs\" \"b/new caf\\303\\251.rs\"\n\
+             similarity index 100%\n\
+             rename from \"old b/caf\\303\\251.rs\"\n\
+             rename to \"new caf\\303\\251.rs\"\n";
+        assert_eq!(changed_files_from_diff(diff), vec!["new café.rs"]);
     }
 }
