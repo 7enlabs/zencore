@@ -672,12 +672,16 @@ pub fn install_builtin(home: &Path, name: &str) -> Result<RegistryEntry> {
             ),
         ));
     }
+    // Load the registry before writing anything: a corrupt registry
+    // must fail before the skill directory is created, or the orphaned
+    // directory blocks the retry with "already installed" even after
+    // the registry is repaired (issue #465).
+    let mut registry = load_registry(home)?;
     std::fs::create_dir_all(&dest)?;
     std::fs::write(dest.join("SKILL.md"), skill_md)?;
     std::fs::write(dest.join("zen-plugin.json"), manifest_json)?;
     std::fs::write(dest.join("test.md"), test_md)?;
 
-    let mut registry = load_registry(home)?;
     let entry = RegistryEntry {
         name: name.to_string(),
         version: manifest.version.clone(),
@@ -688,7 +692,13 @@ pub fn install_builtin(home: &Path, name: &str) -> Result<RegistryEntry> {
         pinned_hash: "builtin".to_string(),
     };
     registry.skills.insert(name.to_string(), entry.clone());
-    save_registry(home, &registry)?;
+    if let Err(e) = save_registry(home, &registry) {
+        // Roll back the directory this call created: it did not exist
+        // on entry, so a retry after the registry is repaired must not
+        // be blocked by a stale directory.
+        std::fs::remove_dir_all(&dest).ok();
+        return Err(e);
+    }
     Ok(entry)
 }
 
@@ -1099,6 +1109,11 @@ pub fn create_skill(home: &Path, name: &str) -> Result<PathBuf> {
             format!("skill {:?} already exists at {}", name, dir.display()),
         ));
     }
+    // Load the registry before writing anything: a corrupt registry
+    // must fail before the scaffold directory is created, or the
+    // orphaned directory blocks the retry with "already exists" even
+    // after the registry is repaired (issue #465).
+    let mut registry = load_registry(home)?;
     std::fs::create_dir_all(&dir)?;
     let title = {
         let mut c = name.chars();
@@ -1122,7 +1137,6 @@ pub fn create_skill(home: &Path, name: &str) -> Result<PathBuf> {
         SCAFFOLD_TEST_MD.replace("{name}", name),
     )?;
 
-    let mut registry = load_registry(home)?;
     registry.skills.insert(
         name.to_string(),
         RegistryEntry {
@@ -1135,7 +1149,13 @@ pub fn create_skill(home: &Path, name: &str) -> Result<PathBuf> {
             pinned_hash: "none".to_string(),
         },
     );
-    save_registry(home, &registry)?;
+    if let Err(e) = save_registry(home, &registry) {
+        // Roll back the directory this call created: it did not exist
+        // on entry, so a retry after the registry is repaired must not
+        // be blocked by a stale directory.
+        std::fs::remove_dir_all(&dir).ok();
+        return Err(e);
+    }
     Ok(dir)
 }
 
@@ -2960,6 +2980,67 @@ mod tests {
             "a refused install must leave the corrupt file untouched for repair"
         );
         let _ = before;
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn install_builtin_corrupt_registry_leaves_no_orphan_dir_and_retry_succeeds() {
+        // P2 on PR #576: a corrupt registry was only rejected after the
+        // skill directory had been created, so the orphaned directory
+        // made the retry fail with "already installed" even after the
+        // registry was repaired. The failed install must leave nothing
+        // behind and the retry after repair must succeed.
+        let home = tmp_home("registry-corrupt-builtin-retry");
+        let dest = skills_root(&home).join("token-diet");
+        std::fs::create_dir_all(skills_root(&home)).unwrap();
+        std::fs::write(registry_path(&home), "{\"skills\": {\"tdd\": ").unwrap();
+
+        assert!(install_builtin(&home, "token-diet").is_err());
+        assert!(
+            !dest.exists(),
+            "a refused install must not leave an orphan skill directory behind"
+        );
+
+        std::fs::remove_file(registry_path(&home)).unwrap();
+        let entry = install_builtin(&home, "token-diet")
+            .expect("retry after repairing the registry must succeed");
+        assert_eq!(entry.name, "token-diet");
+        assert!(dest.join("SKILL.md").is_file());
+        assert!(
+            load_registry(&home)
+                .unwrap()
+                .skills
+                .contains_key("token-diet")
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn create_skill_corrupt_registry_leaves_no_orphan_dir_and_retry_succeeds() {
+        // Same P2 as install_builtin, on the `skill create` path: the
+        // scaffold directory was written before the registry was read.
+        let home = tmp_home("registry-corrupt-create-retry");
+        let dir = skills_root(&home).join("my-skill");
+        std::fs::create_dir_all(skills_root(&home)).unwrap();
+        std::fs::write(registry_path(&home), "not json at all").unwrap();
+
+        assert!(create_skill(&home, "my-skill").is_err());
+        assert!(
+            !dir.exists(),
+            "a refused create must not leave an orphan skill directory behind"
+        );
+
+        std::fs::remove_file(registry_path(&home)).unwrap();
+        let created = create_skill(&home, "my-skill")
+            .expect("retry after repairing the registry must succeed");
+        assert_eq!(created, dir);
+        assert!(dir.join("SKILL.md").is_file());
+        assert!(
+            load_registry(&home)
+                .unwrap()
+                .skills
+                .contains_key("my-skill")
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
