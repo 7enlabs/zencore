@@ -2754,6 +2754,53 @@ async fn handle_slash(
     Ok(LineAction::Continue)
 }
 
+/// Exclusive lock for the `.zen/settings.local.json` read-modify-write
+/// (issue #469). The lock is an `flock` on a dedicated file that is never
+/// renamed or read as data, so it stays valid across settings rewrites -
+/// the same pattern `zen_core::secret` uses for its store lock (issue
+/// #319). It is held across the whole read-modify-write, so two sessions
+/// (or threads) saving at the same moment serialize instead of racing:
+/// without it the last rename won the whole document and silently
+/// dropped the other writer's keys. Released when the guard drops; a
+/// crashed holder releases it with the process, so it can never stick.
+struct SettingsLock {
+    _file: std::fs::File,
+}
+
+/// Acquire the settings lock, waiting a bounded time.
+fn lock_local_settings(parent: &Path) -> Result<SettingsLock> {
+    use fs2::FileExt;
+    let lock_path = parent.join("settings.local.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        // The file only carries the flock; its content is never read
+        // or written, so it must not be truncated on open.
+        .truncate(false)
+        .open(&lock_path)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(SettingsLock { _file: file }),
+            // Contention means retry until the deadline: Unix reports
+            // it as WouldBlock, Windows as ERROR_LOCK_VIOLATION
+            // (raw OS error 33), which std maps to ErrorKind::Other
+            // instead of WouldBlock (issue #319).
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(33) =>
+            {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("settings.local.json is locked by another process; try again");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("cannot lock {}: {e}", lock_path.display()));
+            }
+        }
+    }
+}
+
 fn save_local_setting(cwd: &Path, key: &str, value: &str) -> Result<std::path::PathBuf> {
     save_local_settings(cwd, &[(key, value)])
 }
@@ -2768,6 +2815,15 @@ fn save_local_settings(cwd: &Path, entries: &[(&str, &str)]) -> Result<std::path
         }
     }
     let path = cwd.join(".zen").join("settings.local.json");
+    // `path` is `cwd/.zen/settings.local.json`, so its parent (`.zen`) always exists.
+    let parent = cwd.join(".zen");
+    std::fs::create_dir_all(&parent)?;
+    // Issue #469: hold the lock across the whole read-modify-write.
+    // Reading first and locking only for the write would still lose
+    // the other writer's keys - the read itself must be inside the
+    // critical section, so every writer sees the previous writer's
+    // keys before adding its own.
+    let _lock = lock_local_settings(&parent)?;
     let mut obj = match std::fs::read_to_string(&path) {
         Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
             .map_err(|e| anyhow::anyhow!("{} is not valid JSON: {}", path.display(), e))?,
@@ -2781,9 +2837,6 @@ fn save_local_settings(cwd: &Path, entries: &[(&str, &str)]) -> Result<std::path
             serde_json::from_str(value).unwrap_or_else(|_| serde_json::Value::String(value.into()));
         map.insert(key.to_string(), parsed);
     }
-    // `path` is `cwd/.zen/settings.local.json`, so its parent (`.zen`) always exists.
-    let parent = cwd.join(".zen");
-    std::fs::create_dir_all(&parent)?;
     // Write a sibling temp file and rename it over the live path -
     // the atomic pattern models::save_cache already uses. A crash
     // mid-write or a second session saving at the same moment can no
@@ -4429,13 +4482,17 @@ mod model_picker_tests {
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["model"], "m1");
         assert_eq!(value["baseUrl"], "http://x");
-        let names: Vec<String> = std::fs::read_dir(dir.join(".zen"))
+        let mut names: Vec<String> = std::fs::read_dir(dir.join(".zen"))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
+        names.sort();
+        // Issue #469: the settings lock file is a permanent companion
+        // of the settings file, not a leftover temp file - it must be
+        // the only other entry besides the settings file itself.
         assert_eq!(
             names,
-            ["settings.local.json"],
+            ["settings.local.json", "settings.local.lock"],
             "temp file must be renamed away"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -4463,6 +4520,43 @@ mod model_picker_tests {
         }
         for h in handles {
             h.join().unwrap();
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn save_local_settings_concurrent_writers_keep_each_others_keys() {
+        // Issue #469: the read-modify-write in `save_local_settings`
+        // had no lock, so two writers racing each other silently lost
+        // one side's keys - the last rename won the whole document.
+        // Each thread writes its own distinct key; every key must
+        // survive, whichever write lands last.
+        let dir = std::env::temp_dir().join(format!("zen_lost_update_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+        for t in 0..4 {
+            let d = dir.clone();
+            let start = start.clone();
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                for i in 0..50 {
+                    let key = format!("key-{t}");
+                    let value = format!("v-{t}-{i}");
+                    save_local_settings(&d, &[(key.as_str(), value.as_str())]).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let text = std::fs::read_to_string(dir.join(".zen").join("settings.local.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        for t in 0..4 {
+            let key = format!("key-{t}");
+            assert!(
+                value.get(&key).is_some(),
+                "concurrent save lost {key}: final file is {text}"
+            );
         }
         std::fs::remove_dir_all(&dir).ok();
     }

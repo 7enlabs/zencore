@@ -3733,6 +3733,7 @@ dependencies = [
  "dialoguer",
  "dirs",
  "ed25519-dalek",
+ "fs2",
  "globset",
  "libc",
  "regex",
