@@ -4581,6 +4581,11 @@ mod model_picker_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // Linux-only: on Windows the same contention yields
+    // ErrorKind::Uncategorized (CI run 45926671546, PR #574), and on
+    // macOS the raw error is 35 (EAGAIN), not 11 - so this premise
+    // test must not run off Linux.
+    #[cfg(target_os = "linux")]
     #[test]
     fn lock_contention_on_linux_is_would_block_with_raw_error_11() {
         // PR #574, repl.rs:2790: the contention guard also accepts a
