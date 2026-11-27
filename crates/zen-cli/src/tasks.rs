@@ -196,7 +196,8 @@ pub fn registry_path(home: &Path) -> PathBuf {
 
 /// Load the registry, folding snapshots in file order so the latest
 /// line for an id wins. A missing or empty file is an empty registry,
-/// not an error; a malformed line is an error that names the line.
+/// not an error; a malformed line is skipped with a warning naming
+/// the line, so one torn write cannot brick the registry (#467).
 pub fn load_registry(path: &Path) -> Result<Vec<TaskCard>> {
     let data = match std::fs::read_to_string(path) {
         Ok(d) => d,
@@ -211,13 +212,21 @@ pub fn load_registry(path: &Path) -> Result<Vec<TaskCard>> {
         if line.is_empty() {
             continue;
         }
-        let card: TaskCard = serde_json::from_str(line).with_context(|| {
-            format!(
-                "task registry {} line {} is not a valid task card",
-                path.display(),
-                i + 1
-            )
-        })?;
+        let card: TaskCard = match serde_json::from_str(line) {
+            Ok(card) => card,
+            Err(e) => {
+                // A torn line (crash mid-append, hand-edit) must not brick
+                // the whole registry: skip it with a warning and keep the
+                // valid cards (issue #467; cf. session::load_messages).
+                eprintln!(
+                    "warning: {}:{}: skipping malformed task registry line: {}",
+                    path.display(),
+                    i + 1,
+                    e
+                );
+                continue;
+            }
+        };
         if let Some(slot) = cards.iter_mut().find(|c| c.id == card.id) {
             *slot = card;
         } else {
@@ -1347,10 +1356,24 @@ mod tests {
     }
 
     #[test]
-    fn malformed_line_is_an_error() {
+    fn malformed_only_file_loads_as_empty_registry() {
         let path = temp_registry("malformed");
         std::fs::write(&path, "{\"id\": 42}\n").unwrap();
-        assert!(load_registry(&path).is_err());
+        assert!(load_registry(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_line_is_skipped_and_valid_lines_load() {
+        let path = temp_registry("malformed_skip");
+        append_snapshot(&path, &card("B-1", "first")).unwrap();
+        let mut data = std::fs::read_to_string(&path).unwrap();
+        data.push_str("{\"id\": 42}\n");
+        std::fs::write(&path, data).unwrap();
+        append_snapshot(&path, &card("B-2", "second")).unwrap();
+        let cards = load_registry(&path).unwrap();
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].id, "B-1");
+        assert_eq!(cards[1].id, "B-2");
     }
 
     #[test]
