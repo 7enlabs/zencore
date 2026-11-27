@@ -168,55 +168,56 @@ pub(crate) fn unquote_path(p: &str) -> String {
     };
     let inner = inner.as_bytes();
     let mut bytes = Vec::with_capacity(inner.len());
-    let mut i = 0;
-    while i < inner.len() {
-        if inner[i] == b'\\' && i + 1 < inner.len() {
-            match inner[i + 1] {
-                b'n' => {
-                    bytes.push(b'\n');
-                    i += 2;
-                }
-                b't' => {
-                    bytes.push(b'\t');
-                    i += 2;
-                }
-                b'"' => {
-                    bytes.push(b'"');
-                    i += 2;
-                }
-                b'\\' => {
-                    bytes.push(b'\\');
-                    i += 2;
-                }
-                b'0'..=b'7' => {
-                    let mut value: u32 = 0;
-                    let mut count = 0;
-                    while count < 3 && i + 1 + count < inner.len() {
-                        let d = inner[i + 1 + count];
-                        if !matches!(d, b'0'..=b'7') {
-                            break;
+    // Iterate by consuming the input: each loop step takes at least
+    // one byte out of the iterator, so progress never depends on
+    // arithmetic on an index. (The old index loop had `i += k` steps
+    // whose `+=` -> `*=` mutant froze the loop when `i` was 0.)
+    let mut it = inner.iter().peekable();
+    while let Some(&b) = it.next() {
+        if b != b'\\' {
+            bytes.push(b);
+            continue;
+        }
+        let Some(&next) = it.next() else {
+            // Trailing backslash: kept literally.
+            bytes.push(b'\\');
+            break;
+        };
+        match next {
+            b'n' => bytes.push(b'\n'),
+            b't' => bytes.push(b'\t'),
+            b'"' => bytes.push(b'"'),
+            b'\\' => bytes.push(b'\\'),
+            b'0'..=b'7' => {
+                let mut value: u32 = (next - b'0') as u32;
+                let mut digits = [0u8; 3];
+                digits[0] = next;
+                let mut count = 1;
+                while count < 3 {
+                    match it.next_if(|&&x| matches!(x, b'0'..=b'7')) {
+                        Some(&x) => {
+                            digits[count] = x;
+                            value = value * 8 + (x - b'0') as u32;
+                            count += 1;
                         }
-                        value = value * 8 + (d - b'0') as u32;
-                        count += 1;
-                    }
-                    if value > 0o377 {
-                        // Not a byte value: keep the backslash literally and
-                        // let the digits through on later iterations.
-                        bytes.push(b'\\');
-                        i += 1;
-                    } else {
-                        bytes.push(value as u8);
-                        i += 1 + count;
+                        None => break,
                     }
                 }
-                _ => {
+                if value > 0o377 {
+                    // Not a byte value: keep the backslash literally
+                    // and let the digits through as literal bytes.
                     bytes.push(b'\\');
-                    i += 1;
+                    bytes.extend_from_slice(&digits[..count]);
+                } else {
+                    bytes.push(value as u8);
                 }
             }
-        } else {
-            bytes.push(inner[i]);
-            i += 1;
+            other => {
+                // Unknown escape: keep the backslash literally and
+                // let the char through as a literal byte.
+                bytes.push(b'\\');
+                bytes.push(other);
+            }
         }
     }
     String::from_utf8_lossy(&bytes).into_owned()
