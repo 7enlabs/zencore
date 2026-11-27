@@ -1342,4 +1342,85 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Kills the `+` -> `-` mutant on the file-cap marker check
+    /// (repomap.rs:627): one token below header + file-cap marker the
+    /// marker must be omitted so the map stays within budget. The P2
+    /// test only checks the exact-fit case, where the mutant's
+    /// subtraction still passes the check and appends the same marker.
+    /// Here the subtraction (`header - files_tokens <= budget`) would
+    /// wrongly append a marker that pushes the map over budget.
+    #[test]
+    fn budget_file_cap_marker_one_token_below_fit_is_omitted() {
+        let dir = unique_dir("filemarkerbelow");
+        let _ = std::fs::remove_dir_all(&dir);
+        for i in 0..=MAX_FILES {
+            write_file(
+                &dir,
+                &format!("f{i:03}.rs"),
+                &format!("pub fn func_{i}() {{}}\n"),
+            );
+        }
+        let files_marker = format!("[map truncated: file limit reached (max {MAX_FILES} files)]\n");
+        let budget = budget_at(token_cost(&files_marker) - 1);
+        let map = repo_map(&dir, budget).expect("map");
+        assert!(map.truncated, "file cap hit must mark the map truncated");
+        assert!(
+            !map.text().contains("file limit"),
+            "one token short, the file-cap marker must be omitted: {}",
+            map.text()
+        );
+        assert!(
+            map.text().contains("token budget exhausted"),
+            "truncation marker missing, got:\n{}",
+            map.text()
+        );
+        let est = map.text().chars().count().div_ceil(4);
+        assert!(
+            est <= budget,
+            "map must fit its {budget}-token budget, got {est} estimated tokens:\n{}",
+            map.text()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Kills the `+` -> `-` mutant on the line-cap marker check
+    /// (repomap.rs:630): one token below header + line-cap marker the
+    /// marker must be omitted so the map stays within budget. The P2
+    /// test only checks the exact-fit case, where the mutant's
+    /// subtraction still passes the check and appends the same marker.
+    /// Here the subtraction (`header - lines_tokens <= budget`) would
+    /// wrongly append a marker that pushes the map over budget.
+    #[test]
+    fn budget_line_cap_marker_one_token_below_fit_is_omitted() {
+        let dir = unique_dir("linemarkerbelow");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut src = String::from("pub fn first() {}\n");
+        for _ in 1..MAX_LINES_PER_FILE {
+            src.push_str("// filler\n");
+        }
+        src.push_str("pub fn beyond_cap() {}\n");
+        write_file(&dir, "long.rs", &src);
+        let lines_marker = format!("[map truncated: file exceeds {MAX_LINES_PER_FILE} lines]\n");
+        let budget = budget_at(token_cost(&lines_marker) - 1);
+        let map = repo_map(&dir, budget).expect("map");
+        assert!(map.truncated, "line cap hit must mark the map truncated");
+        assert!(
+            !map.text().contains("4000 lines"),
+            "one token short, the line-cap marker must be omitted: {}",
+            map.text()
+        );
+        assert!(
+            map.text().contains("token budget exhausted"),
+            "truncation marker missing, got:\n{}",
+            map.text()
+        );
+        let est = map.text().chars().count().div_ceil(4);
+        assert!(
+            est <= budget,
+            "map must fit its {budget}-token budget, got {est} estimated tokens:\n{}",
+            map.text()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
