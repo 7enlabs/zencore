@@ -2754,6 +2754,78 @@ async fn handle_slash(
     Ok(LineAction::Continue)
 }
 
+/// Exclusive lock for the `.zen/settings.local.json` read-modify-write
+/// (issue #469). The lock is an `flock` on a dedicated file that is never
+/// renamed or read as data, so it stays valid across settings rewrites -
+/// the same pattern `zen_core::secret` uses for its store lock (issue
+/// #319). It is held across the whole read-modify-write, so two sessions
+/// (or threads) saving at the same moment serialize instead of racing:
+/// without it the last rename won the whole document and silently
+/// dropped the other writer's keys. Released when the guard drops; a
+/// crashed holder releases it with the process, so it can never stick.
+struct SettingsLock {
+    _file: std::fs::File,
+}
+
+/// Whether a failed `try_lock_exclusive` means the lock is held by
+/// another process (retry until the deadline) rather than a hard error
+/// (fail at once). Unix reports contention as WouldBlock; Windows
+/// reports it as ERROR_LOCK_VIOLATION (raw OS error 33), which std
+/// maps to ErrorKind::Other instead of WouldBlock (issue #319).
+/// A pure function so the classification itself is unit-testable with
+/// synthetic errors (PR #574): the two mutants on this guard are
+/// killed by the `is_lock_contention_*` tests, not by an exclusion
+/// in .cargo/mutants.toml.
+fn is_lock_contention(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(33)
+}
+
+/// Acquire the settings lock, retrying contention until the deadline
+/// and failing at once on a hard error. The lock attempt is a closure
+/// so the retry decision itself is unit-testable with synthetic errors
+/// (PR #574): the `lock_with_retry_*` tests inject a hard error and a
+/// contended-then-free sequence, which pins the call-site guard
+/// `is_lock_contention(&e)` - a mutant replacing that guard with
+/// `true` survives the `is_lock_contention_*` tests, because those
+/// only classify the error and never reach the call site.
+fn lock_with_retry(
+    mut attempt: impl FnMut() -> std::io::Result<()>,
+    lock_path: &Path,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match attempt() {
+            Ok(()) => return Ok(()),
+            // Contention means retry until the deadline; anything else
+            // is a hard error (see is_lock_contention).
+            Err(e) if is_lock_contention(&e) => {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("settings.local.json is locked by another process; try again");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("cannot lock {}: {e}", lock_path.display()));
+            }
+        }
+    }
+}
+
+/// Acquire the settings lock, waiting a bounded time.
+fn lock_local_settings(parent: &Path) -> Result<SettingsLock> {
+    use fs2::FileExt;
+    let lock_path = parent.join("settings.local.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        // The file only carries the flock; its content is never read
+        // or written, so it must not be truncated on open.
+        .truncate(false)
+        .open(&lock_path)?;
+    lock_with_retry(|| file.try_lock_exclusive(), &lock_path)?;
+    Ok(SettingsLock { _file: file })
+}
+
 fn save_local_setting(cwd: &Path, key: &str, value: &str) -> Result<std::path::PathBuf> {
     save_local_settings(cwd, &[(key, value)])
 }
@@ -2768,6 +2840,15 @@ fn save_local_settings(cwd: &Path, entries: &[(&str, &str)]) -> Result<std::path
         }
     }
     let path = cwd.join(".zen").join("settings.local.json");
+    // `path` is `cwd/.zen/settings.local.json`, so its parent (`.zen`) always exists.
+    let parent = cwd.join(".zen");
+    std::fs::create_dir_all(&parent)?;
+    // Issue #469: hold the lock across the whole read-modify-write.
+    // Reading first and locking only for the write would still lose
+    // the other writer's keys - the read itself must be inside the
+    // critical section, so every writer sees the previous writer's
+    // keys before adding its own.
+    let _lock = lock_local_settings(&parent)?;
     let mut obj = match std::fs::read_to_string(&path) {
         Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
             .map_err(|e| anyhow::anyhow!("{} is not valid JSON: {}", path.display(), e))?,
@@ -2781,9 +2862,6 @@ fn save_local_settings(cwd: &Path, entries: &[(&str, &str)]) -> Result<std::path
             serde_json::from_str(value).unwrap_or_else(|_| serde_json::Value::String(value.into()));
         map.insert(key.to_string(), parsed);
     }
-    // `path` is `cwd/.zen/settings.local.json`, so its parent (`.zen`) always exists.
-    let parent = cwd.join(".zen");
-    std::fs::create_dir_all(&parent)?;
     // Write a sibling temp file and rename it over the live path -
     // the atomic pattern models::save_cache already uses. A crash
     // mid-write or a second session saving at the same moment can no
@@ -4429,13 +4507,17 @@ mod model_picker_tests {
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["model"], "m1");
         assert_eq!(value["baseUrl"], "http://x");
-        let names: Vec<String> = std::fs::read_dir(dir.join(".zen"))
+        let mut names: Vec<String> = std::fs::read_dir(dir.join(".zen"))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
+        names.sort();
+        // Issue #469: the settings lock file is a permanent companion
+        // of the settings file, not a leftover temp file - it must be
+        // the only other entry besides the settings file itself.
         assert_eq!(
             names,
-            ["settings.local.json"],
+            ["settings.local.json", "settings.local.lock"],
             "temp file must be renamed away"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -4465,6 +4547,190 @@ mod model_picker_tests {
             h.join().unwrap();
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn save_local_settings_concurrent_writers_keep_each_others_keys() {
+        // Issue #469: the read-modify-write in `save_local_settings`
+        // had no lock, so two writers racing each other silently lost
+        // one side's keys - the last rename won the whole document.
+        // Each thread writes its own distinct key; every key must
+        // survive, whichever write lands last.
+        let dir = std::env::temp_dir().join(format!("zen_lost_update_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+        for t in 0..4 {
+            let d = dir.clone();
+            let start = start.clone();
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                for i in 0..50 {
+                    let key = format!("key-{t}");
+                    let value = format!("v-{t}-{i}");
+                    save_local_settings(&d, &[(key.as_str(), value.as_str())]).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let text = std::fs::read_to_string(dir.join(".zen").join("settings.local.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        for t in 0..4 {
+            let key = format!("key-{t}");
+            assert!(
+                value.get(&key).is_some(),
+                "concurrent save lost {key}: final file is {text}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lock_local_settings_acquires_and_releases() {
+        // Issue #469 / PR #574: the settings lock itself had no direct
+        // test - it was only exercised indirectly through
+        // save_local_settings. Acquiring twice in a row (with a drop
+        // between) pins the happy path the contention guard protects.
+        let dir = std::env::temp_dir().join(format!("zen_lock_acquire_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let parent = dir.join(".zen");
+        std::fs::create_dir_all(&parent).unwrap();
+        {
+            let _lock = lock_local_settings(&parent).unwrap();
+            assert!(parent.join("settings.local.lock").exists());
+        }
+        // Dropped: the flock is released with the guard, so a second
+        // acquire in the same process must succeed immediately.
+        let _lock = lock_local_settings(&parent).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Linux-only: on Windows the same contention yields
+    // ErrorKind::Uncategorized (CI run 45926671546, PR #574), and on
+    // macOS the raw error is 35 (EAGAIN), not 11 - so this premise
+    // test must not run off Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lock_contention_on_linux_is_would_block_with_raw_error_11() {
+        // PR #574, repl.rs:2790: the contention guard also accepts a
+        // raw OS error of 33 (Windows ERROR_LOCK_VIOLATION, which std
+        // maps to ErrorKind::Other - issue #319). On Linux, flock
+        // contention is always WouldBlock with raw error 11 (EAGAIN),
+        // never 33 (EDOM on Linux, which flock never returns). This
+        // test pins that Linux premise. The two mutants on the guard
+        // itself are killed by the is_lock_contention_* tests below,
+        // not by an exclusion in .cargo/mutants.toml.
+        use fs2::FileExt;
+        let dir =
+            std::env::temp_dir().join(format!("zen_lock_contention_kind_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let parent = dir.join(".zen");
+        std::fs::create_dir_all(&parent).unwrap();
+        let lock_path = parent.join("settings.local.lock");
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        holder.lock_exclusive().unwrap();
+        let contender = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        let err = contender.try_lock_exclusive().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(err.raw_os_error(), Some(11));
+        assert_ne!(err.raw_os_error(), Some(33));
+        drop(holder);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn is_lock_contention_accepts_contention_errors() {
+        // PR #574 (Z Tester fault injection): a non-WouldBlock error
+        // must fail at once instead of retrying for 10 s. The guard
+        // is classified here with synthetic errors so both mutants
+        // on it are killed deterministically on every platform.
+        // WouldBlock (any raw error) is contention.
+        assert!(is_lock_contention(&std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "contended"
+        )));
+        // Raw 33 is Windows ERROR_LOCK_VIOLATION (issue #319):
+        // contention even though std maps it to a non-WouldBlock kind.
+        assert!(is_lock_contention(&std::io::Error::from_raw_os_error(33)));
+    }
+
+    #[test]
+    fn is_lock_contention_rejects_other_errors() {
+        // PR #574: kills both mutants on the guard. Replacing the
+        // guard with true, or == with != in the raw-33 check, makes
+        // these errors classify as contention (retry 10 s) instead
+        // of failing at once.
+        assert!(!is_lock_contention(&std::io::Error::other("other failure")));
+        assert!(!is_lock_contention(&std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "missing"
+        )));
+        // Raw 22 (EINVAL on Linux) is not contention and not 33.
+        assert!(!is_lock_contention(&std::io::Error::from_raw_os_error(22)));
+        // Raw 11 is deliberately NOT asserted here: on Linux it maps
+        // to WouldBlock (covered above) while on Windows it is a
+        // different error, so a raw-11 assertion cannot be portable.
+        // The Linux flock behaviour is pinned by
+        // lock_contention_on_linux_is_would_block_with_raw_error_11.
+    }
+
+    #[test]
+    fn lock_with_retry_fails_at_once_on_hard_error() {
+        // PR #574, repl.rs:2800: the mutant replacing the call-site
+        // guard `is_lock_contention(&e)` with `true` survives the
+        // `is_lock_contention_*` tests - those only classify the
+        // error, they never reach the guard. A hard error injected
+        // here must fail at once with "cannot lock" instead of
+        // retrying until the 10 s deadline and bailing "locked by
+        // another process" (which is what the mutant does).
+        let lock_path = std::path::Path::new("settings.local.lock");
+        let start = std::time::Instant::now();
+        let err =
+            lock_with_retry(|| Err(std::io::Error::other("other failure")), lock_path).unwrap_err();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "hard error must fail at once, took {:?}",
+            start.elapsed()
+        );
+        assert!(
+            err.to_string().starts_with("cannot lock"),
+            "hard error must fail with 'cannot lock', got: {err}"
+        );
+    }
+
+    #[test]
+    fn lock_with_retry_retries_contention_then_succeeds() {
+        // PR #574: the other half of the guard - contention must be
+        // retried, not failed at once. A closure that contends twice
+        // and then succeeds pins the retry branch of lock_with_retry.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = AtomicUsize::new(0);
+        let lock_path = std::path::Path::new("settings.local.lock");
+        lock_with_retry(
+            || {
+                let n = attempts.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "contended",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+            lock_path,
+        )
+        .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 
     #[test]
