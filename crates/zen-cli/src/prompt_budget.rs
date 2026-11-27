@@ -87,7 +87,10 @@ mod tests {
         );
     }
 
-    const CURRENT_BUDGET_TOKENS: u64 = 2_331;
+    // Raised 2,331 -> 2,850 on 2026-11-28 per Leader decision (CI run 46044930682):
+    // Chặng 1 added six browser tools (browser_navigate/content/screenshot/wait/
+    // click/type); measured total 2,831 after trimming descriptions, plus a small buffer.
+    const CURRENT_BUDGET_TOKENS: u64 = 2_850;
 
     #[test]
     fn g4_prompt_budget_no_growth() {
@@ -95,7 +98,7 @@ mod tests {
         println!("{}", b.report());
         assert!(
             b.total() <= CURRENT_BUDGET_TOKENS,
-            "prompt budget grew: {} > {CURRENT_BUDGET_TOKENS} tokens (was 2,331 on 2026-10-17)\n{}",
+            "prompt budget grew: {} > {CURRENT_BUDGET_TOKENS} tokens (was 2,850 on 2026-11-28)\n{}",
             b.total(),
             b.report()
         );
