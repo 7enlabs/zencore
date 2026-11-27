@@ -1,0 +1,20 @@
+[package]
+name = "browser-cdp-spike"
+version = "0.1.0"
+edition = "2021"
+description = "Spike: drive headless Chromium from Rust over raw CDP (WebSocket). Spec-only companion to docs/browser-agent-spec.md; not part of the ZenCore workspace."
+license = "MIT"
+
+# Detached from the ZenCore workspace on purpose: this is a throwaway spike
+# with its own dependency set. Do not add it to the workspace members.
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.26"
+tungstenite = "0.26"
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+base64 = "0.22"
+anyhow = "1"
+futures-util = "0.3"
