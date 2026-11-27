@@ -1852,6 +1852,11 @@ mod tests {
                                "x": 10, "y": 10, "width": 80, "height": 30,
                                "visible": true, "editable": false,
                                "isPassword": false, "isSubmit": true, "inPasswordForm": true})
+                    } else if sel == "#plain-submit" {
+                        json!({"found": true, "tag": "BUTTON", "type": "submit", "text": "Submit",
+                               "x": 10, "y": 10, "width": 80, "height": 30,
+                               "visible": true, "editable": false,
+                               "isPassword": false, "isSubmit": true, "inPasswordForm": false})
                     } else if sel == "#delete" {
                         json!({"found": true, "tag": "BUTTON", "type": "button", "text": "Delete account",
                                "x": 10, "y": 10, "width": 80, "height": 30,
@@ -1881,7 +1886,40 @@ mod tests {
     /// Fake CDP endpoint on loopback: answers every method with
     /// `fake_result`, records every request, and after a navigate sends
     /// two paused requests (one private, one public) plus loadEventFired.
-    async fn run_fake_server(addr_tx: oneshot::Sender<String>, seen: Arc<StdMutex<Vec<Value>>>) {
+    /// Like fake_result, but the network-idle probe returns a growing request
+    /// count when `changing` is set, so wait_network_idle never sees stability.
+    fn fake_result_mode(
+        method: &str,
+        params: &Value,
+        net_idle_n: &StdMutex<u64>,
+        changing: bool,
+    ) -> Value {
+        if method == "Runtime.callFunctionOn" {
+            let decl = params
+                .get("functionDeclaration")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if decl.contains("resource") {
+                let n = if changing {
+                    let mut g = net_idle_n.lock().unwrap();
+                    let n = *g;
+                    *g += 1;
+                    n
+                } else {
+                    3
+                };
+                return json!({"result": {"type": "object", "value": {"n": n, "state": "complete"}}});
+            }
+        }
+        fake_result(method, params)
+    }
+
+    async fn run_fake_server(
+        addr_tx: oneshot::Sender<String>,
+        seen: Arc<StdMutex<Vec<Value>>>,
+        net_idle_changing: bool,
+    ) {
+        let net_idle_n = StdMutex::new(3u64);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let _ = addr_tx.send(format!("ws://127.0.0.1:{port}/"));
@@ -1901,7 +1939,12 @@ mod tests {
                 .unwrap_or("")
                 .to_string();
             let id = req.get("id").and_then(Value::as_u64).unwrap_or(0);
-            let result = fake_result(&method, req.get("params").unwrap_or(&Value::Null));
+            let result = fake_result_mode(
+                &method,
+                req.get("params").unwrap_or(&Value::Null),
+                &net_idle_n,
+                net_idle_changing,
+            );
             let resp = json!({"id": id, "result": result});
             let _ = sink.send(Message::Text(resp.to_string().into())).await;
             if method == "Page.navigate" {
@@ -1923,6 +1966,15 @@ mod tests {
                 let load = json!({"method": "Page.loadEventFired", "params": {}});
                 let _ = sink.send(Message::Text(load.to_string().into())).await;
             }
+            if method == "Page.enable" {
+                sleep(Duration::from_millis(30)).await;
+                let frame =
+                    json!({"method": "Page.frameNavigated", "params": {"frame": {"id": "F1"}}});
+                let _ = sink.send(Message::Text(frame.to_string().into())).await;
+                sleep(Duration::from_millis(30)).await;
+                let load = json!({"method": "Page.loadEventFired", "params": {}});
+                let _ = sink.send(Message::Text(load.to_string().into())).await;
+            }
         }
     }
 
@@ -1933,10 +1985,21 @@ mod tests {
         Arc<StdMutex<Vec<Value>>>,
         tokio::task::JoinHandle<()>,
     ) {
+        fake_session_mode(key, false).await
+    }
+
+    async fn fake_session_mode(
+        key: &str,
+        net_idle_changing: bool,
+    ) -> (
+        BrowserSession,
+        Arc<StdMutex<Vec<Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let seen: Arc<StdMutex<Vec<Value>>> = Arc::new(StdMutex::new(Vec::new()));
         let (tx, rx) = oneshot::channel();
         let seen2 = seen.clone();
-        let handle = tokio::spawn(run_fake_server(tx, seen2));
+        let handle = tokio::spawn(run_fake_server(tx, seen2, net_idle_changing));
         let ws_url = rx.await.expect("fake server address");
         let dir = std::env::temp_dir().join(format!("zen-browser-fake-{key}"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1944,6 +2007,20 @@ mod tests {
             .await
             .expect("connect to fake CDP server");
         (session, seen, handle)
+    }
+
+    /// Raw fake CDP endpoint without a session, for CdpClient-level tests.
+    async fn spawn_fake_server() -> (
+        String,
+        Arc<StdMutex<Vec<Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let seen: Arc<StdMutex<Vec<Value>>> = Arc::new(StdMutex::new(Vec::new()));
+        let (tx, rx) = oneshot::channel();
+        let seen2 = seen.clone();
+        let handle = tokio::spawn(run_fake_server(tx, seen2, false));
+        let ws_url = rx.await.expect("fake server address");
+        (ws_url, seen, handle)
     }
 
     fn has_verdict(seen: &Arc<StdMutex<Vec<Value>>>, method: &str, request_id: &str) -> bool {
@@ -1954,6 +2031,140 @@ mod tests {
                     .and_then(Value::as_str)
                     == Some(request_id)
         })
+    }
+
+    fn call_ids(seen: &Arc<StdMutex<Vec<Value>>>) -> Vec<u64> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m.get("id").and_then(Value::as_u64))
+            .collect()
+    }
+
+    fn count_calls(seen: &Arc<StdMutex<Vec<Value>>>, method: &str, decl_substr: &str) -> usize {
+        count_calls_from(seen, 0, method, decl_substr)
+    }
+
+    fn count_calls_from(
+        seen: &Arc<StdMutex<Vec<Value>>>,
+        from: usize,
+        method: &str,
+        decl_substr: &str,
+    ) -> usize {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .skip(from)
+            .filter(|m| {
+                if m.get("method").and_then(Value::as_str) != Some(method) {
+                    return false;
+                }
+                if decl_substr.is_empty() {
+                    return true;
+                }
+                m.get("params")
+                    .and_then(|p| p.get("functionDeclaration"))
+                    .and_then(Value::as_str)
+                    .map(|d| d.contains(decl_substr))
+                    .unwrap_or(false)
+            })
+            .count()
+    }
+
+    fn last_call_ctx(seen: &Arc<StdMutex<Vec<Value>>>) -> Option<u64> {
+        seen.lock().unwrap().iter().rev().find_map(|m| {
+            if m.get("method").and_then(Value::as_str) != Some("Runtime.callFunctionOn") {
+                return None;
+            }
+            m.get("params")
+                .and_then(|p| p.get("executionContextId"))
+                .and_then(Value::as_u64)
+        })
+    }
+
+    fn dispatch_coords(seen: &Arc<StdMutex<Vec<Value>>>) -> Vec<(f64, f64)> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|m| {
+                if m.get("method").and_then(Value::as_str) != Some("Input.dispatchMouseEvent") {
+                    return None;
+                }
+                let p = m.get("params")?;
+                Some((
+                    p.get("x").and_then(Value::as_f64)?,
+                    p.get("y").and_then(Value::as_f64)?,
+                ))
+            })
+            .collect()
+    }
+
+    /// Restores an env var on drop. Serialises tests that mutate the process env.
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+    impl EnvGuard {
+        fn set(key: &'static str, val: &str) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, val) };
+            EnvGuard { key, old }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    /// Seed a fake session into the global registry so tool `call` fns use it
+    /// instead of launching a real Chromium.
+    async fn seeded_tool_ctx(key: &str) -> (ToolContext, tokio::task::JoinHandle<()>) {
+        let (session, _seen, handle) = fake_session(key).await;
+        let arc = Arc::new(tokio::sync::Mutex::new(session));
+        {
+            let mut sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+            sessions.insert(key.to_string(), arc);
+        }
+        let dir = std::env::temp_dir().join(format!("zen-browser-tool-{key}"));
+        let _ = std::fs::create_dir_all(&dir);
+        (ToolContext::new(dir, key), handle)
+    }
+
+    /// Tiny loopback HTTP server for wait_for_version / create_target tests.
+    /// The first request gets `first`, later requests get `after`.
+    async fn run_version_server(first: (u16, &'static str), after: (u16, &'static str)) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut seen = 0u32;
+            while let Ok((mut stream, _)) = listener.accept().await {
+                loop {
+                    let mut buf = [0u8; 4096];
+                    let Ok(n) = stream.read(&mut buf).await else {
+                        break;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    let (status, body) = if seen == 0 { first } else { after };
+                    seen += 1;
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    if stream.write_all(resp.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        port
     }
 
     #[tokio::test]
@@ -2113,5 +2324,685 @@ mod tests {
         assert!(size > 1000, "screenshot too small: {size}");
         assert!(path.exists());
         s.close().await;
+    }
+
+    // ==================== PR #580 mutant kills ====================
+
+    #[test]
+    fn validate_selector_quotes_do_not_count_parens_or_brackets() {
+        // A paren/bracket inside a quoted attribute value is data, not syntax.
+        for sel in [
+            "div[title=\"(x\"]",
+            "div[title=\")x\"]",
+            "div[title=\"[x\"]",
+            "div[title=\"]x\"]",
+            "div[data-x='a\"b']",
+        ] {
+            assert!(validate_selector(sel).is_ok(), "{sel}");
+        }
+        // Unbalanced ( / [ must report the right bracket in the message.
+        let err = validate_selector("#x(()").expect_err("unbalanced (");
+        assert!(err.contains("unbalanced ("), "{err}");
+        let err = validate_selector("#x[[]").expect_err("unbalanced [");
+        assert!(err.contains("unbalanced ["), "{err}");
+    }
+
+    #[test]
+    fn selector_hints_need_only_one_keyword() {
+        // "passwd" alone must count as a password hint (kills || -> &&).
+        assert!(selector_hints_password("#passwd"));
+        assert!(selector_hints_password("input[type=password]"));
+        assert!(!selector_hints_password("#search"));
+        // "#submit" alone must count as a submit hint.
+        assert!(selector_hints_submit("#submit"));
+        assert!(selector_hints_submit("button[type=submit]"));
+        assert!(!selector_hints_submit("#cancel"));
+    }
+
+    #[test]
+    fn element_from_value_reads_floats() {
+        let el = element_from_value(&json!({
+            "found": true, "tag": "DIV", "type": "", "text": "hello",
+            "x": 10.5, "y": 20.25, "width": 80.0, "height": 30.5,
+            "visible": true, "editable": false,
+            "isPassword": false, "isSubmit": false, "inPasswordForm": false
+        }));
+        assert!(el.found);
+        assert_eq!(el.tag, "DIV");
+        assert_eq!(el.text, "hello");
+        assert_eq!(el.x, 10.5);
+        assert_eq!(el.y, 20.25);
+        assert_eq!(el.width, 80.0);
+        assert_eq!(el.height, 30.5);
+    }
+
+    #[test]
+    fn arg_accessors_read_typed_values() {
+        let args =
+            json!({"timeout_ms": 5000, "submit": true, "url": "https://example.com", "n": -5});
+        assert_eq!(arg_i64(&args, "timeout_ms"), Some(5000));
+        assert_eq!(arg_i64(&args, "n"), Some(-5));
+        assert_eq!(arg_i64(&args, "missing"), None);
+        assert_eq!(arg_bool(&args, "submit"), Some(true));
+        assert_eq!(arg_bool(&json!({"submit": false}), "submit"), Some(false));
+        assert_eq!(arg_bool(&args, "missing"), None);
+        assert_eq!(
+            arg_str_opt(&args, "url"),
+            Some("https://example.com".to_string())
+        );
+        assert_eq!(arg_str_opt(&args, "missing"), None);
+    }
+
+    #[test]
+    fn clamp_timeout_bounds_and_defaults() {
+        assert_eq!(
+            clamp_timeout(Some(5000), 30_000, 120_000),
+            Duration::from_millis(5000)
+        );
+        assert_eq!(
+            clamp_timeout(Some(0), 30_000, 120_000),
+            Duration::from_millis(30_000)
+        );
+        assert_eq!(
+            clamp_timeout(Some(-5), 30_000, 120_000),
+            Duration::from_millis(30_000)
+        );
+        assert_eq!(
+            clamp_timeout(None, 30_000, 120_000),
+            Duration::from_millis(30_000)
+        );
+        assert_eq!(
+            clamp_timeout(Some(999_999), 30_000, 120_000),
+            Duration::from_millis(120_000)
+        );
+    }
+
+    #[test]
+    fn clamp_usize_bounds_and_defaults() {
+        assert_eq!(clamp_usize(Some(5), 10, 100), 5);
+        assert_eq!(clamp_usize(Some(0), 10, 100), 10);
+        assert_eq!(clamp_usize(Some(-3), 10, 100), 10);
+        assert_eq!(clamp_usize(None, 10, 100), 10);
+        assert_eq!(clamp_usize(Some(999), 10, 100), 100);
+    }
+
+    #[test]
+    fn permission_title_is_the_hint_or_the_tool_name() {
+        update_cached_page("title-key", "https://example.com/page".to_string(), false);
+        let title = browser_permission_title(BROWSER_CLICK, &json!({"selector": "#ok"}));
+        assert!(title.contains("browser_click"), "{title}");
+        assert!(title.contains("#ok"), "{title}");
+        assert_eq!(browser_permission_title("Read", &json!({})), "Read");
+    }
+
+    #[test]
+    fn page_cache_round_trips() {
+        update_cached_page("cache-key", "https://myhost.test/page".to_string(), true);
+        let page = cached_page("cache-key").expect("cached page");
+        assert_eq!(page.url, "https://myhost.test/page");
+        assert_eq!(page.host, "myhost.test");
+        assert!(page.has_password_field);
+        // Host / password helpers read the most recently active session.
+        assert_eq!(current_browser_host().as_deref(), Some("myhost.test"));
+        assert!(current_browser_has_password());
+        update_cached_page("cache-key-2", "https://other.test/".to_string(), false);
+        assert_eq!(current_browser_host().as_deref(), Some("other.test"));
+        assert!(!current_browser_has_password());
+    }
+
+    #[test]
+    fn selector_flags_round_trip() {
+        let flags = SelectorFlags {
+            is_password_field: true,
+            is_submit: true,
+            is_destructive: false,
+            in_password_form: true,
+        };
+        record_selector_flags("flags-key", "#login", flags);
+        let back = selector_flags_for("flags-key", "#login").expect("flags stored");
+        assert!(back.is_password_field);
+        assert!(back.is_submit);
+        assert!(!back.is_destructive);
+        assert!(back.in_password_form);
+        assert!(selector_flags_for("flags-key", "#other").is_none());
+    }
+
+    #[test]
+    fn classify_browser_call_gate_branches() {
+        // Cached submit flags outside a password form do not imply login.
+        record_selector_flags(
+            "class-key",
+            "#plain-submit",
+            SelectorFlags {
+                is_password_field: false,
+                is_submit: true,
+                is_destructive: false,
+                in_password_form: false,
+            },
+        );
+        let (mark, login) = classify_browser_call(
+            BROWSER_CLICK,
+            &json!({"selector": "#plain-submit"}),
+            "class-key",
+        );
+        assert!(!login, "submit outside a password form is not a login");
+        assert!(mark.submit);
+        assert!(!mark.login);
+
+        // Typing on a page known to hold a password field is a login.
+        update_cached_page("class-key-2", "https://example.com/login".to_string(), true);
+        let (_mark, login) =
+            classify_browser_call(BROWSER_TYPE, &json!({"selector": "#search"}), "class-key-2");
+        assert!(login, "typing on a login page is a login");
+
+        // ... but only for browser_type, not for a plain click ...
+        let (_mark, login) = classify_browser_call(
+            BROWSER_CLICK,
+            &json!({"selector": "#search"}),
+            "class-key-2",
+        );
+        assert!(!login, "clicking on a login page is not itself a login");
+
+        // ... and only with a non-empty selector.
+        let (_mark, login) =
+            classify_browser_call(BROWSER_TYPE, &json!({"selector": ""}), "class-key-2");
+        assert!(!login, "typing with no selector is not a login");
+
+        // The current-session classifier reports the login mark.
+        let (mark, login) =
+            classify_current_browser_call(BROWSER_CLICK, &json!({"selector": "#password"}));
+        assert!(login);
+        assert!(mark.login);
+    }
+
+    #[test]
+    fn tool_descriptions_are_exact() {
+        assert_eq!(
+            BrowserNavigateTool.description(),
+            "Navigate the browser tab to a public http(s) URL; returns final URL, status, title, and text length."
+        );
+        assert_eq!(
+            BrowserContentTool.description(),
+            "Read rendered page text (after JS ran), or of one element. Text only, never HTML."
+        );
+        assert_eq!(
+            BrowserScreenshotTool.description(),
+            "Capture a PNG screenshot of the viewport or one element; saves it under the session work dir and returns the file path."
+        );
+        assert_eq!(
+            BrowserWaitTool.description(),
+            "Wait for an element or text to appear in the rendered page. Use exactly one of selector or text."
+        );
+        assert_eq!(
+            BrowserClickTool.description(),
+            "Click one element in the browser tab. Always asks for approval; login, submit, and destructive clicks need a separate approval."
+        );
+        assert_eq!(
+            BrowserTypeTool.description(),
+            "Type text into an input or textarea. Always asks for approval; never returns or logs the text. Password fields need a BrowserLogin approval."
+        );
+    }
+
+    #[test]
+    fn find_chromium_env_bin_and_path_lookup() {
+        // (1) CHROMIUM_BIN wins outright.
+        {
+            let _guard = EnvGuard::set("CHROMIUM_BIN", "/usr/bin/chromium-test");
+            assert_eq!(find_chromium().expect("env bin"), "/usr/bin/chromium-test");
+        }
+        // (2) Without it, the first `chromium` on PATH wins.
+        let dir = std::env::temp_dir().join(format!(
+            "zen-browser-which-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("chromium");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{}", dir.display(), old_path);
+        unsafe { std::env::set_var("PATH", &new_path) };
+        let _env_bin = EnvGuard::set("CHROMIUM_BIN", "");
+        let found = find_chromium().expect("fake chromium on PATH");
+        unsafe { std::env::set_var("PATH", &old_path) };
+        assert_eq!(found, fake.to_string_lossy().to_string());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn navigate_tool_validates_url_and_wait_until() {
+        let (ctx, handle) = seeded_tool_ctx("tool-nav-1").await;
+        let out = BrowserNavigateTool
+            .call(
+                json!({"url": "https://8.8.8.8/page", "wait_until": "load"}),
+                &ctx,
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.content
+                .contains("navigated to https://example.com/page"),
+            "{}",
+            out.content
+        );
+        assert!(out.content.contains("status: 200"), "{}", out.content);
+
+        let out = BrowserNavigateTool
+            .call(
+                json!({"url": "https://8.8.8.8/page", "wait_until": "networkidle"}),
+                &ctx,
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+
+        let out = BrowserNavigateTool
+            .call(
+                json!({"url": "https://8.8.8.8/page", "wait_until": "bogus"}),
+                &ctx,
+            )
+            .await;
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("unsupported wait_until"),
+            "{}",
+            out.content
+        );
+
+        let out = BrowserNavigateTool
+            .call(json!({"url": "ftp://example.com/x"}), &ctx)
+            .await;
+        assert!(out.is_error, "{}", out.content);
+        assert!(out.content.contains("unsupported URL"), "{}", out.content);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn wait_tool_needs_exactly_one_condition() {
+        let (ctx, handle) = seeded_tool_ctx("tool-wait-1").await;
+        let out = BrowserWaitTool
+            .call(json!({"selector": "#x", "timeout_ms": 1000}), &ctx)
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("condition met: selector"),
+            "{}",
+            out.content
+        );
+
+        let out = BrowserWaitTool
+            .call(json!({"selector": "#x", "text": "hello"}), &ctx)
+            .await;
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("use only one of selector or text"),
+            "{}",
+            out.content
+        );
+
+        let out = BrowserWaitTool.call(json!({"timeout_ms": 100}), &ctx).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("no condition given"),
+            "{}",
+            out.content
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn navigate_request_ids_increase_and_load_skips_idle_wait() {
+        let (mut s, seen, handle) = fake_session("fake-ids-1").await;
+        let info = s
+            .navigate("https://8.8.8.8/page", "load", Duration::from_secs(10))
+            .await
+            .expect("navigate");
+        assert_eq!(info.status, 200);
+        let ids = call_ids(&seen);
+        assert!(ids.len() >= 5, "expected several CDP calls, got {ids:?}");
+        assert!(
+            ids.windows(2).all(|w| w[0] < w[1]),
+            "request ids must increase: {ids:?}"
+        );
+        // A plain "load" navigation never waits for network idle.
+        assert_eq!(count_calls(&seen, "Runtime.callFunctionOn", "resource"), 0);
+        // navigate refreshes the page cache.
+        let page = cached_page("fake-ids-1").expect("page cache updated by navigate");
+        assert_eq!(page.url, "https://example.com/page");
+        assert!(page.has_password_field);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn wait_event_times_out_when_nothing_arrives() {
+        let (mut s, _seen, handle) = fake_session("fake-wait-1").await;
+        let err = s
+            .cdp
+            .wait_event("Page.loadEventFired", Duration::from_millis(300))
+            .await
+            .expect_err("no event arrives, must time out");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn wait_event_reads_live_event_after_buffering_other_events() {
+        let (ws_url, _seen, handle) = spawn_fake_server().await;
+        let mut client = CdpClient::connect(&ws_url, None).await.expect("connect");
+        client
+            .call("Page.enable", json!({}), Duration::from_secs(5))
+            .await
+            .expect("Page.enable");
+        // The fake server sends Page.frameNavigated, then Page.loadEventFired.
+        client
+            .wait_event("Page.loadEventFired", Duration::from_secs(5))
+            .await
+            .expect("load event");
+        // The other event must have been buffered, not swallowed.
+        let buffered: Vec<String> = client
+            .events
+            .iter()
+            .filter_map(|e| e.get("method").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        assert_eq!(buffered, vec!["Page.frameNavigated".to_string()]);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn exec_ctx_learned_only_from_main_frame_default_context() {
+        let (mut s, seen, handle) = fake_session("fake-ctx-1").await;
+        let ctx_of_last_probe = |seen: &Arc<StdMutex<Vec<Value>>>| last_call_ctx(seen);
+
+        // Baseline: the seeded dummy context is used.
+        s.probe_element("#x", Duration::from_secs(5))
+            .await
+            .expect("probe baseline");
+        assert_eq!(ctx_of_last_probe(&seen), Some(1));
+
+        // Main frame F1, then a default context from an iframe is ignored.
+        s.cdp
+            .on_message(json!({"method": "Page.frameNavigated", "params": {"frame": {"id": "F1"}}}))
+            .await
+            .expect("frame");
+        s.cdp.on_message(json!({"method": "Runtime.executionContextCreated", "params": {"context": {"id": 42, "auxData": {"isDefault": true, "frameId": "F2"}}}})).await.expect("iframe ctx");
+        s.probe_element("#x", Duration::from_secs(5))
+            .await
+            .expect("probe after iframe ctx");
+        assert_eq!(ctx_of_last_probe(&seen), Some(1));
+
+        // A non-default context of the main frame is ignored too.
+        s.cdp.on_message(json!({"method": "Runtime.executionContextCreated", "params": {"context": {"id": 43, "auxData": {"isDefault": false, "frameId": "F1"}}}})).await.expect("non-default ctx");
+        s.probe_element("#x", Duration::from_secs(5))
+            .await
+            .expect("probe after non-default ctx");
+        assert_eq!(ctx_of_last_probe(&seen), Some(1));
+
+        // The default context of the main frame is learned.
+        s.cdp.on_message(json!({"method": "Runtime.executionContextCreated", "params": {"context": {"id": 44, "auxData": {"isDefault": true, "frameId": "F1"}}}})).await.expect("main ctx");
+        s.probe_element("#x", Duration::from_secs(5))
+            .await
+            .expect("probe after main ctx");
+        assert_eq!(ctx_of_last_probe(&seen), Some(44));
+
+        // Destroying a different context leaves the learned one alone.
+        s.cdp.on_message(json!({"method": "Runtime.executionContextDestroyed", "params": {"executionContextId": 7}})).await.expect("destroy other");
+        s.probe_element("#x", Duration::from_secs(5))
+            .await
+            .expect("probe after destroying other");
+        assert_eq!(ctx_of_last_probe(&seen), Some(44));
+
+        // Destroying the learned context drops back to waiting (short timeout).
+        s.cdp.on_message(json!({"method": "Runtime.executionContextDestroyed", "params": {"executionContextId": 44}})).await.expect("destroy learned");
+        let err = s
+            .probe_element("#x", Duration::from_millis(300))
+            .await
+            .expect_err("no context left, must time out");
+        assert!(err.to_string().contains("timed out"), "{err}");
+
+        // With no context, ensure_exec_ctx waits the full duration.
+        let start = tokio::time::Instant::now();
+        let err = s
+            .cdp
+            .ensure_exec_ctx(Duration::from_millis(500))
+            .await
+            .expect_err("still no context");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(
+            start.elapsed() >= Duration::from_millis(300),
+            "ensure must wait, took {:?}",
+            start.elapsed()
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn wait_network_idle_waits_for_stability() {
+        let (mut s, seen, handle) = fake_session("fake-idle-1").await;
+        let before = seen.lock().unwrap().len();
+        s.wait_network_idle(Duration::from_secs(2))
+            .await
+            .expect("stable page goes idle");
+        let idle_calls = count_calls_from(&seen, before, "Runtime.callFunctionOn", "resource");
+        assert!(
+            idle_calls >= 3,
+            "expected several idle polls, got {idle_calls}"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn wait_network_idle_never_stable_times_out() {
+        let (mut s, _seen, handle) = fake_session_mode("fake-idle-2", true).await;
+        let err = s
+            .wait_network_idle(Duration::from_secs(1))
+            .await
+            .expect_err("request count never settles, must time out");
+        assert!(
+            err.to_string()
+                .contains("timed out waiting for network idle"),
+            "{err}"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn wait_for_missing_selector_polls_until_deadline() {
+        let (mut s, seen, handle) = fake_session("fake-wait-2").await;
+        let before = seen.lock().unwrap().len();
+        let err = s
+            .wait_for(Some("#missing"), None, Duration::from_millis(600))
+            .await
+            .expect_err("missing selector must time out");
+        assert!(
+            err.to_string().contains("timed out waiting for selector"),
+            "{err}"
+        );
+        let probes = count_calls_from(
+            &seen,
+            before,
+            "Runtime.callFunctionOn",
+            "getBoundingClientRect",
+        );
+        assert!(probes >= 2, "expected repeated probes, got {probes}");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn gate_mark_plain_submit_needs_only_submit_approval() {
+        let (mut s, _seen, handle) = fake_session("fake-gate-plain").await;
+        // #plain-submit is a submit button outside any password form:
+        // no login is needed, only a separate submit approval.
+        let err = s
+            .click("#plain-submit", Duration::from_secs(10))
+            .await
+            .expect_err("plain submit click without a mark must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("a separate submit approval"), "{msg}");
+        assert!(!msg.contains("BrowserLogin approval"), "{msg}");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn gate_mark_submit_with_both_marks_clicks() {
+        let (mut s, _seen, handle) = fake_session("fake-gate-marks").await;
+        record_gate_mark(
+            "fake-gate-marks",
+            "#submit",
+            GateMark {
+                login: true,
+                submit: true,
+                destructive: false,
+            },
+        );
+        let (text, _url) = s
+            .click("#submit", Duration::from_secs(10))
+            .await
+            .expect("submit click with both marks");
+        assert_eq!(text, "Log in");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn click_dispatches_at_element_center() {
+        let (mut s, seen, handle) = fake_session("fake-click-xy").await;
+        let (text, _url) = s
+            .click("#x", Duration::from_secs(10))
+            .await
+            .expect("plain click");
+        assert_eq!(text, "hello");
+        let coords = dispatch_coords(&seen);
+        assert_eq!(coords.len(), 2, "pressed + released, got {coords:?}");
+        for (x, y) in coords {
+            assert_eq!(x, 50.0, "cx = 10 + 80/2");
+            assert_eq!(y, 25.0, "cy = 10 + 30/2");
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn screenshot_element_and_numbering() {
+        let (mut s, _seen, handle) = fake_session("fake-shot-1").await;
+        let (path1, size1, _, _) = s
+            .screenshot(Some("#x"), false, Duration::from_secs(10))
+            .await
+            .expect("element screenshot");
+        assert!(size1 > 0);
+        assert!(path1.exists());
+        assert!(
+            path1
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("screenshot-1.png")
+        );
+        let (path2, _, _, _) = s
+            .screenshot(None, false, Duration::from_secs(10))
+            .await
+            .expect("viewport screenshot");
+        assert!(
+            path2
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("screenshot-2.png")
+        );
+        assert_ne!(path1, path2);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn session_close_closes_the_socket() {
+        let (s, _seen, handle) = fake_session("fake-close-1").await;
+        s.close().await;
+        sleep(Duration::from_millis(500)).await;
+        assert!(
+            handle.is_finished(),
+            "fake server must see the socket close"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_drop_removes_the_profile_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "zen-browser-drop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (ws_url, _seen, handle) = spawn_fake_server().await;
+        let cdp = CdpClient::connect(&ws_url, None).await.expect("connect");
+        let session = BrowserSession {
+            cdp,
+            child: None,
+            profile_dir: Some(dir.clone()),
+            work_dir: std::env::temp_dir(),
+            allow_private_network: false,
+            pinned: Arc::new(crate::builtin::PinnedResolver::default()),
+            shot_count: 0,
+            current_url: String::new(),
+            session_key: "drop-test".to_string(),
+        };
+        drop(session);
+        assert!(!dir.exists(), "profile dir must be removed on drop");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn free_port_returns_a_bindable_port() {
+        let port = free_port().await.expect("free port");
+        assert!(port > 1024, "ephemeral port, got {port}");
+        let _listener = TcpListener::bind(format!("127.0.0.1:{port}"))
+            .await
+            .expect("port must be bindable");
+    }
+
+    #[tokio::test]
+    async fn wait_for_version_retries_until_success() {
+        let port = run_version_server(
+            (500, r#"{"error": "not ready yet"}"#),
+            (200, r#"{"Browser": "HeadlessChrome/155.0", "Protocol-Version": "1.3", "webSocketDebuggerUrl": "ws://127.0.0.1:9/devtools/browser/ABC"}"#),
+        ).await;
+        let client = reqwest::Client::new();
+        let v = wait_for_version(&client, port)
+            .await
+            .expect("version after one retry");
+        assert_eq!(
+            v.get("Browser").and_then(Value::as_str),
+            Some("HeadlessChrome/155.0")
+        );
+        assert!(
+            v.get("webSocketDebuggerUrl")
+                .and_then(Value::as_str)
+                .map(|u| u.starts_with("ws://"))
+                .unwrap_or(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn create_target_returns_the_debugger_url() {
+        let port = run_version_server(
+            (
+                200,
+                r#"{"webSocketDebuggerUrl": "ws://127.0.0.1:9/devtools/page/ABC123"}"#,
+            ),
+            (
+                200,
+                r#"{"webSocketDebuggerUrl": "ws://127.0.0.1:9/devtools/page/ABC123"}"#,
+            ),
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let url = create_target(&client, port).await.expect("target url");
+        assert_eq!(url, "ws://127.0.0.1:9/devtools/page/ABC123");
     }
 }

@@ -3089,4 +3089,91 @@ mod permission_tests {
             Some("browser_navigate(domain:example.com)".to_string())
         );
     }
+
+    // ==================== PR #580 mutant kills ====================
+
+    #[test]
+    fn rule_browser_name_matching_needs_same_tool() {
+        let cwd = PathBuf::from("/tmp/work");
+        // A rule naming browser_click must not match browser_navigate.
+        assert!(!rule_matches(
+            "BrowserClick",
+            "browser_navigate",
+            &json!({}),
+            &cwd
+        ));
+        // ... and BrowserLogin must not match a read-only browser tool.
+        assert!(!rule_matches(
+            "BrowserLogin",
+            "browser_navigate",
+            &json!({}),
+            &cwd
+        ));
+        // Positive control: the same tool matches (BrowserClick spelling).
+        assert!(rule_matches(
+            "BrowserClick",
+            "browser_click",
+            &json!({}),
+            &cwd
+        ));
+    }
+
+    #[test]
+    fn browser_login_call_needs_a_mutating_login_call() {
+        // Read-only browser tools are never login calls.
+        assert!(!browser_login_call("browser_navigate", &json!({})));
+        assert!(!browser_login_call("browser_content", &json!({})));
+        // A mutating call on a password selector is a login call.
+        assert!(browser_login_call(
+            "browser_click",
+            &json!({"selector": "#password"})
+        ));
+        assert!(browser_login_call(
+            "browser_type",
+            &json!({"selector": "#password"})
+        ));
+        // ... but the same tools on a plain selector are not.
+        assert!(!browser_login_call(
+            "browser_click",
+            &json!({"selector": "#ok"})
+        ));
+    }
+
+    #[test]
+    fn accept_edits_does_not_allow_unlisted_tools_with_paths() {
+        let dir = tmpdir("accept-edits-2");
+        let ctx = ctx_for(&dir);
+        let p = perms(PermissionMode::AcceptEdits, &[], &[], &[], None);
+        // A tool that is neither an edit tool nor a browser tool must still ask,
+        // even when its file path is inside the workdir.
+        let d = p.evaluate(
+            "mcp__files__write",
+            &json!({"file_path": "x.txt"}),
+            false,
+            &ctx,
+        );
+        assert!(
+            is_ask(&d),
+            "AcceptEdits must ask for unlisted tools, got {d:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_suggested_rule_prefers_the_host_scoped_rule() {
+        // With a known host, click/type suggest the host-scoped rule.
+        crate::browser::update_cached_page(
+            "suggest-key",
+            "https://example.com/page".to_string(),
+            false,
+        );
+        assert_eq!(
+            suggested_rule("browser_click", &json!({"selector": "#ok"})),
+            Some("browser_click(domain:example.com)".to_string())
+        );
+        assert_eq!(
+            suggested_rule("browser_type", &json!({"selector": "#ok"})),
+            Some("browser_type(domain:example.com)".to_string())
+        );
+    }
 }
