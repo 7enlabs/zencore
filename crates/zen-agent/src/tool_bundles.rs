@@ -149,9 +149,13 @@ impl FromStr for ToolBundle {
     }
 }
 
+// Budgets raised for browser agent stage 1 (six new browser tools):
+// Core keeps a fixed deferred stub for each of the six new tools, so
+// trimming descriptions cannot bring it back under 1000; Read holds all
+// four browser read-phase tools.
 pub const SCHEMA_TOKEN_BUDGETS: &[(ToolBundle, u64)] = &[
-    (ToolBundle::Core, 1_000),
-    (ToolBundle::Read, 1_700),
+    (ToolBundle::Core, 1_010),
+    (ToolBundle::Read, 1_800),
     (ToolBundle::Write, 1_500),
     (ToolBundle::Exec, 1_500),
 ];
