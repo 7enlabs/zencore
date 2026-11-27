@@ -238,6 +238,17 @@ pub fn load_registry(path: &Path) -> Result<Vec<TaskCard>> {
 
 /// Append one snapshot line for `card`, creating the `.zen` tree and
 /// the registry file when they do not exist yet.
+/// Append one snapshot line for `card`, creating the `.zen` tree and
+/// the registry file when they do not exist yet.
+///
+/// A previous append may have left the file without a trailing
+/// newline (crash mid-append, kill, hand-edit): appending blindly
+/// would glue the new snapshot onto that partial line, and the load
+/// would then discard both lines as one malformed line (#571) - a
+/// claim the CLI just reported as recorded would vanish on re-read.
+/// Terminate the partial line first so the new snapshot starts on
+/// its own line; the torn fragment itself stays malformed and is
+/// skipped on load (#467).
 pub fn append_snapshot(path: &Path, card: &TaskCard) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -245,9 +256,19 @@ pub fn append_snapshot(path: &Path, card: &TaskCard) -> Result<()> {
     }
     let mut file = OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(path)
         .with_context(|| format!("opening task registry {}", path.display()))?;
+    if file.metadata()?.len() > 0 {
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0u8; 1];
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            file.write_all(b"\n")?;
+        }
+    }
     let mut line = serde_json::to_string(card)?;
     line.push('\n');
     file.write_all(line.as_bytes())?;
@@ -1374,6 +1395,40 @@ mod tests {
         assert_eq!(cards.len(), 2);
         assert_eq!(cards[0].id, "B-1");
         assert_eq!(cards[1].id, "B-2");
+    }
+
+    #[test]
+    fn append_after_unterminated_complete_line_keeps_both_cards() {
+        // #571: a valid card line without a trailing newline (crash
+        // mid-append, hand-edit) must not swallow the next snapshot:
+        // the repair terminates the line, so both cards load back.
+        let path = temp_registry("unterminated_complete");
+        let seed = serde_json::to_string(&card("B-1", "first")).unwrap();
+        std::fs::write(&path, seed).unwrap();
+        append_snapshot(&path, &card("B-2", "second")).unwrap();
+        let cards = load_registry(&path).unwrap();
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].id, "B-1");
+        assert_eq!(cards[1].id, "B-2");
+        assert_eq!(std::fs::read(&path).unwrap().last(), Some(&10u8));
+    }
+
+    #[test]
+    fn append_after_torn_partial_line_keeps_new_snapshot() {
+        // #571: the torn fragment itself is unrecoverable and stays
+        // skipped (#467), but the new snapshot must start on its own
+        // line and load back instead of gluing onto the fragment.
+        let path = temp_registry("unterminated_torn");
+        append_snapshot(&path, &card("B-1", "first")).unwrap();
+        let mut data = std::fs::read_to_string(&path).unwrap();
+        data.push_str("{not json");
+        std::fs::write(&path, data).unwrap();
+        append_snapshot(&path, &card("B-2", "second")).unwrap();
+        let cards = load_registry(&path).unwrap();
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].id, "B-1");
+        assert_eq!(cards[1].id, "B-2");
+        assert_eq!(cards[1].title, "second");
     }
 
     #[test]
