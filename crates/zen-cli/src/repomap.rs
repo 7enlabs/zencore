@@ -1073,4 +1073,236 @@ mod tests {
             DEFAULT_MAP_TOKENS
         );
     }
+
+    /// Token estimate used by `repo_map`: characters divided by 4, rounded up.
+    fn token_cost(text: &str) -> usize {
+        text.chars().count().div_ceil(4)
+    }
+
+    /// Exact header cost for a two-digit budget. All budgets below stay
+    /// two digits, so the header length cannot drift mid-computation.
+    fn header_tokens(budget: usize) -> usize {
+        assert!(
+            (10..100).contains(&budget),
+            "budget must stay two digits, got {budget}"
+        );
+        token_cost(&format!(
+            "Repository map (top Rust symbols by cross-file references, {budget}-token budget):\n"
+        ))
+    }
+
+    /// Budget whose header cost is `header_tokens(50)` plus `rest`.
+    fn budget_at(rest: usize) -> usize {
+        let header = header_tokens(50);
+        let budget = header + rest;
+        assert_eq!(
+            header_tokens(budget),
+            header,
+            "budget crossed a digit boundary"
+        );
+        budget
+    }
+
+    fn trunc_marker_tokens() -> usize {
+        token_cost("[map truncated: token budget exhausted]\n")
+    }
+
+    /// Kills the `>` -> `>=` and `+` -> `*` mutants on the file-line
+    /// budget check: at exactly header + file line + marker tokens the
+    /// file line still fits, so it must be rendered. Note the file has
+    /// no `FileEntry` here: when its first symbol line does not fit,
+    /// `repo_map` breaks out before pushing the entry.
+    #[test]
+    fn budget_file_line_exact_fit_is_included() {
+        let dir = unique_dir("fileexact");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_file(&dir, "a.rs", "pub fn f() {}\n");
+        let budget = budget_at(token_cost("a.rs\n") + trunc_marker_tokens());
+        let map = repo_map(&dir, budget).expect("map");
+        assert!(
+            map.text().contains("a.rs"),
+            "exact-fit file line must be rendered, got:\n{}",
+            map.text()
+        );
+        assert!(
+            map.truncated,
+            "the symbol line no longer fits, so the map is truncated"
+        );
+        assert!(
+            map.text().contains("token budget exhausted"),
+            "truncation marker missing, got:\n{}",
+            map.text()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Kills the `+` -> `-` mutants on the file-line budget check: one
+    /// token below the exact fit the file line must not be rendered.
+    #[test]
+    fn budget_file_line_one_token_below_fit_is_truncated() {
+        let dir = unique_dir("filebelow");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_file(&dir, "a.rs", "pub fn f() {}\n");
+        let budget = budget_at(token_cost("a.rs\n") + trunc_marker_tokens()) - 1;
+        let map = repo_map(&dir, budget).expect("map");
+        assert!(
+            map.files.is_empty(),
+            "one token short, the file must be dropped: {}",
+            map.text()
+        );
+        assert!(
+            !map.text().contains("a.rs"),
+            "one token short, the file line must not be rendered: {}",
+            map.text()
+        );
+        assert!(map.truncated, "dropping the file must mark truncation");
+        assert!(
+            map.text().contains("token budget exhausted"),
+            "truncation marker missing, got:\n{}",
+            map.text()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Kills the `>` -> `>=` and `+` -> `*` mutants on the symbol-line
+    /// budget check: at exactly header + file line + symbol line +
+    /// marker tokens the symbol still fits, so the map is whole.
+    #[test]
+    fn budget_symbol_line_exact_fit_is_included() {
+        let dir = unique_dir("symexact");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_file(&dir, "a.rs", "pub fn f() {}\n");
+        let symbol_line = "  pub fn pub fn f() {}  # line 1, referenced in 0 file(s)\n";
+        let budget =
+            budget_at(token_cost("a.rs\n") + token_cost(symbol_line) + trunc_marker_tokens());
+        let map = repo_map(&dir, budget).expect("map");
+        assert_eq!(map.files.len(), 1, "file must be present");
+        assert_eq!(
+            map.files[0].symbols.len(),
+            1,
+            "exact-fit symbol line must be kept: {}",
+            map.text()
+        );
+        assert_eq!(map.files[0].symbols[0].name, "f");
+        assert!(
+            !map.truncated,
+            "exact fit means nothing is truncated, got:\n{}",
+            map.text()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Kills the `+` -> `-` mutants on the symbol-line budget check: one
+    /// token below the exact fit the symbol must be dropped while the
+    /// file line itself is still rendered.
+    #[test]
+    fn budget_symbol_line_one_token_below_fit_is_truncated() {
+        let dir = unique_dir("symbelow");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_file(&dir, "a.rs", "pub fn f() {}\n");
+        let symbol_line = "  pub fn pub fn f() {}  # line 1, referenced in 0 file(s)\n";
+        let budget =
+            budget_at(token_cost("a.rs\n") + token_cost(symbol_line) + trunc_marker_tokens()) - 1;
+        let map = repo_map(&dir, budget).expect("map");
+        assert!(
+            map.text().contains("a.rs"),
+            "file line still fits, got:\n{}",
+            map.text()
+        );
+        assert!(
+            !map.text().contains(symbol_line.trim_end()),
+            "one token short, the symbol must be dropped: {}",
+            map.text()
+        );
+        assert!(map.truncated, "dropping the symbol must mark truncation");
+        assert!(
+            map.text().contains("token budget exhausted"),
+            "truncation marker missing, got:\n{}",
+            map.text()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Kills the `+=` -> `*=` mutant reserving the file-cap marker: the
+    /// reserve is additive (truncation marker + file-cap marker), so a
+    /// budget of exactly header + file line + symbol line + both markers
+    /// still keeps the first file and its symbol.
+    #[test]
+    fn budget_file_cap_marker_reserve_is_additive() {
+        let dir = unique_dir("filecapreserve");
+        let _ = std::fs::remove_dir_all(&dir);
+        for i in 0..=MAX_FILES {
+            write_file(
+                &dir,
+                &format!("f{i:03}.rs"),
+                &format!("pub fn func_{i}() {{}}\n"),
+            );
+        }
+        let files_marker = format!("[map truncated: file limit reached (max {MAX_FILES} files)]\n");
+        // Longest symbol line wins: the first file can be any fNNN.rs,
+        // and a three-digit `func_NNN` costs one token more than `func_0`.
+        let symbol_line = "  pub fn pub fn func_499() {}  # line 1, referenced in 0 file(s)\n";
+        let budget = budget_at(
+            token_cost("f000.rs\n")
+                + token_cost(symbol_line)
+                + trunc_marker_tokens()
+                + token_cost(&files_marker),
+        );
+        let map = repo_map(&dir, budget).expect("map");
+        assert!(
+            !map.files.is_empty(),
+            "additive reserve must keep the first file: {}",
+            map.text()
+        );
+        assert!(
+            !map.files[0].symbols.is_empty(),
+            "first file must keep its symbol, got:\n{}",
+            map.text()
+        );
+        assert!(map.truncated, "file cap hit must mark the map truncated");
+        assert!(
+            map.text().contains("file limit"),
+            "file cap must emit a marker, got:\n{}",
+            map.text()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Kills the `+=` -> `*=` mutant reserving the line-cap marker: the
+    /// reserve is additive (truncation marker + line-cap marker), so a
+    /// budget of exactly header + file line + symbol line + both markers
+    /// still keeps the file and its first symbol.
+    #[test]
+    fn budget_line_cap_marker_reserve_is_additive() {
+        let dir = unique_dir("linecapreserve");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut src = String::from("pub fn first() {}\n");
+        for _ in 1..MAX_LINES_PER_FILE {
+            src.push_str("// filler\n");
+        }
+        src.push_str("pub fn beyond_cap() {}\n");
+        write_file(&dir, "long.rs", &src);
+        let lines_marker = format!("[map truncated: file exceeds {MAX_LINES_PER_FILE} lines]\n");
+        let symbol_line = "  pub fn pub fn first() {}  # line 1, referenced in 0 file(s)\n";
+        let budget = budget_at(
+            token_cost("long.rs\n")
+                + token_cost(symbol_line)
+                + trunc_marker_tokens()
+                + token_cost(&lines_marker),
+        );
+        let map = repo_map(&dir, budget).expect("map");
+        assert_eq!(map.files.len(), 1, "additive reserve must keep the file");
+        assert!(
+            map.files[0].symbols.iter().any(|s| s.name == "first"),
+            "first symbol must be kept, got:\n{}",
+            map.text()
+        );
+        assert!(map.truncated, "line cap hit must mark the map truncated");
+        assert!(
+            map.text().contains("4000 lines"),
+            "line cap must emit a marker, got:\n{}",
+            map.text()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
