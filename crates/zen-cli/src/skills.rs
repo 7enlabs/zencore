@@ -326,12 +326,24 @@ pub fn registry_path(home: &Path) -> PathBuf {
     skills_root(home).join("registry.json")
 }
 
-pub fn load_registry(home: &Path) -> Registry {
+/// Load the skill registry. A missing file means a fresh home and
+/// loads as empty; a present-but-unreadable or unparsable file is an
+/// error, never an empty registry - the old code silently returned
+/// `Registry::default()` on any failure, so a registry truncated by a
+/// crash mid-write made the next install unregister every skill
+/// (issue #465).
+pub fn load_registry(home: &Path) -> Result<Registry> {
     let path = registry_path(home);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Registry::default();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Registry::default());
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading {}", path.display()));
+        }
     };
-    serde_json::from_str(&text).unwrap_or_default()
+    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
 pub fn save_registry(home: &Path, registry: &Registry) -> Result<()> {
@@ -339,7 +351,22 @@ pub fn save_registry(home: &Path, registry: &Registry) -> Result<()> {
     std::fs::create_dir_all(&root)?;
     let path = registry_path(home);
     let text = serde_json::to_string_pretty(registry)?;
-    std::fs::write(&path, text)?;
+    // Write a sibling temp file and rename it over the live path - the
+    // atomic pattern save_local_settings in repl.rs uses. A crash
+    // mid-write can no longer leave registry.json torn, which the old
+    // truncating fs::write did (issue #465). The temp name is unique
+    // per write (pid + sequence) so concurrent writers never share one.
+    // A failed write or rename removes the temp file and leaves the
+    // previous registry untouched.
+    static SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = root.join(format!("registry.json.{}-{}.tmp", std::process::id(), seq));
+    if let Err(e) =
+        std::fs::write(&tmp, text.as_bytes()).and_then(|()| std::fs::rename(&tmp, &path))
+    {
+        std::fs::remove_file(&tmp).ok();
+        return Err(e).with_context(|| format!("writing {}", path.display()));
+    }
     Ok(())
 }
 
@@ -513,7 +540,7 @@ pub fn install_skill(home: &Path, source: &InstallSource, yes: bool) -> Result<R
     }
 
     let tier = assign_tier(source, manifest.as_ref());
-    let mut registry = load_registry(home);
+    let mut registry = load_registry(home)?;
     let old_manifest = registry.skills.get(&name).and_then(|_| manifest.clone());
 
     if manifest.is_none() {
@@ -650,7 +677,7 @@ pub fn install_builtin(home: &Path, name: &str) -> Result<RegistryEntry> {
     std::fs::write(dest.join("zen-plugin.json"), manifest_json)?;
     std::fs::write(dest.join("test.md"), test_md)?;
 
-    let mut registry = load_registry(home);
+    let mut registry = load_registry(home)?;
     let entry = RegistryEntry {
         name: name.to_string(),
         version: manifest.version.clone(),
@@ -666,7 +693,7 @@ pub fn install_builtin(home: &Path, name: &str) -> Result<RegistryEntry> {
 }
 
 pub fn remove_skill(home: &Path, name: &str) -> Result<()> {
-    let mut registry = load_registry(home);
+    let mut registry = load_registry(home)?;
     if !registry.skills.contains_key(name) {
         return Err(anyhow!("no installed skill named {:?}", name));
     }
@@ -1095,7 +1122,7 @@ pub fn create_skill(home: &Path, name: &str) -> Result<PathBuf> {
         SCAFFOLD_TEST_MD.replace("{name}", name),
     )?;
 
-    let mut registry = load_registry(home);
+    let mut registry = load_registry(home)?;
     registry.skills.insert(
         name.to_string(),
         RegistryEntry {
@@ -1134,7 +1161,17 @@ impl LoadedSkill {
 }
 
 pub fn load_enabled_skills(home: &Path) -> Vec<LoadedSkill> {
-    let registry = load_registry(home);
+    // Read-only hot path (agent run): it cannot return the load error,
+    // so a corrupt registry warns loudly and loads no skills instead
+    // of silently running skill-less. Nothing is written here, so the
+    // corrupt file is left intact for repair.
+    let registry = match load_registry(home) {
+        Ok(registry) => registry,
+        Err(e) => {
+            eprintln!("warning: cannot read skill registry, no skills loaded: {e}");
+            return vec![];
+        }
+    };
     let mut out = vec![];
     for (name, entry) in &registry.skills {
         let dir = skills_root(home).join(name);
@@ -1244,7 +1281,7 @@ pub async fn skill_command(
         crate::cli::SkillSubcommand::List => {
             if cli.json_output || cli.raw {
                 if !cli.quiet {
-                    let registry = load_registry(&home);
+                    let registry = load_registry(&home)?;
                     if cli.raw {
                         println!("{}", serde_json::to_string(&registry)?);
                     } else {
@@ -1345,7 +1382,7 @@ pub async fn skill_command(
         }
         crate::cli::SkillSubcommand::Remove { name, yes, dry_run } => {
             if *dry_run {
-                let registry = load_registry(&home);
+                let registry = load_registry(&home)?;
                 let entry = registry
                     .skills
                     .get(name)
@@ -1415,7 +1452,7 @@ pub async fn skill_command(
 }
 
 fn cmd_list(cli: &crate::cli::Cli, home: &Path, cwd: &Path) -> Result<()> {
-    let registry = load_registry(home);
+    let registry = load_registry(home)?;
     // The discovered section mirrors what the model can load in this
     // folder: project skills appear only when the folder is trusted.
     let discovered = zen_ext::discover_skills(
@@ -1507,7 +1544,7 @@ fn cmd_install(
                     manifest.version,
                     dest.display()
                 );
-                if let Some(old) = load_registry(home).skills.get(name) {
+                if let Some(old) = load_registry(home)?.skills.get(name) {
                     println!(
                         "  replaces: {name} v{} (installed {})",
                         old.version, old.installed_at
@@ -1604,7 +1641,7 @@ fn cmd_install(
                 "would install skill {name} v{version} from {source} to {}",
                 dest.display()
             );
-            if let Some(old) = load_registry(home).skills.get(&name) {
+            if let Some(old) = load_registry(home)?.skills.get(&name) {
                 println!(
                     "  replaces: {name} v{} (installed {})",
                     old.version, old.installed_at
@@ -1653,7 +1690,15 @@ fn cmd_test(home: &Path, name: &str) -> Result<i32> {
 }
 
 pub fn tier_for(home: &Path, name: &str) -> TrustTier {
-    tier_in_registry(&load_registry(home), name)
+    // Fail closed: a corrupt registry is unreadable, so the skill is
+    // treated as unverified (and the warning says why).
+    match load_registry(home) {
+        Ok(registry) => tier_in_registry(&registry, name),
+        Err(e) => {
+            eprintln!("warning: cannot read skill registry, treating {name:?} as unverified: {e}");
+            TrustTier::Unverified
+        }
+    }
 }
 
 /// Trust tier of a skill within an already-loaded registry. Callers
@@ -1673,7 +1718,16 @@ pub fn skills_prompt_with_tiers(home: Option<&Path>, skills: &[zen_core::SkillIn
         return String::new();
     }
     let home = home.map(|p| p.to_path_buf()).or_else(dirs::home_dir);
-    let registry = home.as_deref().map(load_registry);
+    // A corrupt registry warns and falls back to unverified badges
+    // (fail closed); it is a prompt string, not a load path, so the
+    // error cannot propagate here. Nothing is written.
+    let registry = home.as_deref().and_then(|h| match load_registry(h) {
+        Ok(registry) => Some(registry),
+        Err(e) => {
+            eprintln!("warning: cannot read skill registry: {e}");
+            None
+        }
+    });
     let mut out = String::from("Available skills (load with the Skill tool):\n");
     for s in skills {
         let badge = registry
@@ -2162,11 +2216,11 @@ mod tests {
         assert_eq!(entry.tier, TrustTier::Community);
         assert!(skills_root(&home).join("tdd").join("SKILL.md").is_file());
 
-        let reg = load_registry(&home);
+        let reg = load_registry(&home).unwrap();
         assert!(reg.skills.contains_key("tdd"));
 
         remove_skill(&home, "tdd").unwrap();
-        assert!(!load_registry(&home).skills.contains_key("tdd"));
+        assert!(!load_registry(&home).unwrap().skills.contains_key("tdd"));
         assert!(!skills_root(&home).join("tdd").exists());
         assert!(remove_skill(&home, "tdd").is_err());
         std::fs::remove_dir_all(&home).ok();
@@ -2240,7 +2294,7 @@ mod tests {
             "do not delete"
         );
         assert!(!skills_root(&home).join("evil").exists());
-        assert!(load_registry(&home).skills.is_empty());
+        assert!(load_registry(&home).unwrap().skills.is_empty());
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -2758,7 +2812,7 @@ mod tests {
         cmd_install(&home, "builtin:tdd", true, None, false, false).unwrap();
         assert!(cmd_remove(&home, "tdd", true).unwrap());
         assert!(!skills_root(&home).join("tdd").exists());
-        assert!(!load_registry(&home).skills.contains_key("tdd"));
+        assert!(!load_registry(&home).unwrap().skills.contains_key("tdd"));
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -2808,7 +2862,7 @@ mod tests {
     fn format_skill_list_installed_and_discovered() {
         let home = tmp_home("list-unified");
         install_builtin(&home, "tdd").unwrap();
-        let registry = load_registry(&home);
+        let registry = load_registry(&home).unwrap();
         let discovered = vec![
             test_skill_info("tdd", "TDD workflow"),
             test_skill_info("plain", "A plain skill"),
@@ -2834,12 +2888,114 @@ mod tests {
         install_builtin(&home, "tdd").unwrap();
         assert_eq!(tier_for(&home, "tdd"), TrustTier::Verified);
         assert_eq!(tier_for(&home, "no-such-skill"), TrustTier::Unverified);
-        let registry = load_registry(&home);
+        let registry = load_registry(&home).unwrap();
         assert_eq!(tier_in_registry(&registry, "tdd"), TrustTier::Verified);
         assert_eq!(
             tier_in_registry(&registry, "no-such-skill"),
             TrustTier::Unverified
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    fn sample_registry_entry(name: &str) -> RegistryEntry {
+        RegistryEntry {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            tier: TrustTier::Verified,
+            source: "builtin".to_string(),
+            commit: None,
+            installed_at: "2026-11-27T00:00:00Z".to_string(),
+            pinned_hash: "builtin".to_string(),
+        }
+    }
+
+    fn sample_registry(name: &str) -> Registry {
+        let mut registry = Registry::default();
+        registry
+            .skills
+            .insert(name.to_string(), sample_registry_entry(name));
+        registry
+    }
+
+    #[test]
+    fn corrupt_registry_is_an_error_not_an_empty_registry() {
+        // Issue #465: a crash mid-write leaves registry.json truncated,
+        // and the old load silently returned an empty registry, so the
+        // next install unregistered every skill. Missing file is still
+        // fine (fresh home); a present-but-corrupt file must error.
+        let home = tmp_home("registry-corrupt");
+        assert!(load_registry(&home).unwrap().skills.is_empty());
+
+        let registry = sample_registry("tdd");
+        save_registry(&home, &registry).unwrap();
+        assert!(load_registry(&home).unwrap().skills.contains_key("tdd"));
+
+        // Truncated mid-object, as a crash during fs::write leaves it.
+        let path = registry_path(&home);
+        std::fs::write(&path, "{\"skills\": {\"tdd\": ").unwrap();
+        assert!(
+            load_registry(&home).is_err(),
+            "truncated registry.json must error, not load as empty"
+        );
+
+        std::fs::write(&path, "not json at all").unwrap();
+        assert!(load_registry(&home).is_err());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn install_refuses_to_overwrite_a_corrupt_registry() {
+        // The read-modify-write install path must not clobber a corrupt
+        // registry with a fresh one-entry registry (silent unregister).
+        let home = tmp_home("registry-corrupt-install");
+        install_builtin(&home, "tdd").unwrap();
+        let path = registry_path(&home);
+        let before = std::fs::read(&path).unwrap();
+        std::fs::write(&path, "{\"skills\": {\"tdd\": ").unwrap();
+
+        assert!(install_builtin(&home, "token-diet").is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{\"skills\": {\"tdd\": ",
+            "a refused install must leave the corrupt file untouched for repair"
+        );
+        let _ = before;
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn save_registry_leaves_no_temp_file_and_never_tears() {
+        // Atomic save: concurrent writers must never leave a torn
+        // registry.json, and no temp file may be left behind.
+        let home = tmp_home("registry-atomic");
+        let registry = sample_registry("tdd");
+        save_registry(&home, &registry).unwrap();
+        assert!(load_registry(&home).unwrap().skills.contains_key("tdd"));
+
+        let home = std::sync::Arc::new(home);
+        let mut handles = vec![];
+        for i in 0..8 {
+            let home = std::sync::Arc::clone(&home);
+            handles.push(std::thread::spawn(move || {
+                let registry = sample_registry(&format!("skill-{i}"));
+                save_registry(&home, &registry).unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let loaded = load_registry(&home).expect("concurrent saves must not tear registry.json");
+        assert_eq!(loaded.skills.len(), 1, "{loaded:?}");
+        let leftovers: Vec<_> = std::fs::read_dir(skills_root(&home))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+        std::fs::remove_dir_all(&*home).ok();
     }
 }
