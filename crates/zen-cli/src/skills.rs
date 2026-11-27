@@ -2998,4 +2998,70 @@ mod tests {
         );
         std::fs::remove_dir_all(&*home).ok();
     }
+
+    #[test]
+    fn load_registry_unreadable_file_is_an_error_not_an_empty_registry() {
+        // Mutant-killer for the `NotFound` guard in load_registry
+        // (issue #465 follow-up): the guard must only match a missing
+        // file. If it were `true`, any read failure - a directory at
+        // the registry path, a permission error - would silently load
+        // as an empty registry, and the next install would unregister
+        // every skill.
+        let home = tmp_home("registry-unreadable");
+        let path = registry_path(&home);
+        std::fs::create_dir_all(&path).unwrap();
+        let err = load_registry(&home)
+            .expect_err("a directory at registry.json must error, not load as empty");
+        assert!(
+            err.to_string().contains("reading"),
+            "error should name the unreadable file: {err}"
+        );
+        // A missing file is still a fresh home, not an error.
+        std::fs::remove_dir(&path).unwrap();
+        assert!(load_registry(&home).unwrap().skills.is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
+    async fn skill_list_json_errors_on_corrupt_registry_unless_quiet() {
+        // Mutant-killer for the `if !cli.quiet` guard in skill_command
+        // (`skill list --json`): without `--quiet` the registry must be
+        // loaded, so a corrupt registry fails the command. If the guard
+        // were flipped, the load would be skipped and the command would
+        // succeed silently on a corrupt registry.
+        use clap::Parser;
+        let home = tmp_home("skill-list-json-corrupt");
+        let cwd = tmp_home("skill-list-json-corrupt-cwd");
+        std::fs::create_dir_all(skills_root(&home)).unwrap();
+        std::fs::write(registry_path(&home), "not json at all").unwrap();
+        let cli = crate::cli::Cli::parse_from(["zen", "--json", "skill", "list"]);
+        let err = skill_command(&cli, &cwd, Some(&home), &crate::cli::SkillSubcommand::List)
+            .await
+            .expect_err("`skill list --json` must fail on a corrupt registry");
+        assert!(
+            err.to_string().contains("parsing"),
+            "unexpected error: {err}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[tokio::test]
+    async fn skill_list_json_quiet_skips_corrupt_registry() {
+        // Same guard, other direction: with `--quiet` the JSON list must
+        // not load the registry at all, so a corrupt registry still
+        // exits 0. If the guard were flipped, the load would run and fail.
+        use clap::Parser;
+        let home = tmp_home("skill-list-json-quiet-corrupt");
+        let cwd = tmp_home("skill-list-json-quiet-corrupt-cwd");
+        std::fs::create_dir_all(skills_root(&home)).unwrap();
+        std::fs::write(registry_path(&home), "not json at all").unwrap();
+        let cli = crate::cli::Cli::parse_from(["zen", "--quiet", "--json", "skill", "list"]);
+        let code = skill_command(&cli, &cwd, Some(&home), &crate::cli::SkillSubcommand::List)
+            .await
+            .expect("`skill list --json --quiet` must succeed without loading the registry");
+        assert_eq!(code, 0);
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&cwd).ok();
+    }
 }
