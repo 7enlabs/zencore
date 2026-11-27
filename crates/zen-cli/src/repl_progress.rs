@@ -58,9 +58,12 @@ impl ReplProgressSink {
     }
 
     fn attach_result(&self, id: &str, content: &str, is_error: bool) -> Option<usize> {
-        // Lock order (#468): cards before by_id, same as register_card.
-        // Taking by_id first inverts the order (AB-BA) and can deadlock
-        // against a concurrent register_card.
+        // Lock order (#468): cards before by_id, same as register_card,
+        // so the two paths never take the locks in opposite orders.
+        // Note the old code took by_id, dropped that guard, and only
+        // then took cards, so it never held both locks at once and
+        // could not deadlock this way (no hold-and-wait); the
+        // consistent order is hygiene, not a deadlock fix.
         let mut cards = lock_or_recover(&self.cards, "repl progress cards");
         let by_id = lock_or_recover(&self.by_id, "repl progress by-id");
         let idx = *by_id.get(id)?;
@@ -543,14 +546,21 @@ mod tests {
     fn text_delta_is_not_echoed() {
         assert!(render(&AgentEvent::TextDelta { text: "x".into() }).is_empty());
     }
-    /// Regression test for #468 (AB-BA lock-order inversion): `register_card`
-    /// takes `cards` then `by_id`, so `attach_result` must take them in the
-    /// same order. Probed by holding `by_id` from this thread: while
+    /// Regression test for #468: `register_card` takes `cards` then
+    /// `by_id`, so `attach_result` must take them in the same order.
+    /// Probed by holding `by_id` from this thread: while
     /// `attach_result` waits for `by_id` it must already hold `cards`.
+    ///
+    /// The probe waits for that condition instead of sleeping a fixed
+    /// 500 ms: a scheduling delay in the spawned thread (Z Tester
+    /// injected 900 ms and the old test failed on unchanged product
+    /// code) only extends the wait, it no longer fails the test. On
+    /// the old order the spawned thread waits for `by_id` holding
+    /// nothing, so the deadline expires and the test fails.
     #[test]
     fn attach_result_acquires_cards_before_by_id() {
         use std::sync::Arc;
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
         let sink = Arc::new(ReplProgressSink::new());
         sink.register_card("id-1", "tool", "arg".to_string());
@@ -560,15 +570,69 @@ mod tests {
         let handle = std::thread::spawn(move || {
             sink2.attach_result("id-1", "ok", false);
         });
-        // Give the spawned thread time to reach the by_id wait.
-        std::thread::sleep(Duration::from_millis(500));
-        // Cards-first order: attach_result holds cards while waiting for by_id.
-        let cards_held = sink.cards.try_lock().is_err();
+        // Wait until the spawned thread holds `cards` (or a generous
+        // deadline passes) instead of assuming it gets there in 500 ms.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let cards_held = loop {
+            if sink.cards.try_lock().is_err() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
         drop(by_id);
         handle.join().expect("attach_result thread finished");
         assert!(
             cards_held,
             "attach_result must acquire cards before by_id (lock order cards -> by_id, #468)"
         );
+    }
+
+    /// Real-deadlock check for #468: hammer `register_card` and
+    /// `attach_result` from two threads at once; both must finish.
+    /// The old `attach_result` dropped its `by_id` guard before
+    /// taking `cards`, so it never held both locks and no AB-BA
+    /// deadlock existed there either - this test passes on the old
+    /// order too, and only a genuine circular wait would hang it
+    /// past the timeout.
+    #[test]
+    fn concurrent_register_and_attach_finish_without_deadlock() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+
+        let sink = Arc::new(ReplProgressSink::new());
+        for i in 0..20 {
+            sink.register_card(&format!("id-{i}"), "tool", "arg".to_string());
+        }
+        let (done_tx, done_rx) = mpsc::channel();
+        let sink_a = Arc::clone(&sink);
+        let tx_a = done_tx.clone();
+        std::thread::spawn(move || {
+            for i in 0..200 {
+                sink_a.register_card(&format!("new-{i}"), "tool", "arg".to_string());
+            }
+            let _ = tx_a.send(());
+        });
+        let sink_b = Arc::clone(&sink);
+        std::thread::spawn(move || {
+            let mut attached = 0;
+            for i in 0..200 {
+                if sink_b
+                    .attach_result(&format!("id-{}", i % 20), "ok", false)
+                    .is_some()
+                {
+                    attached += 1;
+                }
+            }
+            assert_eq!(attached, 200, "every attach to a registered card lands");
+            let _ = done_tx.send(());
+        });
+        for _ in 0..2 {
+            done_rx.recv_timeout(Duration::from_secs(10)).expect(
+                "register_card and attach_result must both finish: a real AB-BA deadlock would hang here (#468)",
+            );
+        }
     }
 }
