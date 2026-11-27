@@ -1234,7 +1234,7 @@ mod tests {
         // with "Unknown tool". It now documents from the agent's own
         // full tool set, so every name there must resolve.
         let names = crate::agent_run::documentable_tools().names();
-        assert_eq!(names.len(), 19, "documentable tools: {names:?}");
+        assert_eq!(names.len(), 25, "documentable tools: {names:?}");
         for name in &names {
             let help = tool_help(name);
             assert!(

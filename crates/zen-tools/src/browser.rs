@@ -1453,15 +1453,15 @@ impl Tool for BrowserNavigateTool {
         BROWSER_NAVIGATE
     }
     fn description(&self) -> &str {
-        "Navigate the browser tab to a URL and return the final URL, HTTP status, title, and rendered text length. Public http(s) only; private-network targets are blocked."
+        "Navigate the browser tab to a public http(s) URL; returns final URL, status, title, and text length."
     }
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "url": {"type": "string", "description": "Absolute http(s) URL to navigate to."},
-                "wait_until": {"type": "string", "description": "\"load\" (default) or \"networkidle\" (wait until 500ms with no network activity)."},
-                "timeout_ms": {"type": "integer", "description": "Timeout in ms, default 30000, max 120000."}
+                "url": {"type": "string", "description": "URL to navigate to."},
+                "wait_until": {"type": "string", "description": "\"load\" (default) or \"networkidle\"."},
+                "timeout_ms": {"type": "integer", "description": "Timeout in ms, default 30000."}
             },
             "required": ["url"],
             "additionalProperties": false
@@ -1509,14 +1509,14 @@ impl Tool for BrowserContentTool {
         BROWSER_CONTENT
     }
     fn description(&self) -> &str {
-        "Read the rendered text of the current page (after JS ran), or of one element. Returns text only, never HTML."
+        "Read rendered page text (after JS ran), or of one element. Text only, never HTML."
     }
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "selector": {"type": "string", "description": "CSS selector of one element. Omit for the whole page body text."},
-                "max_chars": {"type": "integer", "description": "Max chars to return, default 20000, max 100000."}
+                "selector": {"type": "string", "description": "CSS selector of one element; omit for whole page."},
+                "max_chars": {"type": "integer", "description": "Max chars, default 20000."}
             },
             "required": [],
             "additionalProperties": false
@@ -1559,14 +1559,14 @@ impl Tool for BrowserScreenshotTool {
         BROWSER_SCREENSHOT
     }
     fn description(&self) -> &str {
-        "Capture a PNG screenshot of the viewport (or of one element) and save it as a file under the session work dir. Returns the file path, never the image bytes."
+        "Capture a PNG screenshot of the viewport or one element; saves it under the session work dir and returns the file path."
     }
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "selector": {"type": "string", "description": "CSS selector of one element. Omit for the viewport."},
-                "full_page": {"type": "boolean", "description": "Capture the whole page, default false."}
+                "selector": {"type": "string", "description": "CSS selector of one element; omit for viewport."},
+                "full_page": {"type": "boolean", "description": "Whole page, default false."}
             },
             "required": [],
             "additionalProperties": false
@@ -1607,15 +1607,15 @@ impl Tool for BrowserWaitTool {
         BROWSER_WAIT
     }
     fn description(&self) -> &str {
-        "Wait for an element (selector) or a text to appear in the rendered page. Use exactly one of selector or text; with neither, waits out the timeout."
+        "Wait for an element or text to appear in the rendered page. Use exactly one of selector or text."
     }
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "selector": {"type": "string", "description": "Wait for this element to appear."},
-                "text": {"type": "string", "description": "Wait for this text to appear in the page text."},
-                "timeout_ms": {"type": "integer", "description": "Timeout in ms, default 10000, max 60000."}
+                "selector": {"type": "string", "description": "Element to wait for."},
+                "text": {"type": "string", "description": "Text to wait for."},
+                "timeout_ms": {"type": "integer", "description": "Timeout in ms, default 10000."}
             },
             "required": [],
             "additionalProperties": false
@@ -1663,7 +1663,7 @@ impl Tool for BrowserClickTool {
         BROWSER_CLICK
     }
     fn description(&self) -> &str {
-        "Click one element in the browser tab. Asks for approval in every permission mode; login, submit, and destructive clicks need a separate approval for that specific action."
+        "Click one element in the browser tab. Always asks for approval; login, submit, and destructive clicks need a separate approval."
     }
     fn parameters_schema(&self) -> Value {
         json!({
@@ -1706,7 +1706,7 @@ impl Tool for BrowserTypeTool {
         BROWSER_TYPE
     }
     fn description(&self) -> &str {
-        "Type text into an input, textarea, or contenteditable element. Asks for approval in every permission mode. Never returns the typed text (only its length), and never logs it; typing into a password field is a login action and needs a separate BrowserLogin approval."
+        "Type text into an input or textarea. Always asks for approval; never returns or logs the text. Password fields need a BrowserLogin approval."
     }
     fn parameters_schema(&self) -> Value {
         json!({
@@ -1714,7 +1714,7 @@ impl Tool for BrowserTypeTool {
             "properties": {
                 "selector": {"type": "string", "description": "CSS selector of an input, textarea, or contenteditable element."},
                 "text": {"type": "string", "description": "Text to type."},
-                "submit": {"type": "boolean", "description": "Press Enter after typing, default false. Submitting a form needs a separate approval."},
+                "submit": {"type": "boolean", "description": "Press Enter after typing, default false."},
                 "timeout_ms": {"type": "integer", "description": "Timeout in ms, default 10000."}
             },
             "required": ["selector", "text"],

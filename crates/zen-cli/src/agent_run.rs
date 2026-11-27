@@ -464,8 +464,8 @@ impl zen_core::SubAgentRunner for DocsRunner {
 /// I/O: no MCP startup, no skill discovery, no agent loading, no
 /// permission filtering. `tool_help` documents from this set, so the help
 /// text can never drift from the agent's real tool list (issue #251):
-/// the 10 builtins, the 2 job tools, Skill, Task, delegate and the 4 LSP
-/// tools.
+/// the 16 builtins (incl. the 6 browser tools), the 2 job tools, Skill,
+/// Task, delegate and the 4 LSP tools.
 ///
 /// The instances are documentation-only: `Task`/`delegate` carry a
 /// runner that can never run (see `DocsRunner`), `Skill` carries no
@@ -2786,7 +2786,7 @@ mod lsp_provider_tests {
             assembled, documented,
             "assembled vs documented tools must match"
         );
-        assert_eq!(assembled.len(), 19, "assembled tools: {assembled:?}");
+        assert_eq!(assembled.len(), 25, "assembled tools: {assembled:?}");
         for name in &assembled {
             let help = crate::commands::tool_help(name);
             assert!(

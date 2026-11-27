@@ -56,6 +56,12 @@ pub fn tool_phase(name: &str) -> Option<ToolPhase> {
         "Task" | "delegate" => Some(ToolPhase::Exec),
         // Loads skill instructions as text only.
         "Skill" => Some(ToolPhase::Read),
+        // Browser tools (Ch.1): the four observers are read-only,
+        // click/type mutate the page.
+        "browser_navigate" | "browser_content" | "browser_screenshot" | "browser_wait" => {
+            Some(ToolPhase::Read)
+        }
+        "browser_click" | "browser_type" => Some(ToolPhase::Exec),
         // LSP navigation tools are genuinely read-only.
         "goto_definition" | "hover" | "find_references" | "diagnostics" => Some(ToolPhase::Read),
         // MCP tools have no per-tool read-only flag visible here:
@@ -317,6 +323,12 @@ mod tests {
         assert_eq!(tool_phase("hover"), Some(ToolPhase::Read));
         assert_eq!(tool_phase("find_references"), Some(ToolPhase::Read));
         assert_eq!(tool_phase("diagnostics"), Some(ToolPhase::Read));
+        assert_eq!(tool_phase("browser_navigate"), Some(ToolPhase::Read));
+        assert_eq!(tool_phase("browser_content"), Some(ToolPhase::Read));
+        assert_eq!(tool_phase("browser_screenshot"), Some(ToolPhase::Read));
+        assert_eq!(tool_phase("browser_wait"), Some(ToolPhase::Read));
+        assert_eq!(tool_phase("browser_click"), Some(ToolPhase::Exec));
+        assert_eq!(tool_phase("browser_type"), Some(ToolPhase::Exec));
         // The bare name table is intentionally partial: an unknown name
         // stays `None` here and only the registry-aware `tool_phase_for`
         // can classify it (via the `is_read_only` fallback).
