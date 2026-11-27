@@ -69,7 +69,13 @@ pub struct ReplPrompter;
 impl Prompter for ReplPrompter {
     fn ask_permission(&self, tool_name: &str, input: &serde_json::Value) -> zen_core::PromptAnswer {
         use std::io::Write;
-        eprint!("Allow {} {}? [y]es / [a]lways / [n]o: ", tool_name, input);
+        // Browser agent (spec section 4.7): the prompt names the tool,
+        // selector, host, and action, and never prints the raw input,
+        // which for `browser_type` would leak typed text (including
+        // passwords) to the terminal.
+        let detail = zen_tools::browser_permission_hint(tool_name, input)
+            .unwrap_or_else(|| format!("{input}"));
+        eprint!("Allow {tool_name} {detail}? [y]es / [a]lways / [n]o: ");
         let _ = std::io::stderr().flush();
         let mut line = String::new();
         if std::io::stdin().read_line(&mut line).is_err() {

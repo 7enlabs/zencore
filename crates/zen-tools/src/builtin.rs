@@ -1893,7 +1893,7 @@ pub const WEBFETCH_MAX_BYTES: usize = 5 * 1024 * 1024;
 
 pub const WEBFETCH_MAX_CHARS: usize = 100_000;
 
-fn upgrade_scheme(url: &str) -> String {
+pub(crate) fn upgrade_scheme(url: &str) -> String {
     let t = url.trim();
     if let Some(rest) = t.strip_prefix("http://") {
         return format!("https://{}", rest);
@@ -1928,7 +1928,7 @@ fn is_public_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-fn url_host_port(url: &str) -> (String, u16) {
+pub(crate) fn url_host_port(url: &str) -> (String, u16) {
     let default_port = if url.starts_with("https://") { 443 } else { 80 };
     let after_scheme = url.split("://").nth(1).unwrap_or(url);
     let host_port = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
@@ -1960,7 +1960,7 @@ fn join_redirect_url(base: &str, loc: &str) -> Result<String, String> {
         .map_err(|e| format!("Error: bad redirect target '{}': {}", loc, e))
 }
 
-async fn check_fetch_target(
+pub(crate) async fn check_fetch_target(
     url: &str,
     allow_private: bool,
     pinned: &PinnedResolver,
@@ -2019,12 +2019,12 @@ async fn check_fetch_target(
 /// when one is configured; every fetch target is pinned by the guard before
 /// the connect, so a fetch target never takes the fallback path.
 #[derive(Debug, Default)]
-struct PinnedResolver {
+pub(crate) struct PinnedResolver {
     pinned: Mutex<HashMap<String, Vec<std::net::SocketAddr>>>,
 }
 
 impl PinnedResolver {
-    fn pin(&self, host: &str, addrs: Vec<std::net::SocketAddr>) {
+    pub(crate) fn pin(&self, host: &str, addrs: Vec<std::net::SocketAddr>) {
         if let Ok(mut map) = self.pinned.lock() {
             map.insert(host.to_ascii_lowercase(), addrs);
         }
@@ -2263,6 +2263,12 @@ pub fn builtin_tools() -> Vec<std::sync::Arc<dyn Tool>> {
         std::sync::Arc::new(GrepTool),
         std::sync::Arc::new(WebFetchTool),
         std::sync::Arc::new(WebSearchTool),
+        std::sync::Arc::new(crate::browser::BrowserNavigateTool),
+        std::sync::Arc::new(crate::browser::BrowserContentTool),
+        std::sync::Arc::new(crate::browser::BrowserScreenshotTool),
+        std::sync::Arc::new(crate::browser::BrowserWaitTool),
+        std::sync::Arc::new(crate::browser::BrowserClickTool),
+        std::sync::Arc::new(crate::browser::BrowserTypeTool),
         std::sync::Arc::new(TodoWriteTool),
     ]
 }
@@ -2771,6 +2777,12 @@ mod tests {
                 "Grep",
                 "WebFetch",
                 "WebSearch",
+                "browser_navigate",
+                "browser_content",
+                "browser_screenshot",
+                "browser_wait",
+                "browser_click",
+                "browser_type",
                 "TodoWrite"
             ]
         );
@@ -2780,7 +2792,16 @@ mod tests {
             assert!(!t.description().is_empty());
         }
         let readonly = |n: &str| tools.iter().find(|t| t.name() == n).unwrap().is_read_only();
-        assert!(readonly("Read") && readonly("Glob") && readonly("Grep") && readonly("TodoWrite"));
+        assert!(
+            readonly("Read")
+                && readonly("Glob")
+                && readonly("Grep")
+                && readonly("TodoWrite")
+                && readonly("browser_navigate")
+                && readonly("browser_content")
+                && readonly("browser_screenshot")
+                && readonly("browser_wait")
+        );
         assert!(
             !readonly("Write")
                 && !readonly("Edit")
@@ -2788,6 +2809,8 @@ mod tests {
                 && !readonly("Bash")
                 && !readonly("WebFetch")
                 && !readonly("WebSearch")
+                && !readonly("browser_click")
+                && !readonly("browser_type")
         );
     }
 
