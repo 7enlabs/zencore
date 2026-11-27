@@ -1616,4 +1616,104 @@ mod tests {
         let diff = "diff --git a/old name.rs b/new name.rs\n";
         assert_eq!(changed_files_from_diff(diff), vec!["new name.rs"]);
     }
+
+    // Mutant-kill tests for unquote_git_path (#464, PR #575). Each
+    // escape arm below must decode to its control character; deleting
+    // any single arm makes its test fail, because the escape then
+    // falls through to `_ => return None`.
+    #[test]
+    fn unquote_git_path_bell_escape() {
+        assert_eq!(unquote_git_path("\"\\a\""), Some("\u{7}".to_string()));
+    }
+
+    #[test]
+    fn unquote_git_path_backspace_escape() {
+        assert_eq!(unquote_git_path("\"\\b\""), Some("\u{8}".to_string()));
+    }
+
+    #[test]
+    fn unquote_git_path_form_feed_escape() {
+        assert_eq!(unquote_git_path("\"\\f\""), Some("\u{c}".to_string()));
+    }
+
+    #[test]
+    fn unquote_git_path_newline_escape() {
+        assert_eq!(unquote_git_path("\"\\n\""), Some("\n".to_string()));
+    }
+
+    #[test]
+    fn unquote_git_path_carriage_return_escape() {
+        assert_eq!(unquote_git_path("\"\\r\""), Some("\r".to_string()));
+    }
+
+    #[test]
+    fn unquote_git_path_tab_escape() {
+        assert_eq!(unquote_git_path("\"\\t\""), Some("\t".to_string()));
+    }
+
+    #[test]
+    fn unquote_git_path_vertical_tab_escape() {
+        assert_eq!(unquote_git_path("\"\\v\""), Some("\u{b}".to_string()));
+    }
+
+    #[test]
+    fn unquote_git_path_backslash_escape() {
+        assert_eq!(unquote_git_path("\"\\\\\""), Some("\\".to_string()));
+    }
+
+    #[test]
+    fn unquote_git_path_quote_escape() {
+        assert_eq!(unquote_git_path("\"\\\"\""), Some("\"".to_string()));
+    }
+
+    // Octal escapes: the exact accumulated value matters. `\101` is
+    // 'A' only when `value * 8 + digit` is computed exactly, so this
+    // kills both `+` -> `-` and `+` -> `*` on line 369.
+    #[test]
+    fn unquote_git_path_octal_101_is_capital_a() {
+        assert_eq!(unquote_git_path("\"\\101\""), Some("A".to_string()));
+    }
+
+    #[test]
+    fn unquote_git_path_octal_cafe_escapes_are_exact() {
+        assert_eq!(unquote_git_path("\"\\303\\251\""), Some("é".to_string()));
+    }
+
+    // Only three octal digits are consumed: `\123` is 'S' and the
+    // trailing `4` stays a literal character. With `count <= 3` the
+    // fourth digit is consumed instead, giving 668 > 255, so the
+    // mutant returns `None`.
+    #[test]
+    fn unquote_git_path_octal_stops_after_three_digits() {
+        assert_eq!(unquote_git_path("\"\\1234\""), Some("S4".to_string()));
+    }
+
+    // 0o377 == 255 is the largest valid octal byte. With `>=` the
+    // mutant rejects it and returns `None`; the lone 0xFF byte
+    // decodes lossy to U+FFFD.
+    #[test]
+    fn unquote_git_path_octal_377_is_allowed() {
+        assert_eq!(unquote_git_path("\"\\377\""), Some("\u{fffd}".to_string()));
+    }
+
+    // 0o400 == 256 and 0o777 == 511 overflow a byte and must return
+    // `None`. With `==` instead of `>` the mutant only rejects
+    // exactly 255, so both of these leak through as `Some`.
+    #[test]
+    fn unquote_git_path_octal_overflow_returns_none() {
+        assert_eq!(unquote_git_path("\"\\400\""), None);
+        assert_eq!(unquote_git_path("\"\\777\""), None);
+    }
+
+    // split_diff_git_header: a non-rename path containing a literal
+    // ` b/` must take the early `a == b` return with the exact pair.
+    // With `!=` the mutant returns the first (wrong) fallback pair
+    // instead, because the equal pair no longer returns early.
+    #[test]
+    fn split_diff_git_header_non_rename_path_with_b_slash_returns_exact_pair() {
+        assert_eq!(
+            split_diff_git_header("a/my b/file.rs b/my b/file.rs"),
+            Some(("my b/file.rs".to_string(), "my b/file.rs".to_string()))
+        );
+    }
 }
