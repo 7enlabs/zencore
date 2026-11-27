@@ -561,12 +561,15 @@ pub fn repo_map(cwd: &Path, map_tokens: usize) -> Option<RepoMap> {
     // Reserve room for every marker that will be appended, so the map
     // stays within budget even when a cap (not just the token budget)
     // truncated it.
-    let mut marker_tokens = trunc_marker.chars().count().div_ceil(4);
+    let trunc_tokens = trunc_marker.chars().count().div_ceil(4);
+    let files_tokens = files_marker.chars().count().div_ceil(4);
+    let lines_tokens = lines_marker.chars().count().div_ceil(4);
+    let mut marker_tokens = trunc_tokens;
     if files_truncated {
-        marker_tokens += files_marker.chars().count().div_ceil(4);
+        marker_tokens += files_tokens;
     }
     if lines_truncated {
-        marker_tokens += lines_marker.chars().count().div_ceil(4);
+        marker_tokens += lines_tokens;
     }
     let mut token_truncated = false;
     let mut used = 0usize;
@@ -617,14 +620,18 @@ pub fn repo_map(cwd: &Path, map_tokens: usize) -> Option<RepoMap> {
     }
 
     map.truncated = token_truncated || files_truncated || lines_truncated;
-    if token_truncated {
-        out.push_str(trunc_marker);
-    }
-    if files_truncated {
+    // The header plus the markers can already exceed a tiny budget, so
+    // append only the markers that still fit. Cap markers go first: they
+    // describe map content that is missing, while the token marker only
+    // restates that the budget ran out.
+    if files_truncated && out.chars().count().div_ceil(4) + files_tokens <= map_tokens {
         out.push_str(&files_marker);
     }
-    if lines_truncated {
+    if lines_truncated && out.chars().count().div_ceil(4) + lines_tokens <= map_tokens {
         out.push_str(&lines_marker);
+    }
+    if token_truncated && out.chars().count().div_ceil(4) + trunc_tokens <= map_tokens {
+        out.push_str(trunc_marker);
     }
     map.rendered = Some(out.trim_end().to_string());
     Some(map)
@@ -786,6 +793,36 @@ mod tests {
         assert!(
             !names.contains(&"beyond_cap"),
             "symbol past the line cap must be missing: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn line_cap_marker_stays_within_small_budget() {
+        // P2 on PR #577: with a 4001-line file and a 32-token budget the
+        // header plus both markers came to 40 estimated tokens, over
+        // budget. The map must fit its budget and still carry the line
+        // cap marker.
+        let dir = unique_dir("linecapbudget");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut src = String::from("pub fn first() {}\n");
+        for _ in 1..MAX_LINES_PER_FILE {
+            src.push_str("// filler\n");
+        }
+        src.push_str("pub fn beyond_cap() {}\n");
+        write_file(&dir, "long.rs", &src);
+        let map = repo_map(&dir, 32).expect("map");
+        assert!(map.truncated, "line cap hit must mark the map truncated");
+        let est = map.text().chars().count().div_ceil(4);
+        assert!(
+            est <= 32,
+            "map must fit its 32-token budget, got {est} estimated tokens:\n{}",
+            map.text()
+        );
+        assert!(
+            map.text().contains("4000 lines"),
+            "line cap must still emit a marker, got:\n{}",
+            map.text()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
