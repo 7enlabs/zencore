@@ -714,6 +714,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     fn test_python_exe() -> Option<String> {
         for cand in ["python3", "python"] {
             if std::process::Command::new(cand)
@@ -730,6 +731,7 @@ mod tests {
         None
     }
 
+    #[cfg(target_os = "linux")]
     fn test_tmpdir(tag: &str) -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!("zen_mcp_403_{tag}_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&p).unwrap();
