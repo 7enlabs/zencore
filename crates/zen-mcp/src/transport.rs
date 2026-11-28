@@ -8,6 +8,7 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -376,6 +377,12 @@ pub(crate) enum Transport {
         api_key_env: Option<String>,
         timeout_ms: u64,
         session: tokio::sync::Mutex<Option<Arc<Session>>>,
+        /// Set by `kill()` (#403). Once set, `session()` refuses to
+        /// connect and shuts down any session that finishes
+        /// connecting afterwards. Permanent: no production path
+        /// reuses a transport after `kill()` (the manager drops it),
+        /// so the flag never needs clearing.
+        killed: AtomicBool,
     },
     Http {
         name: String,
@@ -383,6 +390,8 @@ pub(crate) enum Transport {
         headers: BTreeMap<String, String>,
         timeout_ms: u64,
         session: tokio::sync::Mutex<Option<Arc<Session>>>,
+        /// Set by `kill()` (#403); see the Stdio variant.
+        killed: AtomicBool,
     },
 }
 
@@ -405,6 +414,7 @@ impl Transport {
                 headers: cfg.headers.clone(),
                 timeout_ms,
                 session: tokio::sync::Mutex::new(None),
+                killed: AtomicBool::new(false),
             })
         } else {
             let command = cfg
@@ -419,12 +429,40 @@ impl Transport {
                 api_key_env: api_key_env.map(str::to_string),
                 timeout_ms,
                 session: tokio::sync::Mutex::new(None),
+                killed: AtomicBool::new(false),
             })
         }
     }
 
     async fn session(&self) -> anyhow::Result<Arc<Session>> {
-        match self {
+        // One flow for both variants (#403): the session lock is held
+        // across the connect, so `kill()` cannot take it mid-connect.
+        // The `killed` flag is checked twice - before connecting (a kill
+        // that landed earlier refuses outright) and after the connect
+        // finishes (a kill that landed mid-connect shuts the fresh
+        // session down instead of caching it).
+        let mut guard = match self {
+            Transport::Stdio { session, .. } | Transport::Http { session, .. } => {
+                session.lock().await
+            }
+        };
+        if self.is_killed() {
+            return Err(anyhow!(
+                "MCP server '{}' was killed; refusing to connect",
+                self.name()
+            ));
+        }
+        if let Some(existing) = guard.as_ref() {
+            if existing.is_alive() {
+                return Ok(existing.clone());
+            }
+            // Dead session: drop it (killing the child process group,
+            // if any) so the fresh connect below starts a new server
+            // instead of reusing the corpse.
+            existing.shutdown();
+            *guard = None;
+        }
+        let fresh = Arc::new(match self {
             Transport::Stdio {
                 name,
                 command,
@@ -432,55 +470,38 @@ impl Transport {
                 env,
                 api_key_env,
                 timeout_ms,
-                session,
+                ..
             } => {
-                let mut guard = session.lock().await;
-                if let Some(existing) = guard.as_ref() {
-                    if existing.is_alive() {
-                        return Ok(existing.clone());
-                    }
-                    // Dead session: drop it (killing the child process
-                    // group, if any) so the fresh connect below starts a
-                    // new server instead of reusing the corpse.
-                    existing.shutdown();
-                    *guard = None;
-                }
-                let fresh = Arc::new(
-                    connect_stdio(
-                        name,
-                        command,
-                        args,
-                        env,
-                        api_key_env.as_deref(),
-                        *timeout_ms,
-                    )
-                    .await?,
-                );
-                *guard = Some(fresh.clone());
-                Ok(fresh)
+                connect_stdio(
+                    name,
+                    command,
+                    args,
+                    env,
+                    api_key_env.as_deref(),
+                    *timeout_ms,
+                )
+                .await?
             }
             Transport::Http {
                 name,
                 url,
                 headers,
                 timeout_ms,
-                session,
-            } => {
-                let mut guard = session.lock().await;
-                if let Some(existing) = guard.as_ref() {
-                    if existing.is_alive() {
-                        return Ok(existing.clone());
-                    }
-                    // Dead session: drop it so the fresh connect below
-                    // starts a new server instead of reusing the corpse.
-                    existing.shutdown();
-                    *guard = None;
-                }
-                let fresh = Arc::new(connect_http(name, url, headers, *timeout_ms).await?);
-                *guard = Some(fresh.clone());
-                Ok(fresh)
-            }
+                ..
+            } => connect_http(name, url, headers, *timeout_ms).await?,
+        });
+        if self.is_killed() {
+            // Killed mid-connect: shut the fresh session down (kills
+            // its child process) instead of caching a session nobody
+            // owns any more.
+            fresh.shutdown();
+            return Err(anyhow!(
+                "MCP server '{}' was killed during connect",
+                self.name()
+            ));
         }
+        *guard = Some(fresh.clone());
+        Ok(fresh)
     }
 
     /// Drop the cached session, but only if it is still the session the
@@ -587,6 +608,20 @@ impl Transport {
     }
 
     pub(crate) fn kill(&self) {
+        // Flag first (#403): `session()` may be holding the session
+        // lock mid-connect, so the `try_lock` below can fail and
+        // this kill would otherwise be a silent no-op. Setting the
+        // flag before touching the lock makes the in-flight connect
+        // shut its fresh session down when it finishes, and makes
+        // any later `session()` refuse to spawn a replacement. The
+        // flag is permanent: no production path reuses a transport
+        // after `kill()` (the manager drops it), so it never needs
+        // clearing.
+        match self {
+            Transport::Stdio { killed, .. } | Transport::Http { killed, .. } => {
+                killed.store(true, Ordering::SeqCst);
+            }
+        }
         // Called from the synchronous manager shutdown path, so `try_lock`
         // keeps it non-blocking: a session mid-request is dropped with the
         // runtime instead.
@@ -600,6 +635,23 @@ impl Transport {
                 existing.shutdown();
             }
             *guard = None;
+        }
+    }
+
+    /// Server name, for error messages.
+    fn name(&self) -> &str {
+        match self {
+            Transport::Stdio { name, .. } | Transport::Http { name, .. } => name,
+        }
+    }
+
+    /// Whether `kill()` has run (#403). Read by `session()` to refuse
+    /// connects on a killed transport.
+    fn is_killed(&self) -> bool {
+        match self {
+            Transport::Stdio { killed, .. } | Transport::Http { killed, .. } => {
+                killed.load(Ordering::SeqCst)
+            }
         }
     }
 }
@@ -659,6 +711,191 @@ mod tests {
         assert_eq!(
             SessionError::Call(anyhow!("bad args")).to_string(),
             "bad args"
+        );
+    }
+
+    fn test_python_exe() -> Option<String> {
+        for cand in ["python3", "python"] {
+            if std::process::Command::new(cand)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+            {
+                return Some(cand.to_string());
+            }
+        }
+        None
+    }
+
+    fn test_tmpdir(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("zen_mcp_403_{tag}_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    // Linux-only: polls /proc/<pid> to observe the child, and macOS has
+    // no /proc.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn kill_during_slow_connect_shuts_down_fresh_session() {
+        // #403: `kill()` runs while `session()` is mid-connect (the mock
+        // waits 5 s before answering `initialize`), so `kill()` cannot
+        // take the session lock. The fresh session must not survive:
+        // `session()` must fail, the child must die, and nothing may be
+        // cached for a later call.
+        let Some(py) = test_python_exe() else {
+            return;
+        };
+        let dir = test_tmpdir("t_403_race");
+        let log = dir.join("methods.log");
+        let pid_file = dir.join("methods.log.pid");
+        let cfg = McpServerConfig {
+            kind: None,
+            command: Some(py),
+            args: vec![
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/mcp_mock.py")
+                    .to_string_lossy()
+                    .into_owned(),
+                "slow_init".to_string(),
+                log.to_string_lossy().into_owned(),
+            ],
+            env: BTreeMap::new(),
+            url: None,
+            headers: BTreeMap::new(),
+        };
+        let tr = Arc::new(Transport::from_config("fake", &cfg, 30_000, None).unwrap());
+
+        // Killer task: wait for the child to spawn (its pid file proves
+        // the connect is in flight), then kill(). It runs on its own task
+        // so the session future stays on this task (no Send requirement
+        // on the session itself).
+        let killer_tr = tr.clone();
+        let killer_pid_file = pid_file.clone();
+        let killer = tokio::spawn(async move {
+            let mut pid = String::new();
+            for _ in 0..50 {
+                if let Ok(text) = std::fs::read_to_string(&killer_pid_file)
+                    && !text.trim().is_empty()
+                {
+                    pid = text.trim().to_string();
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(!pid.is_empty(), "mock never spawned");
+            let proc_path = format!("/proc/{pid}");
+            assert!(
+                std::path::Path::new(&proc_path).exists(),
+                "child {pid} should be alive mid-connect"
+            );
+            killer_tr.kill();
+            pid
+        });
+
+        let res = tokio::time::timeout(Duration::from_secs(30), tr.session())
+            .await
+            .expect("session() hung");
+        let pid = killer.await.expect("killer task panicked");
+        let proc_path = format!("/proc/{pid}");
+        match res {
+            Ok(_) => panic!("session() returned a live session after kill()"),
+            Err(e) => assert!(
+                e.to_string().contains("killed"),
+                "session() after kill() should report the kill, got: {e}"
+            ),
+        }
+
+        let mut dead = false;
+        for _ in 0..100 {
+            if !std::path::Path::new(&proc_path).exists() {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(dead, "child {pid} still alive after kill-during-connect");
+
+        // Nothing cached: a later session() must fail fast without
+        // spawning a second child (the pid file still names the first).
+        assert!(
+            tr.session().await.is_err(),
+            "session() after kill() must refuse to connect"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pid_file).unwrap().trim(),
+            pid,
+            "a second child must not have spawned after kill()"
+        );
+
+        tr.kill();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn test_stdio_config(command: &str) -> McpServerConfig {
+        McpServerConfig {
+            kind: None,
+            command: Some(command.to_string()),
+            args: vec![],
+            env: BTreeMap::new(),
+            url: None,
+            headers: BTreeMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn kill_while_session_lock_held_sets_flag_and_blocks_connect() {
+        // #403: `kill()` cannot take the session lock while another task
+        // holds it, but the flag must still land - and a later `session()`
+        // must refuse instead of spawning.
+        let cfg = test_stdio_config("true");
+        let tr = Transport::from_config("fake", &cfg, 30_000, None).unwrap();
+        assert!(!tr.is_killed());
+        let guard = match &tr {
+            Transport::Stdio { session, .. } | Transport::Http { session, .. } => {
+                session.lock().await
+            }
+        };
+        tr.kill();
+        assert!(tr.is_killed());
+        drop(guard);
+        let err = match tr.session().await {
+            Ok(_) => panic!("session() after kill() must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("killed"),
+            "session() after kill() should report the kill, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("fake"),
+            "killed error should name the server, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_on_idle_transport_blocks_later_connect() {
+        // #403: killing an idle transport must also refuse any later
+        // connect - the flag, not the lock, is what blocks it.
+        let cfg = test_stdio_config("true");
+        let tr = Transport::from_config("fake", &cfg, 30_000, None).unwrap();
+        assert!(!tr.is_killed());
+        tr.kill();
+        assert!(tr.is_killed());
+        let err = match tr.session().await {
+            Ok(_) => panic!("session() after kill() must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("killed"),
+            "session() after kill() should report the kill, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("fake"),
+            "killed error should name the server, got: {err}"
         );
     }
 }
