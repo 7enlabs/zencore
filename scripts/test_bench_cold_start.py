@@ -61,6 +61,23 @@ TOKEN_CHILD = (
     "sys.stdout.flush()\n"
 )
 
+# Exits 1 at once (a zen binary that fails outright).
+FAIL_CHILD = "import sys; sys.exit(1)\n"
+
+# Temp-dir prefixes the bench creates (isolated HOME, temp workdir,
+# fresh-copy dir). A test snapshots these before the call and asserts
+# the set is unchanged afterwards, on both the success and the
+# failure path.
+TEMP_PREFIXES = ("zen-bench-home-", "zen-bench-cwd-", "zen-bench-cold-")
+
+
+def _leaked_temp_dirs():
+    tmp = Path(tempfile.gettempdir())
+    return sorted(
+        p.name for p in tmp.iterdir()
+        if p.is_dir() and p.name.startswith(TEMP_PREFIXES)
+    )
+
 # Exits at once without printing anything (EOF, no prompt).
 EXIT_CHILD = "import sys\n"
 
@@ -312,6 +329,69 @@ class PromptChildTests(unittest.TestCase):
                 samples, _reqs = bcs.measure_first_token(zen, 1)
             self.assertEqual(len(samples), 1)
             self.assertGreater(samples[0], 0)
+
+
+class TempDirCleanupTests(unittest.TestCase):
+    """No temp dir may leak, on the failure path or the success path (#431)."""
+
+    def setUp(self):
+        self.before = _leaked_temp_dirs()
+
+    def assert_no_leak(self):
+        self.assertEqual(_leaked_temp_dirs(), self.before)
+
+    def test_repl_prompt_failure_cleans_up(self):
+        with tempfile.TemporaryDirectory() as d:
+            zen = _make_fake_zen(d, EXIT_CHILD)
+            with self.assertRaises(RuntimeError):
+                bcs.measure_repl_prompt(zen, 1)
+        self.assert_no_leak()
+
+    def test_repl_prompt_success_cleans_up(self):
+        with tempfile.TemporaryDirectory() as d:
+            zen = _make_fake_zen(d, PROMPT_CHILD)
+            self.assertEqual(len(bcs.measure_repl_prompt(zen, 1)), 1)
+        self.assert_no_leak()
+
+    def test_first_token_failure_cleans_up(self):
+        with tempfile.TemporaryDirectory() as d:
+            zen = _make_fake_zen(d, EXIT_CHILD)
+            with self.assertRaises(RuntimeError):
+                bcs.measure_first_token(zen, 1)
+        self.assert_no_leak()
+
+    def test_first_token_success_cleans_up(self):
+        with tempfile.TemporaryDirectory() as d:
+            zen = _make_fake_zen(d, TOKEN_CHILD)
+            with mock.patch.object(bcs, "TOKEN_TIMEOUT_S", 10):
+                self.assertEqual(len(bcs.measure_first_token(zen, 1)[0]), 1)
+        self.assert_no_leak()
+
+    def test_cold_startup_failure_cleans_up(self):
+        with tempfile.TemporaryDirectory() as d:
+            zen = _make_fake_zen(d, FAIL_CHILD)
+            with self.assertRaises(AssertionError):
+                bcs.measure_cold_startup(zen, 1)
+        self.assert_no_leak()
+
+    def test_cold_startup_success_cleans_up(self):
+        with tempfile.TemporaryDirectory() as d:
+            zen = _make_fake_zen(d, TOKEN_CHILD)
+            self.assertEqual(len(bcs.measure_cold_startup(zen, 1)), 1)
+        self.assert_no_leak()
+
+    def test_warm_failure_cleans_up(self):
+        with tempfile.TemporaryDirectory() as d:
+            zen = _make_fake_zen(d, FAIL_CHILD)
+            with self.assertRaises(AssertionError):
+                bcs.measure_warm(zen, ["--version"], 1)
+        self.assert_no_leak()
+
+    def test_warm_success_cleans_up(self):
+        with tempfile.TemporaryDirectory() as d:
+            zen = _make_fake_zen(d, EXIT_CHILD)
+            self.assertEqual(len(bcs.measure_warm(zen, ["--version"], 1)[0]), 1)
+        self.assert_no_leak()
 
 
 if __name__ == "__main__":

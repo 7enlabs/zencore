@@ -27,4 +27,17 @@ done
 BENCH_SELFTEST=1 bash tools/bench.sh /tmp/bench-selftest.json || fail=1
 BENCH_SELFTEST=1 bash tools/bench.sh /tmp/bench-selftest.json fix_failing_test || fail=1
 
+# B-431: a real bench run must not leak its /tmp/zen-bench.* workdir.
+# The stub zen exits 0 at once (no model, no network); the task fails
+# its grader, but the harness still has to clean up after itself.
+STUB_DIR="$(mktemp -d)"
+STUB_ZEN="$STUB_DIR/zen"
+printf '#!/bin/sh\nexit 0\n' > "$STUB_ZEN"
+chmod +x "$STUB_ZEN"
+BEFORE="$(ls -d /tmp/zen-bench.* 2>/dev/null || true)"
+ZEN_BIN="$STUB_ZEN" BENCH_RUNS=1 bash tools/bench.sh /tmp/bench-leakcheck.json fix_failing_test >/dev/null 2>&1 || fail=1
+AFTER="$(ls -d /tmp/zen-bench.* 2>/dev/null || true)"
+[ "$BEFORE" = "$AFTER" ] || { echo "test_bench: leaked workdir(s): $(comm -13 <(echo "$BEFORE") <(echo "$AFTER") | tr '\n' ' ')" >&2; fail=1; }
+rm -rf "$STUB_DIR" /tmp/bench-leakcheck.json
+
 exit $fail

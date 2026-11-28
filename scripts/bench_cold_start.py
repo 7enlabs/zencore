@@ -280,10 +280,14 @@ def measure_cold_startup(zen, runs):
                 # Least privilege: this copy is a private temp binary run only
                 # by this user; copy2 may have copied broader bits (e.g. 0o775).
                 os.chmod(dest, 0o700)
-            env, _ = isolated_env()
-            ms, rc, out, _, _ = run_timed([dest, "--version"], env, timeout=30)
-            assert rc == 0, f"cold --version failed rc={rc}"
-            assert out.strip(), "cold --version printed nothing"
+            env, home = isolated_env()
+            try:
+                ms, rc, out, _, _ = run_timed([dest, "--version"], env, timeout=30)
+                assert rc == 0, f"cold --version failed rc={rc}"
+                assert out.strip(), "cold --version printed nothing"
+            finally:
+                # B-431: the isolated HOME leaked when the run failed.
+                shutil.rmtree(home, ignore_errors=True)
             samples.append(ms)
     return samples
 
@@ -291,9 +295,13 @@ def measure_cold_startup(zen, runs):
 def measure_warm(zen, args, runs):
     samples, rss = [], []
     for _ in range(runs):
-        env, _ = isolated_env()
-        ms, rc, _out, _, r = run_timed([zen] + args, env, timeout=30)
-        assert rc == 0, f"{' '.join(args)} failed rc={rc}"
+        env, home = isolated_env()
+        try:
+            ms, rc, _out, _, r = run_timed([zen] + args, env, timeout=30)
+            assert rc == 0, f"{' '.join(args)} failed rc={rc}"
+        finally:
+            # B-431: the isolated HOME leaked when the run failed.
+            shutil.rmtree(home, ignore_errors=True)
         samples.append(ms)
         if r is not None:
             rss.append(r)
@@ -306,65 +314,68 @@ def measure_repl_prompt(zen, runs):
     for _ in range(runs):
         env, home = isolated_env()
         workdir = tempfile.mkdtemp(prefix="zen-bench-cwd-")
-        start = time.perf_counter()
-        proc = subprocess.Popen(
-            [zen, "--bare"],
-            env=env,
-            cwd=workdir,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-        marker_at = None
-        buf = b""
-        deadline = start + REPL_TIMEOUT_S
-        timed_out = False
-        reader = _PipeReader(proc.stdout)
-        reader.start()
         try:
-            while True:
-                remaining = deadline - time.perf_counter()
-                if remaining <= 0:
-                    timed_out = True
-                    raise RuntimeError("REPL prompt not seen within timeout")
-                try:
-                    chunk = reader.read_byte(timeout=remaining)
-                except TimeoutError:
-                    # Silent-but-alive child: the deadline is honoured even
-                    # when the child produces no output (issue #422).
-                    timed_out = True
-                    raise RuntimeError("REPL prompt not seen within timeout")
-                if not chunk:
-                    break
-                buf += chunk
-                if buf.endswith(PROMPT_MARKER) or PROMPT_MARKER in buf[-8:]:
-                    marker_at = time.perf_counter()
-                    break
-        finally:
-            if timed_out:
-                # A graceful /quit would wait up to 15 s for a reply from
-                # a hung child that never comes, so kill at once.
-                with suppress(ProcessLookupError):
-                    proc.kill()
-                with suppress(subprocess.TimeoutExpired):
-                    proc.wait(timeout=5)
-            else:
-                # Best-effort /quit: if the REPL already died, the pipe is
-                # broken and there is nothing left to shut down gracefully.
-                with suppress(BrokenPipeError):
-                    proc.stdin.write(b"/quit\n")
-                    proc.stdin.flush()
-                try:
-                    proc.wait(timeout=15)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-        if marker_at is None:
-            raise RuntimeError(
-                f"REPL exited without printing a prompt (out={buf[-200:]!r})"
+            start = time.perf_counter()
+            proc = subprocess.Popen(
+                [zen, "--bare"],
+                env=env,
+                cwd=workdir,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
             )
-        samples.append((marker_at - start) * 1000.0)
-        shutil.rmtree(workdir, ignore_errors=True)
-        shutil.rmtree(home, ignore_errors=True)
+            marker_at = None
+            buf = b""
+            deadline = start + REPL_TIMEOUT_S
+            timed_out = False
+            reader = _PipeReader(proc.stdout)
+            reader.start()
+            try:
+                while True:
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0:
+                        timed_out = True
+                        raise RuntimeError("REPL prompt not seen within timeout")
+                    try:
+                        chunk = reader.read_byte(timeout=remaining)
+                    except TimeoutError:
+                        # Silent-but-alive child: the deadline is honoured even
+                        # when the child produces no output (issue #422).
+                        timed_out = True
+                        raise RuntimeError("REPL prompt not seen within timeout")
+                    if not chunk:
+                        break
+                    buf += chunk
+                    if buf.endswith(PROMPT_MARKER) or PROMPT_MARKER in buf[-8:]:
+                        marker_at = time.perf_counter()
+                        break
+            finally:
+                if timed_out:
+                    # A graceful /quit would wait up to 15 s for a reply from
+                    # a hung child that never comes, so kill at once.
+                    with suppress(ProcessLookupError):
+                        proc.kill()
+                    with suppress(subprocess.TimeoutExpired):
+                        proc.wait(timeout=5)
+                else:
+                    # Best-effort /quit: if the REPL already died, the pipe is
+                    # broken and there is nothing left to shut down gracefully.
+                    with suppress(BrokenPipeError):
+                        proc.stdin.write(b"/quit\n")
+                        proc.stdin.flush()
+                    try:
+                        proc.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+            if marker_at is None:
+                raise RuntimeError(
+                    f"REPL exited without printing a prompt (out={buf[-200:]!r})"
+                )
+            samples.append((marker_at - start) * 1000.0)
+        finally:
+            # B-431: both temp dirs leaked when the prompt never came.
+            shutil.rmtree(workdir, ignore_errors=True)
+            shutil.rmtree(home, ignore_errors=True)
     return samples
 
 
@@ -382,48 +393,51 @@ def measure_first_token(zen, runs):
                 }
             )
             workdir = tempfile.mkdtemp(prefix="zen-bench-cwd-")
-            start = time.perf_counter()
-            proc = subprocess.Popen(
-                [zen, "--bare", "-p", "Reply with exactly: hello"],
-                env=env,
-                cwd=workdir,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
-            first_at = None
-            reader = _PipeReader(proc.stdout)
-            reader.start()
             try:
+                start = time.perf_counter()
+                proc = subprocess.Popen(
+                    [zen, "--bare", "-p", "Reply with exactly: hello"],
+                    env=env,
+                    cwd=workdir,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                first_at = None
+                reader = _PipeReader(proc.stdout)
+                reader.start()
                 try:
-                    chunk = reader.read_byte(timeout=TOKEN_TIMEOUT_S)
-                except TimeoutError:
-                    # Silent-but-alive child: the token deadline is
-                    # honoured even when the child produces no output
-                    # (issue #422). The finally block below kills the
-                    # child; wait briefly here so it is reaped, not left
-                    # as a zombie.
-                    with suppress(ProcessLookupError):
-                        proc.kill()
-                    with suppress(subprocess.TimeoutExpired):
-                        proc.wait(timeout=5)
-                    raise RuntimeError("zen -p timed out against mock server")
-                if chunk:
-                    first_at = time.perf_counter()
-                proc.wait(timeout=TOKEN_TIMEOUT_S)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                raise RuntimeError("zen -p timed out against mock server")
-            finally:
-                if proc.poll() is None:
+                    try:
+                        chunk = reader.read_byte(timeout=TOKEN_TIMEOUT_S)
+                    except TimeoutError:
+                        # Silent-but-alive child: the token deadline is
+                        # honoured even when the child produces no output
+                        # (issue #422). The finally block below kills the
+                        # child; wait briefly here so it is reaped, not left
+                        # as a zombie.
+                        with suppress(ProcessLookupError):
+                            proc.kill()
+                        with suppress(subprocess.TimeoutExpired):
+                            proc.wait(timeout=5)
+                        raise RuntimeError("zen -p timed out against mock server")
+                    if chunk:
+                        first_at = time.perf_counter()
+                    proc.wait(timeout=TOKEN_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
                     proc.kill()
-            if first_at is None:
-                raise RuntimeError("zen -p produced no stdout against mock server")
-            if proc.returncode != 0:
-                raise RuntimeError(f"zen -p exited rc={proc.returncode}")
-            samples.append((first_at - start) * 1000.0)
-            shutil.rmtree(workdir, ignore_errors=True)
-            shutil.rmtree(home, ignore_errors=True)
+                    raise RuntimeError("zen -p timed out against mock server")
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                if first_at is None:
+                    raise RuntimeError("zen -p produced no stdout against mock server")
+                if proc.returncode != 0:
+                    raise RuntimeError(f"zen -p exited rc={proc.returncode}")
+                samples.append((first_at - start) * 1000.0)
+            finally:
+                # B-431: both temp dirs leaked when the run failed.
+                shutil.rmtree(workdir, ignore_errors=True)
+                shutil.rmtree(home, ignore_errors=True)
     finally:
         server.shutdown()
     return samples, _MockHandler.request_count
@@ -576,11 +590,15 @@ def self_test(zen):
         assert body["choices"][0]["finish_reason"] == "stop"
     finally:
         server.shutdown()
-    env, _ = isolated_env()
-    ms, rc, out, _, _ = run_timed([zen, "--version"], env, timeout=30)
-    assert rc == 0 and out.strip() and ms > 0
-    ms, rc, out, _, _ = run_timed([zen, "doctor"], env, timeout=30)
-    assert rc == 0 and b"zen doctor" in out
+    env, home = isolated_env()
+    try:
+        ms, rc, out, _, _ = run_timed([zen, "--version"], env, timeout=30)
+        assert rc == 0 and out.strip() and ms > 0
+        ms, rc, out, _, _ = run_timed([zen, "doctor"], env, timeout=30)
+        assert rc == 0 and b"zen doctor" in out
+    finally:
+        # B-431: the isolated HOME leaked after the self-test.
+        shutil.rmtree(home, ignore_errors=True)
     r = measure_repl_prompt(zen, 1)
     assert r[0] > 0
     s, reqs = measure_first_token(zen, 1)
