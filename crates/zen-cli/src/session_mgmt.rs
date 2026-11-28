@@ -120,13 +120,36 @@ fn collect_dir(dir: &Path, archived: bool, out: &mut Vec<SessionInfo>) {
     }
 }
 
+/// True when `path` (which must exist) resolves inside the managed
+/// session tree (`home/.zen/projects`, archive included). Both sides
+/// are canonicalized first, so a `..` escape or a symlink pointing
+/// outside cannot pass a lexical prefix check (issue #454). Fails
+/// closed: anything that cannot be canonicalized is not managed.
+fn is_managed_session_path(home: &Path, path: &Path) -> bool {
+    let Ok(root) = std::fs::canonicalize(home.join(".zen").join("projects")) else {
+        return false;
+    };
+    let Ok(canon) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    canon.starts_with(&root)
+}
+
 pub fn find_managed_session(home: &Path, id_or_path: &str) -> Option<(PathBuf, bool)> {
     let p = PathBuf::from(id_or_path);
     if p.is_absolute() && p.exists() {
-        return Some((p.clone(), is_archived_path(home, &p)));
+        // Issue #454: only a path inside the managed session tree is
+        // a session. An existing path outside it is not found, never
+        // deleted, archived or restored.
+        let canon = std::fs::canonicalize(&p).ok()?;
+        if is_managed_session_path(home, &canon) {
+            return Some((canon.clone(), is_archived_path(home, &canon)));
+        }
+        return None;
     }
     if p.exists()
         && let Ok(abs) = p.canonicalize()
+        && is_managed_session_path(home, &abs)
     {
         return Some((abs.clone(), is_archived_path(home, &abs)));
     }
@@ -139,8 +162,17 @@ pub fn find_managed_session(home: &Path, id_or_path: &str) -> Option<(PathBuf, b
 }
 
 fn is_archived_path(home: &Path, path: &Path) -> bool {
-    let projects_root = home.join(".zen").join("projects");
-    path.strip_prefix(&projects_root)
+    // Both sides canonical: the caller passes a canonical path (see
+    // find_managed_session), and the root must be canonicalized the
+    // same way or a symlinked home (macOS /tmp) breaks the check.
+    let Ok(root) = std::fs::canonicalize(home.join(".zen").join("projects")) else {
+        return false;
+    };
+    let Ok(canon) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    canon
+        .strip_prefix(&root)
         .ok()
         .and_then(|rel| rel.components().nth(1))
         .and_then(|c| c.as_os_str().to_str())
@@ -233,7 +265,10 @@ pub fn delete_session(home: &Path, id: &str) -> Result<()> {
     if path.exists() {
         std::fs::remove_file(&path)?;
     }
-    if scratch.is_dir() {
+    // Issue #454: the stem-sibling scratch is only removed when it
+    // resolves inside the managed tree - never follow a scratch
+    // symlink (or a `..` escape) outside it.
+    if scratch.is_dir() && is_managed_session_path(home, &scratch) {
         std::fs::remove_dir_all(&scratch)?;
     }
     Ok(())
@@ -488,5 +523,176 @@ mod tests {
 
         restore_session(&home, "sess-s").unwrap();
         assert!(scratch.join("log.txt").exists());
+    }
+
+    #[test]
+    fn issue_454_delete_outside_absolute_path_refused() {
+        // Issue #454: `zen session delete /home/user/notes.jsonl`
+        // must not delete an arbitrary file plus its stem-sibling
+        // directory - only paths under the managed session tree are
+        // sessions. Archive must refuse the same path too.
+        let home = tmp_home("454out");
+        fs::create_dir_all(&home).unwrap();
+        let victim = home.join("notes.jsonl");
+        let sibling = home.join("notes");
+        fs::write(&victim, "keep me").unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(sibling.join("marker.txt"), "keep me too").unwrap();
+
+        assert!(find_managed_session(&home, victim.to_str().unwrap()).is_none());
+        assert!(delete_session(&home, victim.to_str().unwrap()).is_err());
+        assert!(archive_session(&home, victim.to_str().unwrap()).is_err());
+        assert!(
+            victim.exists(),
+            "outside file must survive a refused delete"
+        );
+        assert!(
+            sibling.join("marker.txt").exists(),
+            "stem-sibling dir must survive a refused delete"
+        );
+    }
+
+    #[test]
+    fn issue_454_dotdot_path_escape_refused() {
+        // A path that lexically starts with the managed tree but
+        // resolves outside it (`projects/../../victim.jsonl`) must be
+        // refused: containment is checked after canonicalization.
+        let home = tmp_home("454dot");
+        fs::create_dir_all(&home).unwrap();
+        let victim = home.join("victim.jsonl");
+        fs::write(&victim, "keep me").unwrap();
+        // The `..` escape only resolves through existing directories.
+        fs::create_dir_all(home.join(".zen").join("projects")).unwrap();
+        let escape = home
+            .join(".zen")
+            .join("projects")
+            .join("..")
+            .join("..")
+            .join("victim.jsonl");
+        assert!(escape.exists(), "escape path must resolve to the victim");
+        assert!(find_managed_session(&home, escape.to_str().unwrap()).is_none());
+        assert!(delete_session(&home, escape.to_str().unwrap()).is_err());
+        assert!(
+            victim.exists(),
+            "outside file must survive a refused delete"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn issue_454_symlink_inside_tree_pointing_outside_refused() {
+        // A symlink planted inside the tree pointing outside must not
+        // make the outside file a "managed session".
+        let home = tmp_home("454sym");
+        let cwd = home.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        let proj = crate::session::ensure_session_dir(&home, &cwd, "sess-sym").unwrap();
+        let victim = home.join("victim.jsonl");
+        fs::write(&victim, "keep me").unwrap();
+        let link = proj.join("evil.jsonl");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert!(find_managed_session(&home, link.to_str().unwrap()).is_none());
+        assert!(delete_session(&home, link.to_str().unwrap()).is_err());
+        assert!(
+            victim.exists(),
+            "outside file must survive a refused delete"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn issue_454_scratch_symlink_not_followed() {
+        // The stem-sibling scratch of a real session must not be
+        // followed when it is a symlink: deleting the session removes
+        // the transcript, never the outside directory it points at.
+        let home = tmp_home("454scr");
+        let cwd = home.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        let path = make_session(&home, &cwd, "sess-scr");
+        let scratch = path.with_extension("");
+        let outside = home.join("outside-scratch");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("marker.txt"), "keep me").unwrap();
+        std::os::unix::fs::symlink(&outside, &scratch).unwrap();
+
+        delete_session(&home, "sess-scr").unwrap();
+        assert!(!path.exists(), "transcript must be deleted");
+        assert!(
+            outside.join("marker.txt").exists(),
+            "outside dir behind a scratch symlink must survive"
+        );
+    }
+
+    #[test]
+    fn issue_454_scratch_file_not_removed_on_delete() {
+        // A stem-sibling scratch that is a regular file (not a
+        // directory) inside the managed tree must not make the delete
+        // fail: the guard only removes scratch *directories* inside
+        // the tree. Replacing `&&` with `||` in the guard calls
+        // remove_dir_all on the file and delete_session errors out.
+        let home = tmp_home("454scrf");
+        let cwd = home.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        let path = make_session(&home, &cwd, "sess-sf");
+        let scratch = path.with_extension("");
+        fs::write(&scratch, "not a dir").unwrap();
+
+        delete_session(&home, "sess-sf").unwrap();
+        assert!(!path.exists(), "transcript must be deleted");
+        assert!(
+            scratch.exists(),
+            "scratch file must survive: only scratch dirs are removed"
+        );
+        assert_eq!(fs::read_to_string(&scratch).unwrap(), "not a dir");
+    }
+
+    #[test]
+    fn issue_454_relative_path_must_not_skip_session_id_lookup() {
+        // A relative path that exists in the test process working
+        // directory (the crate root, where Cargo.toml lives) must not
+        // short-circuit the session-id lookup: find_managed_session
+        // only treats absolute paths as paths, and a relative string
+        // still falls through to the id loop. Replacing `&&` with
+        // `||` in the absolute-path guard enters that branch for the
+        // relative path and returns None before the id loop runs.
+        assert!(
+            std::path::Path::new("Cargo.toml").exists(),
+            "test assumes cargo runs unit tests with the crate root as CWD"
+        );
+        let home = tmp_home("454rel");
+        let cwd = home.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        make_session(&home, &cwd, "Cargo.toml");
+
+        let found = find_managed_session(&home, "Cargo.toml");
+        assert!(found.is_some(), "session id must still resolve");
+    }
+
+    #[test]
+    fn issue_454_archived_flag_correct_for_path_lookup() {
+        // is_archived_path is only consulted on the path branches of
+        // find_managed_session: the id loop reports the flag from
+        // list_all_sessions instead. So a path lookup must return
+        // archived=false for an active session and archived=true for
+        // an archived one. Replacing the function body with `true`
+        // or `false` must fail this test.
+        let home = tmp_home("454arc");
+        let cwd = home.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        let active = make_session(&home, &cwd, "sess-act");
+        make_session(&home, &cwd, "sess-arch");
+        let archived_path = archive_session(&home, "sess-arch").unwrap();
+
+        let (_, active_archived) = find_managed_session(&home, active.to_str().unwrap()).unwrap();
+        assert!(
+            !active_archived,
+            "active session found by path must not be archived"
+        );
+        let (_, archived_archived) =
+            find_managed_session(&home, archived_path.to_str().unwrap()).unwrap();
+        assert!(
+            archived_archived,
+            "archived session found by path must be archived"
+        );
     }
 }
