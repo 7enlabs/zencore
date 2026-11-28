@@ -346,8 +346,16 @@ impl CdpClient {
             .send(Message::Text(req.to_string().into()))
             .await
             .context("send CDP message")?;
+        // Bound the whole wait by `dur`: a peer that floods non-matching
+        // messages must not spin this loop forever (the reply is the only
+        // exit otherwise). Each iteration waits at most the time left.
+        let deadline = tokio::time::Instant::now() + dur;
         loop {
-            let msg = self.next_msg(dur).await?;
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                bail!("timed out waiting for CDP {method} reply");
+            }
+            let msg = self.next_msg(left).await?;
             if msg.get("id").and_then(Value::as_u64) == Some(id) {
                 if let Some(err) = msg.get("error") {
                     bail!("CDP {method} failed: {err}");
@@ -355,6 +363,11 @@ impl CdpClient {
                 return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
             }
             self.on_message(msg).await?;
+            // Back off so a peer that floods non-matching messages (or a
+            // next_msg that returns instantly) cannot busy-spin here and
+            // starve the rest of the process. Real servers send events
+            // rarely, so this costs ~1ms per event on the happy path.
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
     }
 
@@ -907,7 +920,7 @@ impl BrowserSession {
         loop {
             let v = self
                 .cdp
-                .call_function_on(FN_NET_IDLE, vec![], Duration::from_secs(10))
+                .call_function_on(FN_NET_IDLE, vec![], Duration::from_secs(5))
                 .await?;
             let n = v.get("n").and_then(Value::as_u64).unwrap_or(0);
             let state = v_str(&v, "state");
@@ -1011,14 +1024,14 @@ impl BrowserSession {
         let deadline = start + dur;
         loop {
             if let Some(sel) = selector {
-                let el = self.probe_element(sel, Duration::from_secs(10)).await?;
+                let el = self.probe_element(sel, Duration::from_secs(5)).await?;
                 if el.found {
                     return Ok(("selector".to_string(), start.elapsed().as_millis() as u64));
                 }
             } else if let Some(t) = text {
                 let v = self
                     .cdp
-                    .call_function_on(FN_TEXT_PRESENT, vec![json!(t)], Duration::from_secs(10))
+                    .call_function_on(FN_TEXT_PRESENT, vec![json!(t)], Duration::from_secs(5))
                     .await?;
                 if v_bool(&v, "found") {
                     return Ok(("text".to_string(), start.elapsed().as_millis() as u64));
@@ -1928,6 +1941,12 @@ mod tests {
         let (mut sink, mut stream) = ws.split();
         while let Some(msg) = stream.next().await {
             let Ok(msg) = msg else { break };
+            if msg.is_close() {
+                // Record a clean WebSocket close so tests can tell it
+                // apart from a bare TCP drop (which yields no Close frame).
+                seen.lock().unwrap().push(json!({"method": "__ws_close__"}));
+                continue;
+            }
             let Message::Text(text) = msg else { continue };
             let Ok(req) = serde_json::from_str::<Value>(&text) else {
                 continue;
@@ -2021,6 +2040,13 @@ mod tests {
         let handle = tokio::spawn(run_fake_server(tx, seen2, false));
         let ws_url = rx.await.expect("fake server address");
         (ws_url, seen, handle)
+    }
+
+    fn has_close_frame(seen: &Arc<StdMutex<Vec<Value>>>) -> bool {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.get("method").and_then(Value::as_str) == Some("__ws_close__"))
     }
 
     fn has_verdict(seen: &Arc<StdMutex<Vec<Value>>>, method: &str, request_id: &str) -> bool {
@@ -2171,7 +2197,7 @@ mod tests {
     async fn fake_navigate_content_wait_screenshot() {
         let (mut s, seen, handle) = fake_session("fake-nav-1").await;
         let info = s
-            .navigate("https://8.8.8.8/page", "load", Duration::from_secs(10))
+            .navigate("https://8.8.8.8/page", "load", Duration::from_secs(3))
             .await
             .expect("navigate");
         assert_eq!(info.url, "https://example.com/page");
@@ -2187,22 +2213,24 @@ mod tests {
             "public request must continue"
         );
         let (text, truncated, total) = s
-            .content(None, 20_000, Duration::from_secs(10))
+            .content(None, 20_000, Duration::from_secs(3))
             .await
             .expect("content");
         assert_eq!(text, "body text here");
         assert!(!truncated);
         assert_eq!(total, 14);
         let (what, _) = s
-            .wait_for(Some("#x"), None, Duration::from_secs(5))
+            .wait_for(Some("#x"), None, Duration::from_secs(2))
             .await
             .expect("wait_for");
         assert_eq!(what, "selector");
         let (path, size, _, _) = s
-            .screenshot(None, false, Duration::from_secs(10))
+            .screenshot(None, false, Duration::from_secs(3))
             .await
             .expect("screenshot");
-        assert!(size > 0);
+        // The fake 1x1 PNG decodes to 68 bytes; a stubbed screenshot
+        // returning size 1 must fail here, not slip past `size > 0`.
+        assert!(size > 50, "screenshot too small: {size}");
         assert!(path.exists(), "screenshot file must exist");
         handle.abort();
     }
@@ -2211,22 +2239,22 @@ mod tests {
     async fn fake_click_and_type_with_gate_marks() {
         let (mut s, _seen, handle) = fake_session("fake-gate-1").await;
         let (text, _url) = s
-            .click("#x", Duration::from_secs(10))
+            .click("#x", Duration::from_secs(3))
             .await
             .expect("plain click");
         assert_eq!(text, "hello");
         let err = s
-            .click("#submit", Duration::from_secs(10))
+            .click("#submit", Duration::from_secs(3))
             .await
             .expect_err("submit click without a gate mark must refuse");
         assert!(err.to_string().contains("BrowserLogin approval"), "{err}");
         let err = s
-            .click("#delete", Duration::from_secs(10))
+            .click("#delete", Duration::from_secs(3))
             .await
             .expect_err("destructive click without a gate mark must refuse");
         assert!(err.to_string().contains("destructive"), "{err}");
         let err = s
-            .type_text("#pass", "secret", false, Duration::from_secs(10))
+            .type_text("#pass", "secret", false, Duration::from_secs(3))
             .await
             .expect_err("password typing without a gate mark must refuse");
         assert!(err.to_string().contains("BrowserLogin approval"), "{err}");
@@ -2240,7 +2268,7 @@ mod tests {
             },
         );
         let (len, is_password) = s
-            .type_text("#pass", "secret", false, Duration::from_secs(10))
+            .type_text("#pass", "secret", false, Duration::from_secs(3))
             .await
             .expect("password typing with a login mark");
         assert_eq!(len, 6);
@@ -2253,7 +2281,7 @@ mod tests {
         let (mut s, seen, handle) = fake_session("fake-quote-1").await;
         let sel = "div[data-x=\"a\\\"b\"]";
         let (text, _, _) = s
-            .content(Some(sel), 20_000, Duration::from_secs(10))
+            .content(Some(sel), 20_000, Duration::from_secs(3))
             .await
             .expect("content with quoted selector");
         assert_eq!(text, "element text");
@@ -2327,6 +2355,137 @@ mod tests {
     }
 
     // ==================== PR #580 mutant kills ====================
+
+    // ---- Round 2 (PR #580 follow-up): kill the 4 missed + 15 timeout
+    // mutants left after 78bca71. ----
+
+    #[tokio::test]
+    async fn cdp_close_sends_websocket_close_frame() {
+        // Kills browser.rs:555 CdpClient::close -> (): the fake server must
+        // see a real WebSocket Close frame, not just a dropped TCP stream.
+        // Dropping the client closes the socket too, so "server finished"
+        // alone cannot tell close() from Drop.
+        let (ws_url, seen, handle) = spawn_fake_server().await;
+        let mut client = CdpClient::connect(&ws_url, None).await.expect("connect");
+        client.close().await;
+        let mut saw_close = false;
+        for _ in 0..10 {
+            if has_close_frame(&seen) {
+                saw_close = true;
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert!(saw_close, "close() must send a WebSocket Close frame");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn session_close_sends_websocket_close_frame() {
+        // Kills browser.rs:1128 BrowserSession::close -> (): same as above
+        // at the session level. close() consumes the session, so Drop would
+        // close the socket anyway; only the Close frame proves close() ran.
+        let (s, seen, handle) = fake_session("fake-close-frame-1").await;
+        s.close().await;
+        let mut saw_close = false;
+        for _ in 0..10 {
+            if has_close_frame(&seen) {
+                saw_close = true;
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            saw_close,
+            "session close() must send a WebSocket Close frame"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn call_respects_deadline_when_server_floods_events() {
+        // Regression test for the call() deadline fix (R1). A server that
+        // floods unrelated events but never replies must not hang call():
+        // it must bail at `dur`. Under the :328 next_msg -> Null mutant
+        // the unfixed code spins forever; the outer timeout below turns
+        // that into a failure instead of hanging the whole suite.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let (mut sink, mut stream) = ws.split();
+            loop {
+                tokio::select! {
+                    _ = sleep(Duration::from_millis(5)) => {
+                        let ev = json!({"method": "Runtime.consoleAPICalled", "params": {}});
+                        if sink.send(Message::Text(ev.to_string().into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    msg = stream.next() => {
+                        // Drain client messages (the request) so the socket
+                        // does not back up; never send a matching reply.
+                        if msg.is_none() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        let ws_url = format!("ws://127.0.0.1:{port}/");
+        let mut client = CdpClient::connect(&ws_url, None).await.expect("connect");
+        let start = tokio::time::Instant::now();
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call("Page.enable", json!({}), Duration::from_millis(500)),
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "outer timeout fired: call() ignored its deadline"
+        );
+        let err = res.unwrap().expect_err("flooded call must time out");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "call() must respect its 500ms deadline, took {:?}",
+            start.elapsed()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn wait_event_matches_live_event_with_short_timeout() {
+        // Kills browser.rs:491 wait_event == -> != : the fake server sends
+        // Page.frameNavigated first, then Page.loadEventFired. The real
+        // code buffers the first and returns on the second; the mutant
+        // returns Ok on the FIRST event it sees (whatever it is), so the
+        // buffer stays empty and this assertion fails.
+        let (ws_url, _seen, handle) = spawn_fake_server().await;
+        let mut client = CdpClient::connect(&ws_url, None).await.expect("connect");
+        client
+            .call("Page.enable", json!({}), Duration::from_secs(2))
+            .await
+            .expect("Page.enable");
+        client
+            .wait_event("Page.loadEventFired", Duration::from_millis(500))
+            .await
+            .expect("load event must arrive promptly");
+        // The non-matching event must have been buffered, not consumed
+        // as the match.
+        let buffered: Vec<String> = client
+            .events
+            .iter()
+            .filter_map(|e| e.get("method").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        assert_eq!(buffered, vec!["Page.frameNavigated".to_string()]);
+        handle.abort();
+    }
 
     #[test]
     fn validate_selector_quotes_do_not_count_parens_or_brackets() {
@@ -2543,6 +2702,32 @@ mod tests {
         );
     }
 
+    /// On Windows, Git Bash/MSYS `which` returns Unix-style paths: `/tmp/`
+    /// for the Windows Temp dir and `/<drive>/...` for drive paths. Map
+    /// them back to Windows paths so the comparison is platform-correct.
+    /// On other platforms the path is returned unchanged.
+    #[cfg(windows)]
+    fn normalize_msys_path(p: &str) -> String {
+        if let Some(rest) = p.strip_prefix("/tmp/") {
+            return std::env::temp_dir()
+                .join(rest)
+                .to_string_lossy()
+                .to_string();
+        }
+        let b = p.as_bytes();
+        if b.len() > 3 && b[0] == b'/' && b[2] == b'/' && b[1].is_ascii_alphabetic() {
+            let drive = (b[1] as char).to_ascii_uppercase();
+            let rest = p[3..].replace('/', "\\");
+            return format!("{drive}:\\{rest}");
+        }
+        p.replace('/', "\\")
+    }
+
+    #[cfg(not(windows))]
+    fn normalize_msys_path(p: &str) -> String {
+        p.to_string()
+    }
+
     #[test]
     fn find_chromium_env_bin_and_path_lookup() {
         // (1) CHROMIUM_BIN wins outright.
@@ -2568,11 +2753,25 @@ mod tests {
             std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let old_path = std::env::var("PATH").unwrap_or_default();
-        let new_path = format!("{}:{}", dir.display(), old_path);
+        // Join with the platform separator (join_paths uses ';' on
+        // Windows, ':' on Unix); a hardcoded ':' breaks PATH parsing
+        // on Windows because drive letters already contain one.
+        // Split the old PATH into entries first: join_paths rejects a
+        // single element that already contains the separator.
+        let mut paths = vec![dir.clone().into_os_string()];
+        paths.extend(std::env::split_paths(&old_path).map(|p| p.into_os_string()));
+        let new_path = std::env::join_paths(paths)
+            .expect("join PATH")
+            .to_string_lossy()
+            .into_owned();
         unsafe { std::env::set_var("PATH", &new_path) };
         let _env_bin = EnvGuard::set("CHROMIUM_BIN", "");
         let found = find_chromium().expect("fake chromium on PATH");
         unsafe { std::env::set_var("PATH", &old_path) };
+        // On Windows, `which` comes from Git Bash/MSYS and returns
+        // Unix-style paths (/tmp/... or /c/...); normalize them back to
+        // Windows paths before comparing with the expected location.
+        let found = normalize_msys_path(&found);
         assert_eq!(found, fake.to_string_lossy().to_string());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2582,7 +2781,7 @@ mod tests {
         let (ctx, handle) = seeded_tool_ctx("tool-nav-1").await;
         let out = BrowserNavigateTool
             .call(
-                json!({"url": "https://8.8.8.8/page", "wait_until": "load"}),
+                json!({"url": "https://8.8.8.8/page", "wait_until": "load", "timeout_ms": 2000}),
                 &ctx,
             )
             .await;
@@ -2597,7 +2796,7 @@ mod tests {
 
         let out = BrowserNavigateTool
             .call(
-                json!({"url": "https://8.8.8.8/page", "wait_until": "networkidle"}),
+                json!({"url": "https://8.8.8.8/page", "wait_until": "networkidle", "timeout_ms": 2000}),
                 &ctx,
             )
             .await;
@@ -2661,7 +2860,7 @@ mod tests {
     async fn navigate_request_ids_increase_and_load_skips_idle_wait() {
         let (mut s, seen, handle) = fake_session("fake-ids-1").await;
         let info = s
-            .navigate("https://8.8.8.8/page", "load", Duration::from_secs(10))
+            .navigate("https://8.8.8.8/page", "load", Duration::from_secs(3))
             .await
             .expect("navigate");
         assert_eq!(info.status, 200);
@@ -2697,12 +2896,12 @@ mod tests {
         let (ws_url, _seen, handle) = spawn_fake_server().await;
         let mut client = CdpClient::connect(&ws_url, None).await.expect("connect");
         client
-            .call("Page.enable", json!({}), Duration::from_secs(5))
+            .call("Page.enable", json!({}), Duration::from_secs(2))
             .await
             .expect("Page.enable");
         // The fake server sends Page.frameNavigated, then Page.loadEventFired.
         client
-            .wait_event("Page.loadEventFired", Duration::from_secs(5))
+            .wait_event("Page.loadEventFired", Duration::from_secs(2))
             .await
             .expect("load event");
         // The other event must have been buffered, not swallowed.
@@ -2721,7 +2920,7 @@ mod tests {
         let ctx_of_last_probe = |seen: &Arc<StdMutex<Vec<Value>>>| last_call_ctx(seen);
 
         // Baseline: the seeded dummy context is used.
-        s.probe_element("#x", Duration::from_secs(5))
+        s.probe_element("#x", Duration::from_secs(2))
             .await
             .expect("probe baseline");
         assert_eq!(ctx_of_last_probe(&seen), Some(1));
@@ -2732,28 +2931,28 @@ mod tests {
             .await
             .expect("frame");
         s.cdp.on_message(json!({"method": "Runtime.executionContextCreated", "params": {"context": {"id": 42, "auxData": {"isDefault": true, "frameId": "F2"}}}})).await.expect("iframe ctx");
-        s.probe_element("#x", Duration::from_secs(5))
+        s.probe_element("#x", Duration::from_secs(2))
             .await
             .expect("probe after iframe ctx");
         assert_eq!(ctx_of_last_probe(&seen), Some(1));
 
         // A non-default context of the main frame is ignored too.
         s.cdp.on_message(json!({"method": "Runtime.executionContextCreated", "params": {"context": {"id": 43, "auxData": {"isDefault": false, "frameId": "F1"}}}})).await.expect("non-default ctx");
-        s.probe_element("#x", Duration::from_secs(5))
+        s.probe_element("#x", Duration::from_secs(2))
             .await
             .expect("probe after non-default ctx");
         assert_eq!(ctx_of_last_probe(&seen), Some(1));
 
         // The default context of the main frame is learned.
         s.cdp.on_message(json!({"method": "Runtime.executionContextCreated", "params": {"context": {"id": 44, "auxData": {"isDefault": true, "frameId": "F1"}}}})).await.expect("main ctx");
-        s.probe_element("#x", Duration::from_secs(5))
+        s.probe_element("#x", Duration::from_secs(2))
             .await
             .expect("probe after main ctx");
         assert_eq!(ctx_of_last_probe(&seen), Some(44));
 
         // Destroying a different context leaves the learned one alone.
         s.cdp.on_message(json!({"method": "Runtime.executionContextDestroyed", "params": {"executionContextId": 7}})).await.expect("destroy other");
-        s.probe_element("#x", Duration::from_secs(5))
+        s.probe_element("#x", Duration::from_secs(2))
             .await
             .expect("probe after destroying other");
         assert_eq!(ctx_of_last_probe(&seen), Some(44));
@@ -2786,13 +2985,23 @@ mod tests {
     async fn wait_network_idle_waits_for_stability() {
         let (mut s, seen, handle) = fake_session("fake-idle-1").await;
         let before = seen.lock().unwrap().len();
+        let start = tokio::time::Instant::now();
         s.wait_network_idle(Duration::from_secs(2))
             .await
             .expect("stable page goes idle");
+        let elapsed = start.elapsed();
         let idle_calls = count_calls_from(&seen, before, "Runtime.callFunctionOn", "resource");
+        // Stability needs 500ms of unchanged counts: the real code polls
+        // ~7 times (one per 100ms), while a guard that returns early
+        // (guard -> true, or >= -> <) returns after exactly 3 polls.
+        // Both the count and the elapsed time must prove the wait happened.
         assert!(
-            idle_calls >= 3,
+            idle_calls >= 4,
             "expected several idle polls, got {idle_calls}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "idle must wait for stability, took {elapsed:?}"
         );
         handle.abort();
     }
@@ -2840,7 +3049,7 @@ mod tests {
         // #plain-submit is a submit button outside any password form:
         // no login is needed, only a separate submit approval.
         let err = s
-            .click("#plain-submit", Duration::from_secs(10))
+            .click("#plain-submit", Duration::from_secs(3))
             .await
             .expect_err("plain submit click without a mark must refuse");
         let msg = err.to_string();
@@ -2862,7 +3071,7 @@ mod tests {
             },
         );
         let (text, _url) = s
-            .click("#submit", Duration::from_secs(10))
+            .click("#submit", Duration::from_secs(3))
             .await
             .expect("submit click with both marks");
         assert_eq!(text, "Log in");
@@ -2873,7 +3082,7 @@ mod tests {
     async fn click_dispatches_at_element_center() {
         let (mut s, seen, handle) = fake_session("fake-click-xy").await;
         let (text, _url) = s
-            .click("#x", Duration::from_secs(10))
+            .click("#x", Duration::from_secs(3))
             .await
             .expect("plain click");
         assert_eq!(text, "hello");
@@ -2890,7 +3099,7 @@ mod tests {
     async fn screenshot_element_and_numbering() {
         let (mut s, _seen, handle) = fake_session("fake-shot-1").await;
         let (path1, size1, _, _) = s
-            .screenshot(Some("#x"), false, Duration::from_secs(10))
+            .screenshot(Some("#x"), false, Duration::from_secs(3))
             .await
             .expect("element screenshot");
         assert!(size1 > 0);
@@ -2903,7 +3112,7 @@ mod tests {
                 .ends_with("screenshot-1.png")
         );
         let (path2, _, _, _) = s
-            .screenshot(None, false, Duration::from_secs(10))
+            .screenshot(None, false, Duration::from_secs(3))
             .await
             .expect("viewport screenshot");
         assert!(

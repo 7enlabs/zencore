@@ -28,6 +28,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn browser_click_has_long_docs() {
+        // Kills tool_docs.rs:12 delete match arm "browser_click": the
+        // docs for browser_click must exist and be the click doc file.
+        let docs = tool_long_docs("browser_click").expect("browser_click docs");
+        assert!(docs.contains("# browser_click"), "{docs}");
+    }
+
+    #[test]
     fn every_builtin_has_docs() {
         for name in [
             "Read",
