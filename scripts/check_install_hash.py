@@ -82,10 +82,14 @@ def main(argv=None):
         url, pinned = parse_defaults(Path(args.install_ps1).read_text(encoding="utf-8"))
         if args.zip_path:
             zip_path = Path(args.zip_path)
+            actual = sha256_of_zen_exe(zip_path)
         else:
-            tmp = tempfile.mkdtemp(prefix="install-hash-")
-            zip_path = download_zip(url, tmp)
-        actual = sha256_of_zen_exe(zip_path)
+            # B-431: the mkdtemp dir (and the downloaded zip in it) was
+            # never removed. TemporaryDirectory cleans it up on the
+            # success path and on any download/hash failure.
+            with tempfile.TemporaryDirectory(prefix="install-hash-") as tmp:
+                zip_path = download_zip(url, tmp)
+                actual = sha256_of_zen_exe(zip_path)
     except Exception as exc:  # unreadable input is a failed check, not a crash
         print(f"FAIL: could not verify install.ps1 pin: {exc}")
         return 1

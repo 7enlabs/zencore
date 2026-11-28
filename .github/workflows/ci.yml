@@ -59,6 +59,8 @@ jobs:
         run: python3 -m unittest scripts/test_arch_lint.py
       - name: Self-test the install hash checker
         run: python3 -m unittest scripts/test_check_install_hash.py
+      - name: Self-test the cold-start bench harness
+        run: python3 -m unittest scripts/test_bench_cold_start.py
       - name: Self-test the bench harness
         run: bash tools/test_bench.sh
       - run: cargo test --workspace

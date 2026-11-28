@@ -196,11 +196,18 @@ case "$BASE" in
     esac ;;
 esac
 
+# B-431: every run leaks its mktemp workdir - the script ends with
+# `exit 0` and no cleanup. Track all of them and remove them on EXIT,
+# which also covers the error path under `set -e`.
+WORK_DIRS=()
+trap '[ "${#WORK_DIRS[@]}" -gt 0 ] && rm -rf "${WORK_DIRS[@]}"' EXIT
+
 RUN_OUTS=()
 for run in $(seq 1 "$RUNS"); do
 if [ "$RUNS" -gt 1 ]; then RUN_OUT="${OUT%.json}-r$run.json"; else RUN_OUT="$OUT"; fi
 RUN_OUTS+=("$RUN_OUT")
 WORK="$(mktemp -d /tmp/zen-bench.XXXXXX)"
+WORK_DIRS+=("$WORK")
 RESULTS="$WORK/results.jsonl"
 : > "$RESULTS"
 echo "bench: run $run/$RUNS model=$MODEL zen=$ZEN_BIN work=$WORK" >&2
