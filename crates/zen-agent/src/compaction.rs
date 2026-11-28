@@ -144,15 +144,27 @@ pub fn serialize_conversation(msgs: &[ChatMessage]) -> String {
         let text = m.transcript_text();
         let text = text.trim();
         match m.role.as_str() {
-            "user" if !text.is_empty() => out.push(format!("[User]: {text}")),
+            "user" if !text.is_empty() => out.push(format!(
+                "[User]: {}",
+                truncate_chars(text, TOOL_RESULT_CHARS)
+            )),
             "assistant" => {
                 if !text.is_empty() {
-                    out.push(format!("[Assistant]: {text}"));
+                    out.push(format!(
+                        "[Assistant]: {}",
+                        truncate_chars(text, TOOL_RESULT_CHARS)
+                    ));
                 }
                 if let Some(calls) = &m.tool_calls {
                     let list: Vec<String> = calls
                         .iter()
-                        .map(|c| format!("{}({})", c.function.name, c.function.arguments.trim()))
+                        .map(|c| {
+                            format!(
+                                "{}({})",
+                                c.function.name,
+                                truncate_chars(c.function.arguments.trim(), TOOL_RESULT_CHARS)
+                            )
+                        })
                         .collect();
                     if !list.is_empty() {
                         out.push(format!("[Assistant tool calls]: {}", list.join("; ")));
@@ -278,6 +290,49 @@ mod tests {
         assert!(t.contains("[… 50 more characters truncated]"));
         assert!(t.ends_with("[Assistant]: done"));
         assert!(t.len() < TOOL_RESULT_CHARS + 300);
+    }
+
+    #[test]
+    fn serialize_conversation_caps_user_assistant_text_and_tool_call_args() {
+        let huge_user = "u".repeat(10_000);
+        let huge_assistant = "a".repeat(10_000);
+        let huge_args = format!(
+            r#"{{"file_path":"big.rs","new_string":"{}"}}"#,
+            "w".repeat(10_000)
+        );
+        let msgs = vec![
+            ChatMessage::user(huge_user.clone()),
+            ChatMessage::assistant(
+                Some(huge_assistant.clone()),
+                Some(vec![call("Write", &huge_args)]),
+            ),
+            ChatMessage::tool("id-Write", "ok"),
+        ];
+        let t = serialize_conversation(&msgs);
+        assert!(
+            !t.contains(&huge_user),
+            "huge user message must be truncated, transcript is {} chars",
+            t.len()
+        );
+        assert!(
+            !t.contains(&huge_assistant),
+            "long assistant reply must be truncated, transcript is {} chars",
+            t.len()
+        );
+        assert!(
+            !t.contains(&"w".repeat(10_000)),
+            "huge tool-call arguments must be truncated, transcript is {} chars",
+            t.len()
+        );
+        assert!(
+            t.matches("[… ").count() >= 3,
+            "each capped part carries a truncation marker: {t}"
+        );
+        assert!(
+            t.len() < 3 * TOOL_RESULT_CHARS + 500,
+            "total transcript stays small, got {} chars",
+            t.len()
+        );
     }
 
     #[test]
