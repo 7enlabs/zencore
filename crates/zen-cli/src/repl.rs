@@ -2017,7 +2017,13 @@ async fn handle_slash(
             "{}",
             commands::context_report(
                 &agent.config.system_prompt,
-                &zen_ext::memory_prompt_with_root(cwd, home, cwd, cfg.folder_trusted),
+                &zen_ext::memory_prompt_with_root_and_excludes(
+                    cwd,
+                    home,
+                    cwd,
+                    &cfg.zen_md_excludes,
+                    cfg.folder_trusted,
+                ),
                 &agent.tools_for_request(),
                 agent.messages(),
                 agent.config.context_window,
@@ -2557,14 +2563,26 @@ async fn handle_slash(
             }
         }
         "/memory" => {
-            for (p, _) in zen_ext::memory_files_with_root(cwd, home, cwd, cfg.folder_trusted) {
+            for (p, _) in zen_ext::memory_files_with_root_and_excludes(
+                cwd,
+                home,
+                cwd,
+                &cfg.zen_md_excludes,
+                cfg.folder_trusted,
+            ) {
                 println!("{}", p.display());
             }
         }
         "/memories" => {
             println!(
                 "{}",
-                zen_ext::memories_report_with_root(cwd, home, cwd, cfg.folder_trusted)
+                zen_ext::memories_report_with_root_and_excludes(
+                    cwd,
+                    home,
+                    cwd,
+                    &cfg.zen_md_excludes,
+                    cfg.folder_trusted,
+                )
             );
         }
         "/todos" => {
@@ -2944,7 +2962,8 @@ fn build_repl_config(
     let mut config = zen_agent::AgentConfig {
         model: cfg.model.clone(),
         fallback_models: cfg.fallback_models.clone(),
-        system_prompt: crate::build_system_prompt(cli, cwd, None).unwrap_or_default(),
+        system_prompt: crate::build_system_prompt(cli, cwd, None, &cfg.zen_md_excludes)
+            .unwrap_or_default(),
         max_turns: cfg.max_turns.max(1),
         loop_stuck_k: cfg.loop_stuck_k,
         permission_mode: crate::agent_run::core_mode(cfg.permission_mode),
@@ -4350,6 +4369,26 @@ mod model_picker_tests {
         let config = build_repl_config(&cli, &cfg, &std::env::temp_dir());
         assert_eq!(config.context_window, 128_000);
         assert_eq!(config.auto_compact_threshold, Some(102_400));
+    }
+
+    #[test]
+    fn build_repl_config_carries_fallback_models_and_system_prompt() {
+        // Issue #397 (mutant killers): build_repl_config must carry
+        // the resolved fallback models and the built system prompt
+        // into the agent config. A mutant dropping either field falls
+        // back to the AgentConfig default (empty vec / empty string)
+        // and must fail here.
+        use clap::Parser;
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cli = crate::cli::Cli::parse_from(["zen"]);
+        let mut cfg = test_cfg();
+        cfg.fallback_models = vec!["fb-model".into()];
+        let config = build_repl_config(&cli, &cfg, &std::env::temp_dir());
+        assert_eq!(config.fallback_models, vec!["fb-model".to_string()]);
+        assert!(
+            !config.system_prompt.is_empty(),
+            "system prompt must be carried into the agent config"
+        );
     }
 
     #[test]

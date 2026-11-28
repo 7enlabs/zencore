@@ -39,7 +39,12 @@ pub fn has_terse_style(prompt: &str) -> bool {
     prompt.ends_with(&TERSE_STYLE_BLOCK)
 }
 
-pub fn build_system_prompt(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result<String> {
+pub fn build_system_prompt(
+    cli: &Cli,
+    cwd: &Path,
+    home: Option<&Path>,
+    excludes: &[String],
+) -> Result<String> {
     let mut parts: Vec<String> = Vec::new();
 
     match &cli.system_prompt {
@@ -56,13 +61,14 @@ pub fn build_system_prompt(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result
             parts.push(map.text().to_string());
         }
 
-        let mem = zen_ext::memory_prompt_with_root(
+        let mem = zen_ext::memory_prompt_with_root_and_excludes(
             cwd,
             home,
             // Issue #395: the ancestor walk stops at the session
             // working directory (the project root). Memory files above
             // it never reach the system prompt.
             cwd,
+            excludes,
             crate::settings::folder_trusted(cli, cwd, home),
         );
         if !mem.trim().is_empty() {
@@ -185,7 +191,7 @@ mod tests {
     #[test]
     fn default_prompt_contains_role_and_env() {
         let c = cli(&["--bare"]);
-        let p = build_system_prompt(&c, Path::new("/tmp"), None).unwrap();
+        let p = build_system_prompt(&c, Path::new("/tmp"), None, &[]).unwrap();
         assert!(p.contains("zen"));
         assert!(p.contains("working directory: /tmp"));
         assert!(p.contains("date:"));
@@ -194,7 +200,7 @@ mod tests {
     #[test]
     fn stable_prefix_contains_no_volatile_values() {
         let c = cli(&["--bare"]);
-        let p = build_system_prompt(&c, Path::new("/tmp"), None).unwrap();
+        let p = build_system_prompt(&c, Path::new("/tmp"), None, &[]).unwrap();
         let (stable, volatile) = zen_core::split_stable_volatile(&p);
         assert!(
             p.contains(zen_core::CACHE_VOLATILE_MARKER),
@@ -215,7 +221,7 @@ mod tests {
             "volatile tail should carry the date"
         );
 
-        let p2 = build_system_prompt(&c, Path::new("/tmp"), None).unwrap();
+        let p2 = build_system_prompt(&c, Path::new("/tmp"), None, &[]).unwrap();
         let (stable2, _) = zen_core::split_stable_volatile(&p2);
         assert_eq!(
             stable, stable2,
@@ -226,7 +232,7 @@ mod tests {
     #[test]
     fn volatile_block_comes_last() {
         let c = cli(&["--bare"]);
-        let p = build_system_prompt(&c, Path::new("/tmp"), None).unwrap();
+        let p = build_system_prompt(&c, Path::new("/tmp"), None, &[]).unwrap();
         let env_pos = p.find("Environment:").expect("env block present");
         let marker_pos = p
             .find(zen_core::CACHE_VOLATILE_MARKER)
@@ -240,7 +246,7 @@ mod tests {
     #[test]
     fn system_prompt_flag_replaces_default() {
         let c = cli(&["--system-prompt", "CUSTOM ROLE", "--bare"]);
-        let p = build_system_prompt(&c, Path::new("/tmp"), None).unwrap();
+        let p = build_system_prompt(&c, Path::new("/tmp"), None, &[]).unwrap();
         assert!(p.starts_with("CUSTOM ROLE"));
         assert!(!p.contains("You are zen, a command-line coding agent"));
     }
@@ -248,7 +254,7 @@ mod tests {
     #[test]
     fn append_system_prompt_appended() {
         let c = cli(&["--append-system-prompt", "EXTRA RULE", "--bare"]);
-        let p = build_system_prompt(&c, Path::new("/tmp"), None).unwrap();
+        let p = build_system_prompt(&c, Path::new("/tmp"), None, &[]).unwrap();
         assert!(p.contains("EXTRA RULE"));
     }
 
@@ -260,7 +266,7 @@ mod tests {
         std::fs::write(dir.join("ZEN.md"), "PROJECT MEMORY NOTE").unwrap();
 
         let c = cli(&["--bare"]);
-        let p = build_system_prompt(&c, &dir, None).unwrap();
+        let p = build_system_prompt(&c, &dir, None, &[]).unwrap();
         assert!(!p.contains("PROJECT MEMORY NOTE"));
     }
 
@@ -272,7 +278,7 @@ mod tests {
         std::fs::write(dir.join("ZEN.md"), "PROJECT MEMORY NOTE").unwrap();
 
         let c = cli(&["--setting-sources", ""]);
-        let p = build_system_prompt(&c, &dir, None).unwrap();
+        let p = build_system_prompt(&c, &dir, None, &[]).unwrap();
         assert!(p.contains("PROJECT MEMORY NOTE"), "prompt was: {}", p);
     }
 
@@ -282,24 +288,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("Cargo.toml"), "[package]").unwrap();
-        let p = build_system_prompt(&cli(&["--setting-sources", ""]), &dir, None).unwrap();
+        let p = build_system_prompt(&cli(&["--setting-sources", ""]), &dir, None, &[]).unwrap();
         assert!(
             p.contains("Project snapshot") && p.contains("`cargo test`"),
             "{}",
             p
         );
-        let again = build_system_prompt(&cli(&["--setting-sources", ""]), &dir, None).unwrap();
+        let again = build_system_prompt(&cli(&["--setting-sources", ""]), &dir, None, &[]).unwrap();
         assert_eq!(
             p, again,
             "same inputs give a byte-identical prompt (cache-stable)"
         );
-        let bare = build_system_prompt(&cli(&["--bare"]), &dir, None).unwrap();
+        let bare = build_system_prompt(&cli(&["--bare"]), &dir, None, &[]).unwrap();
         assert!(!bare.contains("Project snapshot"), "{}", bare);
     }
 
     #[test]
     fn c2_default_prompt_has_change_workflow() {
-        let p = build_system_prompt(&cli(&["-p", "x"]), Path::new("/tmp"), None).unwrap();
+        let p = build_system_prompt(&cli(&["-p", "x"]), Path::new("/tmp"), None, &[]).unwrap();
         for step in [
             "Explore",
             "Reproduce",
@@ -314,6 +320,7 @@ mod tests {
             &cli(&["-p", "x", "--system-prompt", "R"]),
             Path::new("/tmp"),
             None,
+            &[],
         )
         .unwrap();
         assert!(
@@ -389,10 +396,10 @@ call sites) and check them too. Only then report what you changed.
     #[test]
     fn terse_flag_appends_style_block() {
         let c = cli(&["--bare", "--terse"]);
-        let p = build_system_prompt(&c, Path::new("/tmp"), None).unwrap();
+        let p = build_system_prompt(&c, Path::new("/tmp"), None, &[]).unwrap();
         assert!(p.contains(TERSE_STYLE_BLOCK), "terse block missing: {p}");
         assert!(has_terse_style(&p));
-        let plain = build_system_prompt(&cli(&["--bare"]), Path::new("/tmp"), None).unwrap();
+        let plain = build_system_prompt(&cli(&["--bare"]), Path::new("/tmp"), None, &[]).unwrap();
         assert!(!plain.contains(TERSE_STYLE_BLOCK));
         assert!(!has_terse_style(&plain));
     }
@@ -400,7 +407,7 @@ call sites) and check them too. Only then report what you changed.
     #[test]
     fn terse_applies_on_custom_system_prompt_too() {
         let c = cli(&["--bare", "--terse", "--system-prompt", "CUSTOM ROLE"]);
-        let p = build_system_prompt(&c, Path::new("/tmp"), None).unwrap();
+        let p = build_system_prompt(&c, Path::new("/tmp"), None, &[]).unwrap();
         assert!(p.starts_with("CUSTOM ROLE"));
         assert!(has_terse_style(&p));
     }
@@ -427,8 +434,8 @@ call sites) and check them too. Only then report what you changed.
         std::fs::write(proj.join("ZEN.md"), "INSIDE-PROJECT-ROOT").unwrap();
         let nohome = base.join("nohome");
 
-        let p =
-            build_system_prompt(&cli(&["--setting-sources", ""]), &proj, Some(&nohome)).unwrap();
+        let p = build_system_prompt(&cli(&["--setting-sources", ""]), &proj, Some(&nohome), &[])
+            .unwrap();
         assert!(
             !p.contains("OUTSIDE-PROJECT-ROOT"),
             "AGENTS.md above the project root leaked into the system prompt: {p}"
@@ -451,17 +458,17 @@ call sites) and check them too. Only then report what you changed.
         )
         .unwrap();
 
-        let p = build_system_prompt(&cli(&["--setting-sources", ""]), &dir, None).unwrap();
+        let p = build_system_prompt(&cli(&["--setting-sources", ""]), &dir, None, &[]).unwrap();
         assert!(p.contains("Repository map"), "map present by default");
         assert!(p.contains("entry"), "map lists the symbol");
 
-        let bare = build_system_prompt(&cli(&["--bare"]), &dir, None).unwrap();
+        let bare = build_system_prompt(&cli(&["--bare"]), &dir, None, &[]).unwrap();
         assert!(
             !bare.contains("Repository map"),
             "--bare suppresses the map"
         );
 
-        let zero = build_system_prompt(&cli(&["--repomap-budget", "0"]), &dir, None).unwrap();
+        let zero = build_system_prompt(&cli(&["--repomap-budget", "0"]), &dir, None, &[]).unwrap();
         assert!(
             !zero.contains("Repository map"),
             "--repomap-budget 0 suppresses the map"

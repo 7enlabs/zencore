@@ -1338,6 +1338,11 @@ pub struct Settings {
     #[serde(default)]
     pub allow_private_network: bool,
 
+    /// Absolute-path globs of memory files to skip (SPEC C4.6
+    /// `zenMdExcludes`). The managed file can never be excluded.
+    #[serde(default)]
+    pub zen_md_excludes: Vec<String>,
+
     #[serde(default)]
     pub rate_gate: RateGateFileConfig,
     #[serde(flatten)]

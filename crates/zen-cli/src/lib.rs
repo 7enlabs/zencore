@@ -867,7 +867,7 @@ async fn run_headless(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result<i32>
     if cli.ephemeral {
         eprintln!("EPHEMERAL MODE - nothing will be saved");
     }
-    let system_prompt = build_system_prompt(cli, cwd, home)?;
+    let system_prompt = build_system_prompt(cli, cwd, home, &cfg.zen_md_excludes)?;
 
     let mut prompt_parts: Vec<String> = Vec::new();
     if cli.input_format == InputFormat::Text && !std::io::stdin().is_terminal() {

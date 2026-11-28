@@ -42,7 +42,7 @@ impl PromptBudget {
 
 pub fn measure_default_budget() -> Result<PromptBudget> {
     let cli = Cli::try_parse_from(["zen", "--bare"])?;
-    let sys = crate::system_prompt::build_system_prompt(&cli, Path::new("/tmp"), None)?;
+    let sys = crate::system_prompt::build_system_prompt(&cli, Path::new("/tmp"), None, &[])?;
     let system_prompt_tokens = estimate_tokens(&sys);
 
     let mut registry = zen_core::ToolRegistry::new();
