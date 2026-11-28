@@ -690,8 +690,32 @@ fn first_line(s: &str, max: usize) -> String {
 /// Stripping ESC also neutralizes multi-byte CSI/OSC sequences, which
 /// cannot start without it, so the dashboard never depends on the
 /// renderer's own filtering.
+///
+/// `char::is_control` covers only the `Cc` general category, so the
+/// `Cf` format characters are stripped explicitly too (B-430): without
+/// them a U+202E RIGHT-TO-LEFT OVERRIDE (or an isolate, or a zero-width
+/// space) in a log line can reorder the displayed text and spoof what
+/// the dashboard shows. The set below is the Unicode `Cf` category in
+/// the BMP planes the dashboard can display.
 fn strip_control(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).collect()
+    s.chars()
+        .filter(|c| !c.is_control() && !is_format_char(*c))
+        .collect()
+}
+
+/// Whether `c` is a Unicode `Cf` format character (bidi controls,
+/// isolates, zero-width spaces, BOM). These are invisible and reorder
+/// or hide displayed text, so they are stripped like control chars.
+fn is_format_char(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}'
+        | '\u{061C}'
+        | '\u{180E}'
+        | '\u{200B}'..='\u{200F}'
+        | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{206F}'
+        | '\u{FEFF}'
+        | '\u{FFF9}'..='\u{FFFB}')
 }
 
 /// Short id for display: the first `SHORT_ID_CHARS` characters.
@@ -1255,6 +1279,29 @@ mod tests {
             "control chars leaked: {line:?}"
         );
         assert!(line.contains("RED"), "{line}");
+        assert!(line.contains("done"), "{line}");
+    }
+
+    #[test]
+    fn log_lines_strip_bidi_format_chars() {
+        // B-430: Cf format characters are not Cc, so `is_control`
+        // alone lets U+202E reorder the displayed log line (a line
+        // that reads "passed" while the bytes say otherwise). The
+        // payload text survives; only the spoofing characters go.
+        let mut s = state();
+        let evil = "passed\u{202E} failed \u{202D}done\u{2066}hidden\u{2069}\u{200B}\u{FEFF}";
+        s.apply(&assistant_event(evil));
+        let line = &s.visible_log()[0];
+        assert!(
+            !line.chars().any(|c| matches!(c,
+                '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{FEFF}')),
+            "bidi/format chars leaked: {line:?}"
+        );
+        assert!(line.contains("passed"), "{line}");
+        assert!(line.contains("failed"), "{line}");
         assert!(line.contains("done"), "{line}");
     }
 
