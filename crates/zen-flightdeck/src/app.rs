@@ -77,6 +77,18 @@ impl KeyHandler {
     /// Handle one key press. Returns true when the viewer should exit.
     fn handle(&mut self, state: &Arc<Mutex<FlightdeckState>>, key: event::KeyEvent) -> bool {
         if self.filter_editing {
+            // B-432: crossterm reports Ctrl-C as Char('c') with the
+            // CONTROL modifier, so the Char arm below would type a
+            // literal 'c' into the draft. Control keys are commands,
+            // not filter text: Ctrl-C exits the viewer (as documented
+            // and as it does outside editing) and any other control
+            // key is ignored instead of typed.
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                if key.code == KeyCode::Char('c') {
+                    return true;
+                }
+                return false;
+            }
             match key.code {
                 KeyCode::Esc => {
                     // Cancel: discard the draft, restore the old filter.
@@ -375,6 +387,35 @@ mod tests {
         assert!(!h.handle(&s, key(KeyCode::Char('/'))));
         assert!(!h.handle(&s, key(KeyCode::Char('q'))));
         assert_eq!(lock_state(&s).filter, "yq");
+    }
+
+    #[test]
+    fn ctrl_c_exits_while_editing_filter() {
+        // B-432: crossterm reports Ctrl-C as Char('c') with CONTROL;
+        // while the filter is being edited it must exit the viewer
+        // instead of typing a literal 'c' into the draft.
+        let s = state();
+        let mut h = KeyHandler::default();
+        assert!(!h.handle(&s, key(KeyCode::Char('/'))));
+        assert!(!h.handle(&s, key(KeyCode::Char('x'))));
+        assert_eq!(lock_state(&s).filter, "x");
+        assert!(h.handle(&s, key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert_eq!(lock_state(&s).filter, "x");
+    }
+
+    #[test]
+    fn ctrl_keys_do_not_type_into_filter() {
+        // Other control keys arrive as Char with CONTROL too; they
+        // are commands, not filter text, so nothing is typed.
+        let s = state();
+        let mut h = KeyHandler::default();
+        assert!(!h.handle(&s, key(KeyCode::Char('/'))));
+        assert!(!h.handle(&s, key_mod(KeyCode::Char('a'), KeyModifiers::CONTROL)));
+        assert!(!h.handle(&s, key_mod(KeyCode::Char('w'), KeyModifiers::CONTROL)));
+        assert_eq!(lock_state(&s).filter, "");
+        // A plain 'c' with no modifier still types into the draft.
+        assert!(!h.handle(&s, key(KeyCode::Char('c'))));
+        assert_eq!(lock_state(&s).filter, "c");
     }
 
     fn key_with_kind(code: KeyCode, kind: KeyEventKind) -> KeyEvent {
