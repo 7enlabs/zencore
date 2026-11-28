@@ -2708,18 +2708,25 @@ mod tests {
     /// On other platforms the path is returned unchanged.
     #[cfg(windows)]
     fn normalize_msys_path(p: &str) -> String {
-        if let Some(rest) = p.strip_prefix("/tmp/") {
-            return std::env::temp_dir()
+        let p = if let Some(rest) = p.strip_prefix("/tmp/") {
+            // MSYS /tmp is the Windows temp dir; re-root under temp_dir().
+            std::env::temp_dir()
                 .join(rest)
                 .to_string_lossy()
-                .to_string();
-        }
-        let b = p.as_bytes();
-        if b.len() > 3 && b[0] == b'/' && b[2] == b'/' && b[1].is_ascii_alphabetic() {
-            let drive = (b[1] as char).to_ascii_uppercase();
-            let rest = p[3..].replace('/', "\\");
-            return format!("{drive}:\\{rest}");
-        }
+                .into_owned()
+        } else if p.len() > 3
+            && p.as_bytes()[0] == b'/'
+            && p.as_bytes()[2] == b'/'
+            && p.as_bytes()[1].is_ascii_alphabetic()
+        {
+            let drive = (p.as_bytes()[1] as char).to_ascii_uppercase();
+            format!("{drive}:\\{}", &p[3..])
+        } else {
+            p.to_string()
+        };
+        // PathBuf::join keeps the '/' inside a joined tail verbatim on
+        // Windows (temp_dir().join("x/chromium") stays ".../chromium"),
+        // so normalize separators here, on every path shape.
         p.replace('/', "\\")
     }
 
@@ -2771,9 +2778,36 @@ mod tests {
         // On Windows, `which` comes from Git Bash/MSYS and returns
         // Unix-style paths (/tmp/... or /c/...); normalize them back to
         // Windows paths before comparing with the expected location.
-        let found = normalize_msys_path(&found);
-        assert_eq!(found, fake.to_string_lossy().to_string());
+        // Normalize both sides: the `which` output and the expected path
+        // can each carry a different separator mix on Windows.
+        assert_eq!(
+            normalize_msys_path(&found),
+            normalize_msys_path(&fake.to_string_lossy())
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_msys_path_fixes_mixed_separators() {
+        // Regression test for the CI failure on PR #580: MSYS `which`
+        // returned `/tmp/zen-browser-which-.../chromium` and the old
+        // /tmp branch kept the '/' because PathBuf::join does not
+        // convert it on Windows.
+        let tmp = std::env::temp_dir();
+        let mixed = format!("{}\\zen-browser-which-1/chromium", tmp.display());
+        assert_eq!(
+            normalize_msys_path(&mixed),
+            format!("{}\\zen-browser-which-1\\chromium", tmp.display())
+        );
+        assert_eq!(
+            normalize_msys_path("/tmp/zen-browser-which-1/chromium"),
+            format!("{}\\zen-browser-which-1\\chromium", tmp.display())
+        );
+        assert_eq!(
+            normalize_msys_path("/c/Windows/chromium"),
+            "C:\\Windows\\chromium"
+        );
     }
 
     #[tokio::test]
