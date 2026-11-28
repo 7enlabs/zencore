@@ -977,7 +977,10 @@ class Store:
             if not (args[name] or "").strip():
                 raise ZtaskError(f"task record needs a non-empty {name}")
         if deadline:
-            deadline = fmt_time(parse_time(deadline))
+            try:
+                deadline = fmt_time(parse_time(deadline))
+            except ValueError as e:
+                raise ZtaskError(f"bad deadline {deadline!r}: {e}")
             args["deadline"] = deadline
 
         def build(pending, key, fp):
@@ -1464,10 +1467,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         out["ok"] = out["verdict"] == VERIFIED
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return EVIDENCE_EXIT.get(out["verdict"], 3)
-    store = Store(args.db, now=_now_from_env(),
-                  evidence_base=getattr(args, "base", "."),
-                  evidence_repo=getattr(args, "repo", None))
+    store = None
     try:
+        store = Store(args.db, now=_now_from_env(),
+                      evidence_base=getattr(args, "base", "."),
+                      evidence_repo=getattr(args, "repo", None))
         c = args.cmd
         if c == "init":
             store.init(args.leader)
@@ -1538,8 +1542,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(json.dumps({"ok": False, "error": e.code, "message": str(e)},
                          ensure_ascii=False), file=sys.stderr)
         return 1
+    except sqlite3.Error as e:
+        # #425: a corrupt/locked database or disk-full write must come back
+        # as structured JSON, never a traceback.
+        print(json.dumps({"ok": False, "error": "database_error",
+                          "message": str(e)}, ensure_ascii=False),
+              file=sys.stderr)
+        return 1
     finally:
-        store.close()
+        if store is not None:
+            store.close()
 
 
 if __name__ == "__main__":
