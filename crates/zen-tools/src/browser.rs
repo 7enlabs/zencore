@@ -1831,6 +1831,9 @@ mod tests {
 
     #[test]
     fn permission_hint_names_tool_selector_host_action() {
+        let _page_cache_guard = PAGE_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         update_cached_page("hint-key", "https://example.com/page".to_string(), false);
         let hint =
             browser_permission_hint(BROWSER_CLICK, &json!({"selector": "#ok"})).expect("hint");
@@ -2606,6 +2609,9 @@ mod tests {
 
     #[test]
     fn permission_title_is_the_hint_or_the_tool_name() {
+        let _page_cache_guard = PAGE_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         update_cached_page("title-key", "https://example.com/page".to_string(), false);
         let title = browser_permission_title(BROWSER_CLICK, &json!({"selector": "#ok"}));
         assert!(title.contains("browser_click"), "{title}");
@@ -2613,8 +2619,20 @@ mod tests {
         assert_eq!(browser_permission_title("Read", &json!({})), "Read");
     }
 
+    /// Serializes tests that share the process-wide LAST_ACTIVE /
+    /// PAGE_CACHE globals: page-cache tests assert on the
+    /// most-recently-active session, so two of them running in
+    /// parallel can overwrite each other's key mid-assertion
+    /// (PR #580 CI baseline failure in page_cache_round_trips).
+    /// Production code never touches this lock, so it cannot
+    /// deadlock with the PAGE_CACHE / LAST_ACTIVE locks.
+    static PAGE_CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn page_cache_round_trips() {
+        let _page_cache_guard = PAGE_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         update_cached_page("cache-key", "https://myhost.test/page".to_string(), true);
         let page = cached_page("cache-key").expect("cached page");
         assert_eq!(page.url, "https://myhost.test/page");
@@ -2630,6 +2648,9 @@ mod tests {
 
     #[test]
     fn page_cache_concurrent_readers_and_writers_do_not_deadlock() {
+        let _page_cache_guard = PAGE_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Regression test for the PR #580 CI mutant timeouts: the suite
         // stalled (killed at the 5x-baseline cap) with only the
         // suggested-rule tests uncompleted. Root cause was a lock-order
@@ -2684,6 +2705,9 @@ mod tests {
 
     #[test]
     fn classify_browser_call_gate_branches() {
+        let _page_cache_guard = PAGE_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Cached submit flags outside a password form do not imply login.
         record_selector_flags(
             "class-key",
