@@ -576,17 +576,49 @@ fn expand_file_refs(body: &str, base: &Path) -> Result<String> {
 }
 
 fn read_ref(path: &str, base: &Path) -> Option<String> {
-    let p = base.join(path);
-    let p = if p.is_file() {
-        p
-    } else {
-        Path::new(path).to_path_buf()
-    };
-    if p.is_file() {
-        std::fs::read_to_string(p).ok()
-    } else {
-        None
+    // Issue #444: every check used to run on the path before the open, so
+    // a swap in between could redirect the read outside the project, to a
+    // FIFO (which hangs the open), or to a gitignored file. All three
+    // checks now run inside `open_file_inside_project` on the descriptor
+    // that was actually opened, so a swap before the open is caught and a
+    // swap after it cannot affect the pinned descriptor. There is
+    // deliberately no pre-open check left here: the descriptor-bound check
+    // is the single enforcement point, and a redundant early check would
+    // only re-introduce the check-then-open window (and its `||` could
+    // not be killed by a mutant test, see the #554 review).
+    let candidate = base.join(path);
+    let file = zen_core::fs::open_file_inside_project(&candidate, base)?;
+    read_ref_file(file)
+}
+
+/// Read a file for `@ref` inlining, capped at the 512 KiB mention cap
+/// (issue #444). Reads at most cap + 1 bytes, so a huge file never lands
+/// fully in memory. The file arrives already opened and verified inside
+/// the project by `read_ref`; this function only reads the descriptor.
+fn read_ref_file(file: std::fs::File) -> Option<String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    file.take(crate::mentions::MAX_MENTION_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if bytes.len() as u64 > crate::mentions::MAX_MENTION_FILE_BYTES {
+        let keep = crate::mentions::MAX_MENTION_FILE_BYTES as usize;
+        let mut end = keep.min(text.len());
+        // A UTF-8 char is at most 4 bytes, so the previous char boundary
+        // is at most 3 bytes back. Bounding the walk keeps the loop from
+        // hanging forever if `end -= 1` is ever replaced by a no-op
+        // (e.g. the `/=` mutant): the loop exits after 3 steps and the
+        // test fails on the wrong output instead of timing out.
+        let mut steps = 0;
+        while end > 0 && !text.is_char_boundary(end) && steps < 3 {
+            end -= 1;
+            steps += 1;
+        }
+        text.truncate(end);
+        text.push_str("\n[truncated: file exceeds the 512 KiB mention cap]");
     }
+    Some(text)
 }
 
 fn custom_commands_dirs(cwd: &Path, home: Option<&Path>) -> Vec<std::path::PathBuf> {
@@ -1529,6 +1561,257 @@ mod tests {
         let cmd = CustomCommand::parse("show", "data: @data.txt").unwrap();
         let out = cmd.expand_in("", &tmp).unwrap();
         assert!(out.contains("data: inline-content"));
+    }
+
+    fn read_ref_tmp(tag: &str) -> std::path::PathBuf {
+        let tmp = std::env::temp_dir().join(format!(
+            "zen_cmd_readref_{}_{}_{}",
+            tag,
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn read_ref_rejects_absolute_path_outside_project() {
+        // Issue #444: an absolute path outside the project must not inline.
+        let tmp = read_ref_tmp("abs");
+        let secret = tmp.join("secret.txt");
+        fs::write(&secret, "top-secret").unwrap();
+        let proj = tmp.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        assert_eq!(read_ref(secret.to_str().unwrap(), &proj), None);
+    }
+
+    #[test]
+    fn read_ref_rejects_dotdot_escape() {
+        // Issue #444: `..` must not escape the project directory.
+        let tmp = read_ref_tmp("dotdot");
+        fs::write(tmp.join("secret.txt"), "top-secret").unwrap();
+        let proj = tmp.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        assert_eq!(read_ref("../secret.txt", &proj), None);
+    }
+
+    #[test]
+    fn read_ref_respects_gitignore() {
+        // Issue #444: gitignored files must not inline.
+        let tmp = read_ref_tmp("ignore");
+        fs::write(tmp.join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(tmp.join("ignored.txt"), "nope").unwrap();
+        fs::write(tmp.join("kept.txt"), "yes").unwrap();
+        assert_eq!(read_ref("ignored.txt", &tmp), None);
+        assert_eq!(read_ref("kept.txt", &tmp).as_deref(), Some("yes"));
+    }
+
+    #[test]
+    fn read_ref_caps_large_file() {
+        // Issue #444: the inlined size is capped like mentions.
+        let tmp = read_ref_tmp("cap");
+        let big = "x".repeat(crate::mentions::MAX_MENTION_FILE_BYTES as usize + 1000);
+        fs::write(tmp.join("big.txt"), &big).unwrap();
+        let out = read_ref("big.txt", &tmp).expect("in-project file must inline");
+        assert!(out.ends_with("[truncated: file exceeds the 512 KiB mention cap]"));
+        assert!(out.len() < crate::mentions::MAX_MENTION_FILE_BYTES as usize + 100);
+    }
+
+    #[test]
+    fn read_ref_file_exact_cap_is_not_truncated() {
+        // Issue #444 (mutant-killer): `read_ref_file` truncates only when
+        // the file is strictly larger than the cap. A file of exactly
+        // MAX_MENTION_FILE_BYTES must inline whole, with no marker.
+        // Kills commands.rs:609 `>` -> `>=`.
+        let tmp = read_ref_tmp("exactcap");
+        let cap = crate::mentions::MAX_MENTION_FILE_BYTES as usize;
+        let content = "a".repeat(cap);
+        fs::write(tmp.join("exact.txt"), &content).unwrap();
+        let out = read_ref_file(std::fs::File::open(tmp.join("exact.txt")).unwrap())
+            .expect("file must read");
+        assert_eq!(out, content);
+        assert!(!out.contains("[truncated"));
+    }
+
+    #[test]
+    fn read_ref_file_truncates_at_char_boundary() {
+        // Issue #444 (mutant-killer): when a multi-byte character straddles
+        // the cap, truncation must back up to the previous char boundary,
+        // never split the character and never panic.
+        // Kills commands.rs:612 `>` -> `==`, `<`, delete-`!`;
+        // commands.rs:613 `-=` -> `+=`, `/=` (the last one by timeout:
+        // `/=` never moves `end`, so the loop never ends).
+        let tmp = read_ref_tmp("boundary");
+        let cap = crate::mentions::MAX_MENTION_FILE_BYTES as usize;
+        let mut content = "a".repeat(cap - 1);
+        content.push('\u{e9}'); // 2-byte char straddling the cap
+        content.push_str(&"b".repeat(10));
+        fs::write(tmp.join("straddle.txt"), &content).unwrap();
+        let out = read_ref_file(std::fs::File::open(tmp.join("straddle.txt")).unwrap())
+            .expect("file must read");
+        let expected = format!(
+            "{}\n[truncated: file exceeds the 512 KiB mention cap]",
+            "a".repeat(cap - 1)
+        );
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn read_ref_file_over_cap_ascii_truncates_exactly() {
+        // Issue #444 (mutant-killer): an over-cap ASCII file truncates to
+        // exactly the cap plus the marker, nothing less.
+        // Kills commands.rs:612 `&&` -> `||` and delete-`!` (both walk
+        // `end` all the way to 0, returning an empty body).
+        let tmp = read_ref_tmp("asciicap");
+        let cap = crate::mentions::MAX_MENTION_FILE_BYTES as usize;
+        let content = "a".repeat(cap + 1);
+        fs::write(tmp.join("over.txt"), &content).unwrap();
+        let out = read_ref_file(std::fs::File::open(tmp.join("over.txt")).unwrap())
+            .expect("file must read");
+        let expected = format!(
+            "{}\n[truncated: file exceeds the 512 KiB mention cap]",
+            "a".repeat(cap)
+        );
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn read_ref_allows_absolute_path_inside_project() {
+        // Containment, not a blanket ban: an absolute path that stays
+        // inside the project still inlines.
+        let tmp = read_ref_tmp("inside");
+        let p = tmp.join("data.txt");
+        fs::write(&p, "inside-content").unwrap();
+        assert_eq!(
+            read_ref(p.to_str().unwrap(), &tmp).as_deref(),
+            Some("inside-content")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_ref_rejects_symlink_to_outside_file() {
+        // Issue #444 (TOCTOU): a symlink inside the project pointing
+        // to an outside file must not inline, and the decision must be
+        // made on the descriptor actually read, not on the path spelling.
+        let tmp = read_ref_tmp("symlink");
+        let secret = tmp.join("secret.txt");
+        fs::write(&secret, "top-secret").unwrap();
+        let proj = tmp.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        std::os::unix::fs::symlink(&secret, proj.join("link.txt")).unwrap();
+        assert_eq!(read_ref("link.txt", &proj), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_ref_swapped_symlink_mid_read_never_leaks_outside() {
+        // Issue #444 (TOCTOU): `read_ref` used to check the path and
+        // open it in two steps, so a file swapped for a symlink to
+        // outside in between leaked the outside file. A swapper thread
+        // flips the victim between a regular in-project file and a
+        // symlink to an outside secret while the reader loops; the
+        // outside content must never come back. Fails on the pre-fix
+        // code (the swap lands in the check-then-open window) and
+        // passes with the fd-bound open.
+        let tmp = read_ref_tmp("toctou");
+        let secret = tmp.join("secret.txt");
+        fs::write(&secret, "TOP-SECRET-444").unwrap();
+        let proj = tmp.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let victim = proj.join("victim.txt");
+        fs::write(&victim, "inside").unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let swapper = {
+            let stop = std::sync::Arc::clone(&stop);
+            let victim = victim.clone();
+            let secret = secret.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = fs::remove_file(&victim);
+                    let _ = std::os::unix::fs::symlink(&secret, &victim);
+                    let _ = fs::remove_file(&victim);
+                    let _ = fs::write(&victim, "inside");
+                }
+            })
+        };
+        for _ in 0..300 {
+            if let Some(content) = read_ref("victim.txt", &proj) {
+                assert!(
+                    !content.contains("TOP-SECRET-444"),
+                    "TOCTOU leak: swapped symlink read the outside file"
+                );
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = swapper.join();
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_ref_rejects_fifo_without_hanging() {
+        // Issue #444 (Z Tester BLOCKED #554): a FIFO must not inline and
+        // must not hang the reader. Guards the restructured `read_ref`,
+        // which now relies on the descriptor-bound open instead of its
+        // own pre-open type check.
+        let tmp = read_ref_tmp("fifo");
+        let fifo = tmp.join("pipe");
+        let cpath = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        let start = std::time::Instant::now();
+        assert_eq!(read_ref("pipe", &tmp), None);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "read_ref blocked on a FIFO"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_ref_swapped_to_ignored_symlink_never_leaks() {
+        // Issue #444 (Z Tester BLOCKED #554): the gitignore check used to
+        // run on the path before the open, so a swap to a symlink
+        // pointing at an ignored file in between leaked the ignored
+        // content. A swapper thread flips the victim between a regular
+        // file and a symlink to the ignored secret while the reader
+        // loops; the secret must never come back. Fails on the pre-fix
+        // code (the swap lands in the check-then-open window) and passes
+        // with the descriptor-bound ignore check.
+        let tmp = read_ref_tmp("ignoreref");
+        let proj = tmp.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join(".gitignore"), "secret.txt\n").unwrap();
+        fs::write(proj.join("secret.txt"), "IGNORED-SECRET-444").unwrap();
+        let victim = proj.join("victim.txt");
+        fs::write(&victim, "inside").unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let swapper = {
+            let stop = std::sync::Arc::clone(&stop);
+            let victim = victim.clone();
+            let secret = proj.join("secret.txt");
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = fs::remove_file(&victim);
+                    let _ = std::os::unix::fs::symlink(&secret, &victim);
+                    let _ = fs::remove_file(&victim);
+                    let _ = fs::write(&victim, "inside");
+                }
+            })
+        };
+        for _ in 0..300 {
+            if let Some(content) = read_ref("victim.txt", &proj) {
+                assert!(
+                    !content.contains("IGNORED-SECRET-444"),
+                    "gitignore race leak: swapped symlink read the ignored file"
+                );
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = swapper.join();
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]

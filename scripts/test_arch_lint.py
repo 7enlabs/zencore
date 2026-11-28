@@ -55,6 +55,14 @@ class Layers(unittest.TestCase):
         self.assertIn("zen-agent depends on zen-tools", found[0].msg)
         self.assertIn("Fix:", found[0].msg)
 
+    def test_layer_zen_ext_may_not_depend_on_zen_tools(self):
+        # Issue #444: zen-ext used zen_tools::gitignore, which the arch
+        # lint (PR #554) flagged; the matcher moved to zen-core instead.
+        _crate(self.root, "zen-ext", ["zen-core", "zen-tools"])
+        found = al.check_layers(self.root)
+        self.assertEqual(len(found), 1)
+        self.assertIn("zen-ext depends on zen-tools", found[0].msg)
+
     def test_layer_zen_cli_may_depend_on_all(self):
         _crate(self.root, "zen-cli",
                ["zen-core", "zen-agent", "zen-tools", "zen-ext", "zen-mcp",

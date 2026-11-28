@@ -525,4 +525,243 @@ exclude_re = [
   # CI shard mutants (10) on head 5ce94973 failed on this mutant
   # because the stale 1194 number did not match.
   "lsp\\.rs:1200:32: replace match guard !remaining\\.is_zero\\(\\) with true in LspManager::check_respawn_backoff",
+  # PR #554 (issue #444), commands.rs read_ref_file
+  # (line 614, col 19): replace `>` with `>=` in the char-boundary
+  # back-up loop `while end > 0 && !text.is_char_boundary(end)`.
+  # EQUIVALENT (waived by ZC Leader, 2026-11-26; verified by reading
+  # read_ref_file): `end` is usize (from keep.min(text.len())), so
+  # `end >= 0` is always true; byte index 0 is always a char
+  # boundary, so `!is_char_boundary(0)` is false and the loop exits
+  # at end=0 either way. The mutant cannot change any observable
+  # behaviour, and no test can kill this mutant.
+  # EXPIRY (2027-02-26): if the loop is rewritten so `end` can go
+  # negative, or 0 stops being a char boundary, this mutant stops
+  # being equivalent: remove this exclusion and kill it with a test.
+  # NOTE (2026-11-26): the loop-bound guard (5-line comment +
+  # `let mut steps = 0;`) moved the loop from line 612 to line 618;
+  # exclusion updated to match, equivalence argument unchanged.
+  # NOTE (2026-11-26): the TOCTOU fix (read_ref_file now takes an
+  # opened File, plus the open_file_inside_project call in read_ref)
+  # moved the loop from line 618 to line 623; exclusion updated to
+  # match, equivalence argument unchanged.
+  # NOTE (2026-11-26): the #554 rework (read_ref now relies on the
+  # descriptor-bound helper, no pre-open checks) moved the loop from
+  # line 623 to line 614; exclusion updated to match, equivalence
+  # argument unchanged.
+  "commands\\.rs:614:19: replace > with >= in read_ref_file",
+  # PR #554 (issue #444), commands.rs read_ref_file
+  # (line 614, col 63): replace `<` with `<=` in the loop bound
+  # `steps < 3` of the char-boundary back-up loop.
+  # EQUIVALENT (waived by ZC Leader, 2026-11-26; verified by reading
+  # read_ref_file): `text` comes from String::from_utf8_lossy, so it
+  # is always valid UTF-8, and a UTF-8 char is at most 4 bytes, so
+  # the previous char boundary is at most 3 bytes back; the loop
+  # always finds a boundary within 3 iterations and a 4th iteration
+  # is never reached. The mutant cannot change any observable
+  # behaviour, and no test can kill this mutant.
+  # EXPIRY (2027-02-26): if the loop is rewritten so the bound can
+  # be reached (for example `text` stops being valid UTF-8), this
+  # mutant stops being equivalent: remove this exclusion and kill it
+  # with a test.
+  # NOTE (2026-11-26): the TOCTOU fix moved the loop from line 618
+  # to line 623; exclusion updated to match, equivalence argument
+  # unchanged.
+  # NOTE (2026-11-26): the #554 rework moved the loop from line 623
+  # to line 614; exclusion updated to match, equivalence argument
+  # unchanged.
+  "commands\\.rs:614:63: replace < with <= in read_ref_file",
+  # PR #554 (issue #444), commands.rs read_ref_file
+  # (line 616, col 19): replace `+=` with `-=` in `steps += 1`.
+  # EQUIVALENT (waived by ZC Leader, 2026-11-26; verified by reading
+  # read_ref_file): `steps` is an unconstrained integer (inferred
+  # i32); with `-=` it goes 0, -1, -2, ... and `steps < 3` stays
+  # true, so the loop exits only on the char-boundary condition,
+  # which for valid UTF-8 is found within 3 steps, exactly like the
+  # original. The counter never changes the output, and no test can
+  # kill this mutant.
+  # EXPIRY (2027-02-26): if the step counter starts affecting the
+  # output (for example the loop bound is removed, or `steps` gains
+  # another use), this mutant stops being equivalent: remove this
+  # exclusion and kill it with a test.
+  # NOTE (2026-11-26): the TOCTOU fix moved the counter from line
+  # 620 to line 625; exclusion updated to match, equivalence
+  # argument unchanged.
+  # NOTE (2026-11-26): the #554 rework moved the counter from line
+  # 625 to line 616; exclusion updated to match, equivalence
+  # argument unchanged.
+  "commands\\.rs:616:19: replace \\+= with -= in read_ref_file",
+  # PR #554 (issue #444), commands.rs read_ref_file
+  # (line 616, col 19): replace `+=` with `*=` in `steps += 1`.
+  # EQUIVALENT (waived by ZC Leader, 2026-11-26; verified by reading
+  # read_ref_file): `steps *= 1` leaves `steps` at 0 forever, so
+  # `steps < 3` stays true and the loop exits only on the
+  # char-boundary condition, which for valid UTF-8 is found within
+  # 3 steps, exactly like the original. The counter never changes
+  # the output, and no test can kill this mutant.
+  # EXPIRY (2027-02-26): if the step counter starts affecting the
+  # output (for example the loop bound is removed, or `steps` gains
+  # another use), this mutant stops being equivalent: remove this
+  # exclusion and kill it with a test.
+  # NOTE (2026-11-26): the TOCTOU fix moved the counter from line
+  # 620 to line 625; exclusion updated to match, equivalence
+  # argument unchanged.
+  # NOTE (2026-11-26): the #554 rework moved the counter from line
+  # 625 to line 616; exclusion updated to match, equivalence
+  # argument unchanged.
+  "commands\\.rs:616:19: replace \\+= with \\*= in read_ref_file",
+  # PR #554 (issue #444), commands.rs read_ref - REMOVED 2026-11-26
+  # (Z Tester BLOCKED #554 review, tin 24014): the `||` -> `&&`
+  # exclusion at line 588 was NOT equivalent - with the mutant a FIFO
+  # inside the project reached File::open and hung instead of returning
+  # None. The #554 rework removed the pre-open check entirely: read_ref
+  # now relies on the descriptor-bound helper as the single enforcement
+  # point, so the mutant no longer exists and the exclusion is deleted
+  # instead of re-waived.
+  # PR #554 (issue #444), fs.rs open_file_inside_project (Windows
+  # pre-open FIFO guard) - REMOVED 2026-11-26 (overlapped rework,
+  # Leader tin 24130): the pre-open metadata check is gone; the
+  # overlapped probe plus the type check is the single guard now, so
+  # the `delete !` mutant at the old line 46 no longer exists and the
+  # exclusion is deleted instead of re-waived.
+  # PR #554 (issue #444), fs.rs open_nonblocking (non-unix variant,
+  # line 83, col 5): replace the body with Ok(Default::default()).
+  # EQUIVALENT on Linux (same shape as the sandbox.rs:194 non-unix
+  # fallback, waived 2026-11-21): the whole function is #[cfg(not(unix))],
+  # so on Linux this code is never compiled and the mutant cannot change
+  # anything the Linux build observes; the Windows CI job (windows-check)
+  # verifies the function itself. No Linux test can kill this mutant:
+  # verified by hand 2026-11-26, applying the mutant leaves all 7
+  # zen-core fs tests passing. The Unix twin at fs.rs:73 is UNVIABLE
+  # (File has no Default impl, so Ok(Default::default()) does not
+  # compile there) and needs no exclusion. NOTE: this replaces the
+  # killing test asked for in Leader tin 24069 ("code Unix that" was a
+  # misreading - line 86 is the non-unix variant, not the Unix one);
+  # a test cannot observe code that is never compiled on the mutants
+  # platform, so exclusion with this evidence is the correct handling.
+  # EXPIRY: if the mutants job runs on a non-unix platform, this mutant
+  # stops being equivalent: remove this exclusion and kill it with a
+  # test that opens a real file through open_file_inside_project and
+  # reads its content.
+  # NOTE (2026-11-26): the overlapped rework (Leader tin 24130) moved
+  # this mutant from line 86 to line 83; the exclusion number was
+  # corrected to match, equivalence argument unchanged.
+  "fs\\.rs:83:5: replace open_nonblocking -> std::io::Result<File> with Ok\\(Default::default\\(\\)\\)",
+  # PR #554 (issue #444), fs.rs Windows overlapped open (Leader tin
+  # 24130: fix the mechanism, do not accept the limitation by comment).
+  # The non-unix open_nonblocking probes with CreateFileW +
+  # FILE_FLAG_OVERLAPPED (open_overlapped), checks the handle type
+  # (get_file_type), and reopens a regular file without the flag
+  # (reopen_without_overlapped); INVALID_HANDLE_VALUE is the shared
+  # sentinel. All of it is #[cfg(windows)] / #[cfg(not(unix))], so on
+  # Linux this code is never compiled and the mutants cannot change
+  # anything the Linux build observes; the Windows CI job
+  # (windows-check) runs the pipe regression tests that kill these
+  # mutants on Windows (a wrong share mode, a missing OVERLAPPED
+  # flag, an inverted type check, or a broken sentinel check makes
+  # the pipe tests hang or fail there). No Linux test can kill them.
+  # EXPIRY: if the mutants job runs on Windows, these mutants stop
+  # being equivalent: remove these exclusions and kill them with the
+  # fs.rs pipe tests (swapped_pipe_mid_open_never_blocks and
+  # rejects_pipe_symlink_without_blocking).
+  # NOTE (2026-11-26): the ReOpenFile-flags fix added a 6-line doc
+  # comment above reopen_without_overlapped, moving its mutants from
+  # 145:5 / 150:29 / 150:48 / 154:22 / 154:29 / 197:53 to 151:5 /
+  # 156:29 / 156:48 / 160:22 / 160:29 / 203:53; the exclusion
+  # numbers were corrected to match, equivalence argument unchanged.
+  "fs\\.rs:93:45: replace != with == in open_nonblocking",
+  "fs\\.rs:108:5: replace open_overlapped -> std::io::Result<File> with Ok\\(Default::default\\(\\)\\)",
+  "fs\\.rs:119:29: replace \\| with & in open_overlapped",
+  "fs\\.rs:119:29: replace \\| with \\^ in open_overlapped",
+  "fs\\.rs:119:48: replace \\| with & in open_overlapped",
+  "fs\\.rs:119:48: replace \\| with \\^ in open_overlapped",
+  "fs\\.rs:122:34: replace \\| with & in open_overlapped",
+  "fs\\.rs:122:34: replace \\| with \\^ in open_overlapped",
+  "fs\\.rs:126:25: replace \\|\\| with && in open_overlapped",
+  "fs\\.rs:126:35: replace == with != in open_overlapped",
+  "fs\\.rs:136:5: replace get_file_type -> u32 with 0",
+  "fs\\.rs:136:5: replace get_file_type -> u32 with 1",
+  "fs\\.rs:151:5: replace reopen_without_overlapped -> std::io::Result<File> with Ok\\(Default::default\\(\\)\\)",
+  "fs\\.rs:156:29: replace \\| with & in reopen_without_overlapped",
+  "fs\\.rs:156:29: replace \\| with \\^ in reopen_without_overlapped",
+  "fs\\.rs:156:48: replace \\| with & in reopen_without_overlapped",
+  "fs\\.rs:156:48: replace \\| with \\^ in reopen_without_overlapped",
+  "fs\\.rs:160:22: replace \\|\\| with && in reopen_without_overlapped",
+  "fs\\.rs:160:29: replace == with != in reopen_without_overlapped",
+  "fs\\.rs:203:53: delete -",
+  # PR #554 (issue #444), fs.rs resolved_fd_path (Windows)
+  # (line 220, col 5): replace the body with None / with
+  # Some(Default::default()).
+  # EQUIVALENT on Linux (waived by ZC Leader, 2026-11-26; same shape
+  # as the sandbox.rs:194 non-unix fallback, waived 2026-11-21): the
+  # whole function is #[cfg(windows)], so on Linux this code is never
+  # compiled and the mutant cannot change anything the Linux build
+  # observes; the Windows CI job (windows-check) verifies the code
+  # itself. No Linux test can kill these mutants. The Unix twin at
+  # fs.rs:213 is live on Linux and its mutants are caught by the
+  # zen-core fs unit tests.
+  # EXPIRY: if the mutants job runs on Windows, these mutants stop
+  # being equivalent: remove these exclusions and kill them with
+  # tests that call open_file_inside_project on Windows.
+  # NOTE (2026-11-26): cargo-mutants reports the body-replacement
+  # mutant at the first statement of the body (the `use` at line 220),
+  # not the fn line (219); the exclusion numbers were corrected to
+  # match, equivalence argument unchanged. The overlapped rework
+  # (Leader tin 24130) moved this mutant from line 104 to line 214,
+  # and the ReOpenFile-flags fix (2026-11-26) moved it to line 220.
+  "fs\\.rs:220:5: replace resolved_fd_path -> Option<PathBuf> with None",
+  "fs\\.rs:220:5: replace resolved_fd_path -> Option<PathBuf> with Some\\(Default::default\\(\\)\\)",
+  # PR #554 (issue #444), fs.rs resolved_fd_path (Windows)
+  # (line 233, col 10): replace `==` with `!=` in
+  # `if n == 0 || n as usize >= buf.len()`, and (line 233, col 15)
+  # replace `||` with `&&` in the same guard.
+  # EQUIVALENT on Linux (waived by ZC Leader, 2026-11-26; same shape
+  # as the sandbox.rs:194 non-unix fallback): the whole function is
+  # #[cfg(windows)], so on Linux this code is never compiled and the
+  # mutants cannot change anything the Linux build observes. No
+  # Linux test can kill these mutants; the Windows CI job verifies
+  # the guard itself.
+  # EXPIRY: if the mutants job runs on Windows, these mutants stop
+  # being equivalent: remove these exclusions and kill them with
+  # tests where GetFinalPathNameByHandleW returns 0 and where it
+  # returns a full buffer.
+  # NOTE (2026-11-26): the overlapped rework (Leader tin 24130)
+  # moved these mutants from lines 117:10 / 117:15 to 227:10 /
+  # 227:15, and the ReOpenFile-flags fix (2026-11-26) moved them to
+  # 233:10 / 233:15; the exclusion numbers were corrected to match.
+  "fs\\.rs:233:10: replace == with != in resolved_fd_path",
+  "fs\\.rs:233:15: replace \\|\\| with && in resolved_fd_path",
+  # PR #554 (issue #444), fs.rs normalize_verbatim_prefix (Windows)
+  # (line 247, col 5): replace the body with Default::default().
+  # EQUIVALENT on Linux (waived by ZC Leader, 2026-11-26; same shape
+  # as the sandbox.rs:194 non-unix fallback): the whole function is
+  # #[cfg(windows)], so on Linux this code is never compiled and the
+  # mutant cannot change anything the Linux build observes. The
+  # non-Windows twin at fs.rs:256 is the identity function and is live
+  # on Linux. No Linux test can kill this mutant; the Windows CI job
+  # verifies the function itself.
+  # EXPIRY: if the mutants job runs on Windows, this mutant stops
+  # being equivalent: remove this exclusion and kill it with a test
+  # where the path carries the `\\?\` or `\\?\UNC\` prefix.
+  # NOTE (2026-11-26): cargo-mutants reports the body-replacement
+  # mutant at the first statement of the body (the `let text` at line
+  # 247), not the fn line (246); the exclusion number was corrected
+  # to match, equivalence argument unchanged. The overlapped rework
+  # (Leader tin 24130) moved this mutant from line 131 to line 241,
+  # and the ReOpenFile-flags fix (2026-11-26) moved it to line 247.
+  "fs\\.rs:247:5: replace normalize_verbatim_prefix -> PathBuf with Default::default\\(\\)",
+  # PR #554 (issue #444), mentions.rs expand_pattern
+  # (line 194, col 48): replace `>` with `>=` in
+  # `if e.file_type().is_dir() && e.depth() > 0`.
+  # EQUIVALENT (waived by ZC Leader, 2026-11-26; verified by reading
+  # expand_pattern and zen-core gitignore::is_ignored): the mutant
+  # only differs at entry depth 0 (the walk root); is_ignored(root)
+  # always returns false because gitignore.rs skips every rule when
+  # the stripped rel path is empty, so the entry is kept either way.
+  # The mutant cannot change any observable behaviour, and no test
+  # can kill this mutant.
+  # EXPIRY (2027-02-26): if is_ignored stops returning false for the
+  # empty rel, or the walk root stops being the entry at depth 0,
+  # this mutant stops being equivalent: remove this exclusion and
+  # kill it with a test.
+  "mentions\\.rs:194:48: replace > with >= in expand_pattern",
 ]

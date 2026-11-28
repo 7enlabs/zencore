@@ -152,7 +152,7 @@ fn read_mention_file(path: &Path) -> String {
 
 fn expand_pattern(pattern: &str, cwd: &Path) -> Result<Vec<PathBuf>, NoMatchError> {
     let norm = normalize_pattern(pattern);
-    let ignore_rules = zen_tools::gitignore::load_ignore_rules(cwd);
+    let ignore_rules = zen_core::gitignore::load_ignore_rules(cwd);
 
     if !has_glob_meta(&norm) {
         let abs = if Path::new(&norm).is_absolute() {
@@ -170,7 +170,7 @@ fn expand_pattern(pattern: &str, cwd: &Path) -> Result<Vec<PathBuf>, NoMatchErro
         if !abs.is_file() {
             return Err(NoMatchError(pattern.to_string()));
         }
-        if zen_tools::gitignore::is_ignored(&ignore_rules, &abs, false) {
+        if zen_core::gitignore::is_ignored(&ignore_rules, &abs, false) {
             return Err(NoMatchError(format!(
                 "{} is ignored by .gitignore",
                 pattern
@@ -192,7 +192,7 @@ fn expand_pattern(pattern: &str, cwd: &Path) -> Result<Vec<PathBuf>, NoMatchErro
         }
 
         if e.file_type().is_dir() && e.depth() > 0 {
-            return !zen_tools::gitignore::is_ignored(&ignore_rules, e.path(), true);
+            return !zen_core::gitignore::is_ignored(&ignore_rules, e.path(), true);
         }
         true
     });
@@ -208,7 +208,7 @@ fn expand_pattern(pattern: &str, cwd: &Path) -> Result<Vec<PathBuf>, NoMatchErro
         if !matcher.is_match(&rel_str) {
             continue;
         }
-        if zen_tools::gitignore::is_ignored(&ignore_rules, path, false) {
+        if zen_core::gitignore::is_ignored(&ignore_rules, path, false) {
             continue;
         }
         hits.push(path.to_path_buf());
@@ -471,6 +471,20 @@ mod tests {
         let exp = expand_mentions("check @**/*.js", &cwd, DEFAULT_MENTION_TOKEN_BUDGET).unwrap();
         assert_eq!(exp.files.len(), 1);
         assert_eq!(exp.files[0].path, "src/app.js");
+    }
+
+    #[test]
+    fn expand_pattern_dir_only_pattern_does_not_prune_file() {
+        // Issue #444 (mutant-killer): a dir-only .gitignore pattern
+        // (`build/`) must not prune a FILE named `build` from a glob walk.
+        // Kills mentions.rs:194 `&&` -> `||`: with `||` every entry below
+        // the root is gitignore-checked as if it were a directory, so the
+        // file is pruned and the glob finds nothing.
+        let cwd = tmpdir("expdironly");
+        write(&cwd, ".gitignore", "build/\n");
+        write(&cwd, "build", "x");
+        let hits = expand_pattern("b*", &cwd).expect("glob must match the file");
+        assert_eq!(hits, vec![cwd.join("build")]);
     }
 
     #[test]

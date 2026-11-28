@@ -1,3 +1,5 @@
+pub mod fs;
+pub mod gitignore;
 pub mod lock_recovery;
 pub mod secret;
 

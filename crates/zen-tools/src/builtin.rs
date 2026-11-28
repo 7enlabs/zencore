@@ -1,5 +1,4 @@
 use crate::edit_match::apply_edit;
-use crate::gitignore::{is_ignored, load_ignore_rules};
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::{Value, json};
@@ -9,6 +8,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
+use zen_core::gitignore::{is_ignored, load_ignore_rules};
 use zen_core::lock_recovery::lock_or_recover;
 use zen_core::{TodoItem, Tool, ToolContext, ToolOutput};
 
@@ -1014,7 +1014,7 @@ type Matches = Vec<(PathBuf, std::time::SystemTime)>;
 fn glob_paths(
     base: &Path,
     matcher: &globset::GlobMatcher,
-    rules: &[crate::gitignore::IgnoreRule],
+    rules: &[zen_core::gitignore::IgnoreRule],
     match_file_name: bool,
     cap: usize,
 ) -> Matches {

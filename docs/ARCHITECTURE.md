@@ -129,8 +129,8 @@ model researches with read-only tools and its final answer is the plan.
   across calls; long output is truncated in the middle; timeouts kill the process.
 * **Glob/Grep** walk the tree skipping `.git`, build dirs and `.gitignore`d paths; Grep uses `rg` when
   present and a built-in regex walker otherwise.
-* **`.gitignore` support** (`gitignore.rs`) is a small last-match-wins matcher, not a full git
-  implementation.
+* **`.gitignore` support** (`zen-core::gitignore`) is a small last-match-wins matcher, not a full git
+  implementation. It lives in `zen-core` so every layer can use it without breaking the layer map.
 * **`--tools`** (applied in zen-cli `agent_run.rs`) picks the built-in set: `""` none, `default` all,
   `Read,Bash` only those, or a delta `-Bash,-Write` / `+Name` on the default set (forms cannot mix).
 * Other tools live elsewhere: `Skill` (zen-ext), `Task` and `mcp__*` (zen-mcp).

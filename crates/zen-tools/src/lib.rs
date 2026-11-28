@@ -4,7 +4,6 @@ pub mod builtin;
 pub mod checkpoint;
 pub mod classifier;
 pub mod edit_match;
-pub mod gitignore;
 pub mod jobs;
 pub mod permissions;
 pub mod sandbox;
