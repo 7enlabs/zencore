@@ -234,6 +234,64 @@ class AcceptanceTests(Base):
             self.store.verify()
         self.assertIn("chain head mismatch", cm.exception.reason)
 
+    def append_orphan(self, etype, tid, data, idem_key):
+        """Insert a hash-chain-valid orphan event (no task.created for
+        tid) straight into the log, as a truncated/hand-edited log would
+        hold. Returns its seq."""
+        conn = self.raw()
+        head = conn.execute(
+            "SELECT length, hash FROM chain_head WHERE id=1").fetchone()
+        seq = head[0] + 1
+        ev = {"v": ztask.EVENT_VERSION, "type": etype, "task_id": tid,
+              "actor": DEV, "ts": ztask.fmt_time(self.clock()),
+              "idem_key": idem_key, "fingerprint": ztask.sha256_hex(idem_key),
+              "data": data}
+        body = ztask.canonical(ev)
+        h = ztask.row_hash(head[1], seq, body)
+        conn.execute(
+            "INSERT INTO events(seq, idem_key, fingerprint, task_id, body, "
+            "prev_hash, hash) VALUES(?, ?, ?, ?, ?, ?, ?)",
+            (seq, idem_key, ztask.sha256_hex(idem_key), tid, body, head[1],
+             h))
+        conn.execute("UPDATE chain_head SET length=?, hash=? WHERE id=1",
+                     (seq, h))
+        conn.close()
+        return seq
+
+    def test_orphan_event_raises_TamperEvident_not_KeyError(self):
+        # task.claimed with no prior task.created, chain still valid.
+        seq = self.append_orphan(
+            "task.claimed", "T99",
+            {"assignee": DEV, "token": 1,
+             "lease_until": ztask.fmt_time(self.clock())},
+            "orphan:claimed:T99")
+        with self.assertRaises(TamperEvident) as cm:
+            self.store.verify()
+        self.assertEqual(cm.exception.seq, seq)
+        self.assertIn("T99", cm.exception.reason)
+        with self.assertRaises(TamperEvident) as cm:
+            self.store.rebuild()
+        self.assertEqual(cm.exception.seq, seq)
+        # CLI reports it as the structured JSON error, not a traceback.
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = ztask.main(["--db", self.path, "verify"])
+        self.assertEqual(rc, 2)
+        self.assertIn("tamper_evident", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
+    def test_orphan_event_apply_event_direct(self):
+        # A second orphan type, task.verified, at the apply_event level.
+        ev = {"v": ztask.EVENT_VERSION, "type": "task.verified",
+              "task_id": "T98", "actor": QA,
+              "ts": ztask.fmt_time(self.clock()), "idem_key": "orphan:v:T98",
+              "fingerprint": "x",
+              "data": {"verified_by": QA, "command": "python3 -m unittest",
+                       "receipt": "Ran 1 test, OK"}}
+        with self.assertRaises(TamperEvident) as cm:
+            ztask.apply_event({}, ev)
+        self.assertIn("T98", cm.exception.reason)
+
 
 class StateMachineTests(Base):
     def test_happy_path_and_done_only_by_leader(self):

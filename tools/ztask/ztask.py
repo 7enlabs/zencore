@@ -606,7 +606,12 @@ def apply_event(tasks: Dict[str, dict], ev: dict) -> None:
             created_at=ts, updated_at=ts, idem_key=ev["idem_key"])
         tasks[tid] = task
         return
-    task = tasks[tid]
+    task = tasks.get(tid)
+    if task is None:
+        raise TamperEvident(
+            ev.get("seq"),
+            f"orphan event {t} references unknown task {tid} "
+            f"(no task.created)")
     task["updated_at"] = ts
     task["idem_key"] = ev["idem_key"]
     if t == "task.claimed":
@@ -1300,8 +1305,11 @@ class Store:
 
     def replay(self) -> Dict[str, dict]:
         tasks: Dict[str, dict] = {}
-        for r in self.conn.execute("SELECT body FROM events ORDER BY seq"):
-            apply_event(tasks, json.loads(r["body"]))
+        for r in self.conn.execute(
+                "SELECT seq, body FROM events ORDER BY seq"):
+            ev = json.loads(r["body"])
+            ev["seq"] = r["seq"]
+            apply_event(tasks, ev)
         return tasks
 
     def verify(self, check_projection: bool = True) -> dict:
