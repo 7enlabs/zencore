@@ -393,6 +393,26 @@ mod tests {
     }
 
     #[test]
+    fn should_prune_unidentified_boundary_at_exact_threshold() {
+        // Default config: min_prune_tokens 2000 * UNIDENTIFIED_MULTIPLIER 2
+        // = 4000. Exactly at the threshold the result is prunable: the
+        // guard is a strict `<`, so 4000 is not below the threshold.
+        // Flipping `<` to `<=` would make the exact-threshold case
+        // unprunable and break this test.
+        let c = cfg();
+        let threshold = c.min_prune_tokens * UNIDENTIFIED_MULTIPLIER;
+        assert_eq!(threshold, 4000);
+        assert!(
+            should_prune(threshold - 1, 10, None, "unrelated", "", &c).is_none(),
+            "one token below the threshold → not prunable"
+        );
+        assert!(
+            should_prune(threshold, 10, None, "unrelated", "", &c).is_some(),
+            "exactly at the threshold → prunable"
+        );
+    }
+
+    #[test]
     fn should_prune_unidentified_threshold_saturates_on_huge_config() {
         // Issue #366: `min_prune_tokens * UNIDENTIFIED_MULTIPLIER`
         // overflowed for huge configs - panicking in debug builds and
