@@ -467,7 +467,10 @@ fn coerce_value(v: &Value, ty: &str) -> Option<Value> {
         ("integer", Value::String(s)) => s.trim().parse::<i64>().ok().map(Value::from),
         ("integer", Value::Number(n)) if n.is_f64() => {
             let f = n.as_f64()?;
-            (f.fract() == 0.0).then(|| Value::from(f as i64))
+            // Note: i64::MAX as f64 rounds up to 2^63, so the upper bound is
+            // strict; f == 2^63 would otherwise saturate to i64::MAX.
+            let in_range = f >= i64::MIN as f64 && f < 9_223_372_036_854_775_808.0;
+            (f.fract() == 0.0 && in_range).then(|| Value::from(f as i64))
         }
         ("number", Value::String(s)) => s
             .trim()
@@ -742,6 +745,45 @@ mod tests {
             json!("lots"),
             "an unconvertible value is left for the tool to reject"
         );
+    }
+
+    #[test]
+    fn huge_float_is_not_saturated_to_i64_max() {
+        let (v, _) =
+            repair_args(r#"{"file_path":"a.rs","limit":1e30}"#, Some(&read_schema())).unwrap();
+        assert_eq!(
+            v["limit"],
+            json!(1e30),
+            "an out-of-range float is left for the tool to reject, not saturated to i64::MAX"
+        );
+        let (v, _) = repair_args(
+            r#"{"file_path":"a.rs","limit":-1e30}"#,
+            Some(&read_schema()),
+        )
+        .unwrap();
+        assert_eq!(
+            v["limit"],
+            json!(-1e30),
+            "an out-of-range negative float is left for the tool to reject"
+        );
+        // A whole float inside the i64 range still coerces.
+        let (v, _) =
+            repair_args(r#"{"file_path":"a.rs","limit":42.0}"#, Some(&read_schema())).unwrap();
+        assert_eq!(v["limit"], json!(42));
+        // Boundary: 2^63 is out of range even though i64::MAX as f64 rounds
+        // up to it, while -2^63 is exactly i64::MIN and still coerces.
+        let (v, _) = repair_args(
+            r#"{"file_path":"a.rs","limit":9223372036854775808.0}"#,
+            Some(&read_schema()),
+        )
+        .unwrap();
+        assert_eq!(v["limit"], json!(9.223372036854776e18));
+        let (v, _) = repair_args(
+            r#"{"file_path":"a.rs","limit":-9223372036854775808.0}"#,
+            Some(&read_schema()),
+        )
+        .unwrap();
+        assert_eq!(v["limit"], json!(i64::MIN));
     }
 
     #[test]
