@@ -648,6 +648,54 @@ class SafetyAndOpsTests(Base):
                              "--base", REPO)[0], 0)
         self.assertEqual(run("verify")[0], 0)
 
+    def test_cli_bad_deadline_returns_structured_json_error(self):
+        # #425: a malformed --deadline must not leak a traceback; it must
+        # come back as the structured {"ok": false, ...} JSON error.
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = ztask.main(["--db", self.path, "create", "--title", "T",
+                             "--goal", "g", "--owner", LEADER,
+                             "--acceptance", "a",
+                             "--deadline", "not-a-date"])
+        self.assertEqual(rc, 1)
+        self.assertNotIn("Traceback", err.getvalue())
+        out = json.loads(err.getvalue())
+        self.assertFalse(out["ok"])
+        self.assertIn("deadline", out["message"].lower())
+
+    def test_cli_sqlite_error_returns_structured_json_error(self):
+        # #425: a database error mid-command must not leak a traceback.
+        err = io.StringIO()
+        with mock.patch.object(
+                ztask.Store, "tasks",
+                side_effect=sqlite3.Error("disk I/O error")), \
+                redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = ztask.main(["--db", self.path, "list"])
+        self.assertEqual(rc, 1)
+        self.assertNotIn("Traceback", err.getvalue())
+        out = json.loads(err.getvalue())
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"], "database_error")
+
+    def test_cli_corrupt_database_returns_structured_json_error(self):
+        # #425: a corrupt database file fails while opening the Store, so
+        # the structured error must cover Store construction too.
+        self.store.close()
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(self.path + suffix)
+            except FileNotFoundError:
+                pass
+        Path(self.path).write_bytes(b"this is not a sqlite database")
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = ztask.main(["--db", self.path, "list"])
+        self.assertEqual(rc, 1)
+        self.assertNotIn("Traceback", err.getvalue())
+        out = json.loads(err.getvalue())
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"], "database_error")
+
 
 class EvidenceATests(Base):
     """Evidence A: `verify --evidence` and the approve gate."""
