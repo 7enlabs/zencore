@@ -266,38 +266,9 @@ pub fn parse_porcelain(text: &str) -> Vec<String> {
         if let Some((_, new)) = rest.split_once(" -> ") {
             rest = new;
         }
-        files.push(unquote_path(rest));
+        files.push(crate::git::unquote_path(rest));
     }
     files
-}
-
-fn unquote_path(p: &str) -> String {
-    let p = p.trim();
-    if p.len() >= 2 && p.starts_with('"') && p.ends_with('"') {
-        let inner = &p[1..p.len() - 1];
-        let mut s = String::with_capacity(inner.len());
-        let mut it = inner.chars();
-        while let Some(c) = it.next() {
-            if c == '\\' {
-                match it.next() {
-                    Some('n') => s.push('\n'),
-                    Some('t') => s.push('\t'),
-                    Some('"') => s.push('"'),
-                    Some('\\') => s.push('\\'),
-                    Some(o) => {
-                        s.push('\\');
-                        s.push(o);
-                    }
-                    None => s.push('\\'),
-                }
-            } else {
-                s.push(c);
-            }
-        }
-        s
-    } else {
-        p.to_string()
-    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -662,6 +633,20 @@ mod tests {
         let quoted = "?? \"my docs/note one.md\"\n";
         assert_eq!(parse_porcelain(quoted), vec!["my docs/note one.md"]);
         assert!(parse_porcelain("").is_empty());
+    }
+
+    #[test]
+    fn parse_porcelain_decodes_git_octal_escapes() {
+        // Git quotes non-ASCII paths as octal byte escapes (core.quotepath):
+        // café.txt appears as "caf\303\251.txt".
+        let text = " M \"caf\\303\\251.txt\"\n";
+        assert_eq!(parse_porcelain(text), vec!["café.txt"]);
+        // Octal escapes mix with plain text.
+        let mixed = "?? \"dir/\\303\\251t\\303\\251.txt\"\n";
+        assert_eq!(parse_porcelain(mixed), vec!["dir/été.txt"]);
+        // An invalid UTF-8 byte decodes lossy instead of a phantom path.
+        let invalid = "?? \"bad\\377.txt\"\n";
+        assert_eq!(parse_porcelain(invalid), vec!["bad\u{FFFD}.txt"]);
     }
 
     #[test]

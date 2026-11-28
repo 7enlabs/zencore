@@ -150,18 +150,84 @@ pub fn git_diff(cwd: &Path, mode: DiffMode, color: bool) -> Option<String> {
     run_git(cwd, &args, GIT_DIFF_TIMEOUT)
 }
 
+/// Unquote a git-quoted path (C-style quoting used by `status --porcelain`
+/// when `core.quotepath` is on): handles `\n`, `\t`, `\"`, `\\` and octal
+/// byte escapes (`\303\251` for the UTF-8 bytes of `é`). Octal escapes are
+/// accumulated as bytes and decoded as UTF-8 (lossy if invalid), so a
+/// multi-byte character split across escapes decodes as one character.
+/// Unquoted input is returned unchanged.
+pub(crate) fn unquote_path(p: &str) -> String {
+    let p = p.trim();
+    // Strip one pair of surrounding quotes; anything else (too short,
+    // missing an opening or closing quote) is returned unchanged.
+    // (strip_prefix/strip_suffix also removes the old `len() < 2`
+    // guard, whose `<` -> `<=` mutant was behaviourally equivalent
+    // and therefore unkillable by any test.)
+    let Some(inner) = p.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
+        return p.to_string();
+    };
+    let inner = inner.as_bytes();
+    let mut bytes = Vec::with_capacity(inner.len());
+    // Iterate by consuming the input: each loop step takes at least
+    // one byte out of the iterator, so progress never depends on
+    // arithmetic on an index. (The old index loop had `i += k` steps
+    // whose `+=` -> `*=` mutant froze the loop when `i` was 0.)
+    let mut it = inner.iter().peekable();
+    while let Some(&b) = it.next() {
+        if b != b'\\' {
+            bytes.push(b);
+            continue;
+        }
+        let Some(&next) = it.next() else {
+            // Trailing backslash: kept literally.
+            bytes.push(b'\\');
+            break;
+        };
+        match next {
+            b'n' => bytes.push(b'\n'),
+            b't' => bytes.push(b'\t'),
+            b'"' => bytes.push(b'"'),
+            b'\\' => bytes.push(b'\\'),
+            b'0'..=b'7' => {
+                let mut value: u32 = (next - b'0') as u32;
+                let mut digits = [0u8; 3];
+                digits[0] = next;
+                let mut count = 1;
+                while count < 3 {
+                    match it.next_if(|&&x| matches!(x, b'0'..=b'7')) {
+                        Some(&x) => {
+                            digits[count] = x;
+                            value = value * 8 + (x - b'0') as u32;
+                            count += 1;
+                        }
+                        None => break,
+                    }
+                }
+                if value > 0o377 {
+                    // Not a byte value: keep the backslash literally
+                    // and let the digits through as literal bytes.
+                    bytes.push(b'\\');
+                    bytes.extend_from_slice(&digits[..count]);
+                } else {
+                    bytes.push(value as u8);
+                }
+            }
+            other => {
+                // Unknown escape: keep the backslash literally and
+                // let the char through as a literal byte.
+                bytes.push(b'\\');
+                bytes.push(other);
+            }
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 fn parse_untracked(porcelain: &str) -> Vec<String> {
     porcelain
         .lines()
         .filter_map(|l| l.strip_prefix("?? "))
-        .map(|p| {
-            let p = p.trim();
-            if p.len() >= 2 && p.starts_with('"') && p.ends_with('"') {
-                p[1..p.len() - 1].to_string()
-            } else {
-                p.to_string()
-            }
-        })
+        .map(unquote_path)
         .collect()
 }
 
@@ -783,6 +849,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_untracked_decodes_git_octal_escapes() {
+        let out = "?? plain.txt\n?? \"caf\\303\\251.txt\"\n";
+        assert_eq!(
+            parse_untracked(out),
+            vec!["plain.txt".to_string(), "café.txt".to_string()]
+        );
+    }
+
+    #[test]
     fn diff_color_flag_adds_ansi() {
         let Some(dir) = init_repo() else { return };
         std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
@@ -1076,5 +1151,67 @@ mod tests {
         let Some(dir) = init_repo() else { return };
         assert!(!is_registered_worktree(&dir, &dir.join("no-such-wt")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    // Mutant-killer tests for unquote_path (#438). Each case pins one
+    // behaviour so a mutation of it changes the output (or panics):
+    // every escape arm, the octal digit cap, the >0o377 fallback,
+    // the unknown-escape arm and the index steps after each escape.
+    #[test]
+    fn unquote_path_passthrough() {
+        assert_eq!(unquote_path("abc"), "abc");
+        assert_eq!(unquote_path(""), "");
+        assert_eq!(unquote_path("\""), "\"");
+        assert_eq!(unquote_path("\"ab"), "\"ab");
+        assert_eq!(unquote_path("ab\""), "ab\"");
+        assert_eq!(unquote_path("a\"b\""), "a\"b\"");
+        assert_eq!(unquote_path("  abc  "), "abc");
+    }
+
+    #[test]
+    fn unquote_path_empty_quoted() {
+        assert_eq!(unquote_path("\"\""), "");
+    }
+
+    #[test]
+    fn unquote_path_simple_escapes() {
+        assert_eq!(unquote_path("\"\\n\""), "\n");
+        assert_eq!(unquote_path("\"\\t\""), "\t");
+        assert_eq!(unquote_path("\"\\\"\""), "\"");
+        assert_eq!(unquote_path("\"\\\\\""), "\\");
+        // Escape followed by more content pins the i += 2 step.
+        assert_eq!(unquote_path("\"\\nX\""), "\nX");
+        assert_eq!(unquote_path("\"a\\tb\""), "a\tb");
+        assert_eq!(unquote_path("\"\\\"x\""), "\"x");
+        assert_eq!(unquote_path("\"\\\\y\""), "\\y");
+    }
+
+    #[test]
+    fn unquote_path_unknown_escape_and_trailing_backslash() {
+        assert_eq!(unquote_path("\"\\q\""), "\\q");
+        assert_eq!(unquote_path("\"\\qZ\""), "\\qZ");
+        assert_eq!(unquote_path("\"\\8\""), "\\8");
+        assert_eq!(unquote_path("\"a\\\""), "a\\");
+    }
+
+    #[test]
+    fn unquote_path_octal() {
+        assert_eq!(unquote_path("\"\\101\""), "A");
+        assert_eq!(unquote_path("\"\\4\""), "\u{4}");
+        assert_eq!(unquote_path("\"\\04\""), "\u{4}");
+        assert_eq!(unquote_path("\"\\004\""), "\u{4}");
+        assert_eq!(unquote_path("\"\\0\""), "\u{0}");
+        assert_eq!(unquote_path("\"\\303\\251\""), "é");
+        assert_eq!(unquote_path("\"\\303\\251x\""), "éx");
+        // Four digits: only the first three form one byte; the fourth
+        // stays literal (pins count < 3). The lone 0xC3 byte is
+        // invalid UTF-8 on its own, so it decodes lossy.
+        assert_eq!(unquote_path("\"\\3031\""), "\u{fffd}1");
+    }
+
+    #[test]
+    fn unquote_path_octal_overflow_stays_literal() {
+        assert_eq!(unquote_path("\"\\400\""), "\\400");
+        assert_eq!(unquote_path("\"\\777\""), "\\777");
+        assert_eq!(unquote_path("\"\\400X\""), "\\400X");
     }
 }
