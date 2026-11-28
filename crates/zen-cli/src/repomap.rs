@@ -90,8 +90,11 @@ const SKIP_DIRS: &[&str] = &[
     "coverage",
 ];
 
-fn collect_rust_files(cwd: &Path) -> Vec<PathBuf> {
+/// Collects `.rs` files under `cwd`, capped at `MAX_FILES`.
+/// Returns the files and whether the cap cut off further `.rs` files.
+fn collect_rust_files(cwd: &Path) -> (Vec<PathBuf>, bool) {
     let mut files = Vec::new();
+    let mut truncated = false;
     let walker = walkdir::WalkDir::new(cwd)
         .follow_links(false)
         .into_iter()
@@ -106,16 +109,17 @@ fn collect_rust_files(cwd: &Path) -> Vec<PathBuf> {
             true
         });
     for entry in walker.filter_map(|e| e.ok()) {
-        if files.len() >= MAX_FILES {
-            break;
-        }
         let p = entry.path();
         if p.is_file() && p.extension().map(|e| e == "rs").unwrap_or(false) {
+            if files.len() >= MAX_FILES {
+                truncated = true;
+                break;
+            }
             files.push(p.to_path_buf());
         }
     }
     files.sort();
-    files
+    (files, truncated)
 }
 
 fn strip_noise(line: &str) -> String {
@@ -283,10 +287,13 @@ fn is_mod_tests_decl(clean: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn extract_symbols(path: &Path) -> Vec<Symbol> {
+/// Extracts top-level symbols from the first `MAX_LINES_PER_FILE` lines.
+/// Returns the symbols and whether the file has more lines than the cap.
+fn extract_symbols(path: &Path) -> (Vec<Symbol>, bool) {
     let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
+    let truncated = text.lines().count() > MAX_LINES_PER_FILE;
 
     let mut symbols = Vec::new();
     let mut in_test_mod = false;
@@ -385,7 +392,7 @@ fn extract_symbols(path: &Path) -> Vec<Symbol> {
             });
         }
     }
-    symbols
+    (symbols, truncated)
 }
 
 fn rank_symbols(entries: &mut [(PathBuf, Vec<Symbol>)]) {
@@ -520,14 +527,18 @@ pub fn repo_map(cwd: &Path, map_tokens: usize) -> Option<RepoMap> {
     if map_tokens == 0 {
         return None;
     }
-    let files = collect_rust_files(cwd);
+    let (files, files_truncated) = collect_rust_files(cwd);
     if files.is_empty() {
         return None;
     }
+    let mut lines_truncated = false;
     let mut entries: Vec<(PathBuf, Vec<Symbol>)> = files
         .into_iter()
         .map(|p| {
-            let syms = extract_symbols(&p);
+            let (syms, capped) = extract_symbols(&p);
+            if capped {
+                lines_truncated = true;
+            }
             (p, syms)
         })
         .filter(|(_, syms)| !syms.is_empty())
@@ -545,7 +556,22 @@ pub fn repo_map(cwd: &Path, map_tokens: usize) -> Option<RepoMap> {
 
     let mut map = RepoMap::default();
     let trunc_marker = "[map truncated: token budget exhausted]\n";
-    let marker_tokens = trunc_marker.chars().count().div_ceil(4);
+    let files_marker = format!("[map truncated: file limit reached (max {MAX_FILES} files)]\n");
+    let lines_marker = format!("[map truncated: file exceeds {MAX_LINES_PER_FILE} lines]\n");
+    // Reserve room for every marker that will be appended, so the map
+    // stays within budget even when a cap (not just the token budget)
+    // truncated it.
+    let trunc_tokens = trunc_marker.chars().count().div_ceil(4);
+    let files_tokens = files_marker.chars().count().div_ceil(4);
+    let lines_tokens = lines_marker.chars().count().div_ceil(4);
+    let mut marker_tokens = trunc_tokens;
+    if files_truncated {
+        marker_tokens += files_tokens;
+    }
+    if lines_truncated {
+        marker_tokens += lines_tokens;
+    }
+    let mut token_truncated = false;
     let mut used = 0usize;
     let header = format!(
         "Repository map (top Rust symbols by cross-file references, {}-token budget):\n",
@@ -562,7 +588,7 @@ pub fn repo_map(cwd: &Path, map_tokens: usize) -> Option<RepoMap> {
             .replace('\\', "/");
         let file_line = format!("{}\n", rel);
         if used + file_line.chars().count().div_ceil(4) + marker_tokens > map_tokens {
-            map.truncated = true;
+            token_truncated = true;
             break;
         }
         used += file_line.chars().count().div_ceil(4);
@@ -583,7 +609,7 @@ pub fn repo_map(cwd: &Path, map_tokens: usize) -> Option<RepoMap> {
                 sym.ref_files
             );
             if used + line.chars().count().div_ceil(4) + marker_tokens > map_tokens {
-                map.truncated = true;
+                token_truncated = true;
                 break 'files;
             }
             used += line.chars().count().div_ceil(4);
@@ -593,7 +619,18 @@ pub fn repo_map(cwd: &Path, map_tokens: usize) -> Option<RepoMap> {
         map.files.push(file_entry);
     }
 
-    if map.truncated {
+    map.truncated = token_truncated || files_truncated || lines_truncated;
+    // The header plus the markers can already exceed a tiny budget, so
+    // append only the markers that still fit. Cap markers go first: they
+    // describe map content that is missing, while the token marker only
+    // restates that the budget ran out.
+    if files_truncated && out.chars().count().div_ceil(4) + files_tokens <= map_tokens {
+        out.push_str(&files_marker);
+    }
+    if lines_truncated && out.chars().count().div_ceil(4) + lines_tokens <= map_tokens {
+        out.push_str(&lines_marker);
+    }
+    if token_truncated && out.chars().count().div_ceil(4) + trunc_tokens <= map_tokens {
         out.push_str(trunc_marker);
     }
     map.rendered = Some(out.trim_end().to_string());
@@ -626,7 +663,7 @@ mod tests {
             "a.rs",
             "pub fn hello() {}\nfn private_fn() {}\npub struct Config {}\nenum Hidden {}\nimpl Config {}\nmod inner {}\n",
         );
-        let syms = extract_symbols(&p);
+        let (syms, _) = extract_symbols(&p);
         let names: Vec<(&str, bool)> = syms.iter().map(|s| (s.name.as_str(), s.is_pub)).collect();
         assert!(names.contains(&("hello", true)));
         assert!(names.contains(&("private_fn", false)));
@@ -645,7 +682,7 @@ mod tests {
             "b.rs",
             "pub fn real() {}\n#[cfg(test)]\nmod tests {\n    fn fake_helper() {}\n}\n",
         );
-        let syms = extract_symbols(&p);
+        let (syms, _) = extract_symbols(&p);
         assert!(syms.iter().any(|s| s.name == "real"));
         assert!(!syms.iter().any(|s| s.name == "fake_helper"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -663,9 +700,10 @@ mod tests {
         );
         write_file(&dir, "b.rs", "fn y() { popular(); }\n");
         let mut entries: Vec<(PathBuf, Vec<Symbol>)> = collect_rust_files(&dir)
+            .0
             .into_iter()
             .map(|p| {
-                let s = extract_symbols(&p);
+                let (s, _) = extract_symbols(&p);
                 (p, s)
             })
             .filter(|(_, s)| !s.is_empty())
@@ -708,13 +746,158 @@ mod tests {
     }
 
     #[test]
+    fn file_cap_marks_map_truncated() {
+        let dir = unique_dir("filecap");
+        let _ = std::fs::remove_dir_all(&dir);
+        for i in 0..=MAX_FILES {
+            write_file(
+                &dir,
+                &format!("f{i:03}.rs"),
+                &format!("pub fn func_{i}() {{}}\n"),
+            );
+        }
+        let map = repo_map(&dir, 100_000).expect("map");
+        assert_eq!(map.files.len(), MAX_FILES, "only MAX_FILES files kept");
+        assert!(map.truncated, "file cap hit must mark the map truncated");
+        assert!(
+            map.text().contains("file limit"),
+            "file cap must emit a marker, got:\n{}",
+            map.text()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn line_cap_marks_map_truncated() {
+        let dir = unique_dir("linecap");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut src = String::from("pub fn first() {}\n");
+        for _ in 1..MAX_LINES_PER_FILE {
+            src.push_str("// filler\n");
+        }
+        src.push_str("pub fn beyond_cap() {}\n");
+        write_file(&dir, "long.rs", &src);
+        let map = repo_map(&dir, 100_000).expect("map");
+        assert!(map.truncated, "line cap hit must mark the map truncated");
+        assert!(
+            map.text().contains("4000 lines"),
+            "line cap must emit a marker, got:\n{}",
+            map.text()
+        );
+        let names: Vec<&str> = map.files[0]
+            .symbols
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(names.contains(&"first"), "{names:?}");
+        assert!(
+            !names.contains(&"beyond_cap"),
+            "symbol past the line cap must be missing: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn line_cap_marker_stays_within_small_budget() {
+        // P2 on PR #577: with a 4001-line file and a 32-token budget the
+        // header plus both markers came to 40 estimated tokens, over
+        // budget. The map must fit its budget and still carry the line
+        // cap marker.
+        let dir = unique_dir("linecapbudget");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut src = String::from("pub fn first() {}\n");
+        for _ in 1..MAX_LINES_PER_FILE {
+            src.push_str("// filler\n");
+        }
+        src.push_str("pub fn beyond_cap() {}\n");
+        write_file(&dir, "long.rs", &src);
+        let map = repo_map(&dir, 32).expect("map");
+        assert!(map.truncated, "line cap hit must mark the map truncated");
+        let est = map.text().chars().count().div_ceil(4);
+        assert!(
+            est <= 32,
+            "map must fit its 32-token budget, got {est} estimated tokens:\n{}",
+            map.text()
+        );
+        assert!(
+            map.text().contains("4000 lines"),
+            "line cap must still emit a marker, got:\n{}",
+            map.text()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_symbols_reports_line_cap() {
+        let dir = unique_dir("extractcap");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut src = String::new();
+        for i in 0..MAX_LINES_PER_FILE {
+            src.push_str(&format!("pub fn func_{i}() {{}}\n"));
+        }
+        src.push_str("pub fn beyond_cap() {}\n");
+        let p = write_file(&dir, "long.rs", &src);
+        let (syms, truncated) = extract_symbols(&p);
+        assert!(truncated, "file over the line cap must report truncation");
+        assert!(!syms.iter().any(|s| s.name == "beyond_cap"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_symbols_exactly_at_line_cap_is_not_truncated() {
+        let dir = unique_dir("extractexact");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut src = String::new();
+        for i in 0..MAX_LINES_PER_FILE {
+            src.push_str(&format!("pub fn func_{i}() {{}}\n"));
+        }
+        let p = write_file(&dir, "exact.rs", &src);
+        let (syms, truncated) = extract_symbols(&p);
+        assert!(
+            !truncated,
+            "a file with exactly MAX_LINES_PER_FILE lines is whole"
+        );
+        assert_eq!(syms.len(), MAX_LINES_PER_FILE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collect_rust_files_reports_file_cap() {
+        let dir = unique_dir("collectcap");
+        let _ = std::fs::remove_dir_all(&dir);
+        for i in 0..=MAX_FILES {
+            write_file(&dir, &format!("f{i:03}.rs"), "pub fn f() {}\n");
+        }
+        let (files, truncated) = collect_rust_files(&dir);
+        assert_eq!(files.len(), MAX_FILES);
+        assert!(truncated, "one file over the cap must report truncation");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collect_rust_files_exactly_at_file_cap_is_not_truncated() {
+        let dir = unique_dir("collectexact");
+        let _ = std::fs::remove_dir_all(&dir);
+        for i in 0..MAX_FILES {
+            write_file(&dir, &format!("f{i:03}.rs"), "pub fn f() {}\n");
+        }
+        let (files, truncated) = collect_rust_files(&dir);
+        assert_eq!(files.len(), MAX_FILES);
+        assert!(
+            !truncated,
+            "exactly MAX_FILES files fit the cap, nothing is cut"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn hidden_files_kept_hidden_dirs_skipped() {
         let dir = unique_dir("hidden");
         let _ = std::fs::remove_dir_all(&dir);
         write_file(&dir, ".hidden.rs", "pub fn hidden_fn() {}\n");
         write_file(&dir, ".hiddendir/x.rs", "pub fn concealed() {}\n");
         write_file(&dir, "visible.rs", "pub fn visible_fn() {}\n");
-        let files = collect_rust_files(&dir);
+        let (files, _) = collect_rust_files(&dir);
         let names: Vec<String> = files
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
@@ -758,7 +941,7 @@ mod tests {
             "d.rs",
             "pub fn before() {}\n#[cfg(test)]\nfn test_only() {}\npub fn after() {}\n",
         );
-        let syms = extract_symbols(&p);
+        let (syms, _) = extract_symbols(&p);
         let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"before"), "{names:?}");
         assert!(names.contains(&"test_only"), "{names:?}");
@@ -771,7 +954,7 @@ mod tests {
         let dir = unique_dir("moddecl");
         let _ = std::fs::remove_dir_all(&dir);
         let p = write_file(&dir, "e.rs", "mod tests;\npub fn after_decl() {}\n");
-        let syms = extract_symbols(&p);
+        let (syms, _) = extract_symbols(&p);
         assert!(
             syms.iter().any(|s| s.name == "after_decl"),
             "code after `mod tests;` must not be skipped"
@@ -789,7 +972,7 @@ mod tests {
             "f.rs",
             "pub fn first() {}\nmod tests {\n    fn helper() {}\n}\npub fn last() {}\n",
         );
-        let syms = extract_symbols(&p);
+        let (syms, _) = extract_symbols(&p);
         let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"first"), "{names:?}");
         assert!(names.contains(&"last"), "{names:?}");
@@ -844,9 +1027,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         write_file(&dir, "solo.rs", "fn only_here() {}\n");
         let mut entries: Vec<(PathBuf, Vec<Symbol>)> = collect_rust_files(&dir)
+            .0
             .into_iter()
             .map(|p| {
-                let s = extract_symbols(&p);
+                let (s, _) = extract_symbols(&p);
                 (p, s)
             })
             .filter(|(_, s)| !s.is_empty())
@@ -925,5 +1109,318 @@ mod tests {
             "repo map of own workspace exceeds budget: {est} > {}",
             DEFAULT_MAP_TOKENS
         );
+    }
+
+    /// Token estimate used by `repo_map`: characters divided by 4, rounded up.
+    fn token_cost(text: &str) -> usize {
+        text.chars().count().div_ceil(4)
+    }
+
+    /// Exact header cost for a two-digit budget. All budgets below stay
+    /// two digits, so the header length cannot drift mid-computation.
+    fn header_tokens(budget: usize) -> usize {
+        assert!(
+            (10..100).contains(&budget),
+            "budget must stay two digits, got {budget}"
+        );
+        token_cost(&format!(
+            "Repository map (top Rust symbols by cross-file references, {budget}-token budget):\n"
+        ))
+    }
+
+    /// Budget whose header cost is `header_tokens(50)` plus `rest`.
+    fn budget_at(rest: usize) -> usize {
+        let header = header_tokens(50);
+        let budget = header + rest;
+        assert_eq!(
+            header_tokens(budget),
+            header,
+            "budget crossed a digit boundary"
+        );
+        budget
+    }
+
+    fn trunc_marker_tokens() -> usize {
+        token_cost("[map truncated: token budget exhausted]\n")
+    }
+
+    /// Kills the `>` -> `>=` and `+` -> `*` mutants on the file-line
+    /// budget check: at exactly header + file line + marker tokens the
+    /// file line still fits, so it must be rendered. Note the file has
+    /// no `FileEntry` here: when its first symbol line does not fit,
+    /// `repo_map` breaks out before pushing the entry.
+    #[test]
+    fn budget_file_line_exact_fit_is_included() {
+        let dir = unique_dir("fileexact");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_file(&dir, "a.rs", "pub fn f() {}\n");
+        let budget = budget_at(token_cost("a.rs\n") + trunc_marker_tokens());
+        let map = repo_map(&dir, budget).expect("map");
+        assert!(
+            map.text().contains("a.rs"),
+            "exact-fit file line must be rendered, got:\n{}",
+            map.text()
+        );
+        assert!(
+            map.truncated,
+            "the symbol line no longer fits, so the map is truncated"
+        );
+        assert!(
+            map.text().contains("token budget exhausted"),
+            "truncation marker missing, got:\n{}",
+            map.text()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Kills the `+` -> `-` mutants on the file-line budget check: one
+    /// token below the exact fit the file line must not be rendered.
+    #[test]
+    fn budget_file_line_one_token_below_fit_is_truncated() {
+        let dir = unique_dir("filebelow");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_file(&dir, "a.rs", "pub fn f() {}\n");
+        let budget = budget_at(token_cost("a.rs\n") + trunc_marker_tokens()) - 1;
+        let map = repo_map(&dir, budget).expect("map");
+        assert!(
+            map.files.is_empty(),
+            "one token short, the file must be dropped: {}",
+            map.text()
+        );
+        assert!(
+            !map.text().contains("a.rs"),
+            "one token short, the file line must not be rendered: {}",
+            map.text()
+        );
+        assert!(map.truncated, "dropping the file must mark truncation");
+        assert!(
+            map.text().contains("token budget exhausted"),
+            "truncation marker missing, got:\n{}",
+            map.text()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Kills the `>` -> `>=` and `+` -> `*` mutants on the symbol-line
+    /// budget check: at exactly header + file line + symbol line +
+    /// marker tokens the symbol still fits, so the map is whole.
+    #[test]
+    fn budget_symbol_line_exact_fit_is_included() {
+        let dir = unique_dir("symexact");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_file(&dir, "a.rs", "pub fn f() {}\n");
+        let symbol_line = "  pub fn pub fn f() {}  # line 1, referenced in 0 file(s)\n";
+        let budget =
+            budget_at(token_cost("a.rs\n") + token_cost(symbol_line) + trunc_marker_tokens());
+        let map = repo_map(&dir, budget).expect("map");
+        assert_eq!(map.files.len(), 1, "file must be present");
+        assert_eq!(
+            map.files[0].symbols.len(),
+            1,
+            "exact-fit symbol line must be kept: {}",
+            map.text()
+        );
+        assert_eq!(map.files[0].symbols[0].name, "f");
+        assert!(
+            !map.truncated,
+            "exact fit means nothing is truncated, got:\n{}",
+            map.text()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Kills the `+` -> `-` mutants on the symbol-line budget check: one
+    /// token below the exact fit the symbol must be dropped while the
+    /// file line itself is still rendered.
+    #[test]
+    fn budget_symbol_line_one_token_below_fit_is_truncated() {
+        let dir = unique_dir("symbelow");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_file(&dir, "a.rs", "pub fn f() {}\n");
+        let symbol_line = "  pub fn pub fn f() {}  # line 1, referenced in 0 file(s)\n";
+        let budget =
+            budget_at(token_cost("a.rs\n") + token_cost(symbol_line) + trunc_marker_tokens()) - 1;
+        let map = repo_map(&dir, budget).expect("map");
+        assert!(
+            map.text().contains("a.rs"),
+            "file line still fits, got:\n{}",
+            map.text()
+        );
+        assert!(
+            !map.text().contains(symbol_line.trim_end()),
+            "one token short, the symbol must be dropped: {}",
+            map.text()
+        );
+        assert!(map.truncated, "dropping the symbol must mark truncation");
+        assert!(
+            map.text().contains("token budget exhausted"),
+            "truncation marker missing, got:\n{}",
+            map.text()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Kills the `+=` -> `*=` mutant reserving the file-cap marker: the
+    /// reserve is additive (truncation marker + file-cap marker), so a
+    /// budget of exactly header + file line + symbol line + both markers
+    /// still keeps the first file and its symbol.
+    #[test]
+    fn budget_file_cap_marker_reserve_is_additive() {
+        let dir = unique_dir("filecapreserve");
+        let _ = std::fs::remove_dir_all(&dir);
+        for i in 0..=MAX_FILES {
+            write_file(
+                &dir,
+                &format!("f{i:03}.rs"),
+                &format!("pub fn func_{i}() {{}}\n"),
+            );
+        }
+        let files_marker = format!("[map truncated: file limit reached (max {MAX_FILES} files)]\n");
+        // Longest symbol line wins: the first file can be any fNNN.rs,
+        // and a three-digit `func_NNN` costs one token more than `func_0`.
+        let symbol_line = "  pub fn pub fn func_499() {}  # line 1, referenced in 0 file(s)\n";
+        let budget = budget_at(
+            token_cost("f000.rs\n")
+                + token_cost(symbol_line)
+                + trunc_marker_tokens()
+                + token_cost(&files_marker),
+        );
+        let map = repo_map(&dir, budget).expect("map");
+        assert!(
+            !map.files.is_empty(),
+            "additive reserve must keep the first file: {}",
+            map.text()
+        );
+        assert!(
+            !map.files[0].symbols.is_empty(),
+            "first file must keep its symbol, got:\n{}",
+            map.text()
+        );
+        assert!(map.truncated, "file cap hit must mark the map truncated");
+        assert!(
+            map.text().contains("file limit"),
+            "file cap must emit a marker, got:\n{}",
+            map.text()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Kills the `+=` -> `*=` mutant reserving the line-cap marker: the
+    /// reserve is additive (truncation marker + line-cap marker), so a
+    /// budget of exactly header + file line + symbol line + both markers
+    /// still keeps the file and its first symbol.
+    #[test]
+    fn budget_line_cap_marker_reserve_is_additive() {
+        let dir = unique_dir("linecapreserve");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut src = String::from("pub fn first() {}\n");
+        for _ in 1..MAX_LINES_PER_FILE {
+            src.push_str("// filler\n");
+        }
+        src.push_str("pub fn beyond_cap() {}\n");
+        write_file(&dir, "long.rs", &src);
+        let lines_marker = format!("[map truncated: file exceeds {MAX_LINES_PER_FILE} lines]\n");
+        let symbol_line = "  pub fn pub fn first() {}  # line 1, referenced in 0 file(s)\n";
+        let budget = budget_at(
+            token_cost("long.rs\n")
+                + token_cost(symbol_line)
+                + trunc_marker_tokens()
+                + token_cost(&lines_marker),
+        );
+        let map = repo_map(&dir, budget).expect("map");
+        assert_eq!(map.files.len(), 1, "additive reserve must keep the file");
+        assert!(
+            map.files[0].symbols.iter().any(|s| s.name == "first"),
+            "first symbol must be kept, got:\n{}",
+            map.text()
+        );
+        assert!(map.truncated, "line cap hit must mark the map truncated");
+        assert!(
+            map.text().contains("4000 lines"),
+            "line cap must emit a marker, got:\n{}",
+            map.text()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Kills the `+` -> `-` mutant on the file-cap marker check
+    /// (repomap.rs:627): one token below header + file-cap marker the
+    /// marker must be omitted so the map stays within budget. The P2
+    /// test only checks the exact-fit case, where the mutant's
+    /// subtraction still passes the check and appends the same marker.
+    /// Here the subtraction (`header - files_tokens <= budget`) would
+    /// wrongly append a marker that pushes the map over budget.
+    #[test]
+    fn budget_file_cap_marker_one_token_below_fit_is_omitted() {
+        let dir = unique_dir("filemarkerbelow");
+        let _ = std::fs::remove_dir_all(&dir);
+        for i in 0..=MAX_FILES {
+            write_file(
+                &dir,
+                &format!("f{i:03}.rs"),
+                &format!("pub fn func_{i}() {{}}\n"),
+            );
+        }
+        let files_marker = format!("[map truncated: file limit reached (max {MAX_FILES} files)]\n");
+        let budget = budget_at(token_cost(&files_marker) - 1);
+        let map = repo_map(&dir, budget).expect("map");
+        assert!(map.truncated, "file cap hit must mark the map truncated");
+        assert!(
+            !map.text().contains("file limit"),
+            "one token short, the file-cap marker must be omitted: {}",
+            map.text()
+        );
+        assert!(
+            map.text().contains("token budget exhausted"),
+            "truncation marker missing, got:\n{}",
+            map.text()
+        );
+        let est = map.text().chars().count().div_ceil(4);
+        assert!(
+            est <= budget,
+            "map must fit its {budget}-token budget, got {est} estimated tokens:\n{}",
+            map.text()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Kills the `+` -> `-` mutant on the line-cap marker check
+    /// (repomap.rs:630): one token below header + line-cap marker the
+    /// marker must be omitted so the map stays within budget. The P2
+    /// test only checks the exact-fit case, where the mutant's
+    /// subtraction still passes the check and appends the same marker.
+    /// Here the subtraction (`header - lines_tokens <= budget`) would
+    /// wrongly append a marker that pushes the map over budget.
+    #[test]
+    fn budget_line_cap_marker_one_token_below_fit_is_omitted() {
+        let dir = unique_dir("linemarkerbelow");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut src = String::from("pub fn first() {}\n");
+        for _ in 1..MAX_LINES_PER_FILE {
+            src.push_str("// filler\n");
+        }
+        src.push_str("pub fn beyond_cap() {}\n");
+        write_file(&dir, "long.rs", &src);
+        let lines_marker = format!("[map truncated: file exceeds {MAX_LINES_PER_FILE} lines]\n");
+        let budget = budget_at(token_cost(&lines_marker) - 1);
+        let map = repo_map(&dir, budget).expect("map");
+        assert!(map.truncated, "line cap hit must mark the map truncated");
+        assert!(
+            !map.text().contains("4000 lines"),
+            "one token short, the line-cap marker must be omitted: {}",
+            map.text()
+        );
+        assert!(
+            map.text().contains("token budget exhausted"),
+            "truncation marker missing, got:\n{}",
+            map.text()
+        );
+        let est = map.text().chars().count().div_ceil(4);
+        assert!(
+            est <= budget,
+            "map must fit its {budget}-token budget, got {est} estimated tokens:\n{}",
+            map.text()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
