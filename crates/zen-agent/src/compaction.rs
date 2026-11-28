@@ -336,6 +336,21 @@ mod tests {
     }
 
     #[test]
+    fn serialize_conversation_skips_empty_user_text() {
+        // The user arm is guarded by `!text.is_empty()`: an empty (or
+        // whitespace-only, trimmed to empty) user message contributes no
+        // line to the transcript. Replacing the guard with `true` would
+        // emit a bare "[User]: " line and break this test.
+        let msgs = vec![
+            ChatMessage::user(""),
+            ChatMessage::user("   "),
+            ChatMessage::assistant(Some("hi".into()), None),
+        ];
+        let t = serialize_conversation(&msgs);
+        assert_eq!(t, "[Assistant]: hi", "empty user messages are skipped: {t}");
+    }
+
+    #[test]
     fn serialize_conversation_replaces_image_parts_with_placeholder() {
         let payload = "A".repeat(10_000);
         let msgs = vec![
