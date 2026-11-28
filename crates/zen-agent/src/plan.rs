@@ -139,17 +139,20 @@ fn window_is_valid(window: &[ChatMessage]) -> bool {
 
 pub fn ensure_tool_responses(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
     let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len());
-    let mut open_ids: Vec<String> = Vec::new();
+    // Open call ids paired with the index in `out` of the assistant message
+    // that opened them, so placeholders can be inserted right after it.
+    let mut open: Vec<(String, usize)> = Vec::new();
     for m in messages {
         if m.role == "assistant" {
+            let owner = out.len();
             out.push(m.clone());
             if let Some(calls) = &m.tool_calls {
-                open_ids.extend(calls.iter().map(|c| c.id.clone()));
+                open.extend(calls.iter().map(|c| (c.id.clone(), owner)));
             }
         } else if m.role == "tool" {
             let owns = m.tool_call_id.as_ref().and_then(|id| {
-                open_ids.iter().position(|o| o == id).map(|pos| {
-                    open_ids.remove(pos);
+                open.iter().position(|(o, _)| o == id).map(|pos| {
+                    open.remove(pos);
                     true
                 })
             });
@@ -161,11 +164,13 @@ pub fn ensure_tool_responses(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
         }
     }
 
-    for id in open_ids {
-        out.push(ChatMessage::tool(
-            id,
-            "[No response was recorded for this tool call.]",
-        ));
+    // Insert each placeholder directly after its owning assistant message,
+    // in reverse order so earlier insertion indices stay valid.
+    for (id, owner) in open.into_iter().rev() {
+        out.insert(
+            owner + 1,
+            ChatMessage::tool(id, "[No response was recorded for this tool call.]"),
+        );
     }
     out
 }
@@ -269,6 +274,52 @@ mod tests {
         let tail = safe_tail(&msgs, 2);
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].text_ref(), Some("later"));
+    }
+
+    #[test]
+    fn ensure_tool_responses_inserts_placeholder_after_owning_assistant() {
+        let msgs = vec![tool_call_msg("c1"), ChatMessage::user("...")];
+        let out = ensure_tool_responses(msgs);
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].role, "assistant");
+        assert_eq!(out[1].role, "tool");
+        assert_eq!(out[1].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(out[2].role, "user");
+        assert_eq!(out[2].text_ref(), Some("..."));
+    }
+
+    #[test]
+    fn ensure_tool_responses_keeps_placeholder_order_for_sibling_calls() {
+        let assistant = ChatMessage::assistant(
+            None,
+            Some(vec![
+                ToolCall {
+                    id: "c1".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "Read".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+                ToolCall {
+                    id: "c2".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "Read".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+            ]),
+        );
+        let msgs = vec![assistant, ChatMessage::user("later")];
+        let out = ensure_tool_responses(msgs);
+
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0].role, "assistant");
+        assert_eq!(out[1].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(out[2].tool_call_id.as_deref(), Some("c2"));
+        assert_eq!(out[3].role, "user");
     }
 
     #[test]
