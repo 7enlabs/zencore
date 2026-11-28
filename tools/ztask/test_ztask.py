@@ -817,6 +817,109 @@ class EvidenceATests(Base):
         self.assertEqual(self.store.task(tid)["state"], "DONE")
 
 
+class ApproveAtomicityTests(Base):
+    """Issue #428: approve's load + evidence check + append must be
+    atomic under the store write lock.
+
+    What these tests prove: while approve() is verifying the evidence,
+    the store write lock is held, so a concurrent writer cannot commit
+    a task change between the evidence check and the append. What they
+    do NOT prove: a true multi-process race with real timing (the window
+    is widened deterministically by blocking inside verify_evidence
+    instead), nor anything about artifact files changed out-of-band on
+    disk - files are not transactional, so an edit landing between the
+    in-transaction verify and the append is still invisible to the gate.
+    """
+
+    def _review_task(self):
+        tid = self.new_task()
+        tok = self.claim_start(tid, DEV)
+        self.store.submit(tid, DEV, tok, evidence=EV)
+        self.store.attest(tid, QA, command="c", receipt="r")
+        return tid
+
+    def _write_lock_free(self):
+        """True if a fresh connection can take BEGIN IMMEDIATE right now."""
+        conn = sqlite3.connect(self.path, timeout=0.2,
+                                isolation_level=None)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("ROLLBACK")
+            return True
+        except sqlite3.OperationalError:
+            return False
+        finally:
+            conn.close()
+
+    def test_approve_holds_write_lock_while_verifying(self):
+        tid = self._review_task()
+        real_verify = ztask.verify_evidence
+        seen = {}
+
+        def spy(evidence, base_dir=".", repo=None):
+            seen["lock_free"] = self._write_lock_free()
+            return real_verify(evidence, base_dir, repo)
+
+        with mock.patch.object(ztask, "verify_evidence", spy):
+            ev = self.store.approve(tid, LEADER)
+        self.assertEqual(ev["type"], "task.approved")
+        self.assertIn("lock_free", seen)
+        self.assertFalse(seen["lock_free"],
+                         "approve verified evidence without holding the "
+                         "store write lock (#428)")
+
+    def test_concurrent_drop_cannot_land_between_check_and_append(self):
+        tid = self._review_task()
+        entered = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        real_verify = ztask.verify_evidence
+
+        def blocking_verify(evidence, base_dir=".", repo=None):
+            entered.set()
+            self.assertTrue(release.wait(timeout=10),
+                            "approve test harness did not release verify")
+            return real_verify(evidence, base_dir, repo)
+
+        outcome = {}
+
+        def approver():
+            # Own Store: a sqlite3 connection cannot cross threads.
+            s = Store(self.path, now=self.clock, evidence_base=REPO)
+            try:
+                with mock.patch.object(ztask, "verify_evidence",
+                                       blocking_verify):
+                    outcome["ev"] = s.approve(tid, LEADER)
+            except Exception as e:  # noqa: BLE001 - captured for assertion
+                outcome["error"] = e
+            finally:
+                s.close()
+
+        t = threading.Thread(target=approver)
+        t.start()
+        self.assertTrue(entered.wait(timeout=10),
+                        "approve never reached verify_evidence")
+        # A concurrent leader drop must not commit while approve is
+        # mid-check: after the fix the store lock serialises it.
+        other = Store(self.path, now=self.clock, evidence_base=REPO)
+        other.conn.execute("PRAGMA busy_timeout=200")
+        drop_error = []
+        try:
+            other.drop(tid, LEADER, reason="superseded")
+        except Exception as e:  # noqa: BLE001 - captured for assertion
+            drop_error.append(e)
+        finally:
+            other.close()
+        release.set()
+        t.join(timeout=10)
+        self.assertFalse(t.is_alive(), "approve thread did not finish")
+        self.assertIn("ev", outcome,
+                      "approve failed: %r" % (outcome.get("error"),))
+        self.assertEqual(self.store.task(tid)["state"], "DONE")
+        self.assertEqual(len(drop_error), 1)
+        self.assertIsInstance(drop_error[0], sqlite3.OperationalError)
+
+
 class EvidenceConfinementTests(Base):
     """Issue #424: artifact paths confined to base_dir, no hash oracle,
     special / oversized files refused before reading.

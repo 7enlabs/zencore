@@ -1161,18 +1161,15 @@ class Store:
                 idem_key: Optional[str] = None) -> dict:
         """REVIEW -> DONE. Leader only. Gate (Evidence A): verified triple,
         verified_by never a claimer of the task, and the submitted evidence
-        re-checked now by verify_evidence() with verdict 'verified'."""
-        # Re-check evidence outside the write lock (it reads files and runs
-        # git). Skipped when not REVIEW so an idempotent replay still works;
-        # build() refuses a non-REVIEW task anyway.
-        checked = None
-        pre = self._load_task(task_id)
-        if pre["state"] == "REVIEW":
-            self._require_leader(actor, "approve DONE")
-            checked = (pre["evidence"],
-                       verify_evidence(pre["evidence"], self.evidence_base,
-                                       self.evidence_repo))
+        re-checked now by verify_evidence() with verdict 'verified'.
 
+        The load, the evidence verification and the append all run inside
+        _write()'s BEGIN IMMEDIATE transaction (#428): no concurrent
+        writer can change the task between the evidence check and the
+        append. The verification used to run outside the lock (it reads
+        files and runs git), with build() trusting the pre-computed
+        verdict whenever the evidence string was unchanged; that left
+        the check-then-act window open."""
         def build(pending, key, fp):
             self._require_leader(actor, "approve DONE")
             task = self._load_task(task_id)
@@ -1189,10 +1186,8 @@ class Store:
                 raise NotAllowed(
                     f"{task_id} was verified by {task['verified_by']}, who "
                     f"claimed it (no self-verify)")
-            if checked is None or checked[0] != task["evidence"]:
-                raise InvalidTransition(
-                    f"{task_id} evidence changed during approve; retry")
-            result = checked[1]
+            result = verify_evidence(task["evidence"], self.evidence_base,
+                                     self.evidence_repo)
             if result["verdict"] != VERIFIED:
                 bad = "; ".join(c["detail"] for c in result["checks"]
                                 if c["result"] != VERIFIED)
