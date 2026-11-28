@@ -1186,11 +1186,17 @@ pub(crate) fn cached_page(session_key: &str) -> Option<CachedPage> {
 
 pub(crate) fn update_cached_page(session_key: &str, url: String, has_password: bool) {
     let host = crate::builtin::url_host_port(&url).0;
-    let mut cache = PAGE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    let entry = cache.entry(session_key.to_string()).or_default();
-    entry.url = url;
-    entry.host = host;
-    entry.has_password_field = has_password;
+    // Never hold PAGE_CACHE while locking LAST_ACTIVE: the readers
+    // (current_browser_host / current_browser_has_password /
+    // classify_current_browser_call) take the locks in the opposite
+    // order, and holding both at once deadlocked (PR #580 CI timeouts).
+    {
+        let mut cache = PAGE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = cache.entry(session_key.to_string()).or_default();
+        entry.url = url;
+        entry.host = host;
+        entry.has_password_field = has_password;
+    }
     let mut last = LAST_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
     *last = Some(session_key.to_string());
 }
@@ -1226,15 +1232,24 @@ pub(crate) fn selector_flags_for(session_key: &str, selector: &str) -> Option<Se
 /// Host of the most recently active browser session, for permission
 /// prompts and host-scoped rules. Empty when no session exists yet.
 pub fn current_browser_host() -> Option<String> {
-    let last = LAST_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let key = last.clone()?;
+    // Drop LAST_ACTIVE before cached_page locks PAGE_CACHE:
+    // update_cached_page takes the locks in the opposite order.
+    let key = {
+        let last = LAST_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+        last.clone()?
+    };
     cached_page(&key).map(|c| c.host)
 }
 
 pub fn current_browser_has_password() -> bool {
-    let last = LAST_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(key) = last.clone() else {
-        return false;
+    // Drop LAST_ACTIVE before cached_page locks PAGE_CACHE:
+    // update_cached_page takes the locks in the opposite order.
+    let key = {
+        let last = LAST_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(key) = last.clone() else {
+            return false;
+        };
+        key
     };
     cached_page(&key)
         .map(|c| c.has_password_field)
@@ -1340,8 +1355,12 @@ pub(crate) fn classify_browser_call(
 /// the last-active session key. The permission gate itself passes the
 /// caller session key explicitly.
 pub(crate) fn classify_current_browser_call(tool_name: &str, input: &Value) -> (GateMark, bool) {
-    let last = LAST_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let key = last.clone().unwrap_or_else(|| "default".to_string());
+    // Drop LAST_ACTIVE before classify_browser_call locks PAGE_CACHE:
+    // update_cached_page takes the locks in the opposite order.
+    let key = {
+        let last = LAST_ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+        last.clone().unwrap_or_else(|| "default".to_string())
+    };
     classify_browser_call(tool_name, input, &key)
 }
 
@@ -2610,6 +2629,43 @@ mod tests {
     }
 
     #[test]
+    fn page_cache_concurrent_readers_and_writers_do_not_deadlock() {
+        // Regression test for the PR #580 CI mutant timeouts: the suite
+        // stalled (killed at the 5x-baseline cap) with only the
+        // suggested-rule tests uncompleted. Root cause was a lock-order
+        // inversion: current_browser_host / current_browser_has_password /
+        // classify_current_browser_call held LAST_ACTIVE while locking
+        // PAGE_CACHE (via cached_page / record_gate_mark), while
+        // update_cached_page locked PAGE_CACHE first and LAST_ACTIVE
+        // second. Two threads hammering both sides deadlocked within
+        // milliseconds on the old code; the recv_timeout below turns a
+        // regression into a failure instead of hanging the suite.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let writer = std::thread::spawn(|| {
+                for i in 0..5000 {
+                    update_cached_page("deadlock-key", format!("https://example.com/{i}"), false);
+                }
+            });
+            let reader = std::thread::spawn(|| {
+                for _ in 0..5000 {
+                    let _ = current_browser_host();
+                    let _ = current_browser_has_password();
+                    let _ =
+                        classify_current_browser_call(BROWSER_CLICK, &json!({"selector": "#ok"}));
+                }
+            });
+            let _ = writer.join();
+            let _ = reader.join();
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "page-cache readers/writers deadlocked (lock-order inversion)"
+        );
+    }
+
+    #[test]
     fn selector_flags_round_trip() {
         let flags = SelectorFlags {
             is_password_field: true,
@@ -2795,14 +2851,19 @@ mod tests {
         // /tmp branch kept the '/' because PathBuf::join does not
         // convert it on Windows.
         let tmp = std::env::temp_dir();
-        let mixed = format!("{}\\zen-browser-which-1/chromium", tmp.display());
-        assert_eq!(
-            normalize_msys_path(&mixed),
-            format!("{}\\zen-browser-which-1\\chromium", tmp.display())
+        let expected = tmp
+            .join("zen-browser-which-1")
+            .join("chromium")
+            .to_string_lossy()
+            .into_owned();
+        let mixed = expected.replace(
+            "zen-browser-which-1\\chromium",
+            "zen-browser-which-1/chromium",
         );
+        assert_eq!(normalize_msys_path(&mixed), expected);
         assert_eq!(
             normalize_msys_path("/tmp/zen-browser-which-1/chromium"),
-            format!("{}\\zen-browser-which-1\\chromium", tmp.display())
+            expected
         );
         assert_eq!(
             normalize_msys_path("/c/Windows/chromium"),
