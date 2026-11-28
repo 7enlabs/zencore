@@ -1,5 +1,6 @@
 """Unit tests for scripts/floor_guard.py (stdlib unittest)."""
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -122,6 +123,48 @@ class Ratchet(unittest.TestCase):
 
     def test_tokio_test_counted(self):
         self.assertEqual(len(fg.TEST_FN.findall("#[tokio::test]\n#[test]\n#[testing]")), 2)
+
+    def make_raw(self, tests, baseline_text):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / "crates/a/src").mkdir(parents=True)
+        (d / "crates/a/src/lib.rs").write_text("#[test]\nfn t(){}\n" * tests, encoding="utf-8")
+        (d / "ci").mkdir()
+        (d / "ci/floor-baseline.json").write_text(baseline_text, encoding="utf-8")
+        return d
+
+    def test_string_floor_reports_finding_not_crash(self):
+        found, _ = fg.check_ratchet(self.make_raw(2, '{"min_rust_tests": "100"}'))
+        self.assertEqual(found[0].rule, "R1")
+        self.assertIn("not an integer", found[0].msg)
+
+    def test_float_floor_reports_finding_not_crash(self):
+        found, _ = fg.check_ratchet(self.make_raw(2, '{"min_rust_tests": 100.5}'))
+        self.assertEqual(found[0].rule, "R1")
+        self.assertIn("not an integer", found[0].msg)
+
+    def test_list_floor_reports_finding_not_crash(self):
+        found, _ = fg.check_ratchet(self.make_raw(2, '{"min_rust_tests": [100]}'))
+        self.assertEqual(found[0].rule, "R1")
+        self.assertIn("not an integer", found[0].msg)
+
+    def test_dict_floor_reports_finding_not_crash(self):
+        found, _ = fg.check_ratchet(self.make_raw(2, '{"min_rust_tests": {"v": 100}}'))
+        self.assertEqual(found[0].rule, "R1")
+        self.assertIn("not an integer", found[0].msg)
+
+    def test_bool_floor_reports_finding_not_crash(self):
+        found, _ = fg.check_ratchet(self.make_raw(2, '{"min_rust_tests": true}'))
+        self.assertEqual(found[0].rule, "R1")
+        self.assertIn("not an integer", found[0].msg)
+
+    def test_non_object_baseline_reports_finding_not_crash(self):
+        found, _ = fg.check_ratchet(self.make_raw(2, '[100]'))
+        self.assertEqual(found[0].rule, "R1")
+
+    def test_invalid_json_baseline_reports_finding_not_crash(self):
+        found, _ = fg.check_ratchet(self.make_raw(2, '{not json'))
+        self.assertEqual(found[0].rule, "R1")
 
 
 class Labels(unittest.TestCase):

@@ -209,9 +209,16 @@ def check_ratchet(root: Path) -> tuple[list[Finding], str]:
     path = root / BASELINE
     if not path.exists():
         return [Finding("R1", BASELINE, 0, "baseline file missing")], ""
-    base = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        base = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        return [Finding("R1", BASELINE, 0, f"baseline is not valid JSON: {e}")], ""
+    if not isinstance(base, dict):
+        return [Finding("R1", BASELINE, 0, "baseline is not a JSON object")], ""
+    want = base.get("min_rust_tests", 0)
+    if isinstance(want, bool) or not isinstance(want, int):
+        return [Finding("R1", BASELINE, 0, "baseline min_rust_tests is not an integer")], ""
     have = count_rust_tests(root)
-    want = int(base.get("min_rust_tests", 0))
     if have < want:
         return [Finding("R1", "crates/", 0, f"Rust tests fell to {have}, floor is {want}")], ""
     note = ""
