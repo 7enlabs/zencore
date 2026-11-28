@@ -331,17 +331,139 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {
     }
 }
 
+/// Unquote a git C-style quoted path (`core.quotePath`, on by default):
+/// `"caf\303\251.rs"` is `café.rs`. Returns `None` when the token is not
+/// a well-formed quoted string.
+fn unquote_git_path(token: &str) -> Option<String> {
+    let inner = token.strip_prefix('"')?.strip_suffix('"')?;
+    let bytes = inner.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    // The scan consumes the input through an iterator, never through a
+    // hand-rolled index: every `next()` moves forward by construction,
+    // so no single arithmetic step can stall the loop. (The previous
+    // index version hung forever under the `i += 1` -> `i -= 1` mutant
+    // at the plain-byte step whenever an escape was followed by a plain
+    // byte, e.g. `"\1234"`: the index walked back onto the backslash
+    // and re-decoded the same escape on every pass.)
+    let mut iter = bytes.iter().copied().peekable();
+    while let Some(byte) = iter.next() {
+        if byte != b'\\' {
+            out.push(byte);
+            continue;
+        }
+        let esc = iter.next()?;
+        match esc {
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(0x0b),
+            b'\\' => out.push(b'\\'),
+            b'"' => out.push(b'"'),
+            b'0'..=b'7' => {
+                let mut value: u16 = (esc - b'0') as u16;
+                for _ in 0..2 {
+                    let Some(&digit) = iter.peek() else { break };
+                    if !(b'0'..=b'7').contains(&digit) {
+                        break;
+                    }
+                    value = value * 8 + (digit - b'0') as u16;
+                    iter.next();
+                }
+                if value > u8::MAX as u16 {
+                    return None;
+                }
+                out.push(value as u8);
+            }
+            _ => return None,
+        }
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Strip the `a/` or `b/` prefix from one side of a `diff --git` header,
+/// unquoting first when the side is C-style quoted. Returns `None` when
+/// the side is malformed.
+fn diff_git_side_path(side: &str, prefix: &str) -> Option<String> {
+    if side.starts_with('"') {
+        unquote_git_path(side)?
+            .strip_prefix(prefix)
+            .map(str::to_string)
+    } else {
+        side.strip_prefix(prefix).map(str::to_string)
+    }
+}
+
+/// Split the remainder of a `diff --git` header line into its a-side and
+/// b-side paths.
+///
+/// Issue #464: splitting the header on spaces silently dropped filenames
+/// with spaces and kept git-quoted non-ASCII filenames verbatim (quotes
+/// and octal escapes included). The separator between the two sides is
+/// ` b/` for plain paths and ` "b/` when the b-side is quoted. For the
+/// common non-rename case both sides are the same path, so the split
+/// where the two sides agree is exact even when a side contains spaces
+/// or a literal ` b/`; otherwise the first plausible separator is the
+/// rename split. (A rename whose a-side itself contains ` b/` stays
+/// ambiguous in the header alone; `changed_files_from_diff` resolves
+/// it from the `rename to` line instead.)
+fn split_diff_git_header(rest: &str) -> Option<(String, String)> {
+    let mut separators: Vec<usize> = rest.match_indices(" b/").map(|(i, _)| i).collect();
+    separators.extend(rest.match_indices(" \"b/").map(|(i, _)| i));
+    separators.sort_unstable();
+    separators.dedup();
+    let mut fallback = None;
+    for i in separators {
+        let a = diff_git_side_path(&rest[..i], "a/");
+        let b = diff_git_side_path(&rest[i + 1..], "b/");
+        let Some((a, b)) = a.zip(b) else { continue };
+        if a == b {
+            return Some((a, b));
+        }
+        if fallback.is_none() {
+            fallback = Some((a, b));
+        }
+    }
+    fallback
+}
+
+/// Read the destination of a rename from the `rename to` line git emits
+/// under a `diff --git` header. The header alone is ambiguous when the
+/// old path itself contains ` b/` (for example renaming
+/// `old b/part.rs` to `name.rs`), but the `rename to` line carries the
+/// destination path verbatim, so it is the unambiguous source. The
+/// value is unquoted when git C-style quoted it. Returns `None` when
+/// the section has no rename.
+fn rename_to_path(lines: &[&str], header: usize) -> Option<String> {
+    // The section is scanned with iterators, never with a hand-rolled
+    // index: `skip` + `take_while` bound the scan by construction, so
+    // no single arithmetic step can stall the loop. (The previous
+    // `while` version hung forever under the `i += 1` -> `i *= 1`
+    // mutant on any section line that is neither `rename to` nor the
+    // next `diff --git` header, e.g. `similarity index 100%`.)
+    lines
+        .iter()
+        .skip(header + 1)
+        .take_while(|line| !line.starts_with("diff --git "))
+        .find_map(|line| line.strip_prefix("rename to "))
+        .map(|path| unquote_git_path(path).unwrap_or_else(|| path.to_string()))
+}
+
 fn changed_files_from_diff(diff: &str) -> Vec<String> {
     let mut files = Vec::new();
-    for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git ") {
-            let parts: Vec<&str> = rest.split(' ').collect();
-            if parts.len() == 2 {
-                let b = parts[1].strip_prefix("b/").unwrap_or(parts[1]);
-                if !files.contains(&b.to_string()) {
-                    files.push(b.to_string());
-                }
-            }
+    let lines: Vec<&str> = diff.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(rest) = line.strip_prefix("diff --git ") else {
+            continue;
+        };
+        let file =
+            rename_to_path(&lines, i).or_else(|| split_diff_git_header(rest).map(|(_, b)| b));
+        if let Some(file) = file
+            && !files.contains(&file)
+        {
+            files.push(file);
         }
     }
     files
@@ -1503,5 +1625,187 @@ mod tests {
         let p = build_review_prompt(&diff);
         assert!(p.contains("a.rs"));
         assert!(p.contains("```diff"));
+    }
+
+    // Issue #464: filenames with spaces and git-quoted non-ASCII
+    // filenames must not be silently dropped from the file list.
+    #[test]
+    fn changed_files_from_diff_keeps_spaced_and_quoted_paths() {
+        let diff = "diff --git a/my file.rs b/my file.rs\n--- a/my file.rs\n+++ b/my file.rs\n\
+             diff --git \"a/caf\\303\\251.rs\" \"b/caf\\303\\251.rs\"\n\
+             diff --git \"a/my caf\\303\\251.rs\" \"b/my caf\\303\\251.rs\"\n\
+             diff --git a/plain.rs b/plain.rs\n";
+        assert_eq!(
+            changed_files_from_diff(diff),
+            vec!["my file.rs", "café.rs", "my café.rs", "plain.rs"]
+        );
+    }
+
+    #[test]
+    fn changed_files_from_diff_uses_b_side_on_rename_with_spaces() {
+        let diff = "diff --git a/old name.rs b/new name.rs\n";
+        assert_eq!(changed_files_from_diff(diff), vec!["new name.rs"]);
+    }
+
+    // Mutant-kill tests for unquote_git_path (#464, PR #575). Each
+    // escape arm below must decode to its control character; deleting
+    // any single arm makes its test fail, because the escape then
+    // falls through to `_ => return None`.
+    #[test]
+    fn unquote_git_path_bell_escape() {
+        assert_eq!(unquote_git_path("\"\\a\""), Some("\u{7}".to_string()));
+    }
+
+    #[test]
+    fn unquote_git_path_backspace_escape() {
+        assert_eq!(unquote_git_path("\"\\b\""), Some("\u{8}".to_string()));
+    }
+
+    #[test]
+    fn unquote_git_path_form_feed_escape() {
+        assert_eq!(unquote_git_path("\"\\f\""), Some("\u{c}".to_string()));
+    }
+
+    #[test]
+    fn unquote_git_path_newline_escape() {
+        assert_eq!(unquote_git_path("\"\\n\""), Some("\n".to_string()));
+    }
+
+    #[test]
+    fn unquote_git_path_carriage_return_escape() {
+        assert_eq!(unquote_git_path("\"\\r\""), Some("\r".to_string()));
+    }
+
+    #[test]
+    fn unquote_git_path_tab_escape() {
+        assert_eq!(unquote_git_path("\"\\t\""), Some("\t".to_string()));
+    }
+
+    #[test]
+    fn unquote_git_path_vertical_tab_escape() {
+        assert_eq!(unquote_git_path("\"\\v\""), Some("\u{b}".to_string()));
+    }
+
+    #[test]
+    fn unquote_git_path_backslash_escape() {
+        assert_eq!(unquote_git_path("\"\\\\\""), Some("\\".to_string()));
+    }
+
+    #[test]
+    fn unquote_git_path_quote_escape() {
+        assert_eq!(unquote_git_path("\"\\\"\""), Some("\"".to_string()));
+    }
+
+    // Octal escapes: the exact accumulated value matters. `\101` is
+    // 'A' only when `value * 8 + digit` is computed exactly, so this
+    // kills both `+` -> `-` and `+` -> `*` on the accumulation step.
+    #[test]
+    fn unquote_git_path_octal_101_is_capital_a() {
+        assert_eq!(unquote_git_path("\"\\101\""), Some("A".to_string()));
+    }
+
+    #[test]
+    fn unquote_git_path_octal_cafe_escapes_are_exact() {
+        assert_eq!(unquote_git_path("\"\\303\\251\""), Some("é".to_string()));
+    }
+
+    // Only three octal digits are consumed: `\123` is 'S' and the
+    // trailing `4` stays a literal character. With `count <= 3` the
+    // fourth digit is consumed instead, giving 668 > 255, so the
+    // mutant returns `None`.
+    #[test]
+    fn unquote_git_path_octal_stops_after_three_digits() {
+        assert_eq!(unquote_git_path("\"\\1234\""), Some("S4".to_string()));
+    }
+
+    // 0o377 == 255 is the largest valid octal byte. With `>=` the
+    // mutant rejects it and returns `None`; the lone 0xFF byte
+    // decodes lossy to U+FFFD.
+    #[test]
+    fn unquote_git_path_octal_377_is_allowed() {
+        assert_eq!(unquote_git_path("\"\\377\""), Some("\u{fffd}".to_string()));
+    }
+
+    // 0o400 == 256 and 0o777 == 511 overflow a byte and must return
+    // `None`. With `==` instead of `>` the mutant only rejects
+    // exactly 255, so both of these leak through as `Some`.
+    #[test]
+    fn unquote_git_path_octal_overflow_returns_none() {
+        assert_eq!(unquote_git_path("\"\\400\""), None);
+        assert_eq!(unquote_git_path("\"\\777\""), None);
+    }
+
+    // split_diff_git_header: a non-rename path containing a literal
+    // ` b/` must take the early `a == b` return with the exact pair.
+    // With `!=` the mutant returns the first (wrong) fallback pair
+    // instead, because the equal pair no longer returns early.
+    #[test]
+    fn split_diff_git_header_non_rename_path_with_b_slash_returns_exact_pair() {
+        assert_eq!(
+            split_diff_git_header("a/my b/file.rs b/my b/file.rs"),
+            Some(("my b/file.rs".to_string(), "my b/file.rs".to_string()))
+        );
+    }
+
+    // Z Tester review of PR #575 (P2): renaming `old b/part.rs` to
+    // `name.rs` returned "part.rs b/name.rs" because the first " b/"
+    // inside the old path was taken as the header separator. The
+    // `rename to` line carries the destination verbatim, so it is the
+    // unambiguous source for the renamed file.
+    #[test]
+    fn changed_files_from_diff_uses_rename_to_when_old_path_contains_b_slash() {
+        let diff = "diff --git a/old b/part.rs b/name.rs\n\
+             similarity index 100%\n\
+             rename from old b/part.rs\n\
+             rename to name.rs\n";
+        assert_eq!(changed_files_from_diff(diff), vec!["name.rs"]);
+    }
+
+    #[test]
+    fn changed_files_from_diff_unquotes_rename_to_path() {
+        let diff = "diff --git \"a/old b/caf\\303\\251.rs\" \"b/new caf\\303\\251.rs\"\n\
+             similarity index 100%\n\
+             rename from \"old b/caf\\303\\251.rs\"\n\
+             rename to \"new caf\\303\\251.rs\"\n";
+        assert_eq!(changed_files_from_diff(diff), vec!["new café.rs"]);
+    }
+
+    // Timeout-mutant regressions (PR #575, CI shards 4 and 7). The
+    // old index loops hung forever instead of failing when a single
+    // increment was mutated, so these inputs are the regression net:
+    // they complete in milliseconds on the iterator scan, and they
+    // hang the old code (verified by fault injection with `timeout`).
+    #[test]
+    fn unquote_git_path_escape_followed_by_plain_bytes() {
+        // `i += 1` -> `i -= 1` at the plain-byte step walked the index
+        // back onto the backslash and re-decoded the same escape.
+        assert_eq!(unquote_git_path("\"\\tAB\""), Some("\tAB".to_string()));
+        assert_eq!(unquote_git_path("\"\\101b\""), Some("Ab".to_string()));
+    }
+
+    #[test]
+    fn changed_files_from_diff_non_rename_section_with_body_lines() {
+        // `i += 1` -> `i *= 1` in `rename_to_path` stalled on the
+        // first body line (`index ...`), which is neither `rename to`
+        // nor the next header.
+        let diff = "diff --git a/a.rs b/a.rs\n\
+             index 1111111..2222222 100644\n\
+             --- a/a.rs\n\
+             +++ b/a.rs\n\
+             @@ -1 +1 @@\n\
+             -old\n\
+             +new\n";
+        assert_eq!(changed_files_from_diff(diff), vec!["a.rs"]);
+    }
+
+    #[test]
+    fn changed_files_from_diff_rename_section_without_rename_to() {
+        // A rename header with no `rename to` line: the scan must reach
+        // the end of the section and fall back to the header's b-side
+        // instead of stalling on `similarity index`.
+        let diff = "diff --git a/old.rs b/new.rs\n\
+             similarity index 100%\n\
+             rename from old.rs\n";
+        assert_eq!(changed_files_from_diff(diff), vec!["new.rs"]);
     }
 }
