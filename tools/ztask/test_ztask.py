@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import ztask  # noqa: E402
 from ztask import (  # noqa: E402
     AhoCorasick, IdempotencyConflict, InvalidTransition, NotAllowed,
-    SecretDetected, Store, TamperEvident, ZtaskError,
+    NotFound, SecretDetected, Store, TamperEvident, ZtaskError,
 )
 
 LEADER = "ZC Leader"
@@ -641,6 +641,32 @@ class SafetyAndOpsTests(Base):
         self.assertEqual(len(self.store.outbox()), len(pending) - 1)
         self.assertEqual(len(self.store.outbox(pending_only=False)),
                          len(pending))
+
+    def test_ack_nonexistent_id_raises(self):
+        with self.assertRaises(NotFound):
+            self.store.ack(9999)
+
+    def test_ack_already_delivered_raises(self):
+        tid = self.new_task()
+        tok = self.claim_start(tid)
+        self.store.submit(tid, DEV, tok, evidence="e")
+        pending = self.store.outbox()
+        self.assertTrue(pending)
+        self.store.ack(pending[0]["id"])
+        with self.assertRaises(NotFound):
+            self.store.ack(pending[0]["id"])
+
+    def test_cli_ack_nonexistent_id_errors(self):
+        def run(*argv):
+            out = io.StringIO()
+            err = io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = ztask.main(["--db", self.path, *argv])
+            return rc, out.getvalue(), err.getvalue()
+
+        rc, _out, err = run("ack", "9999")
+        self.assertEqual(rc, 1)
+        self.assertEqual(json.loads(err)["error"], "not_found")
 
     def test_deadline_and_aging_escalation(self):
         tid = self.new_task(deadline="2026-10-28T12:00:00Z")

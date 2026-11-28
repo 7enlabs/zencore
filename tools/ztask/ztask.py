@@ -780,9 +780,16 @@ class Store:
             "SELECT * FROM outbox ORDER BY id")]
 
     def ack(self, outbox_id: int) -> None:
-        self.conn.execute(
+        cur = self.conn.execute(
             "UPDATE outbox SET delivered_at=? WHERE id=? AND "
             "delivered_at IS NULL", (fmt_time(self.now()), outbox_id))
+        if cur.rowcount == 0:
+            row = self.conn.execute(
+                "SELECT delivered_at FROM outbox WHERE id=?",
+                (outbox_id,)).fetchone()
+            if row is None:
+                raise NotFound(f"no outbox entry {outbox_id}")
+            raise NotFound(f"outbox entry {outbox_id} already delivered")
 
     # -- write core ---------------------------------------------------------
 
