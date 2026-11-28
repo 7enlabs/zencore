@@ -50,6 +50,9 @@ Modes:
     hang_first_list_then_refuse - first list hangs, and any later spawn
                       exits immediately at startup (reconnect-failure
                       aid: the client must report "reconnect failed")
+    slow_init         - like ok, but waits 5 s before answering initialize
+                      (regression aid for zencore #403: kill() during a
+                      slow connect must not leak the fresh session)
 """
 
 import sys
@@ -171,6 +174,9 @@ for line in sys.stdin:
 
     if method == "initialize":
         params = msg.get("params") or {}
+        if mode == "slow_init":
+            # Hold the handshake open so the test can kill() mid-connect.
+            time.sleep(5)
         # Echo back whatever protocol version the client asked for so the two
         # sides always agree (the MRTR/tasks results are gated on the
         # negotiated version).
