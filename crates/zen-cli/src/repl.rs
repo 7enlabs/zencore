@@ -1579,1177 +1579,1479 @@ async fn handle_slash(
     let mut it = line.splitn(2, char::is_whitespace);
     let cmd = it.next().unwrap_or("").to_string();
     let arg = it.next().unwrap_or("").trim().to_string();
-
     match cmd.as_str() {
-        "/exit" | "/quit" => return Ok(LineAction::Exit),
-        "/help" => {
-            println!("Built-in commands:");
-            let catalog = commands::slash_command_catalog();
-            for group in commands::HELP_GROUP_ORDER {
-                println!("{}", repl.theme.paint(repl_polish::ColorRole::Dim, group));
-                for (name, desc) in &catalog {
-                    if commands::help_group(name) == *group {
-                        println!("  {:<16} {}", name, desc);
-                    }
-                }
-            }
+        "/exit" | "/quit" => Ok(LineAction::Exit),
+        "/help" => slash_help(cwd, home, cfg, repl).await,
+        "/clear" => slash_clear(cli, cwd, cfg, repl, agent, session_id).await,
+        "/compact" => slash_compact(cwd, cfg, agent, session_id, &arg).await,
+        "/model" => slash_model(cwd, home, cfg, repl, agent, &arg).await,
+        "/provider" => slash_provider(cwd, home, cfg, repl, agent, &arg).await,
+        "/btw" => slash_btw(cfg, agent, &arg).await,
+        "/cost" => slash_cost(cfg, agent).await,
+        "/flightdeck" => slash_flightdeck(repl).await,
+        "/quota" => slash_quota(home, cfg).await,
+        "/commit" => slash_commit(cwd, &arg).await,
+        "/worktree" => slash_worktree(cwd, cfg, agent, session_id, &arg).await,
+        "/context" => slash_context(cwd, home, cfg, agent).await,
+        "/expand" => slash_expand(repl, &arg).await,
+        "/undo" => slash_undo(repl, agent, &arg).await,
+        "/diff" => slash_diff(cwd, repl, &arg).await,
+        "/terse" => slash_terse(agent).await,
+        "/add-dir" => slash_add_dir(cwd, agent, &arg).await,
+        "/done" => slash_done(cwd, repl, agent).await,
+        "/scope" => slash_scope(cwd, repl, agent, &arg).await,
+        "/export" => slash_export(cwd, agent, session_id, &arg).await,
+        "/rename" => slash_rename(repl, session_id, &arg).await,
+        "/loop" => slash_loop(repl, agent, &arg).await,
+        "/goal" => slash_goal(repl, &arg).await,
+        "/personality" => slash_personality(repl, agent, &arg).await,
+        "/vim" => slash_vim(repl).await,
+        "/theme" => slash_theme(repl, &arg).await,
+        "/review" | "/init" => {
+            slash_review_init(
+                SlashCtx {
+                    cli,
+                    cwd,
+                    home,
+                    cfg,
+                    repl,
+                    agent,
+                },
+                &arg,
+                &cmd,
+                line,
+            )
+            .await
+        }
+        "/map" => slash_map(cli, cwd).await,
+        "/map-refresh" => slash_map_refresh(cli, cwd).await,
+        "/deep-research" => slash_deep_research(repl, agent, &arg).await,
+        "/pr_comments" => slash_pr_comments(cwd, cfg, repl, agent, &arg).await,
+        "/ci-fix" => slash_ci_fix(cwd, cfg, repl, agent).await,
+        "/status" => slash_status(cli, cfg, repl, agent, session_id).await,
+        "/plan" => slash_plan(repl, agent).await,
+        "/permissions" => slash_permissions(cfg).await,
+        "/config" => slash_config(cwd, cfg, agent, &arg).await,
+        "/memory" => slash_memory(cwd, home, cfg).await,
+        "/memories" => slash_memories(cwd, home, cfg).await,
+        "/todos" => slash_todos(agent).await,
+        "/agents" => slash_agents(cli, cwd, home).await,
+        "/mcp" => slash_mcp(repl).await,
+        "/hooks" => slash_hooks(cfg).await,
+        "/skills" => slash_skills(cwd, home, cfg).await,
+        "/resume" | "/continue" => slash_resume_continue(cli, cwd, home, repl, agent, &arg).await,
+        "/recall" => slash_recall(cli, cwd, home, agent, session_id, &arg).await,
+        other => {
+            slash_custom_command(
+                SlashCtx {
+                    cli,
+                    cwd,
+                    home,
+                    cfg,
+                    repl,
+                    agent,
+                },
+                session_id,
+                line,
+                other,
+            )
+            .await
+        }
+    }
+}
 
-            let custom = zen_ext::discover_slash_commands(cwd, home, cfg.folder_trusted);
-            if !custom.is_empty() {
-                println!("Custom commands and skills:");
-                for c in &custom {
-                    match &c.description {
-                        Some(d) => println!("  /{}  {}", c.name, d),
-                        None => println!("  /{}", c.name),
-                    }
-                }
-            }
-        }
-        "/clear" => {
-            // Core-perfect phase 2 (B6): clearing drops the in-memory
-            // conversation. Ask first on a terminal; piped input keeps
-            // the old behaviour (a scripted /clear must not eat the
-            // next scripted line as its answer).
-            if !agent.messages().is_empty()
-                && std::io::IsTerminal::is_terminal(&std::io::stdin())
-                && !prompt_yes_no(
-                    "Clear the conversation and start a new session? The transcript stays on disk and can be resumed with /resume.",
-                )
-            {
-                println!("Kept the current conversation.");
-                return Ok(LineAction::Continue);
-            }
-            crate::agent_run::run_session_end(&agent.hooks, session_id, cwd, cfg, "clear").await;
-            agent.set_messages(vec![]);
+/// The REPL state shared by slash handlers that need most of it.
+/// Issue #593: bundling keeps `slash_review_init` and
+/// `slash_custom_command` under clippy's seven-argument limit without
+/// changing what they receive; handlers that need less keep explicit
+/// parameters.
+struct SlashCtx<'a, 'r> {
+    cli: &'a Cli,
+    cwd: &'a Path,
+    home: Option<&'a Path>,
+    cfg: &'a mut crate::settings::ResolvedConfig,
+    repl: &'a mut ReplState<'r>,
+    agent: &'a mut zen_agent::Agent,
+}
 
-            let new_id = crate::session::new_session_id();
-            if cli.ephemeral {
-                agent.ctx.session_dir = None;
-                *repl.writer = crate::session::TranscriptWriter::ephemeral(&new_id, cwd);
-            } else {
-                let path = repl
-                    .writer
-                    .path
-                    .as_ref()
-                    .expect("non-ephemeral writer always has a path")
-                    .with_file_name(format!("{}.jsonl", new_id));
-                agent.ctx.session_dir = Some(crate::session::session_scratch_dir(&path));
-                if let Some(r) = &repl.recorder {
-                    r.set_path(path.clone());
-                }
-                *repl.writer = crate::session::TranscriptWriter::new(path, &new_id, cwd);
-            }
-            *repl.session_id = new_id.clone();
-            agent.ctx.session_id = new_id.clone();
-            repl.goal = None;
-            repl_session_start(agent, &new_id, cwd, cfg, "clear").await;
-            println!("context cleared, new session: {}", new_id);
-        }
-        "/compact" => {
-            let focus = if arg.is_empty() {
-                None
-            } else {
-                Some(arg.as_str())
-            };
-            match agent.compact(focus, "manual").await {
-                Ok(()) => {
-                    println!("context compacted");
-                    repl_session_start(agent, session_id, cwd, cfg, "compact").await;
-                }
-                Err(e) => eprintln!("compact failed: {}", e),
+async fn slash_help(
+    cwd: &Path,
+    home: Option<&Path>,
+    cfg: &mut crate::settings::ResolvedConfig,
+    repl: &mut ReplState<'_>,
+) -> Result<LineAction> {
+    println!("Built-in commands:");
+    let catalog = commands::slash_command_catalog();
+    for group in commands::HELP_GROUP_ORDER {
+        println!("{}", repl.theme.paint(repl_polish::ColorRole::Dim, group));
+        for (name, desc) in &catalog {
+            if commands::help_group(name) == *group {
+                println!("  {:<16} {}", name, desc);
             }
         }
-        "/model" => {
-            let (rows, stale_warning) = available_model_rows(home, &cfg.base_url);
-            // Core-perfect phase 2 (B2): keep the listed rows for
-            // Tab completion of the /model argument.
-            repl.model_rows = rows
-                .iter()
-                .map(|r| (r.short.clone(), r.provider.clone(), r.id.clone()))
-                .collect();
-            if let Some(w) = &stale_warning {
-                eprintln!("{w}");
+    }
+
+    let custom = zen_ext::discover_slash_commands(cwd, home, cfg.folder_trusted);
+    if !custom.is_empty() {
+        println!("Custom commands and skills:");
+        for c in &custom {
+            match &c.description {
+                Some(d) => println!("  /{}  {}", c.name, d),
+                None => println!("  /{}", c.name),
             }
-            if arg.is_empty() {
-                // Bare `/model` on a terminal opens the arrow-key
-                // picker (B2); piped input keeps the numbered list
-                // so a scripted `/model` never blocks on a prompt.
-                if should_open_model_picker(
-                    std::io::IsTerminal::is_terminal(&std::io::stdin()),
-                    &rows,
-                ) {
-                    match run_model_picker(&agent.config.model, &rows) {
-                        Ok(Some(id)) => {
-                            apply_picked_model(&id, cfg, agent, repl, home, cwd).await;
-                        }
-                        Ok(None) => {
-                            println!("model unchanged (still {})", agent.config.model);
-                        }
-                        Err(e) => {
-                            eprintln!("model picker failed ({e}); showing the list instead");
-                            print!(
-                                "{}",
-                                format_model_list(&agent.config.model, &rows, repl.auto_model)
-                            );
-                        }
-                    }
-                } else {
+        }
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_clear(
+    cli: &Cli,
+    cwd: &Path,
+    cfg: &mut crate::settings::ResolvedConfig,
+    repl: &mut ReplState<'_>,
+    agent: &mut zen_agent::Agent,
+    session_id: &str,
+) -> Result<LineAction> {
+    // Core-perfect phase 2 (B6): clearing drops the in-memory
+    // conversation. Ask first on a terminal; piped input keeps
+    // the old behaviour (a scripted /clear must not eat the
+    // next scripted line as its answer).
+    if !agent.messages().is_empty()
+        && std::io::IsTerminal::is_terminal(&std::io::stdin())
+        && !prompt_yes_no(
+            "Clear the conversation and start a new session? The transcript stays on disk and can be resumed with /resume.",
+        )
+    {
+        println!("Kept the current conversation.");
+        return Ok(LineAction::Continue);
+    }
+    crate::agent_run::run_session_end(&agent.hooks, session_id, cwd, cfg, "clear").await;
+    agent.set_messages(vec![]);
+
+    let new_id = crate::session::new_session_id();
+    if cli.ephemeral {
+        agent.ctx.session_dir = None;
+        *repl.writer = crate::session::TranscriptWriter::ephemeral(&new_id, cwd);
+    } else {
+        let path = repl
+            .writer
+            .path
+            .as_ref()
+            .expect("non-ephemeral writer always has a path")
+            .with_file_name(format!("{}.jsonl", new_id));
+        agent.ctx.session_dir = Some(crate::session::session_scratch_dir(&path));
+        if let Some(r) = &repl.recorder {
+            r.set_path(path.clone());
+        }
+        *repl.writer = crate::session::TranscriptWriter::new(path, &new_id, cwd);
+    }
+    *repl.session_id = new_id.clone();
+    agent.ctx.session_id = new_id.clone();
+    repl.goal = None;
+    repl_session_start(agent, &new_id, cwd, cfg, "clear").await;
+    println!("context cleared, new session: {}", new_id);
+    Ok(LineAction::Continue)
+}
+
+async fn slash_compact(
+    cwd: &Path,
+    cfg: &mut crate::settings::ResolvedConfig,
+    agent: &mut zen_agent::Agent,
+    session_id: &str,
+    arg: &str,
+) -> Result<LineAction> {
+    let focus = if arg.is_empty() { None } else { Some(arg) };
+    match agent.compact(focus, "manual").await {
+        Ok(()) => {
+            println!("context compacted");
+            repl_session_start(agent, session_id, cwd, cfg, "compact").await;
+        }
+        Err(e) => eprintln!("compact failed: {}", e),
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_model(
+    cwd: &Path,
+    home: Option<&Path>,
+    cfg: &mut crate::settings::ResolvedConfig,
+    repl: &mut ReplState<'_>,
+    agent: &mut zen_agent::Agent,
+    arg: &str,
+) -> Result<LineAction> {
+    let (rows, stale_warning) = available_model_rows(home, &cfg.base_url);
+    // Core-perfect phase 2 (B2): keep the listed rows for
+    // Tab completion of the /model argument.
+    repl.model_rows = rows
+        .iter()
+        .map(|r| (r.short.clone(), r.provider.clone(), r.id.clone()))
+        .collect();
+    if let Some(w) = &stale_warning {
+        eprintln!("{w}");
+    }
+    if arg.is_empty() {
+        // Bare `/model` on a terminal opens the arrow-key
+        // picker (B2); piped input keeps the numbered list
+        // so a scripted `/model` never blocks on a prompt.
+        if should_open_model_picker(std::io::IsTerminal::is_terminal(&std::io::stdin()), &rows) {
+            match run_model_picker(&agent.config.model, &rows) {
+                Ok(Some(id)) => {
+                    apply_picked_model(&id, cfg, agent, repl, home, cwd).await;
+                }
+                Ok(None) => {
+                    println!("model unchanged (still {})", agent.config.model);
+                }
+                Err(e) => {
+                    eprintln!("model picker failed ({e}); showing the list instead");
                     print!(
                         "{}",
                         format_model_list(&agent.config.model, &rows, repl.auto_model)
                     );
                 }
-            } else if crate::models::is_auto_model(&arg) {
-                // Auto mode back on (Leader tin 7962): the current
-                // provider's best free model.
-                match crate::models::provider_for_base_url(&cfg.base_url)
-                    .and_then(crate::models::provider_default_model)
+            }
+        } else {
+            print!(
+                "{}",
+                format_model_list(&agent.config.model, &rows, repl.auto_model)
+            );
+        }
+    } else if crate::models::is_auto_model(arg) {
+        // Auto mode back on (Leader tin 7962): the current
+        // provider's best free model.
+        match crate::models::provider_for_base_url(&cfg.base_url)
+            .and_then(crate::models::provider_default_model)
+        {
+            Some(entry) => {
+                let id = entry.id.to_string();
+                match switch_model_with_hooks(ModelSwitchRequest {
+                    requested: &id,
+                    source: "command",
+                    cfg,
+                    agent,
+                    repl,
+                    home,
+                })
+                .await
                 {
-                    Some(entry) => {
-                        let id = entry.id.to_string();
-                        match switch_model_with_hooks(ModelSwitchRequest {
-                            requested: &id,
-                            source: "command",
-                            cfg,
-                            agent,
-                            repl,
-                            home,
-                        })
-                        .await
-                        {
-                            Ok(msg) => {
-                                repl.auto_model = true;
-                                report_model_switch(
-                                    cwd,
-                                    true,
-                                    &cfg.model,
-                                    &cfg.base_url,
-                                    &format!("{msg} (auto)"),
-                                );
-                            }
-                            Err(e) => eprintln!("{e}"),
-                        }
-                    }
-                    None => {
-                        eprintln!("auto needs a known provider; the current base URL is custom")
-                    }
-                }
-            } else {
-                match pick_model(&arg, &rows) {
-                    Ok(id) => {
-                        match switch_model_with_hooks(ModelSwitchRequest {
-                            requested: &id,
-                            source: "command",
-                            cfg,
-                            agent,
-                            repl,
-                            home,
-                        })
-                        .await
-                        {
-                            Ok(msg) => {
-                                // A pinned model turns auto off.
-                                repl.auto_model = false;
-                                report_model_switch(cwd, false, &cfg.model, &cfg.base_url, &msg);
-                            }
-                            Err(e) => eprintln!("{e}"),
-                        }
+                    Ok(msg) => {
+                        repl.auto_model = true;
+                        report_model_switch(
+                            cwd,
+                            true,
+                            &cfg.model,
+                            &cfg.base_url,
+                            &format!("{msg} (auto)"),
+                        );
                     }
                     Err(e) => eprintln!("{e}"),
                 }
             }
-        }
-        "/provider" => {
-            // Switch provider (Leader tin 7962): the model resets to
-            // the new provider's best free model, and auto turns on.
-            // apply_model_switch moves base URL, key and backend
-            // together, so the switch cannot strand a model on the
-            // wrong gateway (the PR #71 HTTP 400 bug).
-            if arg.is_empty() {
-                println!(
-                    "usage: /provider <openrouter> — switch provider; model resets to that provider's best free model"
-                );
-            } else {
-                match crate::models::provider_default_model(&arg) {
-                    Some(entry) => {
-                        let id = entry.id.to_string();
-                        match switch_model_with_hooks(ModelSwitchRequest {
-                            requested: &id,
-                            source: "command",
-                            cfg,
-                            agent,
-                            repl,
-                            home,
-                        })
-                        .await
-                        {
-                            Ok(msg) => {
-                                repl.auto_model = true;
-                                // The provider switch also moves the
-                                // base URL; persist it alongside `auto`
-                                // so a restart lands on the same
-                                // provider and its best model.
-                                report_model_switch(
-                                    cwd,
-                                    true,
-                                    &cfg.model,
-                                    &cfg.base_url,
-                                    &format!("{msg} (auto)"),
-                                );
-                            }
-                            Err(e) => eprintln!("{e}"),
-                        }
-                    }
-                    None => eprintln!("unknown provider '{arg}' (openrouter)"),
-                }
+            None => {
+                eprintln!("auto needs a known provider; the current base URL is custom")
             }
         }
-        "/btw" => {
-            if arg.is_empty() {
-                println!(
-                    "usage: /btw <question> \u{2014} ask a quick side question; the main conversation is untouched"
-                );
-            } else {
-                let model = cfg
-                    .btw_model
-                    .clone()
-                    .unwrap_or_else(|| agent.config.model.clone());
-                match crate::btw::run_btw(&agent.llm, &model, &arg).await {
-                    Ok(answer) => {
-                        if answer.trim().is_empty() {
-                            println!("(no answer)");
-                        } else {
-                            println!("{}", answer.trim_end());
-                        }
-                    }
-                    Err(e) => eprintln!("btw failed: {:#}", e),
-                }
-            }
-        }
-        "/cost" => println!(
-            "{}",
-            commands::cost_report(&agent.usage, &agent.config.model, &cfg.base_url)
-        ),
-        "/flightdeck" => {
-            // The viewer owns the terminal while it runs; run it on a
-            // blocking thread so the REPL's runtime keeps working.
-            let state = repl.flightdeck.clone();
-            let gate = repl.flightdeck_gate.clone();
-            match tokio::task::spawn_blocking(move || {
-                zen_flightdeck::run_viewer(state, Some(gate), None)
-            })
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => eprintln!("flightdeck error: {e:#}"),
-                Err(e) => eprintln!("flightdeck error: {e:#}"),
-            }
-        }
-        "/quota" => {
-            let store = home.map(zen_agent::RateGate::default_store_path);
-            let key_url = zen_agent::rategate::key_info_url(&cfg.base_url);
-            let key = cfg.api_key();
-            println!(
-                "{}",
-                zen_agent::rategate::quota_command_report(
-                    key_url.as_deref(),
-                    key,
-                    store.as_deref()
-                )
+    } else {
+        match pick_model(arg, &rows) {
+            Ok(id) => {
+                match switch_model_with_hooks(ModelSwitchRequest {
+                    requested: &id,
+                    source: "command",
+                    cfg,
+                    agent,
+                    repl,
+                    home,
+                })
                 .await
-            );
-        }
-        "/commit" => {
-            let files = crate::git::changed_files(cwd);
-            if files.is_empty() {
-                println!("nothing to commit (working tree clean)");
-            } else {
-                println!("Changed files:");
-                for (status, path) in &files {
-                    println!("  {} {}", status, path);
-                }
-                let (message, confirm) = if let Some(m) = arg.strip_prefix("-m ") {
-                    (m.trim().trim_matches('"').to_string(), false)
-                } else if arg.trim() == "-y" {
-                    (crate::git::suggest_commit_message(&files), false)
-                } else {
-                    (crate::git::suggest_commit_message(&files), true)
-                };
-                if message.trim().is_empty() {
-                    eprintln!("usage: /commit [-y | -m \"message\"]");
-                } else {
-                    println!("Message: {}", message);
-                    let do_commit = !confirm || prompt_yes_no("Commit these changes?");
-                    if do_commit {
-                        match crate::git::stage_and_commit(cwd, &message) {
-                            Ok(summary) => println!("{}", summary),
-                            Err(e) => eprintln!("commit failed: {}", e),
-                        }
-                    } else {
-                        println!("commit cancelled");
-                    }
-                }
-            }
-        }
-        "/worktree" => {
-            let parts: Vec<&str> = arg.split_whitespace().collect();
-            match parts.as_slice() {
-                [] => {
-                    let wts = crate::git::list_worktrees(cwd);
-                    if wts.is_empty() {
-                        println!("no worktrees (or not a git repo)");
-                    } else {
-                        for (p, b, c) in wts {
-                            let label = crate::git::read_isolation_record(std::path::Path::new(&p))
-                                .map(|r| format!("isolated:{}", r.task))
-                                .unwrap_or_else(|| "legacy".to_string());
-                            println!("{} [{}] {} {}", p, b, &c[..7.min(c.len())], label);
-                        }
-                    }
-                }
-                ["rm", name] if crate::git::valid_worktree_name(name) => {
-                    let wt_path = cwd.join(format!(
-                        "../{}-{}",
-                        cwd.file_name().and_then(|n| n.to_str()).unwrap_or("repo"),
-                        name
-                    ));
-                    if worktree_hooks_configured(cfg, "WorktreeRemove") {
-                        // A WorktreeRemove hook owns the cleanup: exit 0
-                        // counts as removed; a non-zero exit fails the
-                        // removal when the directory still exists.
-                        let removed = agent
-                            .hooks
-                            .run(
-                                zen_core::HookEvent::WorktreeRemove,
-                                "",
-                                serde_json::json!({
-                                    "worktree_path": wt_path.display().to_string(),
-                                }),
-                            )
-                            .await;
-                        if !removed.failed || !wt_path.exists() {
-                            println!("removed worktree {}", wt_path.display());
-                        } else {
-                            eprintln!("worktree removal failed, kept: {}", wt_path.display());
-                        }
-                    } else {
-                        match crate::git::remove_isolated_worktree(cwd, &wt_path, name) {
-                            Ok(()) => println!("removed worktree {}", wt_path.display()),
-                            Err(e) => eprintln!("failed: {}", e),
-                        }
-                    }
-                }
-                [name] if crate::git::valid_worktree_name(name) && *name != "rm" => {
-                    let repo = cwd.file_name().and_then(|n| n.to_str()).unwrap_or("repo");
-                    let wt_path = cwd.join(format!("../{}-{}", repo, name));
-                    if worktree_hooks_configured(cfg, "WorktreeCreate") {
-                        // A WorktreeCreate hook replaces the default git
-                        // behavior entirely: the hook creates the worktree
-                        // and returns its path; a failure means no
-                        // worktree is created.
-                        let created = agent
-                            .hooks
-                            .run(
-                                zen_core::HookEvent::WorktreeCreate,
-                                "",
-                                serde_json::json!({ "name": name }),
-                            )
-                            .await;
-                        match created.worktree_path {
-                            Some(p) if !created.blocked && !created.failed => {
-                                let wt = std::path::PathBuf::from(&p);
-                                if !crate::git::is_registered_worktree(cwd, &wt) {
-                                    eprintln!(
-                                        "failed: WorktreeCreate hook returned {p}, which is not a registered worktree of this repo; not marked isolated"
-                                    );
-                                } else if let Some(record) = crate::git::read_isolation_record(&wt)
-                                {
-                                    if record.task == *name {
-                                        println!(
-                                            "created worktree {p} on branch {name}\ncd to it and run zen there for an isolated session"
-                                        );
-                                    } else {
-                                        eprintln!(
-                                            "failed: WorktreeCreate hook returned {p}, isolated for task \"{}\", not \"{name}\"",
-                                            record.task
-                                        );
-                                    }
-                                } else {
-                                    match crate::git::create_isolation_record(
-                                        &wt, name, name, session_id,
-                                    ) {
-                                        Ok(_) => println!(
-                                            "created worktree {p} on branch {name}\ncd to it and run zen there for an isolated session"
-                                        ),
-                                        Err(e) => eprintln!("failed: {e}"),
-                                    }
-                                }
-                            }
-                            _ => {
-                                let reason = created
-                                    .feedback
-                                    .filter(|s| !s.trim().is_empty())
-                                    .unwrap_or_else(|| {
-                                        "WorktreeCreate hook did not return a path".into()
-                                    });
-                                eprintln!("failed: {reason}");
-                            }
-                        }
-                    } else {
-                        match crate::git::create_isolated_worktree(
-                            cwd, &wt_path, name, name, session_id,
-                        ) {
-                            Ok(p) => println!(
-                                "created worktree {} on branch {}\ncd to it and run zen there for an isolated session",
-                                p.display(),
-                                name
-                            ),
-                            Err(e) => eprintln!("failed: {}", e),
-                        }
-                    }
-                }
-                _ => eprintln!(
-                    "usage: /worktree [name] | /worktree rm <name>  (name: letters, digits, - _ .)"
-                ),
-            }
-        }
-        "/context" => println!(
-            "{}",
-            commands::context_report(
-                &agent.config.system_prompt,
-                &zen_ext::memory_prompt_with_root(cwd, home, cwd, cfg.folder_trusted),
-                &agent.tools_for_request(),
-                agent.messages(),
-                agent.config.context_window,
-                agent.last_prompt_tokens,
-            )
-        ),
-        "/expand" => {
-            let parsed = if arg.is_empty() {
-                Ok(None)
-            } else {
-                arg.parse::<usize>()
-                    .map(Some)
-                    .map_err(|_| "usage: /expand [card-number]")
-            };
-            match parsed {
-                Ok(n) => println!("{}", repl.progress.toggle_expand(n)),
-                Err(msg) => println!("{msg}"),
-            }
-        }
-        "/undo" => match arg.as_str() {
-            "" | "--force" => undo_last_turn(repl, agent, arg == "--force"),
-            _ => eprintln!("usage: /undo [--force]"),
-        },
-        "/diff" => {
-            let mut staged = false;
-            let mut stat = false;
-            let mut turn = false;
-            let mut unknown: Option<&str> = None;
-            for tok in arg.split_whitespace() {
-                match tok {
-                    "--staged" => staged = true,
-                    "--stat" => stat = true,
-                    "--turn" | "--last" => turn = true,
-                    _ => unknown = Some(tok),
-                }
-            }
-            if let Some(flag) = unknown {
-                eprintln!("unknown flag '{flag}'; usage: /diff [--staged] [--stat] [--turn]");
-            } else if turn {
-                match repl
-                    .checkpoints
-                    .diff_last_turn(&zen_tools::canonicalize_lenient(cwd))
                 {
-                    None => println!("(no turn has changed files with Write/Edit/MultiEdit yet)"),
-                    Some((t, diff)) => {
-                        println!("Turn {} ({}): {} file(s)", t.id, t.label, t.entries.len());
-                        print!("{diff}");
+                    Ok(msg) => {
+                        // A pinned model turns auto off.
+                        repl.auto_model = false;
+                        report_model_switch(cwd, false, &cfg.model, &cfg.base_url, &msg);
                     }
-                }
-            } else if !crate::git::is_git_repo(cwd) {
-                eprintln!(
-                    "not a git repository: {}\n/diff needs a git repo; read files directly or run `!git ...` instead.",
-                    cwd.display()
-                );
-            } else {
-                let mode = if stat {
-                    crate::git::DiffMode::Stat
-                } else if staged {
-                    crate::git::DiffMode::Staged
-                } else {
-                    crate::git::DiffMode::WorkingTree
-                };
-                let color = std::io::IsTerminal::is_terminal(&std::io::stdout())
-                    && !crate::repl_polish::Theme::colors_disabled();
-                match crate::git::git_diff(cwd, mode, color) {
-                    Some(out) if !out.trim().is_empty() => print!("{out}"),
-                    _ => println!("(no changes)"),
-                }
-
-                if !staged && !stat {
-                    match crate::git::untracked_files(cwd) {
-                        Some(u) if !u.is_empty() => {
-                            println!("\nUntracked files ({}):", u.len());
-                            for f in u {
-                                println!("  {f}");
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        "/terse" => {
-            let sp = std::mem::take(&mut agent.config.system_prompt);
-            if crate::system_prompt::has_terse_style(&sp) {
-                agent.config.system_prompt = crate::system_prompt::without_terse_style(&sp);
-                println!("terse mode off");
-            } else {
-                agent.config.system_prompt = crate::system_prompt::with_terse_style(&sp);
-                println!("terse mode on");
-            }
-        }
-        "/add-dir" => {
-            if arg.is_empty() {
-                eprintln!("usage: /add-dir <path>");
-            } else {
-                let p = cwd.join(&arg);
-                match p.canonicalize() {
-                    Ok(dir) if dir.is_dir() => {
-                        if !agent.ctx.extra_dirs.contains(&dir) {
-                            agent.ctx.extra_dirs.push(dir.clone());
-                            println!("added working directory {}", dir.display());
-                            // `DirectoryAdded`: the add already completed;
-                            // the hook cannot block it. Its systemMessage
-                            // becomes context for the next turn.
-                            let added = agent
-                                .hooks
-                                .run(
-                                    zen_core::HookEvent::DirectoryAdded,
-                                    "slash_command",
-                                    serde_json::json!({
-                                        "directory": dir.display().to_string(),
-                                        "source": "slash_command",
-                                    }),
-                                )
-                                .await;
-                            if let Some(text) =
-                                added.system_message.filter(|s| !s.trim().is_empty())
-                            {
-                                agent.pending_hook_context.push(text);
-                            }
-                        } else {
-                            println!("added working directory {}", dir.display());
-                        }
-                    }
-                    _ => eprintln!("not a directory: {}", p.display()),
-                }
-            }
-        }
-        "/done" => {
-            let todos = lock_or_recover(&agent.ctx.todos, "todos").clone();
-            let checks = crate::doneguard::run_done_checks(cwd, &todos).await;
-            let changed = crate::doneguard::changed_files(cwd);
-            let violations = repl.scope.violations(&changed);
-            let yagni = crate::doneguard::yagni_scan(cwd);
-            println!(
-                "{}",
-                crate::doneguard::format_report(
-                    cwd,
-                    &crate::doneguard::DoneReport {
-                        checks,
-                        changed,
-                        scope: repl.scope.declared.clone(),
-                        scope_violations: violations,
-                        yagni,
-                    }
-                )
-            );
-        }
-        "/scope" => {
-            if arg == "clear" {
-                repl.scope.clear();
-                agent.config.done_scope.clear();
-                println!("scope cleared");
-            } else if arg.is_empty() {
-                if repl.scope.declared.is_empty() {
-                    println!(
-                        "(no declared scope - /scope <glob>... to set one, e.g. /scope src/**)"
-                    );
-                } else {
-                    println!("scope: {}", repl.scope.declared.join(" "));
-                    let changed = crate::doneguard::changed_files(cwd);
-                    let violations = repl.scope.violations(&changed);
-                    if violations.is_empty() {
-                        println!("all {} changed file(s) within scope", changed.len());
-                    } else {
-                        println!("outside scope: {}", violations.join(", "));
-                    }
-                }
-            } else {
-                repl.scope
-                    .set(arg.split_whitespace().map(|s| s.to_string()).collect());
-                repl.scope_seeded = true;
-                agent.config.done_scope = repl.scope.declared.clone();
-                println!("scope set: {}", repl.scope.declared.join(" "));
-            }
-        }
-        "/export" => {
-            let file = if arg.is_empty() {
-                format!("zen-session-{}.md", session_id)
-            } else {
-                arg.clone()
-            };
-            let path = cwd.join(&file);
-            match std::fs::write(
-                &path,
-                commands::transcript_markdown(session_id, agent.messages()),
-            ) {
-                Ok(()) => println!("conversation exported to {}", path.display()),
-                Err(e) => eprintln!("export failed: {}", e),
-            }
-        }
-        "/rename" => {
-            if arg.is_empty() {
-                eprintln!("usage: /rename <name>");
-            } else {
-                match repl.writer.path.as_ref() {
-                    Some(p) => match crate::session::append_title(p, session_id, &arg) {
-                        Ok(()) => println!("session renamed to {}", arg),
-                        Err(e) => eprintln!("rename failed: {}", e),
-                    },
-                    None => println!("session rename is unavailable in ephemeral mode"),
-                }
-            }
-        }
-        "/loop" => match repl_polish::parse_loop_args(&arg) {
-            Ok((n, prompt)) => {
-                for i in 1..=n {
-                    println!(
-                        "{}",
-                        repl.theme
-                            .paint(repl_polish::ColorRole::Accent, &format!("[loop {i}/{n}]"))
-                    );
-                    let result =
-                        run_turn_interruptible(agent, &prompt, repl.interrupts.as_deref_mut())
-                            .await;
-                    let failed = result.as_ref().map(|r| r.is_error).unwrap_or(true);
-                    print_turn(result);
-                    if failed {
-                        eprintln!("loop stopped: iteration {i} failed");
-                        break;
-                    }
+                    Err(e) => eprintln!("{e}"),
                 }
             }
             Err(e) => eprintln!("{e}"),
-        },
-        "/goal" => {
-            if arg.is_empty() {
-                match &repl.goal {
-                    Some(g) => println!("session goal: {g}"),
-                    None => println!("(no session goal; set one with /goal <text>)"),
-                }
-            } else if arg == "clear" {
-                repl.goal = None;
-                println!("session goal cleared");
-            } else {
-                repl.goal = Some(arg.clone());
-                println!("session goal set: {arg}");
-            }
         }
-        "/personality" => {
-            if arg.is_empty() {
-                println!("personality: {}", repl.personality.name());
-            } else {
-                match repl_polish::Personality::parse(&arg) {
-                    Some(p) => {
-                        repl.personality = p;
-                        agent.config.system_prompt =
-                            format!("{}{}", repl.base_system_prompt, p.system_suffix());
-                        println!("personality set to {}", p.name());
-                    }
-                    None => eprintln!("unknown personality {arg:?} (concise | normal | detailed)"),
-                }
-            }
-        }
-        "/vim" => {
-            repl.vim_mode = !repl.vim_mode;
-            if repl.vim_mode {
-                println!("vim keybindings: on (vi editing at the prompt on a terminal)");
-            } else {
-                println!("vim keybindings: off");
-            }
-        }
-        "/theme" => {
-            if arg.is_empty() {
-                let note = if repl_polish::Theme::colors_disabled() {
-                    " (NO_COLOR is set: colors disabled)"
-                } else {
-                    ""
-                };
-                println!("theme: {}{}", repl.theme.name(), note);
-            } else {
-                match repl_polish::Theme::parse(&arg) {
-                    Some(t) => {
-                        repl.theme = t;
-                        if repl_polish::Theme::colors_disabled() && t != repl_polish::Theme::None {
-                            println!(
-                                "theme set to {}; note: NO_COLOR is set, colors stay disabled",
-                                t.name()
-                            );
-                        } else {
-                            println!("theme set to {}", t.name());
-                        }
-                    }
-                    None => eprintln!("unknown theme {arg:?} (dark | light | none)"),
-                }
-            }
-        }
-        "/review" | "/init" => {
-            // `UserPromptExpansion`: a typed slash command expands into a
-            // prompt before it reaches the model. A hook may block the
-            // expansion or inject context for it.
-            let command_name = cmd.trim_start_matches('/');
-            let expansion = agent
-                .hooks
-                .run(
-                    zen_core::HookEvent::UserPromptExpansion,
-                    command_name,
-                    serde_json::json!({
-                        "expansion_type": "slash_command",
-                        "command_name": command_name,
-                        "command_args": arg,
-                        "prompt": line,
-                    }),
-                )
-                .await;
-            if expansion.blocked {
-                eprintln!(
-                    "{}",
-                    expansion
-                        .feedback
-                        .unwrap_or_else(|| format!("/{command_name} blocked by hook"))
-                );
-                return Ok(LineAction::Continue);
-            }
-            let prompt = if cmd == "/review" {
-                commands::review_prompt(&arg)
-            } else {
-                init_prompt_with_import_offer(cwd)
-            };
-            let mut prompt = prompt;
-            if let Some(extra) = expansion.feedback.filter(|s| !s.trim().is_empty()) {
-                prompt.push_str("\n\n");
-                prompt.push_str(&extra);
-            }
-            let usage_before = agent.usage.clone();
-            let result =
-                run_turn_interruptible(agent, &prompt, repl.interrupts.as_deref_mut()).await;
-            record_turn_cost(home, repl.session_id.as_str(), cfg, agent, &usage_before);
-            refresh_flightdeck_after_turn(
-                home,
-                repl.session_id.as_str(),
-                &agent.usage,
-                &repl.flightdeck,
-            );
-            print_turn(result);
-        }
-        "/map" => match crate::repomap::repo_map(cwd, cli.map_tokens) {
-            Some(map) => println!("{}", map.text()),
-            None => println!("no repo map (no Rust files found, or --repomap-budget 0)"),
-        },
-        "/map-refresh" => match crate::repomap::repo_map(cwd, cli.map_tokens) {
-            Some(map) => {
-                println!("{}", map.text());
-                if map.truncated {
-                    println!("[increase --repomap-budget to see more]");
-                }
-            }
-            None => println!("no repo map (no Rust files found, or --repomap-budget 0)"),
-        },
-        "/deep-research" => {
-            use crate::deep_research as dr;
-            match dr::parse_deep_research_args(&arg) {
-                Err(e) => eprintln!("{e}"),
-                Ok(mut opts) => {
-                    if opts.max_budget_usd.is_none() {
-                        opts.max_budget_usd = dr::resolve_budget_usd(None);
-                    }
-                    if let Err(e) = dr::check_budget_usd(opts.max_budget_usd, opts.max_subagents) {
-                        eprintln!("deep-research: {e}");
-                        return Ok(LineAction::Continue);
-                    }
-                    let Some(task) = agent.tools.get("Task") else {
-                        eprintln!(
-                            "deep-research needs the Task tool (sub-agents are disabled in this session)"
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_provider(
+    cwd: &Path,
+    home: Option<&Path>,
+    cfg: &mut crate::settings::ResolvedConfig,
+    repl: &mut ReplState<'_>,
+    agent: &mut zen_agent::Agent,
+    arg: &str,
+) -> Result<LineAction> {
+    // Switch provider (Leader tin 7962): the model resets to
+    // the new provider's best free model, and auto turns on.
+    // apply_model_switch moves base URL, key and backend
+    // together, so the switch cannot strand a model on the
+    // wrong gateway (the PR #71 HTTP 400 bug).
+    if arg.is_empty() {
+        println!(
+            "usage: /provider <openrouter> — switch provider; model resets to that provider's best free model"
+        );
+    } else {
+        match crate::models::provider_default_model(arg) {
+            Some(entry) => {
+                let id = entry.id.to_string();
+                match switch_model_with_hooks(ModelSwitchRequest {
+                    requested: &id,
+                    source: "command",
+                    cfg,
+                    agent,
+                    repl,
+                    home,
+                })
+                .await
+                {
+                    Ok(msg) => {
+                        repl.auto_model = true;
+                        // The provider switch also moves the
+                        // base URL; persist it alongside `auto`
+                        // so a restart lands on the same
+                        // provider and its best model.
+                        report_model_switch(
+                            cwd,
+                            true,
+                            &cfg.model,
+                            &cfg.base_url,
+                            &format!("{msg} (auto)"),
                         );
-                        return Ok(LineAction::Continue);
-                    };
-                    let angles = dr::research_angles(opts.max_subagents);
-                    println!(
-                        "deep-research: spawning {} researcher(s) on \"{}\"",
-                        angles.len(),
-                        opts.topic
-                    );
-                    let ctx = agent.ctx.clone();
-                    let model = agent.config.model.clone();
-                    let findings = dr::fan_out_research(
-                        &task,
-                        &ctx,
-                        &opts.topic,
-                        &opts,
-                        &(|s: String| println!("deep-research {s}")),
-                    )
-                    .await;
-                    let ok_count = findings.iter().filter(|f| f.ok).count();
-                    println!(
-                        "deep-research: {ok_count}/{} researchers finished ok; synthesizing…",
-                        findings.len()
-                    );
-                    let synth_prompt = dr::synthesis_prompt(&opts.topic, &findings);
-                    let turn = run_turn_interruptible(
-                        agent,
-                        &synth_prompt,
-                        repl.interrupts.as_deref_mut(),
-                    )
-                    .await;
-                    let report = match turn {
-                        Some(r) if !r.is_error && !r.result.trim().is_empty() => {
-                            dr::render_report(&opts.topic, &model, &opts, &findings, &r.result)
-                        }
-                        Some(r) => dr::render_fallback_report(
-                            &opts.topic,
-                            &model,
-                            &opts,
-                            &findings,
-                            &format!(
-                                "synthesis turn failed: {}",
-                                r.result.chars().take(160).collect::<String>()
-                            ),
-                        ),
-                        None => dr::render_fallback_report(
-                            &opts.topic,
-                            &model,
-                            &opts,
-                            &findings,
-                            "interrupted",
-                        ),
-                    };
-                    println!("\n{report}");
+                    }
+                    Err(e) => eprintln!("{e}"),
+                }
+            }
+            None => eprintln!("unknown provider '{arg}' (openrouter)"),
+        }
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_btw(
+    cfg: &mut crate::settings::ResolvedConfig,
+    agent: &mut zen_agent::Agent,
+    arg: &str,
+) -> Result<LineAction> {
+    if arg.is_empty() {
+        println!(
+            "usage: /btw <question> \u{2014} ask a quick side question; the main conversation is untouched"
+        );
+    } else {
+        let model = cfg
+            .btw_model
+            .clone()
+            .unwrap_or_else(|| agent.config.model.clone());
+        match crate::btw::run_btw(&agent.llm, &model, arg).await {
+            Ok(answer) => {
+                if answer.trim().is_empty() {
+                    println!("(no answer)");
+                } else {
+                    println!("{}", answer.trim_end());
+                }
+            }
+            Err(e) => eprintln!("btw failed: {:#}", e),
+        }
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_cost(
+    cfg: &mut crate::settings::ResolvedConfig,
+    agent: &mut zen_agent::Agent,
+) -> Result<LineAction> {
+    println!(
+        "{}",
+        commands::cost_report(&agent.usage, &agent.config.model, &cfg.base_url)
+    );
+    Ok(LineAction::Continue)
+}
+
+async fn slash_flightdeck(repl: &mut ReplState<'_>) -> Result<LineAction> {
+    // The viewer owns the terminal while it runs; run it on a
+    // blocking thread so the REPL's runtime keeps working.
+    let state = repl.flightdeck.clone();
+    let gate = repl.flightdeck_gate.clone();
+    match tokio::task::spawn_blocking(move || zen_flightdeck::run_viewer(state, Some(gate), None))
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("flightdeck error: {e:#}"),
+        Err(e) => eprintln!("flightdeck error: {e:#}"),
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_quota(
+    home: Option<&Path>,
+    cfg: &mut crate::settings::ResolvedConfig,
+) -> Result<LineAction> {
+    let store = home.map(zen_agent::RateGate::default_store_path);
+    let key_url = zen_agent::rategate::key_info_url(&cfg.base_url);
+    let key = cfg.api_key();
+    println!(
+        "{}",
+        zen_agent::rategate::quota_command_report(key_url.as_deref(), key, store.as_deref()).await
+    );
+    Ok(LineAction::Continue)
+}
+
+async fn slash_commit(cwd: &Path, arg: &str) -> Result<LineAction> {
+    let files = crate::git::changed_files(cwd);
+    if files.is_empty() {
+        println!("nothing to commit (working tree clean)");
+    } else {
+        println!("Changed files:");
+        for (status, path) in &files {
+            println!("  {} {}", status, path);
+        }
+        let (message, confirm) = if let Some(m) = arg.strip_prefix("-m ") {
+            (m.trim().trim_matches('"').to_string(), false)
+        } else if arg.trim() == "-y" {
+            (crate::git::suggest_commit_message(&files), false)
+        } else {
+            (crate::git::suggest_commit_message(&files), true)
+        };
+        if message.trim().is_empty() {
+            eprintln!("usage: /commit [-y | -m \"message\"]");
+        } else {
+            println!("Message: {}", message);
+            let do_commit = !confirm || prompt_yes_no("Commit these changes?");
+            if do_commit {
+                match crate::git::stage_and_commit(cwd, &message) {
+                    Ok(summary) => println!("{}", summary),
+                    Err(e) => eprintln!("commit failed: {}", e),
+                }
+            } else {
+                println!("commit cancelled");
+            }
+        }
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_worktree(
+    cwd: &Path,
+    cfg: &mut crate::settings::ResolvedConfig,
+    agent: &mut zen_agent::Agent,
+    session_id: &str,
+    arg: &str,
+) -> Result<LineAction> {
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    match parts.as_slice() {
+        [] => {
+            let wts = crate::git::list_worktrees(cwd);
+            if wts.is_empty() {
+                println!("no worktrees (or not a git repo)");
+            } else {
+                for (p, b, c) in wts {
+                    let label = crate::git::read_isolation_record(std::path::Path::new(&p))
+                        .map(|r| format!("isolated:{}", r.task))
+                        .unwrap_or_else(|| "legacy".to_string());
+                    println!("{} [{}] {} {}", p, b, &c[..7.min(c.len())], label);
                 }
             }
         }
-        "/pr_comments" => {
-            let pr_arg = if arg.is_empty() {
-                None
+        ["rm", name] if crate::git::valid_worktree_name(name) => {
+            let wt_path = cwd.join(format!(
+                "../{}-{}",
+                cwd.file_name().and_then(|n| n.to_str()).unwrap_or("repo"),
+                name
+            ));
+            if worktree_hooks_configured(cfg, "WorktreeRemove") {
+                // A WorktreeRemove hook owns the cleanup: exit 0
+                // counts as removed; a non-zero exit fails the
+                // removal when the directory still exists.
+                let removed = agent
+                    .hooks
+                    .run(
+                        zen_core::HookEvent::WorktreeRemove,
+                        "",
+                        serde_json::json!({
+                            "worktree_path": wt_path.display().to_string(),
+                        }),
+                    )
+                    .await;
+                if !removed.failed || !wt_path.exists() {
+                    println!("removed worktree {}", wt_path.display());
+                } else {
+                    eprintln!("worktree removal failed, kept: {}", wt_path.display());
+                }
             } else {
-                Some(arg.as_str())
-            };
-            match crate::github::fetch_pr_comments(cwd, pr_arg) {
-                Ok(fetched) => {
-                    println!("{}", crate::github::format_comments_text(&fetched));
-                    if fetched.total() > 0 {
-                        offer_fix_turn(
-                            &crate::github::pr_fix_prompt(&fetched),
-                            "these comments",
-                            cfg,
-                            repl,
-                            agent,
+                match crate::git::remove_isolated_worktree(cwd, &wt_path, name) {
+                    Ok(()) => println!("removed worktree {}", wt_path.display()),
+                    Err(e) => eprintln!("failed: {}", e),
+                }
+            }
+        }
+        [name] if crate::git::valid_worktree_name(name) && *name != "rm" => {
+            let repo = cwd.file_name().and_then(|n| n.to_str()).unwrap_or("repo");
+            let wt_path = cwd.join(format!("../{}-{}", repo, name));
+            if worktree_hooks_configured(cfg, "WorktreeCreate") {
+                // A WorktreeCreate hook replaces the default git
+                // behavior entirely: the hook creates the worktree
+                // and returns its path; a failure means no
+                // worktree is created.
+                let created = agent
+                    .hooks
+                    .run(
+                        zen_core::HookEvent::WorktreeCreate,
+                        "",
+                        serde_json::json!({ "name": name }),
+                    )
+                    .await;
+                match created.worktree_path {
+                    Some(p) if !created.blocked && !created.failed => {
+                        let wt = std::path::PathBuf::from(&p);
+                        if !crate::git::is_registered_worktree(cwd, &wt) {
+                            eprintln!(
+                                "failed: WorktreeCreate hook returned {p}, which is not a registered worktree of this repo; not marked isolated"
+                            );
+                        } else if let Some(record) = crate::git::read_isolation_record(&wt) {
+                            if record.task == *name {
+                                println!(
+                                    "created worktree {p} on branch {name}\ncd to it and run zen there for an isolated session"
+                                );
+                            } else {
+                                eprintln!(
+                                    "failed: WorktreeCreate hook returned {p}, isolated for task \"{}\", not \"{name}\"",
+                                    record.task
+                                );
+                            }
+                        } else {
+                            match crate::git::create_isolation_record(&wt, name, name, session_id) {
+                                Ok(_) => println!(
+                                    "created worktree {p} on branch {name}\ncd to it and run zen there for an isolated session"
+                                ),
+                                Err(e) => eprintln!("failed: {e}"),
+                            }
+                        }
+                    }
+                    _ => {
+                        let reason = created
+                            .feedback
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or_else(|| "WorktreeCreate hook did not return a path".into());
+                        eprintln!("failed: {reason}");
+                    }
+                }
+            } else {
+                match crate::git::create_isolated_worktree(cwd, &wt_path, name, name, session_id) {
+                    Ok(p) => println!(
+                        "created worktree {} on branch {}\ncd to it and run zen there for an isolated session",
+                        p.display(),
+                        name
+                    ),
+                    Err(e) => eprintln!("failed: {}", e),
+                }
+            }
+        }
+        _ => eprintln!(
+            "usage: /worktree [name] | /worktree rm <name>  (name: letters, digits, - _ .)"
+        ),
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_context(
+    cwd: &Path,
+    home: Option<&Path>,
+    cfg: &mut crate::settings::ResolvedConfig,
+    agent: &mut zen_agent::Agent,
+) -> Result<LineAction> {
+    println!(
+        "{}",
+        commands::context_report(
+            &agent.config.system_prompt,
+            &zen_ext::memory_prompt_with_root(cwd, home, cwd, cfg.folder_trusted),
+            &agent.tools_for_request(),
+            agent.messages(),
+            agent.config.context_window,
+            agent.last_prompt_tokens,
+        )
+    );
+    Ok(LineAction::Continue)
+}
+
+async fn slash_expand(repl: &mut ReplState<'_>, arg: &str) -> Result<LineAction> {
+    let parsed = if arg.is_empty() {
+        Ok(None)
+    } else {
+        arg.parse::<usize>()
+            .map(Some)
+            .map_err(|_| "usage: /expand [card-number]")
+    };
+    match parsed {
+        Ok(n) => println!("{}", repl.progress.toggle_expand(n)),
+        Err(msg) => println!("{msg}"),
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_undo(
+    repl: &mut ReplState<'_>,
+    agent: &mut zen_agent::Agent,
+    arg: &str,
+) -> Result<LineAction> {
+    match arg {
+        "" | "--force" => undo_last_turn(repl, agent, arg == "--force"),
+        _ => eprintln!("usage: /undo [--force]"),
+    };
+    Ok(LineAction::Continue)
+}
+
+async fn slash_diff(cwd: &Path, repl: &mut ReplState<'_>, arg: &str) -> Result<LineAction> {
+    let mut staged = false;
+    let mut stat = false;
+    let mut turn = false;
+    let mut unknown: Option<&str> = None;
+    for tok in arg.split_whitespace() {
+        match tok {
+            "--staged" => staged = true,
+            "--stat" => stat = true,
+            "--turn" | "--last" => turn = true,
+            _ => unknown = Some(tok),
+        }
+    }
+    if let Some(flag) = unknown {
+        eprintln!("unknown flag '{flag}'; usage: /diff [--staged] [--stat] [--turn]");
+    } else if turn {
+        match repl
+            .checkpoints
+            .diff_last_turn(&zen_tools::canonicalize_lenient(cwd))
+        {
+            None => println!("(no turn has changed files with Write/Edit/MultiEdit yet)"),
+            Some((t, diff)) => {
+                println!("Turn {} ({}): {} file(s)", t.id, t.label, t.entries.len());
+                print!("{diff}");
+            }
+        }
+    } else if !crate::git::is_git_repo(cwd) {
+        eprintln!(
+            "not a git repository: {}\n/diff needs a git repo; read files directly or run `!git ...` instead.",
+            cwd.display()
+        );
+    } else {
+        let mode = if stat {
+            crate::git::DiffMode::Stat
+        } else if staged {
+            crate::git::DiffMode::Staged
+        } else {
+            crate::git::DiffMode::WorkingTree
+        };
+        let color = std::io::IsTerminal::is_terminal(&std::io::stdout())
+            && !crate::repl_polish::Theme::colors_disabled();
+        match crate::git::git_diff(cwd, mode, color) {
+            Some(out) if !out.trim().is_empty() => print!("{out}"),
+            _ => println!("(no changes)"),
+        }
+
+        if !staged && !stat {
+            match crate::git::untracked_files(cwd) {
+                Some(u) if !u.is_empty() => {
+                    println!("\nUntracked files ({}):", u.len());
+                    for f in u {
+                        println!("  {f}");
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_terse(agent: &mut zen_agent::Agent) -> Result<LineAction> {
+    let sp = std::mem::take(&mut agent.config.system_prompt);
+    if crate::system_prompt::has_terse_style(&sp) {
+        agent.config.system_prompt = crate::system_prompt::without_terse_style(&sp);
+        println!("terse mode off");
+    } else {
+        agent.config.system_prompt = crate::system_prompt::with_terse_style(&sp);
+        println!("terse mode on");
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_add_dir(cwd: &Path, agent: &mut zen_agent::Agent, arg: &str) -> Result<LineAction> {
+    if arg.is_empty() {
+        eprintln!("usage: /add-dir <path>");
+    } else {
+        let p = cwd.join(arg);
+        match p.canonicalize() {
+            Ok(dir) if dir.is_dir() => {
+                if !agent.ctx.extra_dirs.contains(&dir) {
+                    agent.ctx.extra_dirs.push(dir.clone());
+                    println!("added working directory {}", dir.display());
+                    // `DirectoryAdded`: the add already completed;
+                    // the hook cannot block it. Its systemMessage
+                    // becomes context for the next turn.
+                    let added = agent
+                        .hooks
+                        .run(
+                            zen_core::HookEvent::DirectoryAdded,
+                            "slash_command",
+                            serde_json::json!({
+                                "directory": dir.display().to_string(),
+                                "source": "slash_command",
+                            }),
                         )
                         .await;
+                    if let Some(text) = added.system_message.filter(|s| !s.trim().is_empty()) {
+                        agent.pending_hook_context.push(text);
                     }
-                }
-                Err(e) => eprintln!("pr_comments failed: {:#}", e),
-            }
-        }
-        "/ci-fix" => match crate::github::fetch_ci_status(cwd) {
-            Ok(status) => {
-                if status.failing.is_empty() {
-                    println!("all CI checks passing on branch {}", status.branch);
                 } else {
-                    println!("{}", crate::github::format_ci_text(&status));
-                    offer_fix_turn(
-                        &crate::github::ci_fix_prompt(&status),
-                        "these failures",
-                        cfg,
-                        repl,
-                        agent,
-                    )
-                    .await;
+                    println!("added working directory {}", dir.display());
                 }
             }
-            Err(e) => eprintln!("ci-fix failed: {:#}", e),
-        },
-        "/status" => {
-            println!("model: {}", agent.config.model);
-            println!("base_url: {}", cfg.base_url);
-            println!("permission_mode: {}", cfg.permission_mode);
-            println!("session_id: {}", session_id);
-            println!("goal: {}", repl.goal.as_deref().unwrap_or("(none)"));
-            println!("personality: {}", repl.personality.name());
-            println!("theme: {}", repl.theme.name());
-            println!("vim_mode: {}", repl.vim_mode);
-            println!("ephemeral: {}", cli.ephemeral);
-            if cfg.loaded_sources.is_empty() {
-                println!("settings: (none)");
+            _ => eprintln!("not a directory: {}", p.display()),
+        }
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_done(
+    cwd: &Path,
+    repl: &mut ReplState<'_>,
+    agent: &mut zen_agent::Agent,
+) -> Result<LineAction> {
+    let todos = lock_or_recover(&agent.ctx.todos, "todos").clone();
+    let checks = crate::doneguard::run_done_checks(cwd, &todos).await;
+    let changed = crate::doneguard::changed_files(cwd);
+    let violations = repl.scope.violations(&changed);
+    let yagni = crate::doneguard::yagni_scan(cwd);
+    println!(
+        "{}",
+        crate::doneguard::format_report(
+            cwd,
+            &crate::doneguard::DoneReport {
+                checks,
+                changed,
+                scope: repl.scope.declared.clone(),
+                scope_violations: violations,
+                yagni,
+            }
+        )
+    );
+    Ok(LineAction::Continue)
+}
+
+async fn slash_scope(
+    cwd: &Path,
+    repl: &mut ReplState<'_>,
+    agent: &mut zen_agent::Agent,
+    arg: &str,
+) -> Result<LineAction> {
+    if arg == "clear" {
+        repl.scope.clear();
+        agent.config.done_scope.clear();
+        println!("scope cleared");
+    } else if arg.is_empty() {
+        if repl.scope.declared.is_empty() {
+            println!("(no declared scope - /scope <glob>... to set one, e.g. /scope src/**)");
+        } else {
+            println!("scope: {}", repl.scope.declared.join(" "));
+            let changed = crate::doneguard::changed_files(cwd);
+            let violations = repl.scope.violations(&changed);
+            if violations.is_empty() {
+                println!("all {} changed file(s) within scope", changed.len());
             } else {
-                for s in &cfg.loaded_sources {
-                    println!("settings: {}", s);
-                }
+                println!("outside scope: {}", violations.join(", "));
             }
         }
-        "/plan" => {
-            if agent.config.permission_mode == zen_core::PermissionMode::Plan {
-                let restore = repl.pre_plan_mode;
-                crate::planmode::set_permission_mode(
-                    &mut agent.config,
-                    restore,
-                    &repl.base_system_prompt,
-                );
-                repl.pending_plan = None;
-                println!("plan mode OFF - permission mode: {}", restore.as_str());
-            } else {
-                repl.pre_plan_mode = agent.config.permission_mode;
-                crate::planmode::set_permission_mode(
-                    &mut agent.config,
-                    zen_core::PermissionMode::Plan,
-                    &repl.base_system_prompt,
-                );
-                repl.pending_plan = None;
+    } else {
+        repl.scope
+            .set(arg.split_whitespace().map(|s| s.to_string()).collect());
+        repl.scope_seeded = true;
+        agent.config.done_scope = repl.scope.declared.clone();
+        println!("scope set: {}", repl.scope.declared.join(" "));
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_export(
+    cwd: &Path,
+    agent: &mut zen_agent::Agent,
+    session_id: &str,
+    arg: &str,
+) -> Result<LineAction> {
+    let file = if arg.is_empty() {
+        format!("zen-session-{}.md", session_id)
+    } else {
+        arg.to_string()
+    };
+    let path = cwd.join(&file);
+    match std::fs::write(
+        &path,
+        commands::transcript_markdown(session_id, agent.messages()),
+    ) {
+        Ok(()) => println!("conversation exported to {}", path.display()),
+        Err(e) => eprintln!("export failed: {}", e),
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_rename(repl: &mut ReplState<'_>, session_id: &str, arg: &str) -> Result<LineAction> {
+    if arg.is_empty() {
+        eprintln!("usage: /rename <name>");
+    } else {
+        match repl.writer.path.as_ref() {
+            Some(p) => match crate::session::append_title(p, session_id, arg) {
+                Ok(()) => println!("session renamed to {}", arg),
+                Err(e) => eprintln!("rename failed: {}", e),
+            },
+            None => println!("session rename is unavailable in ephemeral mode"),
+        }
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_loop(
+    repl: &mut ReplState<'_>,
+    agent: &mut zen_agent::Agent,
+    arg: &str,
+) -> Result<LineAction> {
+    match repl_polish::parse_loop_args(arg) {
+        Ok((n, prompt)) => {
+            for i in 1..=n {
                 println!(
-                    "plan mode ON - read-only. Research with the available tools, then present \
-                     a plan ending with `ExitPlanMode`. /plan again to exit without approving."
+                    "{}",
+                    repl.theme
+                        .paint(repl_polish::ColorRole::Accent, &format!("[loop {i}/{n}]"))
                 );
-            }
-        }
-        "/permissions" => {
-            println!("allow: {:?}", cfg.permissions.allow);
-            println!("ask:   {:?}", cfg.permissions.ask);
-            println!("deny:  {:?}", cfg.permissions.deny);
-            println!("mode:  {}", cfg.permission_mode);
-        }
-        "/config" => {
-            if arg.is_empty() {
-                println!("model: {}", agent.config.model);
-                println!("permission_mode: {}", cfg.permission_mode);
-                println!("base_url: {}", cfg.base_url);
-                println!(
-                    "autoCompact: {}",
-                    cfg.auto_compact
-                        .as_ref()
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "true".into())
-                );
-                println!("set a value with /config key=value (saved to .zen/settings.local.json)");
-            } else if let Some((k, v)) = arg.split_once('=') {
-                match save_local_setting(cwd, k.trim(), v.trim()) {
-                    Ok(p) => println!(
-                        "saved {} = {} to {} (applies to new sessions)",
-                        k.trim(),
-                        v.trim(),
-                        p.display()
-                    ),
-                    Err(e) => eprintln!("could not save setting: {}", e),
+                let result =
+                    run_turn_interruptible(agent, &prompt, repl.interrupts.as_deref_mut()).await;
+                let failed = result.as_ref().map(|r| r.is_error).unwrap_or(true);
+                print_turn(result);
+                if failed {
+                    eprintln!("loop stopped: iteration {i} failed");
+                    break;
                 }
-            } else {
-                eprintln!("usage: /config key=value");
             }
         }
-        "/memory" => {
-            for (p, _) in zen_ext::memory_files_with_root(cwd, home, cwd, cfg.folder_trusted) {
-                println!("{}", p.display());
+        Err(e) => eprintln!("{e}"),
+    };
+    Ok(LineAction::Continue)
+}
+
+async fn slash_goal(repl: &mut ReplState<'_>, arg: &str) -> Result<LineAction> {
+    if arg.is_empty() {
+        match &repl.goal {
+            Some(g) => println!("session goal: {g}"),
+            None => println!("(no session goal; set one with /goal <text>)"),
+        }
+    } else if arg == "clear" {
+        repl.goal = None;
+        println!("session goal cleared");
+    } else {
+        repl.goal = Some(arg.to_string());
+        println!("session goal set: {arg}");
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_personality(
+    repl: &mut ReplState<'_>,
+    agent: &mut zen_agent::Agent,
+    arg: &str,
+) -> Result<LineAction> {
+    if arg.is_empty() {
+        println!("personality: {}", repl.personality.name());
+    } else {
+        match repl_polish::Personality::parse(arg) {
+            Some(p) => {
+                repl.personality = p;
+                agent.config.system_prompt =
+                    format!("{}{}", repl.base_system_prompt, p.system_suffix());
+                println!("personality set to {}", p.name());
+            }
+            None => eprintln!("unknown personality {arg:?} (concise | normal | detailed)"),
+        }
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_vim(repl: &mut ReplState<'_>) -> Result<LineAction> {
+    repl.vim_mode = !repl.vim_mode;
+    if repl.vim_mode {
+        println!("vim keybindings: on (vi editing at the prompt on a terminal)");
+    } else {
+        println!("vim keybindings: off");
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_theme(repl: &mut ReplState<'_>, arg: &str) -> Result<LineAction> {
+    if arg.is_empty() {
+        let note = if repl_polish::Theme::colors_disabled() {
+            " (NO_COLOR is set: colors disabled)"
+        } else {
+            ""
+        };
+        println!("theme: {}{}", repl.theme.name(), note);
+    } else {
+        match repl_polish::Theme::parse(arg) {
+            Some(t) => {
+                repl.theme = t;
+                if repl_polish::Theme::colors_disabled() && t != repl_polish::Theme::None {
+                    println!(
+                        "theme set to {}; note: NO_COLOR is set, colors stay disabled",
+                        t.name()
+                    );
+                } else {
+                    println!("theme set to {}", t.name());
+                }
+            }
+            None => eprintln!("unknown theme {arg:?} (dark | light | none)"),
+        }
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_review_init(
+    ctx: SlashCtx<'_, '_>,
+    arg: &str,
+    cmd: &str,
+    line: &str,
+) -> Result<LineAction> {
+    let SlashCtx {
+        cwd,
+        home,
+        cfg,
+        repl,
+        agent,
+        ..
+    } = ctx;
+    // `UserPromptExpansion`: a typed slash command expands into a
+    // prompt before it reaches the model. A hook may block the
+    // expansion or inject context for it.
+    let command_name = cmd.trim_start_matches('/');
+    let expansion = agent
+        .hooks
+        .run(
+            zen_core::HookEvent::UserPromptExpansion,
+            command_name,
+            serde_json::json!({
+                "expansion_type": "slash_command",
+                "command_name": command_name,
+                "command_args": arg,
+                "prompt": line,
+            }),
+        )
+        .await;
+    if expansion.blocked {
+        eprintln!(
+            "{}",
+            expansion
+                .feedback
+                .unwrap_or_else(|| format!("/{command_name} blocked by hook"))
+        );
+        return Ok(LineAction::Continue);
+    }
+    let prompt = if cmd == "/review" {
+        commands::review_prompt(arg)
+    } else {
+        init_prompt_with_import_offer(cwd)
+    };
+    let mut prompt = prompt;
+    if let Some(extra) = expansion.feedback.filter(|s| !s.trim().is_empty()) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&extra);
+    }
+    let usage_before = agent.usage.clone();
+    let result = run_turn_interruptible(agent, &prompt, repl.interrupts.as_deref_mut()).await;
+    record_turn_cost(home, repl.session_id.as_str(), cfg, agent, &usage_before);
+    refresh_flightdeck_after_turn(
+        home,
+        repl.session_id.as_str(),
+        &agent.usage,
+        &repl.flightdeck,
+    );
+    print_turn(result);
+    Ok(LineAction::Continue)
+}
+
+async fn slash_map(cli: &Cli, cwd: &Path) -> Result<LineAction> {
+    match crate::repomap::repo_map(cwd, cli.map_tokens) {
+        Some(map) => println!("{}", map.text()),
+        None => println!("no repo map (no Rust files found, or --repomap-budget 0)"),
+    };
+    Ok(LineAction::Continue)
+}
+
+async fn slash_map_refresh(cli: &Cli, cwd: &Path) -> Result<LineAction> {
+    match crate::repomap::repo_map(cwd, cli.map_tokens) {
+        Some(map) => {
+            println!("{}", map.text());
+            if map.truncated {
+                println!("[increase --repomap-budget to see more]");
             }
         }
-        "/memories" => {
+        None => println!("no repo map (no Rust files found, or --repomap-budget 0)"),
+    };
+    Ok(LineAction::Continue)
+}
+
+async fn slash_deep_research(
+    repl: &mut ReplState<'_>,
+    agent: &mut zen_agent::Agent,
+    arg: &str,
+) -> Result<LineAction> {
+    use crate::deep_research as dr;
+    match dr::parse_deep_research_args(arg) {
+        Err(e) => eprintln!("{e}"),
+        Ok(mut opts) => {
+            if opts.max_budget_usd.is_none() {
+                opts.max_budget_usd = dr::resolve_budget_usd(None);
+            }
+            if let Err(e) = dr::check_budget_usd(opts.max_budget_usd, opts.max_subagents) {
+                eprintln!("deep-research: {e}");
+                return Ok(LineAction::Continue);
+            }
+            let Some(task) = agent.tools.get("Task") else {
+                eprintln!(
+                    "deep-research needs the Task tool (sub-agents are disabled in this session)"
+                );
+                return Ok(LineAction::Continue);
+            };
+            let angles = dr::research_angles(opts.max_subagents);
             println!(
-                "{}",
-                zen_ext::memories_report_with_root(cwd, home, cwd, cfg.folder_trusted)
+                "deep-research: spawning {} researcher(s) on \"{}\"",
+                angles.len(),
+                opts.topic
             );
+            let ctx = agent.ctx.clone();
+            let model = agent.config.model.clone();
+            let findings = dr::fan_out_research(
+                &task,
+                &ctx,
+                &opts.topic,
+                &opts,
+                &(|s: String| println!("deep-research {s}")),
+            )
+            .await;
+            let ok_count = findings.iter().filter(|f| f.ok).count();
+            println!(
+                "deep-research: {ok_count}/{} researchers finished ok; synthesizing…",
+                findings.len()
+            );
+            let synth_prompt = dr::synthesis_prompt(&opts.topic, &findings);
+            let turn =
+                run_turn_interruptible(agent, &synth_prompt, repl.interrupts.as_deref_mut()).await;
+            let report = match turn {
+                Some(r) if !r.is_error && !r.result.trim().is_empty() => {
+                    dr::render_report(&opts.topic, &model, &opts, &findings, &r.result)
+                }
+                Some(r) => dr::render_fallback_report(
+                    &opts.topic,
+                    &model,
+                    &opts,
+                    &findings,
+                    &format!(
+                        "synthesis turn failed: {}",
+                        r.result.chars().take(160).collect::<String>()
+                    ),
+                ),
+                None => {
+                    dr::render_fallback_report(&opts.topic, &model, &opts, &findings, "interrupted")
+                }
+            };
+            println!("\n{report}");
         }
-        "/todos" => {
-            let todos = lock_or_recover(&agent.ctx.todos, "todos").clone();
-            if todos.is_empty() {
-                println!("(no todos)");
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_pr_comments(
+    cwd: &Path,
+    cfg: &mut crate::settings::ResolvedConfig,
+    repl: &mut ReplState<'_>,
+    agent: &mut zen_agent::Agent,
+    arg: &str,
+) -> Result<LineAction> {
+    let pr_arg = if arg.is_empty() { None } else { Some(arg) };
+    match crate::github::fetch_pr_comments(cwd, pr_arg) {
+        Ok(fetched) => {
+            println!("{}", crate::github::format_comments_text(&fetched));
+            if fetched.total() > 0 {
+                offer_fix_turn(
+                    &crate::github::pr_fix_prompt(&fetched),
+                    "these comments",
+                    cfg,
+                    repl,
+                    agent,
+                )
+                .await;
+            }
+        }
+        Err(e) => eprintln!("pr_comments failed: {:#}", e),
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_ci_fix(
+    cwd: &Path,
+    cfg: &mut crate::settings::ResolvedConfig,
+    repl: &mut ReplState<'_>,
+    agent: &mut zen_agent::Agent,
+) -> Result<LineAction> {
+    match crate::github::fetch_ci_status(cwd) {
+        Ok(status) => {
+            if status.failing.is_empty() {
+                println!("all CI checks passing on branch {}", status.branch);
             } else {
-                println!("● Todos");
-                for t in todos {
-                    let box_char = if t.status == "completed" {
-                        "☑"
-                    } else {
-                        "□"
-                    };
-                    println!("└ {box_char} {}", t.content);
+                println!("{}", crate::github::format_ci_text(&status));
+                offer_fix_turn(
+                    &crate::github::ci_fix_prompt(&status),
+                    "these failures",
+                    cfg,
+                    repl,
+                    agent,
+                )
+                .await;
+            }
+        }
+        Err(e) => eprintln!("ci-fix failed: {:#}", e),
+    };
+    Ok(LineAction::Continue)
+}
+
+async fn slash_status(
+    cli: &Cli,
+    cfg: &mut crate::settings::ResolvedConfig,
+    repl: &mut ReplState<'_>,
+    agent: &mut zen_agent::Agent,
+    session_id: &str,
+) -> Result<LineAction> {
+    println!("model: {}", agent.config.model);
+    println!("base_url: {}", cfg.base_url);
+    println!("permission_mode: {}", cfg.permission_mode);
+    println!("session_id: {}", session_id);
+    println!("goal: {}", repl.goal.as_deref().unwrap_or("(none)"));
+    println!("personality: {}", repl.personality.name());
+    println!("theme: {}", repl.theme.name());
+    println!("vim_mode: {}", repl.vim_mode);
+    println!("ephemeral: {}", cli.ephemeral);
+    if cfg.loaded_sources.is_empty() {
+        println!("settings: (none)");
+    } else {
+        for s in &cfg.loaded_sources {
+            println!("settings: {}", s);
+        }
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_plan(repl: &mut ReplState<'_>, agent: &mut zen_agent::Agent) -> Result<LineAction> {
+    if agent.config.permission_mode == zen_core::PermissionMode::Plan {
+        let restore = repl.pre_plan_mode;
+        crate::planmode::set_permission_mode(&mut agent.config, restore, &repl.base_system_prompt);
+        repl.pending_plan = None;
+        println!("plan mode OFF - permission mode: {}", restore.as_str());
+    } else {
+        repl.pre_plan_mode = agent.config.permission_mode;
+        crate::planmode::set_permission_mode(
+            &mut agent.config,
+            zen_core::PermissionMode::Plan,
+            &repl.base_system_prompt,
+        );
+        repl.pending_plan = None;
+        println!(
+            "plan mode ON - read-only. Research with the available tools, then present \
+             a plan ending with `ExitPlanMode`. /plan again to exit without approving."
+        );
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_permissions(cfg: &mut crate::settings::ResolvedConfig) -> Result<LineAction> {
+    println!("allow: {:?}", cfg.permissions.allow);
+    println!("ask:   {:?}", cfg.permissions.ask);
+    println!("deny:  {:?}", cfg.permissions.deny);
+    println!("mode:  {}", cfg.permission_mode);
+    Ok(LineAction::Continue)
+}
+
+async fn slash_config(
+    cwd: &Path,
+    cfg: &mut crate::settings::ResolvedConfig,
+    agent: &mut zen_agent::Agent,
+    arg: &str,
+) -> Result<LineAction> {
+    if arg.is_empty() {
+        println!("model: {}", agent.config.model);
+        println!("permission_mode: {}", cfg.permission_mode);
+        println!("base_url: {}", cfg.base_url);
+        println!(
+            "autoCompact: {}",
+            cfg.auto_compact
+                .as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "true".into())
+        );
+        println!("set a value with /config key=value (saved to .zen/settings.local.json)");
+    } else if let Some((k, v)) = arg.split_once('=') {
+        match save_local_setting(cwd, k.trim(), v.trim()) {
+            Ok(p) => println!(
+                "saved {} = {} to {} (applies to new sessions)",
+                k.trim(),
+                v.trim(),
+                p.display()
+            ),
+            Err(e) => eprintln!("could not save setting: {}", e),
+        }
+    } else {
+        eprintln!("usage: /config key=value");
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_memory(
+    cwd: &Path,
+    home: Option<&Path>,
+    cfg: &mut crate::settings::ResolvedConfig,
+) -> Result<LineAction> {
+    for (p, _) in zen_ext::memory_files_with_root(cwd, home, cwd, cfg.folder_trusted) {
+        println!("{}", p.display());
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_memories(
+    cwd: &Path,
+    home: Option<&Path>,
+    cfg: &mut crate::settings::ResolvedConfig,
+) -> Result<LineAction> {
+    println!(
+        "{}",
+        zen_ext::memories_report_with_root(cwd, home, cwd, cfg.folder_trusted)
+    );
+    Ok(LineAction::Continue)
+}
+
+async fn slash_todos(agent: &mut zen_agent::Agent) -> Result<LineAction> {
+    let todos = lock_or_recover(&agent.ctx.todos, "todos").clone();
+    if todos.is_empty() {
+        println!("(no todos)");
+    } else {
+        println!("● Todos");
+        for t in todos {
+            let box_char = if t.status == "completed" {
+                "☑"
+            } else {
+                "□"
+            };
+            println!("└ {box_char} {}", t.content);
+        }
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_agents(cli: &Cli, cwd: &Path, home: Option<&Path>) -> Result<LineAction> {
+    let agents = zen_mcp::load_agents(cwd, home, cli.agents.as_deref())?;
+    for a in agents {
+        println!("{}: {}", a.name, a.description);
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_mcp(repl: &mut ReplState<'_>) -> Result<LineAction> {
+    println!("{}", commands::mcp_report(&repl.mcp_status));
+    Ok(LineAction::Continue)
+}
+
+async fn slash_hooks(cfg: &mut crate::settings::ResolvedConfig) -> Result<LineAction> {
+    if cfg.hooks.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+        println!("(no hooks)");
+    } else {
+        println!("{}", serde_json::to_string_pretty(&cfg.hooks)?);
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_skills(
+    cwd: &Path,
+    home: Option<&Path>,
+    cfg: &mut crate::settings::ResolvedConfig,
+) -> Result<LineAction> {
+    let skills = zen_ext::discover_skills(cwd, home, cfg.folder_trusted);
+    if skills.is_empty() {
+        println!("(no skills)");
+    } else {
+        for s in skills {
+            println!("{}: {}", s.name, s.description);
+        }
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_resume_continue(
+    cli: &Cli,
+    cwd: &Path,
+    home: Option<&Path>,
+    repl: &mut ReplState<'_>,
+    agent: &mut zen_agent::Agent,
+    arg: &str,
+) -> Result<LineAction> {
+    if cli.ephemeral {
+        println!("cannot resume sessions in ephemeral mode (nothing is persisted)");
+        return Ok(LineAction::Continue);
+    }
+    let home_dir = home
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    let sessions = crate::session::list_sessions_for_cwd(&home_dir, cwd);
+    if arg.is_empty() {
+        if sessions.is_empty() {
+            println!("(no previous sessions)");
+        } else {
+            println!("Available sessions (/resume <id|name>):");
+            for (id, path) in sessions {
+                match crate::session::session_title(&path) {
+                    Some(t) => println!("  {}  {}", id, t),
+                    None => println!("  {}", id),
                 }
             }
         }
-        "/agents" => {
-            let agents = zen_mcp::load_agents(cwd, home, cli.agents.as_deref())?;
-            for a in agents {
-                println!("{}: {}", a.name, a.description);
+    } else {
+        let found = crate::session::find_session_path(&home_dir, arg).or_else(|| {
+            sessions
+                .into_iter()
+                .find(|(_, p)| crate::session::session_title(p).as_deref() == Some(arg))
+                .map(|(_, p)| p)
+        });
+        match found {
+            Some(path) => {
+                resume_into(path, cwd, agent, repl)?;
             }
+            None => eprintln!("no session found: {}", arg),
         }
-        "/mcp" => println!("{}", commands::mcp_report(&repl.mcp_status)),
-        "/hooks" => {
-            if cfg.hooks.as_object().map(|o| o.is_empty()).unwrap_or(true) {
-                println!("(no hooks)");
-            } else {
-                println!("{}", serde_json::to_string_pretty(&cfg.hooks)?);
-            }
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_recall(
+    cli: &Cli,
+    cwd: &Path,
+    home: Option<&Path>,
+    agent: &mut zen_agent::Agent,
+    session_id: &str,
+    arg: &str,
+) -> Result<LineAction> {
+    if cli.ephemeral {
+        println!("cannot recall sessions in ephemeral mode (nothing is persisted)");
+        return Ok(LineAction::Continue);
+    }
+    let n = match crate::recall::parse_recall_count(arg) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("{e}");
+            return Ok(LineAction::Continue);
         }
-        "/skills" => {
-            let skills = zen_ext::discover_skills(cwd, home, cfg.folder_trusted);
-            if skills.is_empty() {
-                println!("(no skills)");
-            } else {
-                for s in skills {
-                    println!("{}: {}", s.name, s.description);
-                }
-            }
-        }
-        "/resume" | "/continue" => {
-            if cli.ephemeral {
-                println!("cannot resume sessions in ephemeral mode (nothing is persisted)");
-                return Ok(LineAction::Continue);
-            }
-            let home_dir = home
-                .map(Path::to_path_buf)
-                .unwrap_or_else(std::env::temp_dir);
-            let sessions = crate::session::list_sessions_for_cwd(&home_dir, cwd);
-            if arg.is_empty() {
-                if sessions.is_empty() {
-                    println!("(no previous sessions)");
-                } else {
-                    println!("Available sessions (/resume <id|name>):");
-                    for (id, path) in sessions {
-                        match crate::session::session_title(&path) {
-                            Some(t) => println!("  {}  {}", id, t),
-                            None => println!("  {}", id),
-                        }
-                    }
-                }
-            } else {
-                let found = crate::session::find_session_path(&home_dir, &arg).or_else(|| {
-                    sessions
-                        .into_iter()
-                        .find(|(_, p)| {
-                            crate::session::session_title(p).as_deref() == Some(arg.as_str())
-                        })
-                        .map(|(_, p)| p)
-                });
-                match found {
-                    Some(path) => {
-                        resume_into(path, cwd, agent, repl)?;
-                    }
-                    None => eprintln!("no session found: {}", arg),
-                }
-            }
-        }
-        "/recall" => {
-            if cli.ephemeral {
-                println!("cannot recall sessions in ephemeral mode (nothing is persisted)");
-                return Ok(LineAction::Continue);
-            }
-            let n = match crate::recall::parse_recall_count(&arg) {
-                Ok(n) => n,
-                Err(e) => {
+    };
+    let home_dir = home
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    let summaries = crate::recall::recall_summaries(&home_dir, cwd, n, Some(session_id));
+    if let Some(block) = crate::recall::recall_block(&summaries) {
+        let mut msgs = vec![zen_core::ChatMessage::user(block)];
+        msgs.extend(agent.messages().iter().cloned());
+        agent.set_messages(msgs);
+        println!(
+            "recalled summaries of {} previous session(s)",
+            summaries.len()
+        );
+    } else {
+        println!("(no previous session summaries to recall)");
+    }
+    Ok(LineAction::Continue)
+}
+
+async fn slash_custom_command(
+    ctx: SlashCtx<'_, '_>,
+    session_id: &str,
+    line: &str,
+    other: &str,
+) -> Result<LineAction> {
+    let SlashCtx {
+        cli,
+        cwd,
+        home,
+        cfg,
+        repl,
+        agent,
+    } = ctx;
+    let name = other.trim_start_matches('/');
+
+    if zen_ext::find_slash_command(cwd, home, cfg.folder_trusted, name).is_some() {
+        let (expanded, slash_cmd) =
+            crate::agent_run::expand_slash_prompt_cmd(cli, cwd, home, line, cfg, session_id)?;
+
+        let saved_model = agent.config.model.clone();
+        let saved_perms = agent.permissions.clone();
+        // A slash `model:` pin routes for this turn only; the
+        // startup route is restored after the turn (below).
+        let saved_base_url = cfg.base_url.clone();
+        let saved_api_key = cfg.api_key.clone();
+        let saved_cfg_model = cfg.model.clone();
+        let saved_llm = agent.llm.clone();
+        if let Some(c) = &slash_cmd {
+            if let Some(m) = c
+                .model
+                .as_ref()
+                .filter(|m| !m.is_empty() && *m != "inherit")
+            {
+                // Route the pin like /model for this turn only:
+                // model + base URL + key + live backend together.
+                // A refused route (the provider key is unset)
+                // prints the reason and skips the turn instead
+                // of sending the id to the wrong gateway.
+                if let Err(e) = switch_model_with_hooks(ModelSwitchRequest {
+                    requested: m,
+                    source: "command",
+                    cfg,
+                    agent,
+                    repl,
+                    home,
+                })
+                .await
+                {
                     eprintln!("{e}");
                     return Ok(LineAction::Continue);
                 }
-            };
-            let home_dir = home
-                .map(Path::to_path_buf)
-                .unwrap_or_else(std::env::temp_dir);
-            let summaries = crate::recall::recall_summaries(&home_dir, cwd, n, Some(session_id));
-            if let Some(block) = crate::recall::recall_block(&summaries) {
-                let mut msgs = vec![zen_core::ChatMessage::user(block)];
-                msgs.extend(agent.messages().iter().cloned());
-                agent.set_messages(msgs);
-                println!(
-                    "recalled summaries of {} previous session(s)",
-                    summaries.len()
-                );
-            } else {
-                println!("(no previous session summaries to recall)");
+            }
+            if !c.allowed_tools.is_empty() {
+                agent.permissions =
+                    crate::agent_run::build_permissions_with(cwd, cfg, cli, &c.allowed_tools);
             }
         }
-        other => {
-            let name = other.trim_start_matches('/');
-
-            if zen_ext::find_slash_command(cwd, home, cfg.folder_trusted, name).is_some() {
-                let (expanded, slash_cmd) = crate::agent_run::expand_slash_prompt_cmd(
-                    cli, cwd, home, line, cfg, session_id,
-                )?;
-
-                let saved_model = agent.config.model.clone();
-                let saved_perms = agent.permissions.clone();
-                // A slash `model:` pin routes for this turn only; the
-                // startup route is restored after the turn (below).
-                let saved_base_url = cfg.base_url.clone();
-                let saved_api_key = cfg.api_key.clone();
-                let saved_cfg_model = cfg.model.clone();
-                let saved_llm = agent.llm.clone();
-                if let Some(c) = &slash_cmd {
-                    if let Some(m) = c
-                        .model
-                        .as_ref()
-                        .filter(|m| !m.is_empty() && *m != "inherit")
-                    {
-                        // Route the pin like /model for this turn only:
-                        // model + base URL + key + live backend together.
-                        // A refused route (the provider key is unset)
-                        // prints the reason and skips the turn instead
-                        // of sending the id to the wrong gateway.
-                        if let Err(e) = switch_model_with_hooks(ModelSwitchRequest {
-                            requested: m,
-                            source: "command",
-                            cfg,
-                            agent,
-                            repl,
-                            home,
-                        })
-                        .await
-                        {
-                            eprintln!("{e}");
-                            return Ok(LineAction::Continue);
-                        }
-                    }
-                    if !c.allowed_tools.is_empty() {
-                        agent.permissions = crate::agent_run::build_permissions_with(
-                            cwd,
-                            cfg,
-                            cli,
-                            &c.allowed_tools,
-                        );
-                    }
-                }
-                let usage_before = agent.usage.clone();
-                let result =
-                    run_turn_interruptible(agent, &expanded, repl.interrupts.as_deref_mut()).await;
-                record_turn_cost(home, repl.session_id.as_str(), cfg, agent, &usage_before);
-                refresh_flightdeck_after_turn(
-                    home,
-                    repl.session_id.as_str(),
-                    &agent.usage,
-                    &repl.flightdeck,
-                );
-                let pinned = agent.config.model.clone();
-                cfg.base_url = saved_base_url;
-                cfg.api_key = saved_api_key;
-                cfg.model = saved_cfg_model;
-                agent.llm = saved_llm;
-                agent.config.model = saved_model.clone();
-                agent.permissions = saved_perms;
-                // Restoring the startup route is an automatic model
-                // change: PostModelSwitch only, no Pre hook.
-                if pinned != saved_model {
-                    fire_post_model_switch(agent, &pinned, &saved_model, "auto").await;
-                }
-                print_turn(result);
-            } else {
-                eprintln!("unknown command: {}", other);
-            }
+        let usage_before = agent.usage.clone();
+        let result = run_turn_interruptible(agent, &expanded, repl.interrupts.as_deref_mut()).await;
+        record_turn_cost(home, repl.session_id.as_str(), cfg, agent, &usage_before);
+        refresh_flightdeck_after_turn(
+            home,
+            repl.session_id.as_str(),
+            &agent.usage,
+            &repl.flightdeck,
+        );
+        let pinned = agent.config.model.clone();
+        cfg.base_url = saved_base_url;
+        cfg.api_key = saved_api_key;
+        cfg.model = saved_cfg_model;
+        agent.llm = saved_llm;
+        agent.config.model = saved_model.clone();
+        agent.permissions = saved_perms;
+        // Restoring the startup route is an automatic model
+        // change: PostModelSwitch only, no Pre hook.
+        if pinned != saved_model {
+            fire_post_model_switch(agent, &pinned, &saved_model, "auto").await;
         }
+        print_turn(result);
+    } else {
+        eprintln!("unknown command: {}", other);
     }
     Ok(LineAction::Continue)
 }
@@ -6085,6 +6387,85 @@ mod pr208_mutant_tests {
             format!("---\nmodel: {model}\n---\nSay hi.\n"),
         )
         .unwrap();
+    }
+
+    /// Issue #593: the thin `handle_slash` dispatcher must route every
+    /// builtin to its extracted `slash_*` handler. Read-only dispatches
+    /// (no turn, no network, no prompt) go through the dispatcher and
+    /// must all return `Continue`; `/exit` returns `Exit` and an
+    /// unknown command stays `Continue`. Commands that need a turn,
+    /// a terminal, the network or a git repo are excluded here and
+    /// stay covered by their own tests (`/worktree`, `/add-dir`,
+    /// `/review`, custom `/probe`).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // floor-guard: ENV_LOCK held across await on purpose, env must not change mid-test
+    async fn slash_dispatch_builtins_return_continue() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let backend = std::sync::Arc::new(RecordingBackend {
+            models: std::sync::Mutex::new(vec![]),
+        });
+        let mut agent = test_agent_with_hooks(backend, std::sync::Arc::new(zen_core::NoHooks));
+        let mut cfg = test_cfg();
+        let dir = temp_dir("zen_fix593_dispatch");
+        let cli = crate::cli::Cli::parse_from(["zen"]);
+        let mut session_id = crate::session::new_session_id();
+        let mut writer =
+            crate::session::TranscriptWriter::new(dir.join("session.jsonl"), &session_id, &dir);
+        let mut repl = make_repl(&mut session_id, &mut writer, &dir);
+        for line in [
+            "/help",
+            "/cost",
+            "/context",
+            "/status",
+            "/permissions",
+            "/memory",
+            "/memories",
+            "/todos",
+            "/mcp",
+            "/skills",
+            "/hooks",
+            "/theme",
+            "/personality",
+            "/goal",
+            "/vim",
+            "/terse",
+            "/plan",
+            "/scope",
+            "/done",
+            "/expand",
+            "/diff",
+            "/config",
+            "/rename",
+            "/commit",
+            "/map",
+            "/map-refresh",
+            "/export",
+        ] {
+            let action = handle_slash(line, &cli, &dir, None, &mut cfg, &mut repl, &mut agent)
+                .await
+                .unwrap();
+            assert!(
+                matches!(action, LineAction::Continue),
+                "{line} should continue"
+            );
+        }
+        let action = handle_slash("/exit", &cli, &dir, None, &mut cfg, &mut repl, &mut agent)
+            .await
+            .unwrap();
+        assert!(matches!(action, LineAction::Exit));
+        let action = handle_slash(
+            "/no-such-command",
+            &cli,
+            &dir,
+            None,
+            &mut cfg,
+            &mut repl,
+            &mut agent,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(action, LineAction::Continue));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // Mutant #29 (repl.rs:2598, the restore call in `handle_slash`)
