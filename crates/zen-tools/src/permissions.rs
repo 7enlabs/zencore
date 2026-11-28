@@ -13,7 +13,18 @@ use zen_core::{
 pub fn tool_is_read_only(name: &str) -> bool {
     matches!(
         name,
-        "Read" | "Glob" | "Grep" | "TodoWrite" | "Task" | "delegate" | "Skill"
+        "Read"
+            | "Glob"
+            | "Grep"
+            | "TodoWrite"
+            | "Task"
+            | "delegate"
+            | "Skill"
+            // Browser agent (spec section 4): the four read-only tools.
+            | crate::browser::BROWSER_NAVIGATE
+            | crate::browser::BROWSER_CONTENT
+            | crate::browser::BROWSER_SCREENSHOT
+            | crate::browser::BROWSER_WAIT
     )
 }
 
@@ -257,7 +268,17 @@ enum RuleKind {
 /// Whether the named tool edits files (M4: the ACP prompter maps it
 /// to the `edit` tool kind in `session/request_permission`).
 pub fn is_edit_tool(name: &str) -> bool {
-    matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit")
+    matches!(
+        name,
+        "Edit"
+            | "Write"
+            | "MultiEdit"
+            | "NotebookEdit"
+            // Browser agent (spec section 4.6): the two mutating tools,
+            // so the ACP prompter maps them to the `edit` tool kind.
+            | crate::browser::BROWSER_CLICK
+            | crate::browser::BROWSER_TYPE
+    )
 }
 
 pub fn rule_matches(rule: &str, tool_name: &str, input: &Value, cwd: &Path) -> bool {
@@ -293,7 +314,15 @@ fn rule_matches_kind(
         || (kind == RuleKind::Deny
             && spec.is_some()
             && rule_tool == "Read"
-            && (is_edit_tool(tool_name) || matches!(tool_name, "Grep" | "Glob")));
+            && (is_edit_tool(tool_name) || matches!(tool_name, "Grep" | "Glob")))
+        // Browser agent (spec section 4.5): a rule may name either
+        // spelling, so `BrowserClick` matches `browser_click`; and the
+        // `BrowserLogin` class matches a login-gated click/type call.
+        || (crate::browser::is_browser_tool(tool_name)
+            && crate::browser::norm_tool_name(rule_tool)
+                == crate::browser::norm_tool_name(tool_name))
+        || (crate::browser::norm_tool_name(rule_tool) == "browserlogin"
+            && browser_login_call(tool_name, input));
     if !name_ok {
         return false;
     }
@@ -302,6 +331,27 @@ fn rule_matches_kind(
         "Bash" | "bash" => {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
             bash_rule_matches(spec, cmd)
+        }
+        t if rule_tool_is_browser(t) => {
+            // Host-scoped browser rules (spec section 4.7): the host is
+            // the input URL for navigate, the active session's page host
+            // for the other tools.
+            let url = input.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let host = if url.is_empty() {
+                crate::browser::current_browser_host().unwrap_or_default()
+            } else {
+                host_of(url)
+            };
+            match spec.strip_prefix("domain:") {
+                Some(domain) => host_matches_domain(domain, &host),
+                None => {
+                    if url.is_empty() {
+                        host.contains(spec)
+                    } else {
+                        url.contains(spec)
+                    }
+                }
+            }
         }
         t if t == "Read" || is_edit_tool(t) => match path_arg(input) {
             Some(fp) => path_rule_matches(cwd, spec, fp),
@@ -665,11 +715,39 @@ impl RulePermissions {
         self.evaluate_full(tool_name, input, read_only, ctx).0
     }
 
+    /// Full gate evaluation with the browser audit log (spec section
+    /// 4.8): every browser tool decision is logged with tool, host,
+    /// decision, and mode. The log never includes typed text or
+    /// cookies.
+    fn evaluate_full(
+        &self,
+        tool_name: &str,
+        input: &Value,
+        read_only: bool,
+        ctx: &ToolContext,
+    ) -> (PermissionDecision, GateInfo) {
+        let result = self.evaluate_full_inner(tool_name, input, read_only, ctx);
+        if crate::browser::is_browser_tool(tool_name) {
+            let decision = match &result.0 {
+                PermissionDecision::Allow => "allow",
+                PermissionDecision::Ask => "ask",
+                PermissionDecision::Deny(_) => "deny",
+            };
+            let host = crate::browser::current_browser_host().unwrap_or_default();
+            eprintln!(
+                "browser permission: tool={tool_name} host={host} decision={decision} mode={} reason={}",
+                self.current_mode().as_str(),
+                result.1.reason_code
+            );
+        }
+        result
+    }
+
     /// The full gate evaluation (Flightdeck Phase 2): the decision
     /// plus the GATE bucket and reason code that produced it. The
     /// classifier verdict is computed once here and reused by both
     /// the dangerous hard-deny and the safe auto-allow below.
-    fn evaluate_full(
+    fn evaluate_full_inner(
         &self,
         tool_name: &str,
         input: &Value,
@@ -731,6 +809,70 @@ impl RulePermissions {
             );
         }
 
+        // 2b. Browser tools (spec section 4): the permission gate for
+        // the six browser tools. Classification comes from the selector
+        // text, the `submit` flag, and the cached page state; the mark
+        // is recorded for the runtime re-check in `browser.rs`.
+        // Login, submit, and destructive actions always need their own
+        // approval: Ask directly, never via `resolve_ask` (its
+        // BypassPermissions arm would turn the Ask into Allow).
+        if crate::browser::is_browser_tool(tool_name) {
+            // Rule 1: Plan mode blocks every browser tool, read-only
+            // included.
+            if mode == PermissionMode::Plan {
+                return (
+                    PermissionDecision::Deny("plan mode: browser tools are not available".into()),
+                    GateInfo {
+                        bucket: GateBucket::Denied,
+                        reason_code: "mode.plan.browser".into(),
+                    },
+                );
+            }
+            if crate::browser::is_browser_mutating(tool_name) {
+                let session_key = if ctx.session_id.is_empty() {
+                    "default".to_string()
+                } else {
+                    ctx.session_id.clone()
+                };
+                let (mark, _) =
+                    crate::browser::classify_browser_call(tool_name, input, &session_key);
+                // Rule 9 + section 5: login, submit, and destructive
+                // actions always need a separate approval, in every
+                // mode, and no allow rule overrides this.
+                if mark.login {
+                    return (
+                        PermissionDecision::Ask,
+                        GateInfo {
+                            bucket: GateBucket::Classifier,
+                            reason_code: "browser.login".into(),
+                        },
+                    );
+                }
+                if mark.submit || mark.destructive {
+                    return (
+                        PermissionDecision::Ask,
+                        GateInfo {
+                            bucket: GateBucket::Classifier,
+                            reason_code: "browser.submit".into(),
+                        },
+                    );
+                }
+                // Rule 4: BypassPermissions never auto-allows
+                // click/type, even though it skips asking for other
+                // tools. Read-only browser tools follow the general
+                // gate below.
+                if mode == PermissionMode::BypassPermissions {
+                    return (
+                        PermissionDecision::Ask,
+                        GateInfo {
+                            bucket: GateBucket::Classifier,
+                            reason_code: "browser.mutating".into(),
+                        },
+                    );
+                }
+            }
+        }
+
         // 3. Plan mode: only read-only tools run.
         if mode == PermissionMode::Plan && !read_only {
             return (
@@ -776,7 +918,10 @@ impl RulePermissions {
         // askAll: an allow rule never self-allows, and a read-only tool
         // never auto-allows. Everything past the deny/ask rules above
         // falls through to the mode match, which asks.
-        if allowed && mode != PermissionMode::AskAll {
+        if allowed
+            && mode != PermissionMode::AskAll
+            && !(mode == PermissionMode::DontAsk && crate::browser::is_browser_mutating(tool_name))
+        {
             return (
                 PermissionDecision::Allow,
                 GateInfo {
@@ -814,7 +959,11 @@ impl RulePermissions {
         // 8. Mode fallback.
         match mode {
             PermissionMode::AcceptEdits => {
-                let is_edit = is_edit_tool(tool_name);
+                // Browser agent (spec section 4, rule 3): AcceptEdits
+                // only waives asking for file edits, never for browser
+                // click/type, which still ask.
+                let is_edit =
+                    is_edit_tool(tool_name) && !crate::browser::is_browser_mutating(tool_name);
                 if is_edit && self.path_inside_workdir(input, ctx) {
                     return (
                         PermissionDecision::Allow,
@@ -974,6 +1123,56 @@ pub fn persist_allow_rule(path: &Path, rule: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether this browser call is a login call (spec section 5): typing
+/// into a password field, or clicking submit on a form that holds a
+/// password field. Used for `BrowserLogin` rules. Mirrors the gate
+/// classification in `browser.rs`; with no input and no active session
+/// it is conservatively false.
+/// Whether a rule's tool name refers to a browser tool (either
+/// spelling) or to the `BrowserLogin` class (spec section 4.5).
+/// `norm_tool_name` drops `_`, so the comparison normalises both sides
+/// (via the tool constants, so a rename stays correct) instead of
+/// matching the canonical spelling only.
+fn rule_tool_is_browser(rule_tool: &str) -> bool {
+    let norm = crate::browser::norm_tool_name(rule_tool);
+    [
+        crate::browser::BROWSER_NAVIGATE,
+        crate::browser::BROWSER_CLICK,
+        crate::browser::BROWSER_TYPE,
+        crate::browser::BROWSER_CONTENT,
+        crate::browser::BROWSER_SCREENSHOT,
+        crate::browser::BROWSER_WAIT,
+    ]
+    .iter()
+    .any(|c| crate::browser::norm_tool_name(c) == norm)
+        || norm == "browserlogin"
+}
+
+fn browser_login_call(tool_name: &str, input: &Value) -> bool {
+    if !crate::browser::is_browser_mutating(tool_name) {
+        return false;
+    }
+    crate::browser::classify_current_browser_call(tool_name, input).1
+}
+
+/// Host-vs-domain match, shared by browser rules (spec section 4.7).
+/// `*.example.com` matches subdomains; a bare domain matches exactly
+/// (ignoring a `www.` prefix); `*` matches any non-empty host.
+fn host_matches_domain(domain: &str, host: &str) -> bool {
+    let domain = domain.trim().to_lowercase();
+    let host = host.trim().to_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    if domain == "*" {
+        return true;
+    }
+    if let Some(base) = domain.strip_prefix("*.") {
+        return host.ends_with(&format!(".{base}"));
+    }
+    host.trim_start_matches("www.") == domain.trim_start_matches("www.")
+}
+
 pub fn suggested_rule(tool_name: &str, input: &Value) -> Option<String> {
     match tool_name {
         "Bash" => input
@@ -991,6 +1190,28 @@ pub fn suggested_rule(tool_name: &str, input: &Value) -> Option<String> {
                 Some(format!("WebFetch(domain:{})", h))
             }
         }),
+        // Browser agent (spec section 4.5): suggest the rule class the
+        // user can write. Login calls suggest `BrowserLogin`; other
+        // click/type calls suggest a host-scoped rule when the active
+        // session's host is known.
+        "browser_navigate" => input.get("url").and_then(|v| v.as_str()).map(|u| {
+            let h = host_of(u);
+            if h.is_empty() {
+                "browser_navigate".to_string()
+            } else {
+                format!("browser_navigate(domain:{h})")
+            }
+        }),
+        "browser_click" | "browser_type" => {
+            if browser_login_call(tool_name, input) {
+                Some("BrowserLogin".to_string())
+            } else if let Some(h) = crate::browser::current_browser_host().filter(|h| !h.is_empty())
+            {
+                Some(format!("{tool_name}(domain:{h})"))
+            } else {
+                Some(tool_name.to_string())
+            }
+        }
         other => Some(other.to_string()),
     }
 }
@@ -2598,5 +2819,361 @@ mod permission_tests {
         assert_eq!(info.bucket, GateBucket::Classifier);
         assert_eq!(info.reason_code, "mode.default");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Browser agent (spec section 4): the permission gate for the six
+    // browser tools. The test session key is "perm-session" (ctx_for).
+    fn browser_ctx() -> (PathBuf, ToolContext) {
+        let dir = tmpdir("browser-gate");
+        let ctx = ctx_for(&dir);
+        (dir, ctx)
+    }
+
+    fn is_deny(d: &PermissionDecision) -> bool {
+        matches!(d, PermissionDecision::Deny(_))
+    }
+
+    fn browser_perms(
+        mode: PermissionMode,
+        allow: &[&str],
+        ask: &[&str],
+        deny: &[&str],
+    ) -> RulePermissions {
+        perms(mode, allow, ask, deny, None)
+    }
+
+    fn browser_input(tool: &str) -> Value {
+        match tool {
+            "browser_navigate" => serde_json::json!({"url": "https://example.com/page"}),
+            "browser_click" => serde_json::json!({"selector": "#ok"}),
+            "browser_type" => serde_json::json!({"selector": "#q", "text": "hello"}),
+            _ => serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn browser_tool_classification() {
+        assert!(tool_is_read_only("browser_navigate"));
+        assert!(tool_is_read_only("browser_content"));
+        assert!(tool_is_read_only("browser_screenshot"));
+        assert!(tool_is_read_only("browser_wait"));
+        assert!(!tool_is_read_only("browser_click"));
+        assert!(!tool_is_read_only("browser_type"));
+        assert!(is_edit_tool("browser_click"));
+        assert!(is_edit_tool("browser_type"));
+    }
+
+    #[test]
+    fn browser_read_only_tools_allow_in_default() {
+        let (dir, ctx) = browser_ctx();
+        let p = browser_perms(PermissionMode::Default, &[], &[], &[]);
+        for tool in [
+            "browser_navigate",
+            "browser_content",
+            "browser_screenshot",
+            "browser_wait",
+        ] {
+            let d = p.check(tool, &browser_input(tool), true, &ctx);
+            assert!(is_allow(&d), "{tool}: expected Allow, got {d:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_click_and_type_ask_in_default() {
+        let (dir, ctx) = browser_ctx();
+        let p = browser_perms(PermissionMode::Default, &[], &[], &[]);
+        for tool in ["browser_click", "browser_type"] {
+            let d = p.check(tool, &browser_input(tool), false, &ctx);
+            assert!(is_ask(&d), "{tool}: expected Ask, got {d:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_plan_mode_denies_all_browser_tools() {
+        let (dir, ctx) = browser_ctx();
+        let p = browser_perms(PermissionMode::Plan, &[], &[], &[]);
+        for tool in [
+            "browser_navigate",
+            "browser_click",
+            "browser_type",
+            "browser_content",
+            "browser_screenshot",
+            "browser_wait",
+        ] {
+            let d = p.check(tool, &browser_input(tool), tool_is_read_only(tool), &ctx);
+            assert!(is_deny(&d), "{tool}: expected Deny, got {d:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_ask_all_asks_every_browser_tool() {
+        let (dir, ctx) = browser_ctx();
+        let p = browser_perms(PermissionMode::AskAll, &[], &[], &[]);
+        for tool in [
+            "browser_navigate",
+            "browser_click",
+            "browser_type",
+            "browser_content",
+            "browser_screenshot",
+            "browser_wait",
+        ] {
+            let d = p.check(tool, &browser_input(tool), tool_is_read_only(tool), &ctx);
+            assert!(is_ask(&d), "{tool}: expected Ask, got {d:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_accept_edits_does_not_auto_allow_click_type() {
+        let (dir, ctx) = browser_ctx();
+        let p = browser_perms(PermissionMode::AcceptEdits, &[], &[], &[]);
+        for tool in ["browser_click", "browser_type"] {
+            let d = p.check(tool, &browser_input(tool), false, &ctx);
+            assert!(is_ask(&d), "{tool}: expected Ask, got {d:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_bypass_never_auto_allows_click_type() {
+        let (dir, ctx) = browser_ctx();
+        let p = browser_perms(PermissionMode::BypassPermissions, &[], &[], &[]);
+        for tool in ["browser_click", "browser_type"] {
+            let d = p.check(tool, &browser_input(tool), false, &ctx);
+            assert!(is_ask(&d), "{tool}: expected Ask, got {d:?}");
+        }
+        // Read-only browser tools follow the general gate in Bypass.
+        let d = p.check(
+            "browser_navigate",
+            &browser_input("browser_navigate"),
+            true,
+            &ctx,
+        );
+        assert!(is_allow(&d), "navigate: expected Allow, got {d:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_submit_always_asks_despite_allow_rule() {
+        let (dir, ctx) = browser_ctx();
+        let p = browser_perms(
+            PermissionMode::Default,
+            &["BrowserType", "BrowserClick"],
+            &[],
+            &[],
+        );
+        let d = p.check(
+            "browser_type",
+            &serde_json::json!({"selector": "#q", "text": "x", "submit": true}),
+            false,
+            &ctx,
+        );
+        assert!(is_ask(&d), "submit type: expected Ask, got {d:?}");
+        let d = p.check(
+            "browser_click",
+            &serde_json::json!({"selector": "button[type=submit]"}),
+            false,
+            &ctx,
+        );
+        assert!(is_ask(&d), "submit click: expected Ask, got {d:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_login_always_asks_and_browser_login_deny_blocks() {
+        let (dir, ctx) = browser_ctx();
+        let login = serde_json::json!({"selector": "#password", "text": "s3cret"});
+        // Even with an explicit allow rule, a login call asks.
+        let p = browser_perms(PermissionMode::Default, &["BrowserType"], &[], &[]);
+        let d = p.check("browser_type", &login, false, &ctx);
+        assert!(is_ask(&d), "login type: expected Ask, got {d:?}");
+        // In BypassPermissions, a login call still asks.
+        let pb = browser_perms(
+            PermissionMode::BypassPermissions,
+            &["BrowserType"],
+            &[],
+            &[],
+        );
+        let d = pb.check("browser_type", &login, false, &ctx);
+        assert!(is_ask(&d), "login type in Bypass: expected Ask, got {d:?}");
+        // And a BrowserLogin deny rule blocks it outright.
+        let pd = browser_perms(PermissionMode::Default, &[], &[], &["BrowserLogin"]);
+        let d = pd.check("browser_type", &login, false, &ctx);
+        assert!(
+            is_deny(&d),
+            "login type with deny BrowserLogin: expected Deny, got {d:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_allow_rule_allows_plain_click_in_default() {
+        let (dir, ctx) = browser_ctx();
+        let p = browser_perms(PermissionMode::Default, &["BrowserClick"], &[], &[]);
+        let d = p.check(
+            "browser_click",
+            &browser_input("browser_click"),
+            false,
+            &ctx,
+        );
+        assert!(
+            is_allow(&d),
+            "plain click with allow rule: expected Allow, got {d:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_deny_rule_by_host() {
+        let (dir, ctx) = browser_ctx();
+        let p = browser_perms(
+            PermissionMode::Default,
+            &[],
+            &[],
+            &["browser_navigate(domain:example.com)"],
+        );
+        let d = p.check(
+            "browser_navigate",
+            &serde_json::json!({"url": "https://example.com/page"}),
+            true,
+            &ctx,
+        );
+        assert!(
+            is_deny(&d),
+            "navigate to example.com: expected Deny, got {d:?}"
+        );
+        let d = p.check(
+            "browser_navigate",
+            &serde_json::json!({"url": "https://other.test/"}),
+            true,
+            &ctx,
+        );
+        assert!(
+            is_allow(&d),
+            "navigate to other.test: expected Allow, got {d:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_destructive_click_always_asks() {
+        let (dir, ctx) = browser_ctx();
+        let p = browser_perms(PermissionMode::Default, &["BrowserClick"], &[], &[]);
+        let d = p.check(
+            "browser_click",
+            &serde_json::json!({"selector": "#delete-account"}),
+            false,
+            &ctx,
+        );
+        assert!(is_ask(&d), "destructive click: expected Ask, got {d:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_suggested_rule() {
+        assert_eq!(
+            suggested_rule(
+                "browser_type",
+                &serde_json::json!({"selector": "#password"})
+            ),
+            Some("BrowserLogin".to_string())
+        );
+        assert_eq!(
+            suggested_rule(
+                "browser_navigate",
+                &serde_json::json!({"url": "https://example.com/page"})
+            ),
+            Some("browser_navigate(domain:example.com)".to_string())
+        );
+    }
+
+    // ==================== PR #580 mutant kills ====================
+
+    #[test]
+    fn rule_browser_name_matching_needs_same_tool() {
+        let cwd = PathBuf::from("/tmp/work");
+        // A rule naming browser_click must not match browser_navigate.
+        assert!(!rule_matches(
+            "BrowserClick",
+            "browser_navigate",
+            &json!({}),
+            &cwd
+        ));
+        // ... and BrowserLogin must not match a read-only browser tool.
+        assert!(!rule_matches(
+            "BrowserLogin",
+            "browser_navigate",
+            &json!({}),
+            &cwd
+        ));
+        // Positive control: the same tool matches (BrowserClick spelling).
+        assert!(rule_matches(
+            "BrowserClick",
+            "browser_click",
+            &json!({}),
+            &cwd
+        ));
+    }
+
+    #[test]
+    fn browser_login_call_needs_a_mutating_login_call() {
+        // Read-only browser tools are never login calls.
+        assert!(!browser_login_call("browser_navigate", &json!({})));
+        assert!(!browser_login_call("browser_content", &json!({})));
+        // A mutating call on a password selector is a login call.
+        assert!(browser_login_call(
+            "browser_click",
+            &json!({"selector": "#password"})
+        ));
+        assert!(browser_login_call(
+            "browser_type",
+            &json!({"selector": "#password"})
+        ));
+        // ... but the same tools on a plain selector are not.
+        assert!(!browser_login_call(
+            "browser_click",
+            &json!({"selector": "#ok"})
+        ));
+    }
+
+    #[test]
+    fn accept_edits_does_not_allow_unlisted_tools_with_paths() {
+        let dir = tmpdir("accept-edits-2");
+        let ctx = ctx_for(&dir);
+        let p = perms(PermissionMode::AcceptEdits, &[], &[], &[], None);
+        // A tool that is neither an edit tool nor a browser tool must still ask,
+        // even when its file path is inside the workdir.
+        let d = p.evaluate(
+            "mcp__files__write",
+            &json!({"file_path": "x.txt"}),
+            false,
+            &ctx,
+        );
+        assert!(
+            is_ask(&d),
+            "AcceptEdits must ask for unlisted tools, got {d:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_suggested_rule_prefers_the_host_scoped_rule() {
+        // With a known host, click/type suggest the host-scoped rule.
+        crate::browser::update_cached_page(
+            "suggest-key",
+            "https://example.com/page".to_string(),
+            false,
+        );
+        assert_eq!(
+            suggested_rule("browser_click", &json!({"selector": "#ok"})),
+            Some("browser_click(domain:example.com)".to_string())
+        );
+        assert_eq!(
+            suggested_rule("browser_type", &json!({"selector": "#ok"})),
+            Some("browser_type(domain:example.com)".to_string())
+        );
     }
 }

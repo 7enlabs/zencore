@@ -1,4 +1,5 @@
 pub mod atomic;
+pub mod browser;
 pub mod builtin;
 pub mod checkpoint;
 pub mod classifier;
@@ -35,6 +36,10 @@ pub fn job_tools() -> Vec<std::sync::Arc<dyn zen_core::Tool>> {
     ]
 }
 
+pub use browser::{
+    BrowserClickTool, BrowserContentTool, BrowserNavigateTool, BrowserScreenshotTool,
+    BrowserTypeTool, BrowserWaitTool, browser_permission_hint, browser_permission_title,
+};
 pub use permissions::{
     RulePermissions, dedup, persist_allow_rule, rule_matches, rule_removes_tool, split_compound,
     suggested_rule, suggested_rules, tool_is_read_only,

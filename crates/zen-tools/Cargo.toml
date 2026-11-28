@@ -16,6 +16,10 @@ dirs.workspace = true
 globset.workspace = true
 walkdir.workspace = true
 reqwest.workspace = true
+tokio-tungstenite.workspace = true
+tungstenite.workspace = true
+base64.workspace = true
+futures.workspace = true
 
 # Phase 2 #12: Linux-only sandbox enforcement (Landlock + seccomp).
 # Both crates are Linux-only, so they live behind a target gate and the

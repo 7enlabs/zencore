@@ -8,6 +8,12 @@ pub fn tool_long_docs(name: &str) -> Option<&'static str> {
         "Glob" => include_str!("../../../docs/tools/glob.md"),
         "Grep" => include_str!("../../../docs/tools/grep.md"),
         "WebFetch" => include_str!("../../../docs/tools/webfetch.md"),
+        "browser_navigate" => include_str!("../../../docs/tools/browser-navigate.md"),
+        "browser_click" => include_str!("../../../docs/tools/browser-click.md"),
+        "browser_type" => include_str!("../../../docs/tools/browser-type.md"),
+        "browser_content" => include_str!("../../../docs/tools/browser-content.md"),
+        "browser_screenshot" => include_str!("../../../docs/tools/browser-screenshot.md"),
+        "browser_wait" => include_str!("../../../docs/tools/browser-wait.md"),
         "WebSearch" => include_str!("../../../docs/tools/websearch.md"),
         "TodoWrite" => include_str!("../../../docs/tools/todowrite.md"),
         "JobOutput" => include_str!("../../../docs/tools/joboutput.md"),
@@ -22,6 +28,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn browser_click_has_long_docs() {
+        // Kills tool_docs.rs:12 delete match arm "browser_click": the
+        // docs for browser_click must exist and be the click doc file.
+        let docs = tool_long_docs("browser_click").expect("browser_click docs");
+        assert!(docs.contains("# browser_click"), "{docs}");
+    }
+
+    #[test]
     fn every_builtin_has_docs() {
         for name in [
             "Read",
@@ -32,6 +46,12 @@ mod tests {
             "Glob",
             "Grep",
             "WebFetch",
+            "browser_navigate",
+            "browser_click",
+            "browser_type",
+            "browser_content",
+            "browser_screenshot",
+            "browser_wait",
             "WebSearch",
             "TodoWrite",
             "JobOutput",
